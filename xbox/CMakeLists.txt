@@ -12,10 +12,13 @@
 #    (/STACK:16777216,16777216) and 82 threads cost ~1.28 GiB of the 5,120 MiB
 #    before the game ran. 8 MiB with a 64 KiB commit granularity is the lesson.
 
+cmake_minimum_required(VERSION 3.28)
+project(bbxbox LANGUAGES C CXX)
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
     message(FATAL_ERROR "xbox/ must be configured with -DCMAKE_SYSTEM_NAME=WindowsStore")
 endif()
-if(NOT CMAKE_SIZE_OF_VOID_P EQUAL 8)
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "bbxbox is x64 only")
 endif()
 
