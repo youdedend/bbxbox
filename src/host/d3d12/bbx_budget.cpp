@@ -23,12 +23,12 @@ constexpr std::uint64_t kCapsMiB[static_cast<int>(Owner::kCount)] = {
     640,   // kReserve
 };
 
-// The precompiler keeps this much headroom before it starts a compile, and
-// stops until the headroom is back to kCompileResume. A compile can allocate
-// hundreds of MiB in DXC's arena and the PSO library; a console at the ceiling
-// is killed, not slowed.
+// The precompiler keeps this much headroom before it starts a compile. A compile
+// can allocate hundreds of MiB in DXC's arena and the PSO library; a console at
+// the ceiling is killed, not slowed. The hysteresis is the inflight quarantine
+// in bbx_precompile: a draw whose PSO could not compile waits a frame for the
+// memory rather than retrying into the wall.
 constexpr std::uint64_t kCompileReserve = 768ull << 20;
-constexpr std::uint64_t kCompileResume = 512ull << 20;
 
 int OwnerIndex(Owner owner) { return static_cast<int>(owner); }
 
