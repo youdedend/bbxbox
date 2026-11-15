@@ -50,9 +50,22 @@ sources=(
   "$root"/tests/tess_test.cpp
   "$root"/tests/display_test.cpp
   "$root"/tests/shaders_test.cpp
+  "$root"/tests/guest_core_test.cpp
+  "$root"/tests/guest_core_stubs.cpp
+  # The vendored guest core, compiled as the console compiles it (minus the UWP
+  # memory adapter): the tests in guest_core_test.cpp run the real loader pieces,
+  # not copies of them.
+  "$root"/upstream/bbhost/src/core/sha256.cpp
+  "$root"/upstream/bbhost/src/core/imports.cpp
+  "$root"/upstream/bbhost/src/core/tls_rewrite.cpp
+  "$root"/upstream/bbhost/src/core/elf.cpp
+  "$root"/upstream/bbhost/src/core/paced_file.cpp
+  "$root"/upstream/bbhost/src/core/portable.cpp
+  "$root"/upstream/bbhost/src/core/memory.cpp
 )
 
 mkdir -p "$(dirname "$out")"
-"$cxx" -std=c++20 -O2 -Wall -Wextra -Werror -I "$root/src" -I "$root/tests" -I "$root" \
+"$cxx" -std=c++20 -O2 -Wall -Wextra -Werror \
+  -I "$root/src" -I "$root/tests" -I "$root" -I "$root/upstream/bbhost/src" \
   -o "$out" "${sources[@]}"
 "$out"

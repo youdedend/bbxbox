@@ -117,7 +117,25 @@ if(BBX_BUILD_TESTS)
         tests/tess_test.cpp
         tests/display_test.cpp
         tests/shaders_test.cpp
+        tests/guest_core_test.cpp
+        tests/guest_core_stubs.cpp
     )
+    # The vendored guest core, as tests/guest_core_test.cpp exercises it: the real
+    # SHA-256, NID table, TLS rewrite and paced file, not copies of them.
+    # tools/build_host.sh builds the same list for CI; a compiler that cannot build
+    # bbhost's core on the host leaves the five cases out rather than failing.
+    if(NOT WIN32)
+        set(BBX_GUEST_CORE_TEST_SOURCES
+            upstream/bbhost/src/core/sha256.cpp
+            upstream/bbhost/src/core/imports.cpp
+            upstream/bbhost/src/core/tls_rewrite.cpp
+            upstream/bbhost/src/core/elf.cpp
+            upstream/bbhost/src/core/paced_file.cpp
+            upstream/bbhost/src/core/portable.cpp
+        )
+        target_sources(bbx_tests PRIVATE ${BBX_GUEST_CORE_TEST_SOURCES})
+        target_include_directories(bbx_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/bbhost/src")
+    endif()
     target_link_libraries(bbx_tests PRIVATE bbx_d3d12_core bbx_platform_core)
     target_include_directories(bbx_tests PRIVATE tests "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME bbx_unit COMMAND bbx_tests)

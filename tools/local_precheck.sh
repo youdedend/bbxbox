@@ -180,6 +180,22 @@ if ! grep -q "spirv_to_dxil" docs/ARCHITECTURE_XBOX_D3D12.md; then
   fail "docs/ARCHITECTURE_XBOX_D3D12.md must state the SPIR-V -> DXIL plan for guest shaders"
 fi
 
+# --- 5f. the guest core is compiled and tested, not just vendored -------------
+# The loader pieces are the ones whose bugs are silent (a wrong NID becomes the
+# wrong HLE function, a bad TLS slot reads past the TEB), so the test binary must
+# keep compiling them from upstream/bbhost rather than from a copy.
+if ! grep -q "guest_core_test.cpp" tests/../CMakeLists.txt; then
+  fail "tests/guest_core_test.cpp is not in CMakeLists.txt"
+fi
+if ! grep -q "tests/guest_core_test.cpp" tools/build_host.sh; then
+  fail "tests/guest_core_test.cpp is not built by tools/build_host.sh"
+fi
+for core in sha256 imports tls_rewrite elf paced_file portable; do
+  if ! grep -q "core/$core.cpp" tools/build_host.sh; then
+    fail "tools/build_host.sh no longer compiles upstream/bbhost/src/core/$core.cpp; the guest-core tests would run against nothing"
+  fi
+done
+
 # --- 6. the console's shader and pipeline rules ------------------------------
 if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
   fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"

@@ -90,10 +90,22 @@ bbx_shader(OverlayPs OverlayPs ps_6_4 overlay.hlsl)
 get_property(BBX_SHADER_OUTPUTS GLOBAL PROPERTY BBX_SHADER_OUTPUTS)
 get_property(BBX_SHADER_PAIRS GLOBAL PROPERTY BBX_SHADER_PAIRS)
 set(BBX_SHADER_HEADER "${BBX_SHADER_DIR}/bbx_shaders_generated.h")
+# The symbol/file pairs go through a file, not -DPAIRS=a;b: a semicolon-separated
+# value in a -D argument is a CMake list, and a list of Windows paths that a
+# generator may or may not quote is a bug waiting for a runner. A file has one
+# meaning everywhere.
+set(BBX_SHADER_PAIRS_FILE "${BBX_SHADER_DIR}/pairs.txt")
+file(WRITE "${BBX_SHADER_PAIRS_FILE}" "")
+foreach(pair IN LISTS BBX_SHADER_PAIRS)
+    if(pair STREQUAL "")
+        continue()
+    endif()
+    file(APPEND "${BBX_SHADER_PAIRS_FILE}" "${pair}\n")
+endforeach()
 add_custom_command(OUTPUT "${BBX_SHADER_HEADER}"
     COMMAND "${CMAKE_COMMAND}"
             "-DOUT=${BBX_SHADER_HEADER}"
-            "-DPAIRS=${BBX_SHADER_PAIRS}"
+            "-DPAIRS_FILE=${BBX_SHADER_PAIRS_FILE}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/embed_shaders.cmake"
     DEPENDS ${BBX_SHADER_OUTPUTS}
             "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/embed_shaders.cmake"
