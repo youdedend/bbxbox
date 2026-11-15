@@ -20,7 +20,7 @@ namespace bbx::platform {
 
 struct SelfTestResult {
     bool code_generation = false;  // dynamic code + sysv_abi call
-    bool w^x = false;              // never RWX, RX after flush
+    bool wx = false;               // never RWX, RX after flush
     bool guest_arena = false;      // allocated below 1 TiB
     bool budget = false;           // commitment agrees with the plan
     bool under_allowance = false;  // P0 startup allowance
@@ -30,7 +30,7 @@ struct SelfTestResult {
     std::string detail;            // one line per step, for the report file
 
     [[nodiscard]] bool Passed() const {
-        return code_generation && w^x && guest_arena && budget && under_allowance;
+        return code_generation && wx && guest_arena && budget && under_allowance;
     }
 };
 

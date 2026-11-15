@@ -7,8 +7,8 @@
 // C++/CX (/ZW) and the port's translation units are clang-cl (bbhost's guest
 // thunks need __attribute__((sysv_abi))). SDL3 is still the platform layer - the
 // window, the gamepad, the audio device and the text renderer all come from it -
-// it is only the activation object that the port provides. `SDL_SetMainReady()`
-// is what tells SDL3 not to expect its own main.
+// it is only the activation object that the port provides. SDL3 is initialised
+// explicitly (`SDL_Init`), so there is no SDL main to set ready.
 #include <windows.h>
 
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -80,11 +80,12 @@ bbx::platform::ButtonMask MaskFromPad(SDL_Gamepad* pad) {
 
 void SaveLayoutSettings() {
     const std::string path = bbx::platform::Local("bbxbox.ini");
-    const std::string token = g_session.usb_token;
-    (void)token;
-    bbx::platform::IniSet(g_session.ini_text, "dump", "path", g_session.layout.base_path);
-    bbx::platform::IniSet(g_session.ini_text, "dump", "patch_path", g_session.layout.patch_path);
-    bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0");
+    const bool keyed = bbx::platform::IniSet(g_session.ini_text, "dump", "path", g_session.layout.base_path) &&
+                       bbx::platform::IniSet(g_session.ini_text, "dump", "patch_path", g_session.layout.patch_path) &&
+                       bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0");
+    if (!keyed) {
+        bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not key the layout settings");
+    }
     if (!bbx::platform::WriteText(path, g_session.ini_text)) {
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
     }
@@ -128,8 +129,10 @@ void OnAction(PadAction action) {
         case PadAction::kConfirm:
             if (!g_session.keyboard.Accept()) {
                 bbx::platform::LogF("hunter name: \"%s\"", g_session.keyboard.Text().c_str());
-                bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"),
-                                         g_session.keyboard.Text());
+                if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"),
+                                              g_session.keyboard.Text())) {
+                    bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write hunter-name.txt");
+                }
                 g_session.keyboard_open = false;
             }
             return;
@@ -260,7 +263,6 @@ void DrawLauncher() {
 }
 
 bool InitSdl() {
-    SDL_SetMainReady();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_Init: %s", SDL_GetError());
         return false;
@@ -298,7 +300,9 @@ void LoadSettings() {
     const std::string path = bbx::platform::Local("bbxbox.ini");
     if (!bbx::platform::ReadText(path, text) || text.empty()) {
         text = bbx::platform::DefaultIni();
-        bbx::platform::WriteText(path, text);
+        if (!bbx::platform::WriteText(path, text)) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
+        }
     }
     g_session.ini_text = text;
     g_session.ini = bbx::platform::ParseIni(text);

@@ -145,7 +145,9 @@ bool WriteText(const std::string& path, const std::string& text) {
 
 bool AppendText(const std::string& path, const std::string& text) {
     std::string existing;
-    ReadText(path, existing, 4u << 20);
+    // Append never fails on a missing file: ReadText reports false and `existing`
+    // stays empty, which is exactly the file-to-create case.
+    (void)ReadText(path, existing, 4u << 20);
     return WriteText(path, existing + text);
 }
 

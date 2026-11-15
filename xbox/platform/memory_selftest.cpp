@@ -80,9 +80,9 @@ SelfTestResult RunMemorySelfTest(bool guest_arena_probe) {
     result.detail += "codeGeneration + sysv_abi: ";
     result.detail += probe.ok ? "PASS (42)" : "FAIL";
 
-    result.w^x = CheckWx();
+    result.wx = CheckWx();
     result.detail += "\nW^X (no PAGE_EXECUTE_READWRITE, RX after flush): ";
-    result.detail += result.w^x ? "PASS" : "FAIL";
+    result.detail += result.wx ? "PASS" : "FAIL";
 
     // The arena: either the guest's, or a probe of the same shape.
     bbx::guest::Arena arena;
