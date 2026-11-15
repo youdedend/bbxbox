@@ -143,17 +143,40 @@ Write-Host "build-deps: libuwp"
 $libPath = Join-Path $src "libuwp"
 $libCommit = Sync-Repo $LibUwpRepo $LibUwpBranch $libPath
 $libOut = Join-Path $deps "out\libuwp"
-# libuwp is C++/WinRT and sets WindowsStore in its own CMakeLists; the Visual
-# Studio generator with the default MSVC toolset is the combination its project
-# was written for (the app stays clang-cl; this is a dependency, built once).
-& cmake -S $libPath -B $libOut -A $Platform -DCMAKE_BUILD_TYPE=$Configuration
-if ($LASTEXITCODE -ne 0) {
-    & cmake -S $libPath -B $libOut -A $Platform -DCMAKE_SYSTEM_NAME=WindowsStore `
-        -DCMAKE_SYSTEM_VERSION=10.0 -DCMAKE_BUILD_TYPE=$Configuration
-    if ($LASTEXITCODE -ne 0) { throw "libuwp configure failed" }
+# libuwp is C++/WinRT: its own presets pin `CMAKE_SYSTEM_NAME=WindowsStore`
+# with a Visual Studio generator, so use whichever VS generator the runner has
+# (17 2022 -> vs2022, 18 2026 -> vs2026). Nothing in the app calls into libuwp
+# yet, so a failure here is a warning, not a build failure -- but it is logged
+# and annotated so it cannot rot silently.
+$generators = (cmake --help | Out-String)
+$preset = if (Test-Path "$libPath\CMakePresets.json") {
+    if ($generators -match 'Visual Studio 18 2026') { "vs2026" }
+    elseif ($generators -match 'Visual Studio 17 2022') { "vs2022" }
+    else { $null }
+} else { $null }
+$libOk = $false
+$libLog = Join-Path $root "build-deps\libuwp.log"
+if ($preset) {
+    & cmake --preset $preset -S $libPath 2>&1 | Tee-Object -FilePath $libLog
+    if ($LASTEXITCODE -eq 0) { & cmake --build (Join-Path $libPath "build-$preset") --config $Configuration 2>&1 | Tee-Object -FilePath $libLog -Append }
+    $libOk = ($LASTEXITCODE -eq 0)
 }
-& cmake --build $libOut --config $Configuration
-if ($LASTEXITCODE -ne 0) { throw "libuwp build failed" }
+if (-not $libOk) {
+    & cmake -S $libPath -B $libOut -A $Platform -DCMAKE_SYSTEM_NAME=WindowsStore `
+        -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DCMAKE_BUILD_TYPE=$Configuration 2>&1 |
+        Tee-Object -FilePath $libLog
+    if ($LASTEXITCODE -eq 0) { & cmake --build $libOut --config $Configuration 2>&1 | Tee-Object -FilePath $libLog -Append; $libOk = ($LASTEXITCODE -eq 0) }
+}
+if (-not $libOk) {
+    Write-Host "build-deps: WARNING libuwp did not build; see $libLog"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $tail = (Get-Content $libLog -Tail 25 | Out-String) -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        Write-Output "::warning title=libuwp not built (unused so far)::$tail"
+    }
+    $libCommit = "not built"
+} else {
+    $libCommit = (git -C $libPath rev-parse HEAD).Trim()
+}
 
 $libPrefix = Join-Path $prefix "libuwp"
 New-Item -ItemType Directory -Force -Path (Join-Path $libPrefix "lib"), (Join-Path $libPrefix "bin") | Out-Null
