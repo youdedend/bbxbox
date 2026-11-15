@@ -7,6 +7,7 @@
 // pin them.
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "xbox/platform/dump.h"

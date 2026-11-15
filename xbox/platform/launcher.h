@@ -8,6 +8,7 @@
 // pure and tested; the drawing lives in main.cpp.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

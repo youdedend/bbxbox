@@ -9,6 +9,7 @@
 // all: the storage APIs copy, and copying a 30 GB dump is not a launch.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>

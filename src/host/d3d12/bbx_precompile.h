@@ -8,6 +8,7 @@
 // everything so the report can explain a slow or missing warm start.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>

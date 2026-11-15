@@ -24,6 +24,8 @@
 // callable from an AppContainer.
 #pragma once
 
+#include <cstddef>
+#include <utility>
 #include <cstdint>
 #include <cstring>
 #include <vector>

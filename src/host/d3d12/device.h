@@ -17,6 +17,8 @@
 //    case Lesson #6 exists for.
 #pragma once
 
+#include <string>
+#include <cstdint>
 #include <array>
 
 #include "src/host/d3d12/bbx_budget.h"

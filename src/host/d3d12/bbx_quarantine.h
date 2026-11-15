@@ -11,6 +11,7 @@
 // has to be readable in Device Portal's file browser.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>

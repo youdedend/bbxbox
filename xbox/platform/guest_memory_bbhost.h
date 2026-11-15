@@ -5,6 +5,8 @@
 // the declarations below are the whole contract.
 #pragma once
 
+#include <cstdint>
+#include <cstddef>
 #include "xbox/platform/guest_memory.h"
 
 using GuestMemory = bbx::guest::Arena;

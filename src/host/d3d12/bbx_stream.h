@@ -13,6 +13,8 @@
 // the payloads are the replay's business; the walker's contract is the header.
 #pragma once
 
+#include <string>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <span>

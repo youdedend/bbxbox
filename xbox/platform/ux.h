@@ -7,6 +7,7 @@
 // into `Held`/`Pressed` and applies the actions.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

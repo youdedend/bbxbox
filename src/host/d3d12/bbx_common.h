@@ -3,6 +3,7 @@
 // runs and compilers, alignment, and checked arithmetic for address maths.
 #pragma once
 
+#include <string>
 #include <cstddef>
 #include <cstdint>
 #include <span>
