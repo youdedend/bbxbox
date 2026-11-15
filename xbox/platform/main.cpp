@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
 #include "xbox/platform/ini_file.h"
@@ -55,6 +56,11 @@ struct Session {
     bool start_requested = false;
     std::string usb_token;
     SDL_Window* window = nullptr;
+    // The console path: device, 4K swapchain, pipelines, replay and the HUD. When
+    // it comes up the SDL renderer is never created, because two renderers on one
+    // CoreWindow fight over the backbuffer. A failed creation leaves it null and
+    // the launcher draws with SDL exactly as before.
+    std::unique_ptr<bbx::platform::D3d12Session> gpu;
     SDL_Renderer* renderer = nullptr;
     SDL_Gamepad* pad = nullptr;
 };
@@ -219,6 +225,28 @@ std::vector<std::string> WrapLines(const std::string& text) {
     return lines;
 }
 
+// One frame of whichever renderer owns the window. The GPU path draws the boot
+// report; a present that fails (a removed device) falls back to SDL once and logs
+// why, rather than presenting into a dead swapchain every frame.
+void DrawFrame() {
+    if (g_session.gpu) {
+        const bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
+        const bbx::d3d12::Status status = g_session.gpu->Present(hud);
+        if (status == bbx::d3d12::Status::kOk) return;
+        bbx::platform::LogF("d3d12: present failed (%s); SDL takes over",
+                            bbx::d3d12::StatusName(status));
+        g_session.gpu->Destroy();
+        g_session.gpu.reset();
+        if (g_session.renderer == nullptr && g_session.window != nullptr) {
+            g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
+            if (g_session.renderer == nullptr) {
+                bbx::platform::LogF("SDL_CreateRenderer after D3D12: %s", SDL_GetError());
+            }
+        }
+    }
+    DrawLauncher();
+}
+
 void DrawLauncher() {
     if (g_session.renderer == nullptr) return;
     const std::string caption = g_session.model.Title();
@@ -277,23 +305,67 @@ bool InitSdl() {
         bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_CreateWindow: %s", SDL_GetError());
         return false;
     }
-    g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
-    if (g_session.renderer == nullptr) {
-        bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_CreateRenderer: %s", SDL_GetError());
-        return false;
+    // The console's own path first: the D3D12 device, a swapchain sized for the
+    // television, and the HUD. Only when it cannot come up does the SDL renderer
+    // exist at all.
+    {
+        const winrt::Windows::UI::Core::CoreWindow core_window =
+            winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        IUnknown* window_abi = nullptr;
+        std::uint32_t window_width = 1920;
+        std::uint32_t window_height = 1080;
+        if (core_window) {
+            const winrt::Windows::Foundation::Rect bounds = core_window.Bounds();
+            if (bounds.Width >= 320.0f && bounds.Height >= 240.0f) {
+                window_width = static_cast<std::uint32_t>(bounds.Width);
+                window_height = static_cast<std::uint32_t>(bounds.Height);
+            }
+            window_abi = static_cast<IUnknown*>(winrt::get_abi(core_window));
+        }
+        g_session.gpu = std::make_unique<bbx::platform::D3d12Session>();
+        const bbx::d3d12::Status status = g_session.gpu->Create(window_abi, window_width,
+                                                               window_height, false);
+        if (status == bbx::d3d12::Status::kOk) {
+            const bbx::platform::GpuReport& report = g_session.gpu->Report();
+            bbx::platform::LogF("d3d12: %s, %s, self-test %s", report.adapter.c_str(),
+                                report.swapchain.c_str(), report.selftest.c_str());
+        } else {
+            bbx::platform::LogF("d3d12: unavailable (%s); the SDL renderer stays in use",
+                                bbx::d3d12::StatusName(status));
+            g_session.gpu.reset();
+        }
+    }
+    // No GPU path means the launcher needs a renderer; when the GPU path works, a
+    // renderer here would draw over the swapchain's backbuffer.
+    if (g_session.gpu == nullptr) {
+        g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
+        if (g_session.renderer == nullptr) {
+            bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_CreateRenderer: %s",
+                                      SDL_GetError());
+            return false;
+        }
     }
     int pads = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&pads);
     if (ids != nullptr && pads > 0) g_session.pad = SDL_OpenGamepad(ids[0]);
     SDL_free(ids);
-    bbx::platform::LogF("SDL: window %dx%d, renderer %s, gamepads %d",
-                        g_session.window ? 1920 : 0, 1080,
-                        SDL_GetRendererName(g_session.renderer) ? SDL_GetRendererName(g_session.renderer) : "?",
+    // A null renderer is not an error any more: that is the GPU path, where the
+    // swapchain owns the window.
+    const char* renderer_name =
+        g_session.renderer ? SDL_GetRendererName(g_session.renderer) : nullptr;
+    bbx::platform::LogF("SDL: window %s, gamepads %d", renderer_name ? renderer_name : "d3d12",
                         g_session.pad ? 1 : 0);
     return true;
 }
 
 void ShutdownSdl() {
+    if (g_session.gpu) {
+        // Waits for the GPU before the device and the swapchain go away: a released
+        // swapchain with a frame in flight is a device-removed in the log.
+        bbx::platform::LogF("d3d12: shutting down; %s", g_session.gpu->Report().selftest.c_str());
+        g_session.gpu->Destroy();
+        g_session.gpu.reset();
+    }
     if (g_session.pad) SDL_CloseGamepad(g_session.pad);
     if (g_session.renderer) SDL_DestroyRenderer(g_session.renderer);
     if (g_session.window) SDL_DestroyWindow(g_session.window);
@@ -387,7 +459,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             const PadAction action = g_session.chords.Update(edges);
             if (action != PadAction::kNone) OnAction(action);
 
-            DrawLauncher();
+            DrawFrame();
 
             if (g_session.start_requested) {
                 bbx::platform::LogF("launcher: start requested (version %s)",

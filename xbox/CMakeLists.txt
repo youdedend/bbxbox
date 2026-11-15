@@ -131,8 +131,12 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/device.cpp
     ../src/host/d3d12/swapchain.cpp
     ../src/host/d3d12/pipeline.cpp
+    ../src/host/d3d12/replay.cpp
     ../src/host/d3d12/bbx_psocache.cpp
     ../src/host/d3d12/bbx_cache.cpp
+    ../src/host/d3d12/bbx_stream.cpp
+    ../src/host/d3d12/bbx_untile.cpp
+    ../src/host/d3d12/bbx_barriers.cpp
 )
 
 set(BBX_APP_SOURCES
@@ -145,6 +149,8 @@ set(BBX_APP_SOURCES
     platform/ini_file.cpp
     platform/launcher.cpp
     platform/ux.cpp
+    platform/hud.cpp
+    platform/d3d12_session.cpp
     platform/shaders.cpp
     ${BBX_D3D12_SOURCES}
 )

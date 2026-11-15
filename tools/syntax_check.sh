@@ -30,7 +30,12 @@ fi
 
 files=()
 while IFS= read -r file; do files+=("$file"); done < <(
-    ls "$root"/src/host/d3d12/*.cpp 2>/dev/null | grep -Ev 'bbx_(format|barriers|budget|cache|quarantine|precompile|descriptors|present|stream|untile|psocache|tess)\.cpp$'
+    { ls "$root"/src/host/d3d12/*.cpp 2>/dev/null \
+          | grep -Ev 'bbx_(format|barriers|budget|cache|quarantine|precompile|descriptors|present|stream|untile|psocache|tess)\.cpp$'
+      # The UWP platform TUs that avoid C++/WinRT: the D3D12 session takes an
+      # IUnknown* and SDK headers only, precisely so it lands in this check.
+      ls "$root"/xbox/platform/d3d12_session.cpp 2>/dev/null
+    }
 )
 
 if [ ${#files[@]} -eq 0 ]; then

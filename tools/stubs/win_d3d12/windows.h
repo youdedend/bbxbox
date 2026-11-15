@@ -46,6 +46,15 @@ using HWND = void*;
 using HMODULE = void*;
 using HINSTANCE = void*;
 
+// String conversion: an adapter's description is a WCHAR array from DXGI, and the
+// port logs it as UTF-8.
+#ifndef CP_UTF8
+#define CP_UTF8 65001
+#endif
+int WideCharToMultiByte(unsigned int code_page, unsigned long flags, const wchar_t* input,
+                        int input_length, char* output, int output_length,
+                        const char* default_char, int* used_default_char);
+
 #define WINAPI
 #define APIENTRY
 #define STDMETHODCALLTYPE

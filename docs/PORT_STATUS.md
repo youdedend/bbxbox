@@ -12,7 +12,7 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 |---|---|---|
 | P0 | UWP shell, launcher, memory contract, packaging, CI, import audit | **Implemented; not yet run on console.** `.appx` layout, manifest (`codeGeneration` + `removableStorage` only), SDL3-uwp/libuwp cached dependency build, memory self-test, `check-imports.ps1`, `local_precheck.sh`, CI. |
 | P1 | Guest boot + HLE + audio/input, no rendering | **Started.** The portable core (`elf`, `imports`, `thunk`, `tls_rewrite`, `sha256`, `paced_file`, `memory`) is now compiled by the host test build and unit-tested (154 cases), and the UWP arena adapter (`guest_memory_bbhost.h`) is what bbhost's `core/memory.h` resolves to under `BBX_UWP`. `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
-| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Device and swapchain written and compile-verified; replay not yet.** `bbx_d3d12.cpp` (status/HRESULT mapping, log bridge, object naming), `device.cpp` (11_0 device, high-performance adapter with WARP refused, caps validated against `XboxSeriesCaps()`, UMA, one queue + fence + three frame allocators, bounded descriptor heaps, device-loss capture, no pipeline library) and `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized and inverse-scaled, RTVs, resize, present) are compiled by the Windows job against the real SDK. The shader half is done: `present`/`overlay` are build-time SM 6.4 DXIL and no compiler ships. `replay.cpp`, the root signature and the PSOs are unwritten, so nothing has drawn a frame: no console has run this. |
+| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls. Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |
 | P3 | GX draw path: pipelines, bindless descriptors, vertex fetch, buffer shadow | Design + `bbx_psocache`/`bbx_caps` landed. |
 | P4 | YEBIS, Scaleform, compute tessellation, FSR | Policy landed (`bbx_tess`), kernels pending. |
 | P5 | DXIL precompile + PSO cache + quarantine + USB sync | Cache and quarantine landed and tested; DXIL compile and USB sync pending. |
@@ -45,9 +45,12 @@ following are compile-verified rather than hoped for:
   factory), `storage.cpp` (WinRT picker + `*FromApp` file APIs), `dump.cpp`,
   `ux.cpp`, `launcher.cpp`, `log.cpp` (last-chance logger), `display*.cpp`,
   `guest_memory.cpp` (the arena over `VirtualAlloc2FromApp`), `memory_selftest.cpp`;
+* the D3D12 backend translation units in `src/host/d3d12/` (`device.cpp`,
+  `swapchain.cpp`, `pipeline.cpp`, `replay.cpp`, `bbx_d3d12.cpp`) and the one
+  platform TU that avoids C++/WinRT (`d3d12_session.cpp`);
 * the D3D12 policy translation units in `src/host/d3d12/` (`bbx_caps`,
   `bbx_budget`, `bbx_psocache`, `bbx_tess`, `bbx_stream`, `bbx_quarantine`,
-  `bbx_untile`, …);
+  `bbx_untile`, `bbx_hud`'s model is in `xbox/platform/hud.cpp`, …);
 * the vendored guest core's GCN library, LibAtrac9, monocypher and zlib;
 * the package: `bbxbox.exe` + `SDL3.dll` + `libuwp.dll` (and no shader compiler at
   all: the four DXIL blobs are compiled on the runner and embedded in the exe), the
@@ -96,10 +99,12 @@ imports no desktop-only file, memory or loader API.
   `CN=bbxbox` certificate and the VCLibs framework package is staged beside it, but neither has been
   installed on a console), Game-mode memory limit, the memory self-test's numbers, 4K/HDR output,
   rumble, the virtual keyboard, and D3D12 device creation.
-* `src/host/d3d12`'s replay half: the device and swapchain are written and compile against the real
-  SDK, but no `ID3D12Device` has actually been created on a console, no swapchain has presented, and
-  `replay.cpp` (clears, copies, barriers, read-only DSV, PSOs, the present and overlay passes) does not
-  exist yet.
+* `src/host/d3d12`'s replay half: `replay.cpp` and `pipeline.cpp` now exist and compile against the
+  real SDK, but no `ID3D12Device` has been created on a console, no root signature has been
+  serialised by a real driver, no PSO has been created by one, nothing has presented, and the GPU
+  self-test has never actually dispatched — so "the replay is correct" is a compile-time claim and
+  nothing more. In particular, the untile dispatch and the read-only-DSV rule (G12) are not
+  exercised by anything that runs here.
 * bbhost's `src/hle` is not linked into the app, so no guest code has run: `load_orbis_elf` is
   compiled and unit-testable but is not called by any boot path yet, and `CUSA03173` has never been
   opened by this port.

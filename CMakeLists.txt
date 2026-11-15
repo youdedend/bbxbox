@@ -58,6 +58,7 @@ add_library(bbx_platform_core STATIC
     xbox/platform/launcher.cpp
     xbox/platform/ux.cpp
     xbox/platform/display.cpp
+    xbox/platform/hud.cpp
 )
 target_include_directories(bbx_platform_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(bbx_platform_core PUBLIC cxx_std_20)
@@ -116,6 +117,7 @@ if(BBX_BUILD_TESTS)
         tests/psocache_test.cpp
         tests/tess_test.cpp
         tests/display_test.cpp
+        tests/hud_test.cpp
         tests/shaders_test.cpp
         tests/guest_core_test.cpp
         tests/guest_core_stubs.cpp

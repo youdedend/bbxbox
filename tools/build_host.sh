@@ -24,6 +24,7 @@ sources=(
   "$root"/xbox/platform/launcher.cpp
   "$root"/xbox/platform/ux.cpp
   "$root"/xbox/platform/display.cpp
+  "$root"/xbox/platform/hud.cpp
   "$root"/src/host/d3d12/bbx_psocache.cpp
   "$root"/src/host/d3d12/bbx_tess.cpp
   "$root"/tests/main.cpp
@@ -49,6 +50,7 @@ sources=(
   "$root"/tests/psocache_test.cpp
   "$root"/tests/tess_test.cpp
   "$root"/tests/display_test.cpp
+  "$root"/tests/hud_test.cpp
   "$root"/tests/shaders_test.cpp
   "$root"/tests/guest_core_test.cpp
   "$root"/tests/guest_core_stubs.cpp
