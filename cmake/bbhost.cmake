@@ -127,6 +127,24 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/hle/fs.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/fios.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/save_commit.cpp"
+    # src/hle: the CPU-side runtime. The renderer-facing modules (gnm, gnm_exec,
+    # gx_trace, video, system, libc) reach `host/gpu.h` and `host/gxvk*.h`, which
+    # carry Vulkan types not yet sprayed out of them under BBX_UWP; they join
+    # this list once those headers are Vulkan-free for the console.
+    "${BBX_BBHOST_ROOT}/src/hle/kernel.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/pthread.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/sync.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/sysv_va.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/guest_console.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/runtime.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/audio.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/ajm.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/avplayer.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/dialog.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/net.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/http.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/np_matching2.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/np_signaling.cpp"
 )
 target_include_directories(bbhost_guest PUBLIC
     # winpthreads for a SDK that has no <pthread.h>; ahead of everything, and
