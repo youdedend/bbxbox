@@ -66,27 +66,32 @@ using HINSTANCE = void*;
 #define EXCEPTION_EXECUTE_HANDLER 1
 
 // --- COM ---------------------------------------------------------------------
-struct IUnknown {
-    virtual HRESULT QueryInterface(const void* riid, void** out) = 0;
-    virtual ULONG AddRef() = 0;
-    virtual ULONG Release() = 0;
-};
-
-using REFIID = const void*;
-using REFCLSID = const void*;
-
-// clang models the MSVC calling convention and __uuidof without the real SDK.
+// The GUID typedefs come first: IUnknown's QueryInterface takes a REFIID, and the
+// stub interfaces everywhere else take the same.
 #ifndef GUID_DEFINED
 #define GUID_DEFINED
-struct GUID {
+struct _GUID {
     unsigned long Data1;
     unsigned short Data2;
     unsigned short Data3;
     unsigned char Data4[8];
 };
-struct IID : GUID {};
-struct CLSID : GUID {};
+using GUID = _GUID;
+using IID = _GUID;
+using CLSID = _GUID;
 #endif
+
+using REFIID = const IID&;
+using REFCLSID = const CLSID&;
+
+struct IUnknown {
+    virtual HRESULT QueryInterface(REFIID riid, void** out) = 0;
+    virtual ULONG AddRef() = 0;
+    virtual ULONG Release() = 0;
+};
+
+
+// clang models the MSVC calling convention and __uuidof without the real SDK.
 
 // The stubs write `struct DECLSPEC_UUID("...") Name`, not the SDK's
 // `DECLSPEC_UUID("...") struct Name`: clang with -fms-extensions (but without
@@ -102,7 +107,11 @@ struct CLSID : GUID {};
 #else
 #define DECLSPEC_UUID(x)
 #ifndef __uuidof
-#define __uuidof(x) (static_cast<const void*>(nullptr))
+inline const IID& __bbx_null_iid() {
+    static const IID zero{};
+    return zero;
+}
+#define __uuidof(x) (__bbx_null_iid())
 #endif
 #endif
 #define MIDL_INTERFACE(x) struct DECLSPEC_UUID(x)
