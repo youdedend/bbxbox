@@ -40,11 +40,15 @@
 #if defined(BBX_UWP)
 #include <sys/time.h>
 namespace {
+// `_gmtime64_s(struct tm* out, const __time64_t* time)`: the destination is
+// the first argument, the opposite order of the POSIX call.
 inline struct tm* gmtime_r(const time_t* t, struct tm* out) {
-    return _gmtime64_s(reinterpret_cast<__time64_t*>(const_cast<time_t*>(t)), out) == 0 ? out : nullptr;
+    const __time64_t when = static_cast<__time64_t>(*t);
+    return _gmtime64_s(out, &when) == 0 ? out : nullptr;
 }
 inline struct tm* localtime_r(const time_t* t, struct tm* out) {
-    return _localtime64_s(reinterpret_cast<__time64_t*>(const_cast<time_t*>(t)), out) == 0 ? out : nullptr;
+    const __time64_t when = static_cast<__time64_t>(*t);
+    return _localtime64_s(out, &when) == 0 ? out : nullptr;
 }
 }  // namespace
 #else
