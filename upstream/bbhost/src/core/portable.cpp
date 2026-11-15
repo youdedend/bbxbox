@@ -158,14 +158,16 @@ void host_read_safe_recover() {
 bool host_read_safe(const void* addr, void* out, std::size_t len) {
 #if defined(BBX_UWP)
     // `ReadProcessMemory` on our own process is a desktop convenience the
-    // container does not offer; the question it answers is "is this range
-    // committed and readable", and `VirtualQueryFromApp` answers it.
+    // container does not offer - and the question it answers is "is this range
+    // committed and readable". `VirtualQuery` is App-partition (there is no
+    // `FromApp` spelling of it; `xbox/platform/memory_selftest.cpp` uses the
+    // same call to prove the dmem window's state).
     const auto base = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = base + len;
     std::uintptr_t at = base;
     while (at < end) {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQueryFromApp(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
         if (mbi.State != MEM_COMMIT) return false;
         if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
         const auto region_end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
