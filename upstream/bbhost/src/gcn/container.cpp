@@ -5,6 +5,14 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(BBX_UWP)
+// A `.shaderbnd.dcx` lives in the dump, and the dump arrives through a
+// `FutureAccessList` token: `fopen` is `CreateFileW`, which is refused on such a
+// path at run time even though it links. The seam's open is `CreateFile2FromApp`.
+#include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
+#endif
+
 namespace gcn {
 namespace {
 
@@ -35,6 +43,9 @@ std::size_t find(const std::vector<std::uint8_t>& b, const char* needle, std::si
 }  // namespace
 
 bool read_file(const std::string& path, std::vector<std::uint8_t>& out) {
+#if defined(BBX_UWP)
+    return bbx::hostfs::ReadFileAll(path, &out);
+#else
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {
         return false;
@@ -46,6 +57,7 @@ bool read_file(const std::string& path, std::vector<std::uint8_t>& out) {
     const bool ok = out.empty() || std::fread(out.data(), 1, out.size(), f) == out.size();
     std::fclose(f);
     return ok;
+#endif
 }
 
 std::vector<std::uint8_t> dcx_decompress(const std::vector<std::uint8_t>& data, std::string* error) {

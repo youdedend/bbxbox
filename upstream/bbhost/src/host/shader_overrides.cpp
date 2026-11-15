@@ -8,7 +8,15 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#if defined(BBX_UWP)
+// Shader overrides are read from the player's mods overlay, which is on the
+// dump: the seam walks and stats those paths (`*FromApp`), the CRT's
+// `<filesystem>` cannot.
+#include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
+#else
 #include <filesystem>
+#endif
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -135,26 +143,40 @@ std::string label_locked(const Registry& r, const OverrideSource& s) {
 }
 
 // The source of a file as it is now; null when it is not a file.
-std::shared_ptr<const OverrideSource> file_source(int owner, const std::string& name, const std::filesystem::path& p) {
+std::shared_ptr<const OverrideSource> file_source(int owner, const std::string& name, const std::string& path) {
+#if defined(BBX_UWP)
+    bbx::hostfs::FileStat st{};
+    if (!bbx::hostfs::Stat(path, &st) || st.is_dir) return nullptr;
+    const std::uint64_t size = st.size;
+    const std::int64_t mtime = st.mtime;
+#else
+    const std::filesystem::path p(path);
     std::error_code ec;
     if (!std::filesystem::is_regular_file(p, ec)) return nullptr;
     const std::uint64_t size = std::filesystem::file_size(p, ec);
     if (ec) return nullptr;
     const std::int64_t mtime = static_cast<std::int64_t>(std::filesystem::last_write_time(p, ec).time_since_epoch().count());
     if (ec) return nullptr;
+#endif
     // Its text's hash as well: a file's time can be whole seconds (Windows'
     // here), so a copy of the same size in the same second keeps size and time.
     // (Past kMaxText, what no source can be, it is not read.)
     std::string text;
     if (size <= kMaxText) {
+#if defined(BBX_UWP)
+        std::vector<std::uint8_t> bytes;
+        if (!bbx::hostfs::ReadFileAll(path, &bytes)) return nullptr;
+        text.assign(bytes.begin(), bytes.end());
+#else
         std::ifstream in(p, std::ios::binary);
         if (!in) return nullptr;
         text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+#endif
     }
     auto s = std::make_shared<OverrideSource>();
     s->name = name;
     s->owner = owner;
-    s->path = p.string();
+    s->path = path;
     s->size = size;
     s->mtime = mtime;
     Hash64 t;
@@ -173,10 +195,18 @@ std::shared_ptr<const OverrideSource> file_source(int owner, const std::string& 
 // `unnamed`: the .hlsl files whose names are no shader's.
 bool list_folder(int owner, const std::string& dir, std::map<std::string, std::shared_ptr<const OverrideSource>>& out,
                  std::size_t* unnamed) {
+#if defined(BBX_UWP)
+    std::vector<bbx::hostfs::DirEntry> entries;
+    if (!bbx::hostfs::ListDir(dir, &entries)) return false;
+    for (const bbx::hostfs::DirEntry& e : entries) {
+        if (e.is_dir) continue;
+        const std::string& file = e.name;
+#else
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) return false;
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         const std::string file = e.path().filename().string();
+#endif
         if (file.size() <= 5 || file.compare(file.size() - 5, 5, ".hlsl") != 0) continue;
         const std::string name = file.substr(0, file.size() - 5);
         std::string stable, stage, hash16;
@@ -184,7 +214,11 @@ bool list_folder(int owner, const std::string& dir, std::map<std::string, std::s
             if (unnamed) ++*unnamed;
             continue;
         }
-        if (auto s = file_source(owner, name, e.path())) out[name] = std::move(s);
+#if defined(BBX_UWP)
+        if (auto s = file_source(owner, name, bbx::hostfs::JoinPath(dir, file))) out[name] = std::move(s);
+#else
+        if (auto s = file_source(owner, name, e.path().string())) out[name] = std::move(s);
+#endif
     }
     return true;
 }
@@ -435,7 +469,11 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     Registry& r = reg();
     std::map<std::string, std::shared_ptr<const OverrideSource>> files;
     std::size_t unnamed = 0;
+#if defined(BBX_UWP)
+    const std::string dir = bbhost_dir.empty() ? std::string() : bbx::hostfs::JoinPath(bbhost_dir, "shaders");
+#else
     const std::string dir = bbhost_dir.empty() ? std::string() : (std::filesystem::path(bbhost_dir) / "shaders").string();
+#endif
     if (!dir.empty()) list_folder(kOverridePlayer, dir, files, &unnamed);  // listed off too, for the report
     std::lock_guard<std::mutex> lk(r.mu);
     r.on = on;
@@ -653,9 +691,19 @@ int overrides_add_folder(int owner, const char* dir) {
         }
         base = o->second.dir;
     }
+#if defined(BBX_UWP)
+    // Relative or not, decided without `<filesystem>`: a drive letter, a UNC
+    // name or a leading slash is absolute, anything else is taken from the
+    // folder that owner was started with.
+    std::string where(dir);
+    const bool absolute = (!where.empty() && (where[0] == '\\' || where[0] == '/')) ||
+                          (where.size() > 1 && where[1] == ':');
+    if (!absolute && !base.empty()) where = bbx::hostfs::JoinPath(base, where);
+#else
     std::filesystem::path p(dir);
     if (p.is_relative() && !base.empty()) p = std::filesystem::path(base) / p;
     const std::string where = p.lexically_normal().string();
+#endif
     std::map<std::string, std::shared_ptr<const OverrideSource>> files;
     if (!list_folder(owner, where, files, nullptr)) return -1;
     const int n = static_cast<int>(files.size());
@@ -773,6 +821,24 @@ bool override_read(const OverrideSource& s, std::string& text, std::string& why)
         why = "the file is over 4 MiB";
         return false;
     }
+#if defined(BBX_UWP)
+    {
+        std::vector<std::uint8_t> bytes;
+        if (!bbx::hostfs::ReadFileAll(s.path, &bytes)) {
+            why = "the file cannot be read";
+            return false;
+        }
+        text.assign(bytes.begin(), bytes.end());
+    }
+    // As listed, or another file than the source names: listed again.
+    bbx::hostfs::FileStat st{};
+    const bool have = bbx::hostfs::Stat(s.path, &st) && !st.is_dir;
+    const std::uint64_t size = st.size;
+    const std::int64_t mtime = st.mtime;
+    Hash64 t;
+    t.str(text);
+    if (!have || size != s.size || mtime != s.mtime || text.size() != s.size || t.done() != s.content) {
+#else
     {
         std::ifstream in(s.path, std::ios::binary);
         text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -784,6 +850,7 @@ bool override_read(const OverrideSource& s, std::string& text, std::string& why)
     Hash64 t;
     t.str(text);
     if (ec || size != s.size || mtime != s.mtime || text.size() != s.size || t.done() != s.content) {
+#endif
         why = "the file changed since it was listed";
         relist(s);
         return false;

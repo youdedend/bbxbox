@@ -27,7 +27,13 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#if defined(BBX_UWP)
+// The map folders arrive on the dump, which the CRT cannot walk through a
+// `FutureAccessList` token: the seam's listing is `FindFirstFileExFromApp`.
+#include "xbox/platform/host_fs.h"
+#else
 #include <filesystem>
+#endif
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -236,22 +242,51 @@ std::string bnd_path(std::uint64_t t) {
 const std::unordered_set<std::string>& map_names() {
     static const std::unordered_set<std::string> names = [] {
         std::unordered_set<std::string> out;
+        std::vector<std::string> bhds;  // host paths, whichever branch filled it
+#if defined(BBX_UWP)
+        const std::string root = hle_fs_map_path("/app0/dvdroot_ps4/map");
+        std::vector<bbx::hostfs::DirEntry> areas;
+        if (bbx::hostfs::ListDir(root, &areas)) {
+            for (const bbx::hostfs::DirEntry& area : areas) {
+                const std::string& dir = area.name;
+                if (!area.is_dir) continue;
+                if (dir.size() != 3 || dir[0] != 'm') continue;  // mNN, not mNN_NN_NN_NN
+                const std::string area_dir = bbx::hostfs::JoinPath(root, dir);
+                std::vector<bbx::hostfs::DirEntry> files;
+                if (!bbx::hostfs::ListDir(area_dir, &files)) continue;
+                for (const bbx::hostfs::DirEntry& f : files) {
+                    if (f.is_dir) continue;
+                    if (f.name.size() > 7 && f.name.compare(f.name.size() - 7, 7, ".tpfbhd") == 0) {
+                        bhds.push_back(bbx::hostfs::JoinPath(area_dir, f.name));
+                    }
+                }
+            }
+        }
+#else
         std::error_code ec;
         const std::filesystem::path root = hle_fs_map_path("/app0/dvdroot_ps4/map");
-        std::vector<std::filesystem::path> bhds;
+        std::vector<std::filesystem::path> bhd_paths;
         for (auto area = std::filesystem::directory_iterator(root, ec); !ec && area != std::filesystem::directory_iterator(); area.increment(ec)) {
             const std::string dir = area->path().filename().string();
             if (dir.size() != 3 || dir[0] != 'm' || !area->is_directory(ec)) continue;  // mNN, not mNN_NN_NN_NN
             std::error_code ec2;
             for (auto f = std::filesystem::directory_iterator(area->path(), ec2); !ec2 && f != std::filesystem::directory_iterator(); f.increment(ec2)) {
-                if (f->path().extension() == ".tpfbhd") bhds.push_back(f->path());
+                if (f->path().extension() == ".tpfbhd") bhd_paths.push_back(f->path());
             }
         }
-        for (const std::filesystem::path& bhd : bhds) {
+        for (const std::filesystem::path& bhd : bhd_paths) bhds.push_back(bhd.string());
+#endif
+        for (const std::string& bhd : bhds) {
+#if defined(BBX_UWP)
+            std::vector<std::uint8_t> file;
+            if (!bbx::hostfs::ReadFileAll(bhd, &file)) continue;
+            const std::string b(file.begin(), file.end());
+#else
             std::ifstream in(bhd, std::ios::binary | std::ios::ate);
             std::string b(static_cast<std::size_t>(std::max<std::streamoff>(0, in.tellg())), '\0');
             in.seekg(0);
             in.read(b.data(), static_cast<std::streamsize>(b.size()));
+#endif
             // Each name ends ".tpf" (".tpf.dcx"): from there back to its start.
             static const std::string kExt(".\0t\0p\0f\0", 8);
             for (std::size_t at = b.find(kExt); at != std::string::npos; at = b.find(kExt, at + kExt.size())) {

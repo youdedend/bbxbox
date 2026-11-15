@@ -81,7 +81,14 @@ add_library(bbhost_gcn STATIC
 )
 target_include_directories(bbhost_gcn PUBLIC "${BBX_BBHOST_ROOT}/src")
 target_compile_features(bbhost_gcn PUBLIC cxx_std_20)
-target_compile_definitions(bbhost_gcn PUBLIC BBX_UWP=1)
+target_compile_definitions(bbhost_gcn PUBLIC
+    BBX_UWP=1
+    # The console partition, in every guest translation unit and not only in the
+    # app's: without it the Windows SDK headers declare the desktop-side names
+    # (`CreateFile2`, `FindFirstFileExW`, `MapViewOfFile`...) that a packaged
+    # title may not import, and a TU that reaches for one links - then is refused
+    # at run time on a granted path (`check-imports.ps1` refuses it first).
+    WINAPI_FAMILY=WINAPI_FAMILY_APP)
 # Upstream's code is not /W4-clean on clang-cl and its warnings are not this
 # port's to fix; the port's own TUs keep /W4 /WX.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -172,6 +179,12 @@ target_include_directories(bbhost_guest PUBLIC
 target_compile_features(bbhost_guest PUBLIC cxx_std_20)
 target_compile_definitions(bbhost_guest PUBLIC
     BBX_UWP=1
+    # The console partition, in every guest translation unit and not only in the
+    # app's: without it the Windows SDK headers declare the desktop-side names
+    # (`CreateFile2`, `FindFirstFileExW`, `MapViewOfFile`...) that a packaged
+    # title may not import, and a TU that reaches for one links - then is refused
+    # at run time on a granted path (`check-imports.ps1` refuses it first).
+    WINAPI_FAMILY=WINAPI_FAMILY_APP
     BBHOST_HAVE_SDL3=1
     # <windows.h> defines `min`/`max` as macros unless this is set, and
     # upstream's C++ uses std::min/std::max in the same translation unit as
@@ -259,7 +272,16 @@ if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
     target_include_directories(bbhost_host PUBLIC "${BBX_SDL3_PREFIX}/include")
 endif()
 target_compile_features(bbhost_host PUBLIC cxx_std_20)
-target_compile_definitions(bbhost_host PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1 NOMINMAX)
+target_compile_definitions(bbhost_host PUBLIC
+    BBX_UWP=1
+    # The console partition, in every guest translation unit and not only in the
+    # app's: without it the Windows SDK headers declare the desktop-side names
+    # (`CreateFile2`, `FindFirstFileExW`, `MapViewOfFile`...) that a packaged
+    # title may not import, and a TU that reaches for one links - then is refused
+    # at run time on a granted path (`check-imports.ps1` refuses it first).
+    WINAPI_FAMILY=WINAPI_FAMILY_APP
+    BBHOST_HAVE_SDL3=1
+    NOMINMAX)
 target_link_libraries(bbhost_host PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbhost_host PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
@@ -388,7 +410,16 @@ if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
     target_include_directories(bbhost_engine PUBLIC "${BBX_SDL3_PREFIX}/include")
 endif()
 target_compile_features(bbhost_engine PUBLIC cxx_std_20)
-target_compile_definitions(bbhost_engine PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1 NOMINMAX)
+target_compile_definitions(bbhost_engine PUBLIC
+    BBX_UWP=1
+    # The console partition, in every guest translation unit and not only in the
+    # app's: without it the Windows SDK headers declare the desktop-side names
+    # (`CreateFile2`, `FindFirstFileExW`, `MapViewOfFile`...) that a packaged
+    # title may not import, and a TU that reaches for one links - then is refused
+    # at run time on a granted path (`check-imports.ps1` refuses it first).
+    WINAPI_FAMILY=WINAPI_FAMILY_APP
+    BBHOST_HAVE_SDL3=1
+    NOMINMAX)
 target_link_libraries(bbhost_engine PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbhost_engine PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing

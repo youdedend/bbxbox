@@ -251,23 +251,24 @@ else()
 endif()
 
 if(BBX_BBHOST)
-    # The guest runtime, its host layer and the game's own code are compiled and
-    # ready to run - only the link is behind this switch.
+    # The guest runtime, its host layer and the game's own code, linked into the
+    # app: `main.cpp` boots the guest with them, and
+    # `platform/bbhost_bridge.cpp` answers the host headers the archives call.
     #
-    # `BBX_GUEST_LINK=ON` links the four archives into the app, and `main.cpp`
-    # then boots the guest (platform/bbhost_bridge.cpp answers the host headers
-    # the archives call). It links today: the exe builds with all four archives
-    # and the census comes back empty. What does not pass yet is the import
-    # audit - the guest's own translation units use `std::filesystem`, and MSVC's
-    # implementation of it imports CreateFile2, FindFirstFileW/ExW,
-    # CreateDirectoryW and MoveFileExW directly, so the app's `bbx::hostfs` seam
-    # is bypassed inside the STL. Those call sites have to move onto the seam
-    # before the switch can stay on: a green branch says more than a linked one.
+    # The switch is ON. What had to be true first is the import audit: the
+    # guest's translation units used `std::filesystem`, and MSVC's implementation
+    # of it imports CreateFile2, FindFirstFileW/ExW, CreateDirectoryW and
+    # MoveFileExW into every unit that includes the header - names a packaged
+    # title may not import, and which are refused at run time on a granted dump
+    # path even where they link. Those ten call sites now go through
+    # `bbx::hostfs` instead (`xbox/platform/hostfs_extra.h` has the four shapes
+    # they needed), and no compiled translation unit includes the header.
     #
     # lld-link resolves archives regardless of order, so these may name each
     # other's symbols freely - and it dead-strips an archive member no one
-    # references, so `platform/bbhost_bridge.cpp` is what pulls the runtime in.
-    option(BBX_GUEST_LINK "link the guest runtime into the app and boot it" OFF)
+    # references, so `platform/bbhost_bridge.cpp` and `main.cpp`'s boot are what
+    # pull the runtime in at all.
+    option(BBX_GUEST_LINK "link the guest runtime into the app and boot it" ON)
     if(BBX_GUEST_LINK)
         target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
             bbx_atrac9 bbx_monocypher)

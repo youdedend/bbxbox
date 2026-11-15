@@ -150,6 +150,7 @@ if(BBX_BUILD_TESTS)
         tests/hud_test.cpp
         tests/self_test.cpp
         tests/host_fs_test.cpp
+        tests/hostfs_tree_test.cpp
         tests/save_commit_test.cpp
         tests/shaders_test.cpp
         tests/guest_core_test.cpp

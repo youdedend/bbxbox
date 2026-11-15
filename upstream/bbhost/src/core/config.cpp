@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+#if !defined(BBX_UWP)
+#include <filesystem>  // desktop only: MSVC's header imports CreateFile2/FindFirstFileExW
+#endif
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -19,6 +21,7 @@
 // The host-fs seam: a directory under the player's dump is not the CRT's to
 // create or to ask about in the container.
 #include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
 #endif
 
 #if defined(_WIN32)
@@ -687,10 +690,17 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     std::string local_cfg;
     // Absolute, so an import into the user config can resolve its relative paths.
     std::string cwd;
+#if defined(BBX_UWP)
+    // A packaged title has no working directory to speak of, and `current_path`
+    // is not callable in the container: the folder this copy runs from is the
+    // only absolute answer that means anything.
+    cwd = exe_dir();
+#else
     {
         std::error_code ec;
         cwd = std::filesystem::current_path(ec).generic_string();
     }
+#endif
     // Beside the exe first: the folder this copy of bbhost runs from.
     for (const std::string& cand : {exe_dir() + "/bbhost.toml", cwd.empty() ? std::string("bbhost.toml") : cwd + "/bbhost.toml"}) {
         if (file_exists(cand) && cand != user_cfg) {

@@ -60,6 +60,7 @@ sources=(
   "$root"/tests/hud_test.cpp
   "$root"/tests/self_test.cpp
   "$root"/tests/host_fs_test.cpp
+  "$root"/tests/hostfs_tree_test.cpp
   "$root"/tests/save_commit_test.cpp
   "$root"/tests/shaders_test.cpp
   "$root"/tests/guest_core_test.cpp

@@ -1,3 +1,46 @@
+#if defined(BBX_UWP)
+// Nothing to move on the console. `config_move` exists for one reason: bbhost
+// kept its settings in ~/.config/bbhost on Linux and keeps them in
+// ~/.local/share/bbhost now. The console has neither folder - the player's dump
+// arrives through a `FutureAccessList` token and the settings live in the
+// package's LocalState - so every entry point here is a no-op that reports
+// "nothing moved".
+//
+// It is also the only file in the guest layer that cannot be compiled as it
+// stands: it walks directories with `std::filesystem`, and MSVC's header imports
+// the desktop partition's `FindFirstFileW`/`CreateDirectoryW` into every
+// translation unit that includes it (`check-imports.ps1` refuses those, rightly:
+// they are refused on a granted path at run time too).
+#include "core/config_move.h"
+
+ConfigMove config_move_settings(const std::string& from, const std::string& to) {
+    (void)from;
+    (void)to;
+    return ConfigMove{};
+}
+
+void config_move_at_start(const std::string& from, const std::string& to) {
+    (void)from;
+    (void)to;
+}
+
+std::string config_move_fallback() { return {}; }
+std::vector<ConfigMove> config_moves_to_show() { return {}; }
+void config_moves_dismiss() {}
+std::string config_move_heading(const ConfigMove& m) {
+    (void)m;
+    return {};
+}
+std::vector<ConfigMoveLine> config_move_lines(const ConfigMove& m) {
+    (void)m;
+    return {};
+}
+std::string config_move_log_line(const ConfigMove& m) {
+    (void)m;
+    return {};
+}
+
+#else
 #include "core/config_move.h"
 
 #include "core/config.h"
@@ -725,3 +768,5 @@ void config_move_test_reset() {
     g_config_move_test_no_remove = false;
 }
 #endif
+
+#endif  // BBX_UWP

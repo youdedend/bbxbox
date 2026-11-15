@@ -32,7 +32,9 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
-#include <filesystem>
+#if !defined(BBX_UWP)
+#include <filesystem>  // desktop only: the test-request pipe below is a developer's switch
+#endif
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -304,6 +306,14 @@ std::deque<TestRequest> g_test_reqs;  // under g_test_req_mu
 std::atomic<bool> g_test_exit{false};  // an `exit` request came
 
 void test_requests_read(const std::string& dir) {
+#if defined(BBX_UWP)
+    // `BBHOST_TEST_DIR` is a test harness's pipe: a folder on the machine the
+    // build runs on, read every 100 ms. The console has no such folder, and the
+    // thread ends here rather than walking a packaged title's directory with the
+    // CRT's desktop calls.
+    (void)dir;
+    return;
+#endif
     namespace fs = std::filesystem;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

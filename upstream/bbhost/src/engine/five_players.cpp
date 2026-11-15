@@ -8,14 +8,24 @@
 #include "hle/fs.h"
 #include "log.h"
 
+#if defined(BBX_UWP)
+// The console's names for the four calls below (see hostfs_extra.h): MSVC's
+// `<filesystem>` imports the desktop partition's directory calls.
+#include "xbox/platform/hostfs_extra.h"
+#else
 #include <filesystem>
+#endif
 #include <fstream>
 #include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
 
+#if defined(BBX_UWP)
+namespace fs = bbx::hostfs::shim;
+#else
 namespace fs = std::filesystem;
+#endif
 
 namespace {
 
@@ -23,12 +33,28 @@ namespace {
 constexpr const char* kStamp = "five-players 1";
 
 std::optional<std::vector<std::uint8_t>> read_file(const fs::path& p) {
+#if defined(BBX_UWP)
+    // The file may be on the dump, which the CRT cannot open through a
+    // `FutureAccessList` token; the seam can.
+    std::vector<std::uint8_t> bytes;
+    if (!bbx::hostfs::ReadFileAll(p.string(), &bytes)) return std::nullopt;
+    return bytes;
+#else
     std::ifstream f(p, std::ios::binary);
     if (!f) return std::nullopt;
     return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+#endif
 }
 
 bool write_file(const fs::path& p, const std::vector<std::uint8_t>& b) {
+#if defined(BBX_UWP)
+    // Staged beside the file and moved over it, so a half-written asset never
+    // takes the place of a good one - the same shape as the desktop branch.
+    fs::create_directories(bbx::hostfs::shim::path(p.string()).parent_path());
+    const std::string tmp = p.string() + ".tmp";
+    if (!bbx::hostfs::WriteFileAll(tmp, b)) return false;
+    return bbx::hostfs::Rename(tmp, p.string(), true);
+#else
     std::error_code ec;
     fs::create_directories(p.parent_path(), ec);
     const fs::path tmp = p.string() + ".tmp";
@@ -40,6 +66,7 @@ bool write_file(const fs::path& p, const std::vector<std::uint8_t>& b) {
     }
     fs::rename(tmp, p, ec);
     return !ec;
+#endif
 }
 
 std::string script_path(const char* map) { return std::string("dvdroot_ps4/event/") + map + ".emevd.dcx"; }

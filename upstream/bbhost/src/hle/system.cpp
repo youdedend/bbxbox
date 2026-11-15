@@ -40,7 +40,16 @@
 #include <atomic>
 #include <cctype>
 #include <ctime>
+#if defined(BBX_UWP)
+// Save data and its backups live on the dump (a granted, `FutureAccessList`
+// path) and in LocalState: the seam is the only walker that works on both, and
+// MSVC's `<filesystem>` imports the desktop directory calls into every unit that
+// includes it.
+#include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
+#else
 #include <filesystem>
+#endif
 #include <map>
 #include <cerrno>
 #include <chrono>
@@ -671,7 +680,9 @@ void back_up_save(const std::string& dir) {
     const auto now = std::chrono::steady_clock::now();
     auto last = g_last_backup.find(dir);
     if (last != g_last_backup.end() && now - last->second < std::chrono::minutes(minutes)) return;
+#if !defined(BBX_UWP)
     namespace fs = std::filesystem;
+#endif
     const std::string src = save_dir_host(dir);
     const std::string root = hle_fs_map_path(("/data/save-backups/" + dir).c_str());
     if (src.empty() || root.empty()) return;
@@ -684,6 +695,29 @@ void back_up_save(const std::string& dir) {
     localtime_r(&t, &tm);
 #endif
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+#if defined(BBX_UWP)
+    const std::string dest = bbx::hostfs::JoinPath(root, stamp);
+    const bool made = bbx::hostfs::MkDirs(dest);
+    const bool copied = made && bbx::hostfs::CopyTree(src, dest);
+    if (!copied) {
+        static int said = 0;
+        if (said++ < 4) host_log("save backup: %s could not be copied (error %d)", dir.c_str(), bbx::hostfs::LastError());
+        return;
+    }
+    g_last_backup[dir] = now;
+    // The newest `keep`: the names sort by time.
+    std::vector<bbx::hostfs::DirEntry> entries;
+    std::vector<std::string> backups;
+    if (bbx::hostfs::ListDir(root, &entries)) {
+        for (const bbx::hostfs::DirEntry& e : entries) {
+            if (e.is_dir) backups.push_back(bbx::hostfs::JoinPath(root, e.name));
+        }
+    }
+    std::sort(backups.begin(), backups.end());
+    for (std::size_t i = 0; i + static_cast<std::size_t>(keep) < backups.size(); ++i) {
+        (void)bbx::hostfs::RemoveAll(backups[i]);
+    }
+#else
     std::error_code ec;
     fs::create_directories(fs::path(root) / stamp, ec);
     if (!ec) fs::copy(src, fs::path(root) / stamp, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
@@ -700,6 +734,7 @@ void back_up_save(const std::string& dir) {
     }
     std::sort(backups.begin(), backups.end());
     for (std::size_t i = 0; i + static_cast<std::size_t>(keep) < backups.size(); ++i) fs::remove_all(backups[i], ec);
+#endif
     host_log("save backup: %s -> save-backups/%s/%s (%zu kept)", dir.c_str(), dir.c_str(), stamp,
              std::min(backups.size(), static_cast<std::size_t>(keep)));
 }
@@ -708,13 +743,22 @@ void back_up_save(const std::string& dir) {
 // stage, its marker, an old copy), settled for each save before the game
 // looks: a save is then whole, the old one or the new one (save_commit.h).
 void recover_all_saves() {
+#if !defined(BBX_UWP)
     namespace fs = std::filesystem;
+#endif
     const std::string root = hle_fs_map_path("/data/saves");
     if (root.empty()) return;
     std::vector<std::string> dirs;
+#if defined(BBX_UWP)
+    std::vector<bbx::hostfs::DirEntry> listed;
+    if (!bbx::hostfs::ListDir(root, &listed)) return;
+    for (const bbx::hostfs::DirEntry& e : listed) {
+        const std::string& n = e.name;
+#else
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(fs::path(root), ec)) {
         const std::string n = e.path().filename().string();
+#endif
         for (const char* tail : {".stage", ".old", ".commit", ".commit.new"}) {
             const std::size_t t = std::strlen(tail);
             if (n.size() > t + 1 && n[0] == '.' && n.compare(n.size() - t, t, tail) == 0) dirs.push_back(n.substr(1, n.size() - t - 1));
@@ -824,7 +868,12 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
         else host_log("save %s: no stage could be made; this session writes in place", dir.c_str());
     }
     const bool staged = writable && host != live && host == save_commit::paths_of(live).stage;
-    if (!hle_fs_mount(mp, ("saves/" + std::filesystem::path(host.empty() ? dir : host).filename().string()).c_str())) {
+#if defined(BBX_UWP)
+    const std::string mount_name = "saves/" + bbx::hostfs::shim::path(host.empty() ? dir : host).filename();
+#else
+    const std::string mount_name = "saves/" + std::filesystem::path(host.empty() ? dir : host).filename().string();
+#endif
+    if (!hle_fs_mount(mp, mount_name.c_str())) {
         return kSaveErrParam;
     }
     g_save_mounts[slot].used = true;
@@ -904,9 +953,13 @@ GUEST_ABI int hle_save_delete(const SaveMountReq* req) {
     {
         // What a session or a commit left beside it goes too.
         const save_commit::Paths sp = save_commit::paths_of(h);
+#if defined(BBX_UWP)
+        for (const std::string& left : {sp.stage, sp.old, sp.marker, sp.marker_new}) (void)bbx::hostfs::RemoveAll(left);
+#else
         std::error_code ec;
         for (const std::string& left : {sp.stage, sp.old, sp.marker, sp.marker_new})
             std::filesystem::remove_all(std::filesystem::path(left), ec);
+#endif
     }
     host_log("sceSaveDataDelete %s", req->dir_name);
     return 0;
