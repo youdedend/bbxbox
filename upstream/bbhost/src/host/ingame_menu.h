@@ -16,7 +16,28 @@
 // queue.
 #pragma once
 
+// Local change, marked BBX_UWP: the console draws its own UI over the guest's
+// frame (`xbox/platform/hud.cpp`), and Vulkan is not in the console build at
+// all - so under BBX_UWP the handles below are opaque and the two record calls
+// are the ones the D3D12 presenter does not make. `hle/system.cpp` and
+// `host/options.h` include this header for the event/pump/open calls, and those
+// are unchanged; nothing else here is compiled for the console.
+#if defined(BBX_UWP)
+#include <cstdint>
+#define BBX_VK_HANDLE(name) struct name
+struct VkInstance_T; struct VkPhysicalDevice_T; struct VkDevice_T; struct VkQueue_T;
+struct VkCommandBuffer_T; struct VkImageView_T;
+using VkInstance = VkInstance_T*;
+using VkPhysicalDevice = VkPhysicalDevice_T*;
+using VkDevice = VkDevice_T*;
+using VkQueue = VkQueue_T*;
+using VkCommandBuffer = VkCommandBuffer_T*;
+using VkImageView = VkImageView_T*;
+using VkFormat = int;
+struct VkExtent2D { std::uint32_t width, height; };
+#else
 #include <vulkan/vulkan.h>
+#endif
 
 #include <cstdint>
 

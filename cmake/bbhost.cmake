@@ -147,6 +147,13 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/hle/np_signaling.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/libc.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/gnm.cpp"
+    # The renderer-facing HLE. These reach `host/gpu.h` and the `gxvk` headers,
+    # which carry no Vulkan types; the one that did - `host/ingame_menu.h` - now
+    # declares opaque handles under BBX_UWP.
+    "${BBX_BBHOST_ROOT}/src/hle/gnm_exec.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/gx_trace.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/video.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/system.cpp"
 )
 target_include_directories(bbhost_guest PUBLIC
     # winpthreads for a SDK that has no <pthread.h>; ahead of everything, and
