@@ -5,6 +5,11 @@
 
 #include <windows.h>
 
+// CreateFile2FromApp / CreateFileFromApp: the APP-partition-only file APIs that
+// UWP needs for a path outside the package's own folders. They live in their own
+// header and are not part of <windows.h>.
+#include <fileapifromapp.h>
+
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.AccessCache.h>

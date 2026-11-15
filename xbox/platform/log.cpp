@@ -29,15 +29,16 @@ void WriteRaw(const char* text) {
 LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
     const auto* record = info->ExceptionRecord;
     char line[512];
-    const unsigned long long address =
-        reinterpret_cast<unsigned long long>(record ? record->ExceptionAddress : nullptr);
+    const auto fault = reinterpret_cast<std::uintptr_t>(record ? record->ExceptionAddress : nullptr);
+    const unsigned long long address = static_cast<unsigned long long>(fault);
     HMODULE module = nullptr;
     if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                              reinterpret_cast<LPCWSTR>(record ? record->ExceptionAddress : nullptr),
                              &module) &&
         module != nullptr) {
-        const auto base = reinterpret_cast<unsigned long long>(module);
+        const unsigned long long base = static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(module));
         std::snprintf(line, sizeof(line),
                       "\n! fault code=0x%08lx at 0x%llx (RVA 0x%llx); last: %s\n",
                       record ? record->ExceptionCode : 0ul, address, address - base, g_last_line);
@@ -114,7 +115,8 @@ void InstallLastChanceLogger() {
         char line[256];
         std::snprintf(line, sizeof(line), "\n! unhandled: code=0x%08lx at 0x%llx; last: %s\n",
                       record ? record->ExceptionCode : 0ul,
-                      static_cast<unsigned long long>(record ? record->ExceptionAddress : nullptr),
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<std::uintptr_t>(record ? record->ExceptionAddress : nullptr)),
                       g_last_line);
         WriteRaw(line);
         return EXCEPTION_EXECUTE_HANDLER;

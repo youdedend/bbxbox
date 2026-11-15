@@ -81,7 +81,14 @@ target_compile_features(bbxbox PRIVATE cxx_std_20)
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1
     WINAPI_FAMILY=WINAPI_FAMILY_APP
-    _WIN32_WINNT=0x10
+    # 0x0A00 is Windows 10. `0x10` is a *version*, not a header constant: with it
+    # the SDK compiles out everything newer than NT 3.x and GetTickCount64,
+    # AddVectoredExceptionHandler and friends vanish.
+    _WIN32_WINNT=0x0A00
+    NTDDI_VERSION=NTDDI_WIN10
+    # The CRT's fopen/strncpy deprecation warnings are noise on a console build
+    # where those calls are the correct ones.
+    _CRT_SECURE_NO_WARNINGS
     SDL_MAIN_HANDLED=1
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
