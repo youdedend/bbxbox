@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: ci
+
+on:
+  push:
+    branches: ["arena/**", "main"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: portable core + tests (2 min)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
+      - name: host build + unit tests + precheck
+        run: ./tools/local_precheck.sh
+
+  console:
+    name: UWP build + import audit
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies (SDL3-uwp, libuwp) -- cached
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: build-deps/prefix
+          key: deps-${{ runner.os }}-sdl3-uwp-3.4.20-${{ hashFiles('xbox/scripts/build-deps.ps1') }}
+      - name: build dependencies when the cache misses
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./xbox/scripts/build-deps.ps1
+      - name: configure and build
+        shell: pwsh
+        run: ./xbox/scripts/build.ps1
+      - name: package + check imports
+        shell: pwsh
+        run: ./xbox/scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbxbox-appx
+          path: |
+            build/appx/*.appx
+            build/xbox/**/bbxbox.map
+            build/xbox/**/bbxbox.pdb
+          if-no-files-found: error

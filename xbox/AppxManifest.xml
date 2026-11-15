@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!--
+  bbxbox, Xbox Series X|S Retail Developer Mode, Game mode.
+
+  Capabilities are the minimum the port needs and nothing else:
+
+    codeGeneration    the guest is emitted and patched at run time (bbhost is a
+                      HLE, not an interpreter), and the D3D12 swapchain requires
+                      it anyway;
+    removableStorage  the dump is on a USB drive, picked once and remembered in
+                      the FutureAccessList.
+
+  Deliberately absent: runFullTrust (not available to a Store-style app and not
+  needed), broadFileSystemAccess (the dump is reached through the picker's
+  grant), internetClient, microphone, webcam (SDL3's WASAPI capture is unused),
+  and any background task. `TargetDeviceFamily` is Windows.Desktop because
+  Developer Mode on Xbox presents as that family with the Xbox device in
+  `System.DeviceModel`.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap2="http://schemas.microsoft.com/appx/manifest/uap/windows10/2"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+  IgnorableNamespaces="uap uap2 rescap virtualization">
+
+  <Identity Name="bbxbox.Bloodborne"
+            Publisher="CN=bbxbox"
+            Version="0.1.0.0"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>bbxbox</DisplayName>
+    <PublisherDisplayName>bbxbox</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Bloodborne v1.09 native x86-64 compatibility layer with a Direct3D 12 renderer.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- No EntryPoint: the EXE is a Win32-style UWP binary whose wWinMain calls
+         CoreApplication::Run, which is the shape prior art shipped and the one
+         C++/WinRT supports without a C++/CX activation class. -->
+    <Application Id="App" Executable="bbxbox.exe">
+      <uap:VisualElements
+        DisplayName="bbxbox"
+        Description="Bloodborne compatibility layer"
+        BackgroundColor="#0C0E12"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\LargeTile.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0C0E12" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Game mode: keeps the title foreground and the frame paced. -->
+        <uap:Extension Category="windows.gameExplorer" />
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="codeGeneration" />
+    <rescap:Capability Name="removableStorage" />
+    <DeviceCapability Name="gamepad" />
+  </Capabilities>
+
+</Package>

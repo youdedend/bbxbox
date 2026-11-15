@@ -1,0 +1,41 @@
+# build output and dependencies (built by xbox/scripts/build-deps.ps1, cached in CI)
+build/
+build-deps/
+out/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.exe
+*.appx
+*.msix
+*.appxupload
+*.map
+
+# console and local state
+*.log
+.vs/
+.vscode/
+.cache/
+precompile_inflight.txt
+precompile_quarantine.txt
+memory-selftest.txt
+hunter-name.txt
+bbxbox.ini
+
+# never: game data, dumps, keys, caches from a console
+*.pkg
+*.sfo
+*.prx
+*.sprx
+*.self
+*.elf
+*.dcx
+*.bnd
+*.mapbnd
+*.shaderbnd
+eboot.bin
+dvdroot_ps4/
+shadercache/
