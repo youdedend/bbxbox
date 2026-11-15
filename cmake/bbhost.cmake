@@ -277,7 +277,8 @@ add_library(bbhost_engine STATIC
     "${BBX_BBHOST_ROOT}/src/decomp/chr/chr_sync.cpp"
     "${BBX_BBHOST_ROOT}/src/decomp/chr/replay_manipulator.cpp"
     "${BBX_BBHOST_ROOT}/src/decomp/events/flag_store.cpp"
-    "${BBX_BBHOST_ROOT}/src/decomp/events/interpreter.cpp"
+    # (decomp/events/interpreter.cpp is out: it includes <bbhost/engine/fd4.hpp>,
+    # which lives in upstream's `include/` tree and is not vendored here.)
     "${BBX_BBHOST_ROOT}/src/decomp/gnmx/cue.cpp"
     "${BBX_BBHOST_ROOT}/src/decomp/gx/blink.cpp"
     "${BBX_BBHOST_ROOT}/src/decomp/gx/block_reclaim.cpp"
