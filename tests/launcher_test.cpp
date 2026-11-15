@@ -146,3 +146,61 @@ TEST(BaseOnlyFooterWarnsInWords) {
     CHECK(footer.find("01.09 is required") != std::string::npos);
     CHECK(footer.find("never modified") != std::string::npos);
 }
+
+// --- the <dump>\mods overlay ------------------------------------------------
+// The Arabic localisation for CUSA03173 v1.09 is loose files in `msg/`, `font/`
+// and `menu/` plus a patched `eboot.bin`: exactly what the two switches are for.
+
+TEST(NoModsFolderNoModsItems) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.mods_present = false;
+    model.Rebuild();
+    CHECK(!Has(model, Action::kToggleMods));
+    CHECK(!Has(model, Action::kToggleModdedEboot));
+}
+
+TEST(ModsFolderAddsTheOverlaySwitchOnByDefault) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.mods_present = true;
+    model.mods_enabled = true;
+    model.Rebuild();
+    CHECK(Has(model, Action::kToggleMods));
+    bool on = false;
+    for (const Item& item : model.items) {
+        if (item.action == Action::kToggleMods) on = item.label.find("on") != std::string::npos;
+    }
+    CHECK(on);
+    // On by default also means the modded-eboot switch is offered.
+    CHECK(Has(model, Action::kToggleModdedEboot));
+}
+
+TEST(OverlayOffHidesTheModdedEbootSwitch) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.mods_present = true;
+    model.mods_enabled = false;
+    model.Rebuild();
+    CHECK(Has(model, Action::kToggleMods));
+    // A patched eboot without the files it was patched for is not offered at all.
+    CHECK(!Has(model, Action::kToggleModdedEboot));
+}
+
+TEST(ModdedEbootSwitchSaysAllowedWhenOn) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.mods_present = true;
+    model.mods_enabled = true;
+    model.modded_eboot_ok = true;
+    model.Rebuild();
+    bool allowed = false;
+    for (const Item& item : model.items) {
+        if (item.action == Action::kToggleModdedEboot) allowed = item.label.find("on") != std::string::npos;
+    }
+    CHECK(allowed);
+    // Dangerous: it runs a build whose digest the port does not pin.
+    for (const Item& item : model.items) {
+        if (item.action == Action::kToggleModdedEboot) CHECK(item.dangerous);
+    }
+}

@@ -95,7 +95,10 @@ void SaveLayoutSettings() {
     const std::string path = bbx::platform::Local("bbxbox.ini");
     const bool keyed = bbx::platform::IniSet(g_session.ini_text, "dump", "path", g_session.layout.base_path) &&
                        bbx::platform::IniSet(g_session.ini_text, "dump", "patch_path", g_session.layout.patch_path) &&
-                       bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0");
+                       bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0") &&
+                       bbx::platform::IniSet(g_session.ini_text, "dump", "mods", g_session.model.mods_enabled ? "1" : "0") &&
+                       bbx::platform::IniSet(g_session.ini_text, "dump", "modded_eboot",
+                                             g_session.model.modded_eboot_ok ? "1" : "0");
     if (!keyed) {
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not key the layout settings");
     }
@@ -104,9 +107,31 @@ void SaveLayoutSettings() {
     }
 }
 
+// `<dump>\mods`: the overlay the player drops loose files into. Asked of the
+// dump's own root each time the launcher is rebuilt, through the host-fs seam,
+// because the folder may be on a stick that was granted a minute ago.
+void RefreshModsOverlay() {
+    const std::string& root = g_session.layout.base_path;
+    if (root.empty()) {
+        g_session.model.mods_present = false;
+        return;
+    }
+    // The detection is the same question the dump scanner asks ("is there a
+    // directory at this path"), so it goes through the same seam - `DumpFs`
+    // wraps `bbx::hostfs` on the console and the test harness's map in a test.
+    const std::string mods = root + "\\mods";
+    const bbx::platform::DumpFs fs = bbx::platform::MakeDumpFs();
+    const bool present = fs.is_dir && fs.is_dir(mods);
+    if (present != g_session.model.mods_present) {
+        bbx::platform::LogF("mods overlay: %s at %s", present ? "present" : "absent", mods.c_str());
+    }
+    g_session.model.mods_present = present;
+}
+
 void RefreshLauncher() {
     g_session.model.layout = g_session.layout;
     g_session.model.has_usb = !g_session.usb_token.empty();
+    RefreshModsOverlay();
     g_session.model.Rebuild();
 }
 
@@ -190,6 +215,18 @@ void OnAction(PadAction action) {
             g_session.layout.effective_ver =
                 g_session.layout.CanRunPatched() ? g_session.layout.patch.Version()
                                                  : g_session.layout.base.Version();
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleMods:
+            g_session.model.mods_enabled = !g_session.model.mods_enabled;
+            bbx::platform::LogF("mods overlay %s", g_session.model.mods_enabled ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleModdedEboot:
+            g_session.model.modded_eboot_ok = !g_session.model.modded_eboot_ok;
+            bbx::platform::LogF("modded eboot %s", g_session.model.modded_eboot_ok ? "allowed" : "refused");
             SaveLayoutSettings();
             RefreshLauncher();
             return;
@@ -387,6 +424,11 @@ void LoadSettings() {
     }
     g_session.ini_text = text;
     g_session.ini = bbx::platform::ParseIni(text);
+    // The two overlay switches the launcher offers. The overlay defaults to on
+    // (a player who put files in `mods\` meant them); a modded eboot defaults
+    // to off, because it is the one that steps outside the verified digests.
+    g_session.model.mods_enabled = bbx::platform::IniFlag(g_session.ini, "dump.mods", true);
+    g_session.model.modded_eboot_ok = bbx::platform::IniFlag(g_session.ini, "dump.modded_eboot", false);
 }
 
 void RestoreDump() {

@@ -24,6 +24,8 @@ enum class Action : std::uint8_t {
     kPickDump,
     kPickPatch,
     kTogglePatch,
+    kToggleMods,
+    kToggleModdedEboot,
     kContinueUnpatched,
     kSyncCacheToUsb,
     kSyncCacheFromUsb,
@@ -50,6 +52,22 @@ struct LauncherModel {
     std::size_t stages = 0;
     std::size_t pipelines = 0;
     std::string cache_stamp;
+
+    // The `<dump>\mods` overlay: a directory the player drops loose files into
+    // (`msg/`, `font/`, `menu/` - the Arabic localisation patch for CUSA03173
+    // v1.09 is exactly that) which resolves ahead of `dvdroot_ps4` without the
+    // dump being touched. `mods_present` is whether the directory exists,
+    // `mods_enabled` the player's switch; the overlay is on by default when the
+    // directory is there, because a player who put files there meant them.
+    //
+    // A localisation patch usually rewrites `eboot.bin` as well, and that file
+    // no longer matches the SHA-256 the port pins for v1.09 - so the second
+    // switch exists: with it on, a v1.09 eboot whose digest is not the pinned
+    // one is loaded anyway (`BBHOST_ANY_EBOOT=1`'s meaning), and the digest is
+    // logged so a bug report says which build was actually run.
+    bool mods_present = false;
+    bool mods_enabled = true;
+    bool modded_eboot_ok = false;
 
     std::vector<Item> items;
     std::size_t selected = 0;

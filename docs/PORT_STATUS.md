@@ -56,14 +56,27 @@ free:
     uses — the thunk stub page flips its pages, stores the bytes, flips to
     `PAGE_EXECUTE_READ` and flushes the instruction cache.
 
-**What still does not compile for the console:** `hle/video.cpp`,
-`hle/system.cpp`, `hle/gnm_exec.cpp` and `hle/gx_trace.cpp`. Each of them
-includes a host header that carries Vulkan types — `host/ingame_menu.h`,
-`host/gxvk.h`, `host/gxvk_lists.h`, `host/gxvk_homes.h`, `host/cb_capture.h`,
-`host/list_resolve.h` — and those headers have to be fenced under `BBX_UWP`
-before those four files can join the library. `hle/dialog.cpp` and `hle/libc.cpp`
-needed a local patch each for the MinGW-only `<sys/time.h>` and the reentrant
-`gmtime_r`/`localtime_r`; both are marked and one line each.
+**All of `src/hle` compiles for the console: 23 of 23.** The last four
+(`video`, `system`, `gnm_exec`, `gx_trace`) needed three small local changes and
+no host-header surgery: `host/ingame_menu.h` now declares opaque handles under
+`BBX_UWP` (it was the only one of the six "Vulkan headers" that carried a single
+`#include <vulkan/vulkan.h>`; the `gxvk*`/`cb_capture`/`list_resolve` headers
+only ever had the name), `hle/gnm_exec.cpp` needed `<array>`, and
+`hle/system.cpp`'s save-directory `::stat`/`S_ISDIR`/`fopen` became the host-fs
+seam — the save folder on a granted USB stick is not the CRT's to open.
+`host/window.h`'s `host_pad_rumble(std::uint8_t small, ...)` lost a parameter
+name to `<rpcndr.h>`'s `#define small char`. Forty-four translation units total:
+`20/20` console `src/core`, `23/23` `src/hle`, and the winpthreads shim.
+
+**The `<dump>\mods` overlay is a launcher switch.** The Arabic localisation for
+CUSA03173 v1.09 is loose files under `msg/`, `font/` and `menu/` plus a patched
+`eboot.bin`. `LauncherModel` now carries `mods_present` (asked of the dump root
+through the dump's own file seam), `mods_enabled` (`[dump] mods`, on by default
+when the folder exists) and `modded_eboot_ok` (`[dump] modded_eboot`, off by
+default, offered *only* with the overlay on, and marked dangerous because it
+loads a v1.09 eboot whose SHA-256 is not the pinned one — `BBHOST_ANY_EBOOT`'s
+meaning, and the digest is logged either way). Four new tests cover the four
+states. 195 host tests green.
 `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
 | P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls — the app therefore **links and packages** with the
 whole P2 path in it (run `43734984657`). Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |

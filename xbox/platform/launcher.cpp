@@ -13,6 +13,8 @@ const char* ActionName(Action action) {
     case Action::kPickDump: return "pick-dump";
     case Action::kPickPatch: return "pick-patch";
     case Action::kTogglePatch: return "toggle-patch";
+    case Action::kToggleMods: return "toggle-mods";
+    case Action::kToggleModdedEboot: return "toggle-modded-eboot";
     case Action::kContinueUnpatched: return "continue-unpatched";
     case Action::kSyncCacheToUsb: return "sync-cache-to-usb";
     case Action::kSyncCacheFromUsb: return "sync-cache-from-usb";
@@ -51,6 +53,19 @@ void LauncherModel::Rebuild() {
     } else {
         items.push_back(Item{Action::kPickPatch, "Add 1.09 update folder",
                              "Choose the separate update folder, if your dump is split", true, false});
+    }
+    if (mods_present) {
+        items.push_back(Item{Action::kToggleMods, mods_enabled ? "Mods overlay: on" : "Mods overlay: off",
+                             "Dump\\mods resolves ahead of dvdroot_ps4; the dump itself is not modified",
+                             true, false});
+        // Only offered with the overlay on: a patched eboot without the files
+        // it was patched for is a build the port cannot vouch for at all.
+        if (mods_enabled) {
+            items.push_back(Item{Action::kToggleModdedEboot,
+                                 modded_eboot_ok ? "Allow modded eboot: on" : "Allow modded eboot: off",
+                                 "Load a v1.09 eboot whose SHA-256 is not the pinned one; the digest is logged",
+                                 true, true});
+        }
     }
     if (has_usb && !syncing) {
         items.push_back(Item{Action::kSyncCacheToUsb, "Copy shader cache to USB",
