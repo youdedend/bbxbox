@@ -230,6 +230,12 @@ else()
 endif()
 
 if(BBX_BBHOST)
+    # `bbhost_guest` owns these two as well, so the day the link switch below is
+    # flipped they must come out of this list - two copies of `bbx::hostfs`'s
+    # wrappers is a duplicate definition, and this is the line that would do it.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
+
     # The guest runtime, its host layer and the game's own code are compiled,
     # and the link is one switch away - but the switch is off: the residue needs
     # `xbox/platform/bbhost_bridge.cpp` (the display/pad/flip surface the omitted
