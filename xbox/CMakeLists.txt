@@ -85,7 +85,7 @@ target_compile_definitions(bbxbox PRIVATE
     # the SDK compiles out everything newer than NT 3.x and GetTickCount64,
     # AddVectoredExceptionHandler and friends vanish.
     _WIN32_WINNT=0x0A00
-    NTDDI_VERSION=NTDDI_WIN10
+    NTDDI_VERSION=NTDDI_WIN10_RS3
     # The CRT's fopen/strncpy deprecation warnings are noise on a console build
     # where those calls are the correct ones.
     _CRT_SECURE_NO_WARNINGS
@@ -95,7 +95,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # System V ABI for guest calls, the lesson that forces clang-cl at all.
     # /WX only on the port's own TUs: upstream's code is built with /W3 and its
     # warnings are not this port's to fix.
-    target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus)
+    target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus
+        # C++/WinRT is written for MSVC's non-conforming two-phase lookup, which
+        # is what -fdelayed-template-parsing restores for clang-cl.
+        -fdelayed-template-parsing)
     target_link_options(bbxbox PRIVATE
         /STACK:8388608,65536
         /APPCONTAINER

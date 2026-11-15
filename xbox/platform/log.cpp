@@ -109,7 +109,20 @@ void LogLastChance(const char* what, std::uintptr_t address, std::uintptr_t modu
 
 void InstallLastChanceLogger() {
     if (g_installed.exchange(true)) return;
-    ::AddVectoredExceptionHandler(1, &LastChance);
+    // AddVectoredExceptionHandler is desktop-partition only in the SDK's family
+    // filter, but kernel32 exports it for apps too (and on the console). Resolve
+    // it by name instead of losing the last-chance log.
+    using AddVectoredFn = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    const HMODULE kernel = ::GetModuleHandleW(L"kernel32.dll");
+    const auto add_vectored = kernel == nullptr
+                                  ? nullptr
+                                  : reinterpret_cast<AddVectoredFn>(
+                                        ::GetProcAddress(kernel, "AddVectoredExceptionHandler"));
+    if (add_vectored != nullptr) {
+        add_vectored(1, &LastChance);
+    } else {
+        LogMessage(Level::kWarn, "log: no vectored exception handler; first-chance faults unseen");
+    }
     ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* info) -> LONG {
         const auto* record = info->ExceptionRecord;
         char line[256];

@@ -5,9 +5,10 @@
 
 #include <windows.h>
 
-// CreateFile2FromApp / CreateFileFromApp: the APP-partition-only file APIs that
-// UWP needs for a path outside the package's own folders. They live in their own
-// header and are not part of <windows.h>.
+// The FromApp file APIs: the APP-partition surface for paths outside the
+// package's own folders. They live in their own header, they are not in
+// <windows.h>, and the SDK declares them only when NTDDI_VERSION is at least
+// NTDDI_WIN10_RS3 (see xbox/CMakeLists.txt).
 #include <fileapifromapp.h>
 
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -28,6 +29,16 @@ namespace {
 
 StoragePaths g_paths;
 std::once_flag g_once;
+
+// GetFileAttributesExFromApp is the APP-partition way to ask about a path;
+// GetFileAttributesW is desktop-only.
+DWORD AttributesOf(const std::wstring& wide) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!::GetFileAttributesExFromAppW(wide.c_str(), GetFileExInfoStandard, &data)) {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return data.dwFileAttributes;
+}
 
 std::wstring Widen(const std::string& text) {
     if (text.empty()) return {};
@@ -81,9 +92,9 @@ bool StorageInit() {
                        static_cast<unsigned>(error.code().value));
         }
         if (ok) {
-            ::CreateDirectoryW(Widen(Local("shadercache")).c_str(), nullptr);
-            ::CreateDirectoryW(Widen(Local("crashes")).c_str(), nullptr);
-            ::CreateDirectoryW(Widen(Local("guestswap")).c_str(), nullptr);
+            ::CreateDirectoryFromAppW(Widen(Local("shadercache")).c_str(), nullptr);
+            ::CreateDirectoryFromAppW(Widen(Local("crashes")).c_str(), nullptr);
+            ::CreateDirectoryFromAppW(Widen(Local("guestswap")).c_str(), nullptr);
         }
     });
     return ok;
@@ -136,11 +147,11 @@ bool WriteBinary(const std::string& path, std::span<const std::uint8_t> bytes) {
     ok = ok && ::FlushFileBuffers(file);
     ::CloseHandle(file);
     if (!ok) {
-        ::DeleteFileW(temporary.c_str());
+        ::DeleteFileFromAppW(temporary.c_str());
         return false;
     }
-    ::DeleteFileW(wide.c_str());
-    return ::MoveFileW(temporary.c_str(), wide.c_str()) != 0;
+    ::DeleteFileFromAppW(wide.c_str());
+    return ::MoveFileFromAppW(temporary.c_str(), wide.c_str()) != 0;
 }
 
 bool WriteText(const std::string& path, const std::string& text) {
@@ -158,12 +169,12 @@ bool AppendText(const std::string& path, const std::string& text) {
 
 bool Exists(const std::string& path) {
     const std::wstring wide = Widen(path);
-    const DWORD attributes = ::GetFileAttributesW(wide.c_str());
+    const DWORD attributes = AttributesOf(wide);
     return attributes != INVALID_FILE_ATTRIBUTES;
 }
 
 bool IsDir(const std::string& path) {
-    const DWORD attributes = ::GetFileAttributesW(Widen(path).c_str());
+    const DWORD attributes = AttributesOf(Widen(path));
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
@@ -299,7 +310,8 @@ DumpFs MakeDumpFs() {
     fs.is_dir = [](const std::string& path) { return IsDir(path); };
     fs.read = [](const std::string& path, std::size_t cap) {
         std::vector<std::uint8_t> bytes;
-        ReadBinary(path, bytes, cap);
+        const bool ok = ReadBinary(path, bytes, cap);
+        if (!ok) return std::vector<std::uint8_t>{};
         return bytes;
     };
     fs.list_dirs = [](const std::string& path) { return ListDirs(path); };
