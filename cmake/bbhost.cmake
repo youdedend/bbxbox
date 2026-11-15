@@ -134,8 +134,11 @@ target_include_directories(bbhost_guest PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim"
     "${BBX_BBHOST_ROOT}/src"
     # bbhost's `core/memory.h` resolves to the port's arena adapter by that
-    # path, so the repository root is on the include path too.
-    "${BBX_BBHOST_ROOT}/../..")
+    # path, so the repository root is on the include path too - which is also
+    # where `xbox/platform/bbhost_version.h` stands in for the header upstream's
+    # build generates.
+    "${BBX_BBHOST_ROOT}/../.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/platform")
 target_compile_features(bbhost_guest PUBLIC cxx_std_20)
 target_compile_definitions(bbhost_guest PUBLIC
     BBX_UWP=1
