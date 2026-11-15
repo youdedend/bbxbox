@@ -93,8 +93,9 @@ $assetPrefix = 'Assets\'
 $assetPattern = [regex]::Escape($assetPrefix) + '[A-Za-z0-9]+\.png'
 $missing = @()
 foreach ($asset in ([regex]::Matches($text, $assetPattern) | ForEach-Object { $_.Value } | Sort-Object -Unique)) {
-    $relative = $asset.Substring($assetPrefix.Length)
-    if (-not (Test-Path (Join-Path $Root (Join-Path 'xbox' $relative)))) { $missing += $asset }
+    # The manifest path is relative to the package root, which is xbox/.
+    $path = Join-Path $Root (Join-Path 'xbox' $asset)
+    if (-not (Test-Path $path)) { $missing += "$asset (looked for $path)" }
 }
 foreach ($asset in ($missing | Sort-Object -Unique)) {
     $problems.Add("manifest names '$asset' but xbox/$asset does not exist (run tools/make-assets.py)")
