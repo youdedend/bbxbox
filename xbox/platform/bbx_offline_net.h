@@ -177,6 +177,14 @@ inline int WSACleanup() { return 0; }
 // "Network is down", not "would block": a retry loop gives up instead of spinning.
 inline int WSAGetLastError() { return WSAENETDOWN; }
 inline int getaddrinfo(const char*, const char*, const ADDRINFOA*, ADDRINFOA**) { return WSAHOST_NOT_FOUND; }
+// `inet_pton` answers 0: "this text is not an address", which is the same answer
+// the guest's code gets from a network it cannot reach.
+inline int inet_pton(int, const char*, void*) { return 0; }
+inline const char* inet_ntop(int, const void*, char* dst, std::size_t len) {
+    if (dst != nullptr && len > 0) dst[0] = '\0';
+    return dst;
+}
+inline unsigned long inet_addr(const char*) { return static_cast<unsigned long>(~0ul); }
 inline void freeaddrinfo(ADDRINFOA*) {}
 
 }  // namespace bbx::offline_net
@@ -187,6 +195,9 @@ using bbx::offline_net::connect;
 using bbx::offline_net::freeaddrinfo;
 using bbx::offline_net::getaddrinfo;
 using bbx::offline_net::getsockname;
+using bbx::offline_net::inet_addr;
+using bbx::offline_net::inet_ntop;
+using bbx::offline_net::inet_pton;
 using bbx::offline_net::ioctlsocket;
 using bbx::offline_net::recv;
 using bbx::offline_net::recvfrom;
