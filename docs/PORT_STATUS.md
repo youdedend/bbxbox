@@ -77,6 +77,28 @@ default, offered *only* with the overlay on, and marked dangerous because it
 loads a v1.09 eboot whose SHA-256 is not the pinned one — `BBHOST_ANY_EBOOT`'s
 meaning, and the digest is logged either way). Four new tests cover the four
 states. 195 host tests green.
+**The host layer and the guest's own code compile too, as two more libraries.**
+`bbhost_host` is thirty-one translation units of `src/host` (upstream's own
+`host/gpu_stub.cpp` covers the entire `host_gpu_*` surface with no Vulkan at
+build time; then the audio device and its ATRAC9 path, the bindings, the frame
+stats, the list plumbing, `gxvk_*`'s bookkeeping, the shader override and
+bundle tables) plus `replay/json.cpp`. `bbhost_engine` is fifty-eight: the whole
+of `src/decomp`, all of `src/engine` except the six that reach the frame
+generator, the two upscalers or the ImGui menu, and `src/net`. That is **133
+translation units compiled for the console**, and the last two libraries also
+needed the `.att_syntax prefix` fix (the engine's `frame_ret` and friends are
+module-level asm too).
+
+The three libraries are still **not on `bbxbox`'s link line**, and that is now
+the only thing between the tree and a booting guest. The census machinery is in
+place so the gap closes in one run rather than twenty: the app links with
+`/ERRORLIMIT:0`, and `xbox/scripts/build.ps1` turns a link failure into one
+deduplicated `undefined symbols` annotation (each symbol with the object that
+wanted it, up to 50 KB) instead of the first eighty lines. The sandbox cannot
+read job logs — `results-receiver.actions.githubusercontent.com` is not
+reachable and the API's log endpoint is 404 — so the annotation *is* the
+channel, and it now holds the whole list.
+
 `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
 | P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls — the app therefore **links and packages** with the
 whole P2 path in it (run `43734984657`). Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |
