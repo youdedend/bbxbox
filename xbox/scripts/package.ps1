@@ -45,22 +45,24 @@ $exe = Get-ChildItem -Recurse -Path $build -Filter "bbxbox.exe" | Select-Object 
 if (-not $exe) { throw "build first: xbox/scripts/build.ps1" }
 Copy-Item $exe.FullName (Join-Path $layout "bbxbox.exe")
 
-# The symbols go into the package layout (the crash report resolves against
-# them) *and* beside the .appx in `build\appx`, so the artifact a reviewer
-# downloads carries a standalone .map/.pdb: a stack from the player's USB stick
-# (`bbxbox_logs\crash.log`) is turned into names with
-# `xbox/scripts/symbolicate.py` and nothing else.
-foreach ($name in @("bbxbox.map", "bbxbox.pdb")) {
+# The symbols go *beside* the .appx in `build\appx`, never inside it. The
+# console never reads a .pdb or a .a map file - `LastChance` prints
+# `module+0xRVA` from the module table alone - so a symbol file in the package
+# is dead weight that inflates every sideload upload to Xbox Device Portal (the
+# guest runtime links with /DEBUG, and the .pdb is ~100 MB). Beside the .appx,
+# in the artifact a reviewer downloads, it is what turns a stack from the
+# player's USB stick (`bbxbox_logs\crash.log`) into names with
+# `xbox/scripts/symbolicate.py`.
+foreach ($name in @("bbxbox.map", "bbxbox.pdb", "SDL3.pdb")) {
     $found = Get-ChildItem -Recurse -Path $build -Filter $name | Select-Object -First 1
     if ($found) {
-        Copy-Item $found.FullName (Join-Path $layout $name) -Force
         Copy-Item $found.FullName (Join-Path $out $name) -Force
-    } else {
+    } elseif ($name -ne "SDL3.pdb") {
         Write-Warning "no $name under build: a crash report from the console cannot be symbolised"
     }
 }
 
-foreach ($dll in @("sdl3\bin\SDL3.dll", "sdl3\bin\SDL3.pdb", "libuwp\bin\libuwp.dll")) {
+foreach ($dll in @("sdl3\bin\SDL3.dll", "libuwp\bin\libuwp.dll")) {
     $path = Join-Path $prefix $dll
     if (Test-Path $path) { Copy-Item $path (Join-Path $layout (Split-Path $path -Leaf)) }
 }

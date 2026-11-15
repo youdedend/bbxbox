@@ -122,7 +122,18 @@ void* host_guest_memalign(std::size_t align, std::size_t n);  // zeroed
 void host_guest_free(void* p);
 
 // Pages for generated code: RWX on request (the thunk stubs), RW otherwise.
+// Under BBX_UWP "on request" means "will hold code, so it is never RWX": the
+// pages come back writable and `host_page_make_executable` is what makes them
+// code, because the container refuses PAGE_EXECUTE_READWRITE outright (strict
+// W^X, even with the `codeGeneration` capability).
 void* host_page_alloc(std::size_t size, bool exec);
+// W^X transitions for a page range that holds generated code. A writer calls
+// `host_page_make_writable`, stores the bytes, then
+// `host_page_make_executable`, which also flushes the instruction cache. Both
+// apply to whole pages and both are no-ops when the range is already in the
+// requested state on a platform that allows it.
+bool host_page_make_writable(void* p, std::size_t size);
+bool host_page_make_executable(void* p, std::size_t size);
 void host_page_free(void* p, std::size_t size);
 // Makes [p, p+size) inaccessible: a guard below a stack.
 void host_page_guard(void* p, std::size_t size);

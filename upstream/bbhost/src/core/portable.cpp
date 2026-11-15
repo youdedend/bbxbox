@@ -18,7 +18,14 @@
 #include <SDL3/SDL.h>
 #endif
 
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+// The container's calls are `*FromApp`, and there is no `<timeapi.h>` (winmm
+// is a desktop partition DLL) and no `_mkdir` on a path that arrives from a
+// `FutureAccessList` token: the file system is the port's host-fs seam.
+#include "xbox/platform/host_fs.h"
+#include <malloc.h>
+#include <windows.h>
+#elif defined(_WIN32)
 #include <direct.h>
 #include <malloc.h>
 #include <windows.h>
@@ -38,7 +45,9 @@
 #endif
 
 bool host_mkdir(const char* path) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    return bbx::hostfs::MkDir(path, false);
+#elif defined(_WIN32)
     return _mkdir(path) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
 #else
     return mkdir(path, 0777) == 0 || errno == EEXIST;
@@ -47,7 +56,12 @@ bool host_mkdir(const char* path) {
 
 bool host_list_dir(const char* path, std::vector<std::string>* names) {
     names->clear();
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    std::vector<bbx::hostfs::DirEntry> entries;
+    if (!bbx::hostfs::ListDir(path, &entries)) return false;
+    for (const auto& e : entries) names->push_back(e.name);
+    return true;
+#elif defined(_WIN32)
     std::string pattern = std::string(path) + "\\*";
     WIN32_FIND_DATAA fd{};
     HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
@@ -142,7 +156,25 @@ void host_read_safe_recover() {
 #endif
 
 bool host_read_safe(const void* addr, void* out, std::size_t len) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // `ReadProcessMemory` on our own process is a desktop convenience the
+    // container does not offer; the question it answers is "is this range
+    // committed and readable", and `VirtualQueryFromApp` answers it.
+    const auto base = reinterpret_cast<std::uintptr_t>(addr);
+    const auto end = base + len;
+    std::uintptr_t at = base;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryFromApp(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        const auto region_end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= at) return false;
+        at = region_end;
+    }
+    std::memcpy(out, addr, len);
+    return true;
+#elif defined(_WIN32)
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), addr, out, len, &got) && got == len;
 #else
@@ -359,7 +391,7 @@ std::atomic<bool> g_headless{false};
 void host_set_headless(bool headless) { g_headless.store(headless); }
 
 bool host_desktop_max_size(int* w, int* h) {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(BBX_UWP)
     // EnumDisplaySettings gives each display's mode in physical pixels,
     // whatever the process's DPI awareness (the monitor rectangles would be
     // scaled for a process that is not aware).
@@ -414,7 +446,7 @@ bool host_desktop_max_size(int* w, int* h) {
 }
 
 bool host_desktop_primary_size(int* w, int* h) {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(BBX_UWP)
     // The primary display's mode in physical pixels (EnumDisplaySettings with
     // no device name: the primary one, whatever the DPI awareness).
     DEVMODEW dm{};
@@ -479,7 +511,7 @@ float host_desktop_refresh_hz() {
     }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
     return hz;
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !defined(BBX_UWP)
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
     if (g_headless.load() || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1) return 0.0f;
@@ -493,7 +525,12 @@ void host_sleep_us(std::uint64_t usec) {
 #if defined(_WIN32)
     static thread_local HANDLE timer = [] {
         static const bool period = [] {
+#if !defined(BBX_UWP)
             timeBeginPeriod(1);  // for Sleep and the waits that fall back to the tick
+#endif
+            // The AppContainer has no winmm; `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`
+            // below is the whole of the timer surface here, and it does not need
+            // the period raised.
             return true;
         }();
         (void)period;
@@ -584,7 +621,13 @@ void host_guest_free(void* p) {
 }
 
 void* host_page_alloc(std::size_t size, bool exec) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // Never RWX: the container answers `ERROR_INVALID_PARAMETER` for it even
+    // with the `codeGeneration` capability. `exec` only says the caller will
+    // hand the pages to `host_page_make_executable` once it has written them.
+    (void)exec;
+    return VirtualAllocFromApp(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif defined(_WIN32)
     void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE);
     return p;
 #else
@@ -603,8 +646,43 @@ void host_page_free(void* p, std::size_t size) {
 #endif
 }
 
+bool host_page_make_writable(void* p, std::size_t size) {
+    if (!p || !size) return false;
+#if defined(BBX_UWP)
+    DWORD old = 0;
+    return VirtualProtectFromApp(p, size, PAGE_READWRITE, &old) != FALSE;
+#elif defined(_WIN32)
+    DWORD old = 0;
+    return VirtualProtect(p, size, PAGE_EXECUTE_READWRITE, &old) != FALSE;
+#else
+    return mprotect(p, size, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+#endif
+}
+
+bool host_page_make_executable(void* p, std::size_t size) {
+    if (!p || !size) return false;
+#if defined(BBX_UWP)
+    DWORD old = 0;
+    const bool ok = VirtualProtectFromApp(p, size, PAGE_EXECUTE_READ, &old) != FALSE;
+    FlushInstructionCache(GetCurrentProcess(), p, size);
+    return ok;
+#elif defined(_WIN32)
+    DWORD old = 0;
+    const bool ok = VirtualProtect(p, size, PAGE_EXECUTE_READ, &old) != FALSE;
+    FlushInstructionCache(GetCurrentProcess(), p, size);
+    return ok;
+#else
+    const bool ok = mprotect(p, size, PROT_READ | PROT_EXEC) == 0;
+    __builtin___clear_cache(static_cast<char*>(p), static_cast<char*>(p) + size);
+    return ok;
+#endif
+}
+
 void host_page_guard(void* p, std::size_t size) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    DWORD old = 0;
+    VirtualProtectFromApp(p, size, PAGE_NOACCESS, &old);
+#elif defined(_WIN32)
     DWORD old = 0;
     VirtualProtect(p, size, PAGE_NOACCESS, &old);
 #else
@@ -613,7 +691,36 @@ void host_page_guard(void* p, std::size_t size) {
 }
 
 const void* host_map_file(const char* path, std::size_t* size) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // No `CreateFileA`, no `CreateFileMappingA`, no `MapViewOfFile`: the path
+    // may be one the player granted through a `FutureAccessList` token, which
+    // only the host-fs seam can open. The file is read into a private
+    // read-only allocation instead of being mapped - a dump's tables are read
+    // once and kept, and the allocation is exactly its size.
+    bbx::hostfs::FileStat st{};
+    if (!bbx::hostfs::Stat(path, &st) || st.is_dir || st.size == 0) return nullptr;
+    const int f = bbx::hostfs::Open(path, bbx::hostfs::kRead);
+    if (f < 0) return nullptr;
+    void* p = VirtualAllocFromApp(nullptr, static_cast<SIZE_T>(st.size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p == nullptr) {
+        bbx::hostfs::Close(f);
+        return nullptr;
+    }
+    std::size_t got = 0;
+    while (got < st.size) {
+        const std::int64_t n = bbx::hostfs::Read(f, static_cast<std::uint8_t*>(p) + got, st.size - got);
+        if (n <= 0) break;
+        got += static_cast<std::size_t>(n);
+    }
+    bbx::hostfs::Close(f);
+    DWORD old = 0;
+    if (got != st.size || !VirtualProtectFromApp(p, static_cast<SIZE_T>(st.size), PAGE_READONLY, &old)) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    *size = got;
+    return p;
+#elif defined(_WIN32)
     // The sharing fopen's "rb" gives, so a file another program has open still maps.
     const HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                  FILE_ATTRIBUTE_NORMAL, nullptr);

@@ -107,12 +107,31 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/core/elf.cpp"
     "${BBX_BBHOST_ROOT}/src/core/paced_file.cpp"
     "${BBX_BBHOST_ROOT}/src/core/host_fs_common.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/win_vm.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/portable.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/thunk.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/memory.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/futex.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/host_clock.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/image_file.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/sfo.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/config.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/config_move.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/legacy_cpu.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/legacy_cpu_code.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/write_watch.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/win_watch.cpp"
+    # The winpthreads surface the Store SDK does not have (xbox/winpthreads_shim).
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim/winpthreads_shim.cpp"
     # src/hle: the file system, over the platform seam.
     "${BBX_BBHOST_ROOT}/src/hle/fs.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/fios.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/save_commit.cpp"
 )
 target_include_directories(bbhost_guest PUBLIC
+    # winpthreads for a SDK that has no <pthread.h>; ahead of everything, and
+    # only for this target (nothing else here includes a POSIX thread header).
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim"
     "${BBX_BBHOST_ROOT}/src"
     # bbhost's `core/memory.h` resolves to the port's arena adapter by that
     # path, so the repository root is on the include path too.
@@ -130,6 +149,9 @@ target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Upstream's code is not /W4-clean and its warnings are not this port's to
     # fix; the port's own TUs keep /W4 /WX.
-    target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- -fdelayed-template-parsing
+    # `/arch:AVX2`: `core/thunk.cpp`'s save/restore of the vector register file
+    # uses `vmovdqu`, and every Xbox Series X|S CPU (Zen 2) has AVX2, FMA and
+    # BMI2 natively - the console is not a lowest-common-denominator CPU.
+    target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
         -Wno-delayed-template-parsing-in-cxx20)
 endif()

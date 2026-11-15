@@ -57,7 +57,8 @@ int sysv_vfscanf(std::FILE* f, const char* fmt, SysvVaList* ap);
 #endif
 #define SYSV_VA_ENTRY(name, target, nfixed, slot)                                                        \
     extern "C" GUEST_ABI int name(...);                                                                  \
-    asm(".text\n"                                                                                        \
+    asm(".att_syntax prefix\n"                                                                             \
+        ".text\n"                                                                                        \
         ".globl " #name "\n" SYSV_VA_TYPE_(name) #name ":\n"                                             \
         ".cfi_startproc\n"                                                                               \
         "subq $0xd8, %rsp\n"                                                                             \
