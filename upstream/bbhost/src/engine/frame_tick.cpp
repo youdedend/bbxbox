@@ -36,7 +36,11 @@ std::atomic<int> g_ticks{1};
 double g_carry = 0.0;
 
 void* exec_page() {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // Writable while it is written; the site that finishes the trampoline flips
+    // it (host_page_make_executable) before it is called.
+    return VirtualAllocFromApp(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(_WIN32)
     return VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 #else
     void* p = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

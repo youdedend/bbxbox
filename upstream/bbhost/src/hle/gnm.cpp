@@ -51,7 +51,9 @@ void* tf_ring() {
     std::lock_guard<std::mutex> lock(g_gnm_mu);
     if (!g_tf_ring) {
         g_tf_ring = nullptr;
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+        g_tf_ring = VirtualAllocFromApp(nullptr, 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(_WIN32)
         g_tf_ring = VirtualAlloc(nullptr, 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
         g_tf_ring = mmap(nullptr, 0x20000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

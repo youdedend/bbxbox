@@ -273,7 +273,9 @@ bool legacy_cpu_check_floor() {
                              "turns AVX on.";
     host_log_decide(true);  // the lines so far (the version, the processor's name) written too
     host_log("cpu: %s", text.c_str());
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(BBX_UWP)
+    // No USER32 in the container (and nothing to click it with); `host_log`
+    // above is the record.
     std::wstring w(text.begin(), text.end());  // the text is ASCII
     MessageBoxW(nullptr, w.c_str(), L"bbhost", MB_OK | MB_ICONERROR);
 #endif

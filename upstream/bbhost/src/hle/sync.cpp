@@ -35,7 +35,17 @@ std::size_t g_arena_used = 0;
 void* g_free[kClasses] = {};
 
 std::uint8_t* arena_map() {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // The address is part of the guest ABI, and `VirtualAllocFromApp` does not
+    // take one: `VirtualAlloc2FromApp` does, and answers where it landed.
+    void* p = VirtualAlloc2FromApp(GetCurrentProcess(), reinterpret_cast<void*>(kArenaBase), kArenaSize,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, nullptr, 0);
+    if (p != nullptr && reinterpret_cast<std::uint64_t>(p) != kArenaBase) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return static_cast<std::uint8_t*>(p);
+#elif defined(_WIN32)
     return static_cast<std::uint8_t*>(
         VirtualAlloc(reinterpret_cast<void*>(kArenaBase), kArenaSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 #else

@@ -15,6 +15,12 @@
 #include <string>
 #include <vector>
 
+#if defined(BBX_UWP)
+// The host-fs seam: a directory under the player's dump is not the CRT's to
+// create or to ask about in the container.
+#include "xbox/platform/host_fs.h"
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -281,8 +287,13 @@ bool file_exists(const std::string& p) {
     return static_cast<bool>(f);
 }
 
+// Local change, marked BBX_UWP: `GetFileAttributesA` is on the import audit's
+// forbidden list and answers only for paths the process can see the desktop way;
+// a settings file the player's dump folder holds arrives by `FutureAccessList`.
 bool dir_exists(const std::string& p) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    return bbx::hostfs::IsDir(p);
+#elif defined(_WIN32)
     const DWORD a = GetFileAttributesA(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 #else
@@ -351,7 +362,9 @@ bool make_dirs(const std::string& path) {
     for (std::size_t i = 0; i <= path.size(); ++i) {
         if (i == path.size() || path[i] == '/') {
             if (!cur.empty() && !(cur.size() == 2 && cur[1] == ':') && !dir_exists(cur)) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+                bbx::hostfs::MkDir(cur, false);
+#elif defined(_WIN32)
                 CreateDirectoryA(cur.c_str(), nullptr);
 #else
                 ::mkdir(cur.c_str(), 0755);

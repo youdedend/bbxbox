@@ -52,7 +52,27 @@ constexpr std::uint64_t kBodyWindow = 0x10000;
 // An executable page from which a rel32 reaches all of [lo, hi), and back.
 std::uint8_t* page_near(std::uint64_t lo, std::uint64_t hi) {
     const auto reaches = [&](std::uint64_t a) { return a >= hi ? a + kPage - lo < kReach : a + kReach > hi && a < lo; };
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // Two console rules at once: `VirtualAllocFromApp` takes no address (so the
+    // fixed one is `VirtualAlloc2FromApp`), and PAGE_EXECUTE_READWRITE is refused
+    // outright. The page comes back writable and `place()` flips it to
+    // PAGE_EXECUTE_READ once the trampoline is in it.
+    const auto at = [](std::uint64_t a) -> std::uint8_t* {
+        void* p = VirtualAlloc2FromApp(GetCurrentProcess(), reinterpret_cast<void*>(a), kPage,
+                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, nullptr, 0);
+        if (p == nullptr) return nullptr;
+        if (reinterpret_cast<std::uint64_t>(p) != a) {
+            VirtualFree(p, 0, MEM_RELEASE);  // not the address that was asked for
+            return nullptr;
+        }
+        return static_cast<std::uint8_t*>(p);
+    };
+    for (std::uint64_t a = (hi + 0xffff) & ~0xffffull; reaches(a); a += 0x10000)
+        if (std::uint8_t* p = at(a)) return p;
+    for (std::uint64_t a = (lo & ~0xffffull) - 0x10000; a > 0x10000 && reaches(a); a -= 0x10000)
+        if (std::uint8_t* p = at(a)) return p;
+    return nullptr;
+#elif defined(_WIN32)
     for (std::uint64_t a = (hi + 0xffff) & ~0xffffull; reaches(a); a += 0x10000)
         if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), kPage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
             return static_cast<std::uint8_t*>(p);
@@ -184,13 +204,20 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
     std::memcpy(leg + 6, &d, 8);
     carve_commit(moved + 5 + 14);
     const std::uint64_t lo = at & ~0xfffull, hi = (at + fn.entry_len + 0xfff) & ~0xfffull;
+#if defined(BBX_UWP)
+    // Strict W^X, and no guest thread is running yet: read-write to patch, then
+    // read-execute and flush before any of it can be entered.
+    if (!guest_protect_rw(&image->mem, lo, hi - lo)) return false;
+#else
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
+#endif
     // The trampoline is published before the jump that can lead to it.
     if (fn.original) *fn.original = t;
     legacy_cpu_release(at, fn.entry_len, fn.name);
     std::memset(p + 5, 0xcc, fn.entry_len - 5);
     put_rel32(p, 0xe9, reinterpret_cast<std::uint64_t>(leg));
     guest_protect_rx(&image->mem, lo, hi - lo);
+    FlushInstructionCache(GetCurrentProcess(), p, fn.entry_len);
     return true;
 }
 

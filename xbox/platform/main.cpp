@@ -33,6 +33,7 @@
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
 #include "xbox/platform/guest_windows.h"
+#include "pthread.h"  // the winpthreads shim: bbxbox::winpthreads::SelfTest
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/ini_file.h"
 #include "xbox/platform/launcher.h"
@@ -482,6 +483,16 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             const bool fs_ok = bbx::hostfs::SelfTest(bbx::platform::Local("guestfs"), &why);
             bbx::platform::LogF("host fs: %s (%s)", fs_ok ? "ok" : "FAILED",
                                 fs_ok ? bbx::hostfs::Table().name : why.c_str());
+        }
+        // The guest runtime's threads are the shim's (`xbox/winpthreads_shim`):
+        // the guest makes up to eighty of them, and every one of them is a
+        // mutex, a condition variable and an SRW lock away from a hang nobody
+        // can read off a console. Proven once here, before the launcher is up.
+        {
+            char why[64] = {0};
+            const int step = bbxbox::winpthreads::SelfTest(why, sizeof(why));
+            bbx::platform::LogF("winpthreads: %s%s%s", step == 0 ? "PASS" : "FAILED",
+                                step == 0 ? "" : " at ", step == 0 ? "" : why);
         }
         LoadSettings();
         RestoreDump();

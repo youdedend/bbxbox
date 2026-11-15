@@ -36,7 +36,10 @@ constexpr Hook kHooks[] = {
 #endif
 
 bool loaded(const char* module) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    (void)module;
+    return false;  // nothing is injected into a packaged title
+#elif defined(_WIN32)
     return GetModuleHandleA(module) != nullptr;
 #else
     struct Find {

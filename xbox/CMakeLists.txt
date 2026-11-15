@@ -170,6 +170,8 @@ target_include_directories(bbxbox PRIVATE
     "${BBX_SHADER_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src"
     "${BBX_SDL3_PREFIX}/include"
+    # The winpthreads shim's header, for the boot self-test.
+    "${CMAKE_CURRENT_SOURCE_DIR}/winpthreads_shim"
 )
 
 # The portable core and the platform model are compiled into the app; the D3D12
@@ -180,11 +182,9 @@ target_sources(bbxbox PRIVATE
     # Both of these are also members of `bbhost_guest`, so the day the link
     # switch below is flipped they must come out of this list - two copies of
     # `bbx::hostfs`'s wrappers is a duplicate definition.
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
     # bbhost's virtual-memory layer: the guest's fixed windows are reserved
     # through it at startup (platform/guest_windows.cpp), and under BBX_UWP its
     # three entry points are the AppContainer's own.
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
@@ -245,7 +245,8 @@ if(BBX_BBHOST)
     #
     # lld-link resolves archives regardless of order, so the three may name each
     # other's symbols freely.
-    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
+    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
+        bbx_atrac9 bbx_monocypher)
 endif()
 
 # The Store CRT. A console has vcruntime140_app.dll / msvcp140_app.dll and their
