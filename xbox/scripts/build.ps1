@@ -114,11 +114,20 @@ $buildArgs = @("--build", $build, "--parallel", "$([Environment]::ProcessorCount
 if ($SyntaxOnly) { $buildArgs += "--target", "bbxbox_syntax" }
 & cmake @buildArgs *> $buildLog
 if ($LASTEXITCODE -ne 0) {
-    $errors = @(Get-Content $buildLog | Where-Object {
-        $_ -match 'error:|fatal error:|FAILED:|undefined symbol|ld\.lld|clang-cl\.exe' } |
-        Where-Object { $_ -notmatch '^\s*$' })
-    if (-not $errors.Count) { $errors = @(Get-Content $buildLog -Tail 80) }
-    $summary = ($errors | Select-Object -First 60) -join "`n"
+    $lines = @(Get-Content $buildLog)
+    # Ninja prints the command and the tool's diagnostics *after* its FAILED
+    # header, so a filter on 'error:' alone misses tools that report failure with
+    # a bare message (dxc, cmd, lld-link). Keep a window around each FAILED.
+    $errors = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $lines.Count; ++$i) {
+        if ($lines[$i] -match 'FAILED:|error:|fatal error:|undefined symbol|dxc:') {
+            $end = [Math]::Min($i + 12, $lines.Count - 1)
+            for ($j = $i; $j -le $end; ++$j) { $errors.Add($lines[$j]) }
+            $i = $end
+        }
+    }
+    if ($errors.Count -eq 0) { $errors.AddRange([string[]]($lines | Select-Object -Last 80)) }
+    $summary = ($errors | Select-Object -First 80) -join "`n"
     Write-Output $summary
     Emit-ErrorAnnotation 'CMake build failed' $summary
     throw "xbox build failed (see build/xbox-build.log)"
