@@ -128,7 +128,11 @@ target_link_libraries(bbxbox PRIVATE
 
 # Debugging: the .map is what xbox/scripts/symbolicate.py resolves a console
 # crash's module+RVA against.
-target_link_options(bbxbox PRIVATE /MAP:"${CMAKE_CURRENT_BINARY_DIR}/bbxbox.map")
+# Bare /MAP: lld-link rejects the quoted CMake /MAP:"path" form ("cannot open
+# ...: invalid argument"). Every driver here is clang-cl -> lld-link, and lld
+# writes <image>.map beside the image, i.e. build/xbox/bbxbox.map, which is what
+# package.ps1 and symbolicate.py expect.
+target_link_options(bbxbox PRIVATE /MAP)
 if(MSVC)
     target_link_options(bbxbox PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()
