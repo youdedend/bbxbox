@@ -167,6 +167,12 @@ for symbol in PresentVs PresentPs OverlayVs OverlayPs; do
     fail "k$symbol is missing from bbx_shaders.h's manifest"
   fi
 done
+if ! grep -q -- "-WX" xbox/scripts/dxc-run.ps1; then
+  fail "dxc-run.ps1 must compile with -WX: a shader warning is a PSO failure on the TV"
+fi
+if ! grep -q -- "-T" xbox/scripts/dxc-run.ps1; then
+  fail "dxc-run.ps1 must pass an explicit -T profile"
+fi
 if grep -Eq 'Copy-Item.*(dxcompiler|dxil)' xbox/scripts/package.ps1; then
   fail "package.ps1 still copies a shader compiler into the package; DXIL is build-time only"
 fi

@@ -51,16 +51,25 @@ if(NOT EXISTS "${BBX_DXC}")
 endif()
 
 set(BBX_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY "${BBX_SHADER_DIR}")
+find_program(BBX_PWSH NAMES pwsh powershell)
+if(NOT BBX_PWSH)
+    message(FATAL_ERROR "pwsh or powershell is required to run dxc (see xbox/scripts/dxc-run.ps1)")
+endif()
 set_property(GLOBAL PROPERTY BBX_SHADER_OUTPUTS "")
 set_property(GLOBAL PROPERTY BBX_SHADER_PAIRS "")
 
 function(bbx_shader symbol entry profile source)
     set(out "${BBX_SHADER_DIR}/${symbol}.dxil")
     add_custom_command(OUTPUT "${out}"
-        COMMAND "${BBX_DXC}" -nologo -T "${profile}" -E "${entry}" -O3 -WX
-                -Fo "${out}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source}"
+        COMMAND "${BBX_PWSH}" -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dxc-run.ps1"
+                -Dxc "${BBX_DXC}" -Out "${out}"
+                -Profile "${profile}" -Entry "${entry}"
+                -Source "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source}"
-        COMMENT "dxc: ${source} -E ${entry} -T ${profile}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/dxc-run.ps1"
+        COMMENT "dxc: ${source} -E ${entry} -T ${profile} -WX"
         VERBATIM)
     # No -enable-16bit-types: the console has no native 16-bit ALU (guard: SM 6.2
     # 16-bit types are lowered, and DXC's own lowering is what adds the helper
