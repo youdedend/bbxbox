@@ -67,12 +67,6 @@ std::string Join(const std::string& a, const std::string& b) {
     return a + "\\" + b;
 }
 
-std::string Lower(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return text;
-}
-
 }  // namespace
 
 bool StorageInit() {
