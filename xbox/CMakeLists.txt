@@ -204,7 +204,7 @@ target_compile_features(bbxbox PRIVATE cxx_std_20)
 # default that does not compile should cost one run, not one run per error.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set_source_files_properties(platform/bbhost_bridge.cpp PROPERTIES
-        COMPILE_OPTIONS "-ferror-limit=0")
+        COMPILE_OPTIONS "-ferror-limit=0;-Wno-unused-parameter")
 endif()
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1

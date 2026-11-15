@@ -131,7 +131,7 @@ PadState host_pad_state() {
     for (int finger = 0; finger < 2; ++finger) {
         bool down = false;
         float x = 0.0f, y = 0.0f, pressure = 0.0f;
-        if (!SDL_GetGamepadTouchpadFinger(pad, finger, &down, &x, &y, &pressure)) continue;
+        if (!SDL_GetGamepadTouchpadFinger(pad, 0, finger, &down, &x, &y, &pressure)) continue;
         if (!down) continue;
         if (s.touch_count == 0) s.buttons |= kTouchPad;
         PadState::Touch& t = s.touch[s.touch_count++];

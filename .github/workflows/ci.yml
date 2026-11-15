@@ -38,6 +38,10 @@ jobs:
   console:
     name: UWP build + import audit
     runs-on: windows-2025
+    env:
+      # ccache would otherwise keep its cache under %LOCALAPPDATA%, outside the
+      # path the cache steps above save and restore.
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
     steps:
       - uses: actions/checkout@v4
       - name: dependencies (SDL3-uwp, libuwp) -- cached
@@ -50,7 +54,7 @@ jobs:
         id: ccache-restore
         uses: actions/cache/restore@v4
         with:
-          path: ~/.ccache
+          path: ${{ github.workspace }}\.ccache
           key: ccache-console-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
             ccache-console-${{ runner.os }}-
@@ -99,11 +103,27 @@ jobs:
             # Compiler and dxc diagnostics first: they are what explains the
             # failure, and they are not always inside the tail.
             $diagnostics = @($lines | Where-Object { $_ -match 'error[: ]|warning[: ]|FAILED:' } |
-                Select-Object -Last 40)
+                Select-Object -Last 120)
             if ($diagnostics.Count -gt 0) {
-                $diag = ($diagnostics -join "`n")
-                $diagEnc = $diag -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
-                Write-Output "::error title=diagnostics::$diagEnc"
+                # Split into annotations of at most 3.5 KB: a message longer than
+                # that is cut by the runner, and the eighth error in a file is
+                # exactly what a link iteration is looking for. Eight as errors,
+                # the rest as warnings (the runner keeps ten of each).
+                $chunks = New-Object System.Collections.Generic.List[string]
+                $current = New-Object System.Collections.Generic.List[string]
+                $size = 0
+                foreach ($line in $diagnostics) {
+                    if ($size + $line.Length -gt 3500 -and $current.Count -gt 0) {
+                        $chunks.Add(($current -join "`n")); $current.Clear(); $size = 0
+                    }
+                    $current.Add($line); $size += $line.Length + 1
+                }
+                if ($current.Count -gt 0) { $chunks.Add(($current -join "`n")) }
+                for ($k = 0; $k -lt $chunks.Count; ++$k) {
+                    $level = if ($k -lt 8) { 'error' } else { 'warning' }
+                    $enc = $chunks[$k] -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+                    Write-Output "::$level title=diagnostics $($k + 1)/$($chunks.Count)::$enc"
+                }
             } else {
                 $tail = ($lines | Select-Object -Last 150) -join "`n"
                 $enc = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
@@ -129,7 +149,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: ~/.ccache
+          path: ${{ github.workspace }}\.ccache
           key: ccache-console-${{ runner.os }}-${{ github.sha }}
       - name: upload build logs
         if: always()
