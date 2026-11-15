@@ -60,7 +60,10 @@ for file in "${files[@]}"; do
         echo "$output" | head -40
         if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
             # The run log is not always reachable after the fact; this is.
-            encoded=$(echo "$output" | head -30 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/')
+            # tr -d '\n': a workflow command ends at a real newline, so the
+            # diagnostics must be escaped *and* joined or only the first line
+            # (an include stack) reaches the annotation.
+            encoded=$(echo "$output" | head -30 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' | tr -d '\n')
             echo "::error title=syntax_check $(basename "$file")::$encoded"
         fi
         status=1

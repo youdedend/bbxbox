@@ -20,7 +20,7 @@ fail() {
   echo "precheck: FAIL: $*"
   # Run logs are not always reachable after the fact; the annotation is.
   if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    echo "::error title=precheck::$(echo "$*" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/')"
+    echo "::error title=precheck::$(echo "$*" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' | tr -d '\n')"
   fi
   status=1
 }
