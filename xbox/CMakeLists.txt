@@ -209,6 +209,10 @@ target_compile_features(bbxbox PRIVATE cxx_std_20)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set_source_files_properties(platform/bbhost_bridge.cpp PROPERTIES
         COMPILE_OPTIONS "-ferror-limit=0;-Wno-unused-parameter")
+    # The unwrapper names the fields it parses; without zlib (the app does not
+    # ask for it) the compressed-entry constants are read by no one.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_self.cpp"
+        PROPERTIES COMPILE_OPTIONS "-Wno-unused-const-variable")
 endif()
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1
