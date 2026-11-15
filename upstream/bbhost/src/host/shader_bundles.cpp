@@ -3,6 +3,7 @@
 #include "gcn/container.h"
 #include "hle/fs.h"
 #include "log.h"
+#include "src/host/core/bbx_self.h"
 
 #include <algorithm>
 #include <chrono>
@@ -131,7 +132,20 @@ const std::vector<BundleShader>& shader_bundles_list() {
 std::vector<BundleShader> eboot_shaders(const std::string& path) {
     std::vector<BundleShader> out;
     std::vector<std::uint8_t> d;
-    if (path.empty() || !gcn::read_file(path, d)) return out;
+    if (path.empty()) return out;
+    // An eboot ships as a PS4 fake SELF; the containers are inside its segments.
+    // Scanning the wrapper's bytes happens to work when nothing is compressed, and
+    // silently finds nothing when something is, so unwrap first and scan the ELF.
+    {
+        bbx::core::FselfResult unwrapped = bbx::core::UnwrapOrbisFile(path.c_str());
+        if (!unwrapped.ok()) {
+            std::vector<std::uint8_t> raw;
+            if (gcn::read_file(path, raw)) d = std::move(raw);
+            if (d.empty()) return out;
+        } else {
+            d = std::move(unwrapped.elf);
+        }
+    }
     std::unordered_map<std::string, bool> seen;
     // Each container: a ShaderFileHeader ('Shdr', not the tail of a footer's
     // 'OrbShdr'), its code, and the ShaderBinaryInfo footer after it, 28 bytes.

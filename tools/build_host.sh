@@ -27,6 +27,7 @@ sources=(
   "$root"/xbox/platform/hud.cpp
   "$root"/src/host/d3d12/bbx_psocache.cpp
   "$root"/src/host/d3d12/bbx_tess.cpp
+  "$root"/src/host/core/bbx_self.cpp
   "$root"/tests/main.cpp
   "$root"/tests/format_test.cpp
   "$root"/tests/budget_test.cpp
@@ -51,6 +52,7 @@ sources=(
   "$root"/tests/tess_test.cpp
   "$root"/tests/display_test.cpp
   "$root"/tests/hud_test.cpp
+  "$root"/tests/self_test.cpp
   "$root"/tests/shaders_test.cpp
   "$root"/tests/guest_core_test.cpp
   "$root"/tests/guest_core_stubs.cpp
@@ -67,7 +69,26 @@ sources=(
 )
 
 mkdir -p "$(dirname "$out")"
+objdir="$(mktemp -d)"
+trap 'rm -rf "$objdir"' EXIT
+
+# The vendored zlib is C, and this script builds the port's own code with -Werror:
+# compiling zlib as C++ (which g++ would do with a .c argument) is neither what the
+# console does nor warning-clean, so it is compiled as C, quietly, into an archive
+# the link picks up. Only what inflating a .shaderbnd.dcx or an fSELF segment needs.
+cc="${CC:-cc}"
+zlib="$root/upstream/third_party/zlib"
+zlib_objs=()
+# compress.c/trees.c/deflate.c are only needed by the tests, which build their own
+# compressed fixtures; the app only ever inflates.
+for unit in adler32 crc32 inflate inffast inftrees uncompr zutil compress trees deflate; do
+  "$cc" -std=c99 -O2 -w -I "$zlib" -c "$zlib/$unit.c" -o "$objdir/$unit.o"
+  zlib_objs+=("$objdir/$unit.o")
+done
+ar rcs "$objdir/libbbx_zlib.a" "${zlib_objs[@]}"
+
 "$cxx" -std=c++20 -O2 -Wall -Wextra -Werror \
   -I "$root/src" -I "$root/tests" -I "$root" -I "$root/upstream/bbhost/src" \
-  -o "$out" "${sources[@]}"
+  -I "$zlib" -DBBX_HAVE_ZLIB=1 \
+  -o "$out" "${sources[@]}" "$objdir/libbbx_zlib.a"
 "$out"

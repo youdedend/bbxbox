@@ -27,6 +27,31 @@ if(BBX_BBHOST_DIR AND NOT BBX_HOST_ONLY)
     enable_language(OBJC)  # not used; fails early on unsupported hosts
 endif()
 
+# --- zlib (vendored) ---------------------------------------------------------
+# An fSELF segment may be zlib-compressed, and bbhost's container.cpp inflates
+# .shaderbnd.dcx. Defined here (not only in the console's bbhost.cmake) so the host
+# tests can exercise the compressed path with the same library the console links.
+if(NOT TARGET bbx_zlib AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/upstream/third_party/zlib/inflate.c")
+    set(BBX_ZLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/upstream/third_party/zlib")
+    add_library(bbx_zlib STATIC
+        "${BBX_ZLIB_ROOT}/adler32.c" "${BBX_ZLIB_ROOT}/compress.c"
+        "${BBX_ZLIB_ROOT}/crc32.c" "${BBX_ZLIB_ROOT}/deflate.c"
+        "${BBX_ZLIB_ROOT}/gzclose.c" "${BBX_ZLIB_ROOT}/gzlib.c"
+        "${BBX_ZLIB_ROOT}/gzread.c" "${BBX_ZLIB_ROOT}/gzwrite.c"
+        "${BBX_ZLIB_ROOT}/infback.c" "${BBX_ZLIB_ROOT}/inffast.c"
+        "${BBX_ZLIB_ROOT}/inflate.c" "${BBX_ZLIB_ROOT}/inftrees.c"
+        "${BBX_ZLIB_ROOT}/trees.c" "${BBX_ZLIB_ROOT}/uncompr.c"
+        "${BBX_ZLIB_ROOT}/zutil.c"
+    )
+    target_include_directories(bbx_zlib PUBLIC "${BBX_ZLIB_ROOT}")
+    set_target_properties(bbx_zlib PROPERTIES C_STANDARD 99)
+    if(MSVC)
+        target_compile_options(bbx_zlib PRIVATE /W0 /D_CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(bbx_zlib PRIVATE -w)
+    endif()
+endif()
+
 # --- the portable core -------------------------------------------------------
 add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_format.cpp
@@ -41,8 +66,13 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_untile.cpp
     src/host/d3d12/bbx_psocache.cpp
     src/host/d3d12/bbx_tess.cpp
+    src/host/core/bbx_self.cpp
 )
-target_include_directories(bbx_d3d12_core PUBLIC src)
+target_include_directories(bbx_d3d12_core PUBLIC src "${CMAKE_CURRENT_SOURCE_DIR}")
+if(TARGET bbx_zlib)
+    target_link_libraries(bbx_d3d12_core PUBLIC bbx_zlib)
+    target_compile_definitions(bbx_d3d12_core PUBLIC BBX_HAVE_ZLIB=1)
+endif()
 target_compile_features(bbx_d3d12_core PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_options(bbx_d3d12_core PRIVATE /W4 /WX)
@@ -118,6 +148,7 @@ if(BBX_BUILD_TESTS)
         tests/tess_test.cpp
         tests/display_test.cpp
         tests/hud_test.cpp
+        tests/self_test.cpp
         tests/shaders_test.cpp
         tests/guest_core_test.cpp
         tests/guest_core_stubs.cpp

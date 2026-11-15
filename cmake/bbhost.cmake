@@ -18,7 +18,10 @@ if(NOT EXISTS "${BBX_BBHOST_ROOT}/src/gcn/lift.cpp")
 endif()
 
 # --- zlib (vendored; bbhost's container.cpp inflates .shaderbnd.dcx) ---------
+# The top-level CMakeLists defines the same target for the host build; define it
+# only once, whichever file is reached first.
 set(BBX_ZLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/third_party/zlib")
+if(NOT TARGET bbx_zlib)
 add_library(bbx_zlib STATIC
     "${BBX_ZLIB_ROOT}/adler32.c"
     "${BBX_ZLIB_ROOT}/compress.c"
@@ -40,6 +43,7 @@ target_include_directories(bbx_zlib PUBLIC "${BBX_ZLIB_ROOT}")
 set_target_properties(bbx_zlib PROPERTIES C_STANDARD 99)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbx_zlib PRIVATE /W0 /D_CRT_SECURE_NO_WARNINGS)
+endif()
 endif()
 
 # --- LibAtrac9 (upstream's own source glob) ---------------------------------

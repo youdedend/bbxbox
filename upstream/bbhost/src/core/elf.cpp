@@ -1,5 +1,6 @@
 #include "core/elf.h"
 #include "core/imports.h"
+#include "src/host/core/bbx_self.h"
 #include "core/sha256.h"
 #include "core/tls_rewrite.h"
 #include "log.h"
@@ -109,19 +110,25 @@ std::string nid_from_strtab(const std::uint8_t* dynlib, std::size_t dynlib_size,
 }  // namespace
 
 bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        host_log("cannot open %s", path);
+    // A dumped eboot is a PS4 fake SELF (4F 15 3D 1D), not a flat ELF: the previous
+    // reader rejected it with "decrypt SELF first", which sent the player looking for
+    // a decryption step that does not exist. src/host/core/bbx_self.h unwraps it;
+    // a plain ELF is passed through unchanged, so both dumps work.
+    bbx::core::FselfResult unwrapped = bbx::core::UnwrapOrbisFile(path);
+    if (!unwrapped.ok()) {
+        host_log("cannot load %s: %s", path, bbx::core::FselfErrorName(unwrapped.error));
+        if (!unwrapped.why.empty()) host_log("  %s", unwrapped.why.c_str());
         return false;
     }
-    in.seekg(0, std::ios::end);
-    const auto file_size = static_cast<std::size_t>(in.tellg());
-    in.seekg(0);
-    std::vector<std::uint8_t> file(file_size);
-    in.read(reinterpret_cast<char*>(file.data()), static_cast<std::streamsize>(file_size));
-    static const unsigned char kElfMag[4] = {0x7f, 'E', 'L', 'F'};
-    if (file.size() < sizeof(Elf64_Ehdr) || std::memcmp(file.data(), kElfMag, 4) != 0) {
-        host_log("%s is not an ELF (decrypt SELF first)", path);
+    if (!unwrapped.info.warning.empty()) {
+        host_log("warning: %s", unwrapped.info.warning.c_str());
+    }
+    if (unwrapped.info.was_fself) {
+        host_log("eboot %s", unwrapped.info.Describe().c_str());
+    }
+    std::vector<std::uint8_t> file = std::move(unwrapped.elf);
+    if (file.size() < sizeof(Elf64_Ehdr)) {
+        host_log("%s: the unwrapped image is too small (%zu bytes)", path, file.size());
         return false;
     }
 
