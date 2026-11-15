@@ -11,6 +11,10 @@
 // explicitly (`SDL_Init`), so there is no SDL main to set ready.
 #include <windows.h>
 
+// HSTRING and WindowsGetStringRawBuffer: the activation export takes a raw
+// HSTRING, so the string ABI has to be visible.
+#include <winstring.h>
+
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Gaming.Input.h>
