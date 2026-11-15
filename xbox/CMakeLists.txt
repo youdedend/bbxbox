@@ -85,7 +85,7 @@ target_compile_definitions(bbxbox PRIVATE
     # the SDK compiles out everything newer than NT 3.x and GetTickCount64,
     # AddVectoredExceptionHandler and friends vanish.
     _WIN32_WINNT=0x0A00
-    NTDDI_VERSION=NTDDI_WIN10_RS3
+    NTDDI_VERSION=NTDDI_WIN10_19H1
     # The CRT's fopen/strncpy deprecation warnings are noise on a console build
     # where those calls are the correct ones.
     _CRT_SECURE_NO_WARNINGS

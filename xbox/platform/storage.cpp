@@ -12,6 +12,7 @@
 #include <fileapifromapp.h>
 
 #include <winrt/Windows.ApplicationModel.Core.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.AccessCache.h>
 #include <winrt/Windows.Storage.Pickers.h>
@@ -190,7 +191,7 @@ std::vector<std::string> ListEntries(const std::string& path, bool want_dirs) {
     std::vector<std::string> out;
     const std::string pattern = Join(path.empty() ? "." : path, "*");
     WIN32_FIND_DATAW data{};
-    HANDLE find = ::FindFirstFileExFromApp(Widen(pattern).c_str(), FindExInfoBasic, &data,
+    HANDLE find = ::FindFirstFileExFromAppW(Widen(pattern).c_str(), FindExInfoBasic, &data,
                                            FindExSearchNameMatch, nullptr, 0);
     if (find == INVALID_HANDLE_VALUE) return out;
     do {
@@ -228,19 +229,25 @@ bool PickFolderGrant(std::string& path_out, std::string& token_out) {
         dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [&result, done]() {
             try {
                 using winrt::Windows::Storage::Pickers::FolderPicker;
+                namespace Collections = winrt::Windows::Foundation::Collections;
+                namespace AccessCache = winrt::Windows::Storage::AccessCache;
                 FolderPicker picker;
                 picker.SuggestedStartLocation(
                     winrt::Windows::Storage::Pickers::PickerLocationId::ComputerFolder);
-                picker.FileTypeFilter().Append(L"*");
-                const auto folder = picker.PickSingleFolderAsync().get();
+                // A FolderPicker shows nothing until its filter has an entry; the
+                // filter is an IVector<hstring>, so the '*' is a real hstring.
+                Collections::IVector<winrt::hstring> filters = picker.FileTypeFilter();
+                const winrt::hstring any_file = L"*";
+                filters.Append(any_file);
+                winrt::Windows::Storage::StorageFolder folder = picker.PickSingleFolderAsync().get();
                 if (folder) {
                     result.path = winrt::to_string(folder.Path());
                     // The token is what survives a restart; the path is what
                     // this run streams from.
-                    result.token = winrt::to_string(
-                        winrt::Windows::Storage::AccessCache::StorageApplicationPermissions::
-                            FutureAccessList()
-                                .AddOrReplace(folder));
+                    AccessCache::StorageItemAccessList recent =
+                        AccessCache::StorageApplicationPermissions::FutureAccessList();
+                    const winrt::Windows::Storage::IStorageItem item = folder;
+                    result.token = winrt::to_string(recent.AddOrReplace(item));
                 }
             } catch (const winrt::hresult_error& error) {
                 LogMessage(Level::kWarn, "storage: folder picker failed (0x%08x)",
@@ -294,7 +301,7 @@ std::vector<std::string> CandidateDumpRoots() {
     for (wchar_t letter = L'D'; letter <= L'Z'; ++letter) {
         const std::wstring root{letter, L':', L'\\'};
         WIN32_FIND_DATAW data{};
-        HANDLE find = ::FindFirstFileExFromApp((root + L"*").c_str(), FindExInfoBasic, &data,
+        HANDLE find = ::FindFirstFileExFromAppW((root + L"*").c_str(), FindExInfoBasic, &data,
                                                FindExSearchNameMatch, nullptr, 0);
         if (find == INVALID_HANDLE_VALUE) continue;
         ::FindClose(find);
