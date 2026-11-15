@@ -45,9 +45,19 @@ $exe = Get-ChildItem -Recurse -Path $build -Filter "bbxbox.exe" | Select-Object 
 if (-not $exe) { throw "build first: xbox/scripts/build.ps1" }
 Copy-Item $exe.FullName (Join-Path $layout "bbxbox.exe")
 
+# The symbols go into the package layout (the crash report resolves against
+# them) *and* beside the .appx in `build\appx`, so the artifact a reviewer
+# downloads carries a standalone .map/.pdb: a stack from the player's USB stick
+# (`bbxbox_logs\crash.log`) is turned into names with
+# `xbox/scripts/symbolicate.py` and nothing else.
 foreach ($name in @("bbxbox.map", "bbxbox.pdb")) {
     $found = Get-ChildItem -Recurse -Path $build -Filter $name | Select-Object -First 1
-    if ($found) { Copy-Item $found.FullName (Join-Path $layout $name) }
+    if ($found) {
+        Copy-Item $found.FullName (Join-Path $layout $name) -Force
+        Copy-Item $found.FullName (Join-Path $out $name) -Force
+    } else {
+        Write-Warning "no $name under build: a crash report from the console cannot be symbolised"
+    }
 }
 
 foreach ($dll in @("sdl3\bin\SDL3.dll", "sdl3\bin\SDL3.pdb", "libuwp\bin\libuwp.dll")) {

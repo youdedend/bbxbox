@@ -37,8 +37,11 @@
 #include <vector>
 
 #if defined(_WIN32)
+#include "core/host_clock_shim.h"  // clock_gettime for a Store build (trap: no pthread_time.h)
 #include "core/win_vm.h"
+#if !defined(_MSC_VER) && !defined(BBX_UWP)
 #include <pthread_time.h>  // winpthreads: clock_gettime and the POSIX clock ids
+#endif
 #else
 #include "core/linux_vm.h"
 #include <fcntl.h>
@@ -198,6 +201,31 @@ bool ensure_dmem_backing() {
     if (g_dmem_map) {
         return true;
     }
+#if defined(BBX_UWP)
+    // An AppContainer gets `CreateFileMappingFromApp`, not `CreateFileMapping`;
+    // and the protection is `PAGE_READWRITE | SEC_RESERVE`, for two reasons
+    // that both bite immediately otherwise:
+    //
+    //  * `PAGE_EXECUTE_READWRITE` is W^X, which the container refuses outright.
+    //    Direct memory is data and GPU memory, never JIT code: a guest mapping
+    //    that asks for execute is split by the arena's ledger, not by the
+    //    section.
+    //  * without `SEC_RESERVE` Windows charges every byte of the 6 GiB at
+    //    section creation, and Game Mode's 5,120 MiB ceiling refuses it with
+    //    ERROR_COMMITMENT_LIMIT. Reserved, the two windows (the CPU one at
+    //    4 GiB and the GPU alias at 0xff00000000) map views of the same
+    //    pages, and each page is committed by the first view that touches it.
+    g_dmem_map = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
+                                          static_cast<ULONG64>(g_dmem_size), nullptr);
+    if (!g_dmem_map) {
+        host_log("CreateFileMappingFromApp dmem 0x%llx failed: %lu",
+                 static_cast<unsigned long long>(g_dmem_size), GetLastError());
+        return false;
+    }
+    host_log("dmem: %llu MiB reserved (SEC_RESERVE: committed as the guest maps it)",
+             static_cast<unsigned long long>(g_dmem_size >> 20));
+    return true;
+#else
     const DWORD hi = static_cast<DWORD>(g_dmem_size >> 32);
     const DWORD lo = static_cast<DWORD>(g_dmem_size);
     g_dmem_map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, hi, lo,
@@ -208,6 +236,7 @@ bool ensure_dmem_backing() {
         return false;
     }
     return true;
+#endif
 #else
     if (g_dmem_fd >= 0) {
         return true;
@@ -445,7 +474,11 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
 }
 
 bool host_protect(std::uintptr_t p, std::uint64_t len, int sce_prot) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    DWORD old = 0;
+    return VirtualProtectFromApp(reinterpret_cast<void*>(p), static_cast<std::size_t>(len),
+                                 static_cast<DWORD>(host_prot(sce_prot)), &old) != 0;
+#elif defined(_WIN32)
     DWORD old = 0;
     return VirtualProtect(reinterpret_cast<void*>(p), static_cast<std::size_t>(len),
                           static_cast<DWORD>(host_prot(sce_prot)), &old) != 0;
@@ -771,7 +804,11 @@ bool hle_kernel_set_dmem_size(std::uint64_t bytes) {
 
 void* hle_kernel_dmem_mirror() {
     if (!ensure_dmem_backing()) return nullptr;
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    void* p = MapViewOfFileFromApp(g_dmem_map, FILE_MAP_ALL_ACCESS, 0, static_cast<std::size_t>(g_dmem_size));
+    if (!p) host_log("dmem mirror view failed: error %lu", GetLastError());
+    return p;
+#elif defined(_WIN32)
     void* p = MapViewOfFile(g_dmem_map, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<std::size_t>(g_dmem_size));
     if (!p) host_log("dmem mirror view failed: error %lu", GetLastError());
     return p;
@@ -790,6 +827,19 @@ bool hle_kernel_reserve_guest_windows() {
     // A second home for the eboot image when 0x400000 is taken (it is under
     // wine): fixed, so a run's guest addresses are the same every time.
     win_vm_reserve(kImageFallbackBase, 0x10000000ull);
+#if defined(BBX_UWP)
+    // Trap 3: the relaunch. A UWP title cannot start itself - there is no
+    // CreateProcess in an AppContainer, and the console would count a second
+    // launch of the same package as a second game. The windows are reserved at
+    // the very first instruction of the process instead (xbox/platform/
+    // guest_windows.cpp, called from main.cpp before SDL and before D3D12), so
+    // nothing has had a chance to take them and there is nothing to relaunch
+    // for. BBHOST_TEST_RESERVE_FAIL is a desktop test hook and is ignored here.
+    host_log("win-vm: guest windows [0x%llx, +0x%llx) and [0x%llx, +4 GiB) %s (AppContainer: no relaunch)",
+             static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kDmemMaxSize),
+             static_cast<unsigned long long>(kGpuDmemBase), ok ? "reserved" : "NOT reserved");
+    return ok;
+#else
     // BBHOST_TEST_RESERVE_FAIL=1: the first process pretends the reservation
     // lost, to see the relaunch below work.
     char relaunch_env[16] = {};
@@ -832,6 +882,7 @@ bool hle_kernel_reserve_guest_windows() {
         _exit(static_cast<int>(code));
     }
     return ok;
+#endif  // BBX_UWP
 #else
     // The same windows on Linux (core/linux_vm.h), PROT_NONE and MAP_NORESERVE
     // - no memory, no commit - before anything else can take those addresses:

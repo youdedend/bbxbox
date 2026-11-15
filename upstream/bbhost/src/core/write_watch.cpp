@@ -155,7 +155,8 @@ void check_mapping_headroom() {
 }
 
 #if defined(_WIN32)
-// The page protections, through VirtualProtect: a view of the direct-memory
+// The page protections, through VirtualProtect (VirtualProtectFromApp on the
+// console): a view of the direct-memory
 // section takes any protection within the section's access, and the fault
 // handler may call it (no errno, no lock).
 // Returns 0, or ENOMEM when the system is out of mappings or resources, else
@@ -163,8 +164,18 @@ void check_mapping_headroom() {
 __attribute__((no_stack_protector, always_inline)) inline int protect_pages(std::uint64_t addr, std::uint64_t len,
                                                                             bool writable) {
     DWORD old = 0;
-    if (VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)), static_cast<SIZE_T>(len),
-                       writable ? PAGE_READWRITE : PAGE_READONLY, &old)) {
+#if defined(BBX_UWP)
+    // The AppContainer's entry point (memoryapi.h). Same protection, same
+    // return: this runs in the fault handler, which must not call the desktop
+    // partition's.
+    const BOOL ok = VirtualProtectFromApp(reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)),
+                                          static_cast<SIZE_T>(len),
+                                          writable ? PAGE_READWRITE : PAGE_READONLY, &old);
+#else
+    const BOOL ok = VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(addr)),
+                                   static_cast<SIZE_T>(len), writable ? PAGE_READWRITE : PAGE_READONLY, &old);
+#endif
+    if (ok) {
         return 0;
     }
     const DWORD e = GetLastError();

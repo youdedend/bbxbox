@@ -21,7 +21,11 @@ PVOID g_handler = nullptr;
 
 void protect_pages(DWORD prot) {
     DWORD old = 0;
+#if defined(BBX_UWP)
+    VirtualProtectFromApp(reinterpret_cast<void*>(g_page_lo.load()), g_page_hi.load() - g_page_lo.load(), prot, &old);
+#else
     VirtualProtect(reinterpret_cast<void*>(g_page_lo.load()), g_page_hi.load() - g_page_lo.load(), prot, &old);
+#endif
 }
 
 LONG CALLBACK handler(EXCEPTION_POINTERS* ep) {

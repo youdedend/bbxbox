@@ -205,17 +205,20 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     Impl& impl = *impl_;
     if (impl.device.DeviceLost()) {
         // A removed device is reported once and never presented into again.
+        LogDeviceRemoved(static_cast<long>(impl.device.RemovedReason()));
         impl.ready = false;
         impl.report.ready = false;
         impl.report.status = d3d12::Status::kDeviceLost;
         LogMessage(Level::kError, "d3d12: device removed; the HUD stops here");
         return d3d12::Status::kDeviceLost;
     }
+    LogCrumb("replay: begin frame");
     d3d12::Status status = impl.replay.BeginFrame();
     if (status != d3d12::Status::kOk) { return status; }
     // The boot colour: near-black, so a missed quad is visible rather than hidden.
     status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f);
     if (status != d3d12::Status::kOk) { return status; }
+    LogCrumb("replay: overlay");
     impl.replay.ResetOverlay();
     for (const HudQuad& quad : hud.Quads()) {
         // The HUD is all solid rectangles, which is the white 1x1 texture: the UVs

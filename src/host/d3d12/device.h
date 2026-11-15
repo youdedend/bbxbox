@@ -83,6 +83,10 @@ public:
     [[nodiscard]] const Budget& Memory() const { return budget_; }
     [[nodiscard]] bool IsUma() const { return uma_; }
     [[nodiscard]] bool DeviceLost() const { return device_lost_; }
+    // GetDeviceRemovedReason() as captured when the loss was noticed: the
+    // crash report carries it, because "device lost 0x887A0006" and "removed
+    // reason 0x887A0005" (an actual GPU hang) mean different bugs.
+    [[nodiscard]] HRESULT RemovedReason() const { return removed_reason_; }
 
     // Queues. The graphics queue also accepts compute and copy work; a dedicated
     // compute queue would let the untiling shader overlap with a submission, but

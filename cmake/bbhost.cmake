@@ -85,3 +85,40 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbhost_gcn PRIVATE /W3 /EHsc /permissive-)
 endif()
 target_link_libraries(bbhost_gcn PUBLIC bbx_zlib)
+
+# --- the guest core, for the console -----------------------------------------
+# bbhost's guest is 33,000 lines of `src/hle` over `src/core`, and it reaches
+# into its host (`src/host`) for the renderer, the audio device, the engine
+# patches and the decomp hooks. The port takes it a translation unit at a time:
+# this library is the list that is already clean against the Store SDK and the
+# AppContainer, compiled on every CI run so the list only grows on evidence.
+#
+# It is a *static library*, deliberately not linked into `bbxbox` yet: the HLE
+# still names host symbols the port has not provided (measure them with
+# `nm -u` over the objects and subtract what the tree defines), and a link that
+# fails says nothing about the TUs above it. Each entry here is compile-verified
+# by the Windows job; the link arrives when the last of them is in.
+add_library(bbhost_guest STATIC
+    # src/core: the pieces the boot path stands on, all of them portable except
+    # the virtual-memory layer (whose AppContainer branch is the point).
+    "${BBX_BBHOST_ROOT}/src/core/sha256.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/imports.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/tls_rewrite.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/elf.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/paced_file.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/host_fs_common.cpp"
+    # src/hle: the file system, over the platform seam.
+    "${BBX_BBHOST_ROOT}/src/hle/fs.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/fios.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/save_commit.cpp"
+)
+target_include_directories(bbhost_guest PUBLIC "${BBX_BBHOST_ROOT}/src")
+target_compile_features(bbhost_guest PUBLIC cxx_std_20)
+target_compile_definitions(bbhost_guest PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1)
+target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Upstream's code is not /W4-clean and its warnings are not this port's to
+    # fix; the port's own TUs keep /W4 /WX.
+    target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- -fdelayed-template-parsing
+        -Wno-delayed-template-parsing-in-cxx20)
+endif()

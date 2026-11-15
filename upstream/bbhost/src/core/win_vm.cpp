@@ -26,6 +26,27 @@ struct Api {
     bool ok = false;
 };
 
+#if defined(BBX_UWP)
+// Under BBX_UWP the three entry points are the AppContainer's own, declared in
+// memoryapi.h and linked from WindowsApp.lib: VirtualAlloc2FromApp,
+// MapViewOfFile3FromApp and UnmapViewOfFile2. They have the same signatures as
+// the desktop names the function pointers below are typed with, so the rest of
+// this file does not know which it got. Resolving the desktop names by hand -
+// GetModuleHandleW + GetProcAddress - cannot work here twice over: the loader
+// calls are desktop-partition, and calling the desktop function would be
+// refused at run time on the very addresses this layer exists to place.
+const Api& api() {
+    static const Api a = [] {
+        Api r;
+        r.VirtualAlloc2 = &::VirtualAlloc2FromApp;
+        r.MapViewOfFile3 = &::MapViewOfFile3FromApp;
+        r.UnmapViewOfFile2 = &::UnmapViewOfFile2;
+        r.ok = true;
+        return r;
+    }();
+    return a;
+}
+#else
 const Api& api() {
     static const Api a = [] {
         Api r;
@@ -42,6 +63,7 @@ const Api& api() {
     }();
     return a;
 }
+#endif  // BBX_UWP
 
 // Every view this layer made: base -> section, offset, length, ownership.
 struct View {

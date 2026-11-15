@@ -43,6 +43,24 @@ void InstallLastChanceLogger();
 // The last line logged, for the crash handler (no allocation on that path).
 const char* LastLine();
 
+// --- the black box on the player's stick -----------------------------------
+//
+// `LogMirrorToUsb` is called as soon as a dump folder is granted (the same
+// folder the picker handed out): it creates `<dump>\bbxbox_logs\`, mirrors
+// every line that follows there unbuffered, and keeps `crash.log` open beside
+// it for the fault report. False (and a logged reason) when the folder cannot
+// be written. Safe to call twice; the folder does not change mid-run.
+bool LogMirrorToUsb(const std::string& dump_root);
+bool LogMirrorActive();
+
+// The backend's breadcrumb: the last command replayed, the PSO or shader that
+// was being built. Written into the crash report, so a device hang says what
+// the GPU was asked to do rather than "it crashed". No lock, no allocation.
+void LogCrumb(const char* what);
+// A removed device and its GetDeviceRemovedReason(); part of the same report.
+void LogDeviceRemoved(long reason);
+long LogDeviceReason();
+
 // Flushes both the log and the crash breadcrumb. Called on suspend and on
 // present failures.
 void LogFlush();

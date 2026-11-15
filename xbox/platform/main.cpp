@@ -32,6 +32,7 @@
 #include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
+#include "xbox/platform/guest_windows.h"
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/ini_file.h"
 #include "xbox/platform/launcher.h"
@@ -400,6 +401,12 @@ void RestoreDump() {
         bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true), false);
     bbx::platform::LogMessage(bbx::platform::Level::kInfo, "%s",
                               bbx::platform::LayoutLogLine(g_session.layout).c_str());
+    // The black box: from here on every line is also written to
+    // `<dump>\bbxbox_logs\loader.log` (and a fault's report to `crash.log`), so
+    // a run that dies on the console is read off the player's USB stick.
+    if (g_session.layout.layout_ok() && !g_session.layout.base_path.empty()) {
+        (void)bbx::platform::LogMirrorToUsb(g_session.layout.base_path);
+    }
 }
 
 }  // namespace
@@ -411,6 +418,11 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
 
     void Initialize(const winrt::Windows::ApplicationModel::Core::CoreApplicationView&) {
         bbx::platform::InstallLastChanceLogger();
+        // Trap: the guest's windows are fixed addresses and the heap, the stack
+        // and every DLL are placed before this runs. They are taken here, first,
+        // because a UWP title cannot relaunch itself the way a desktop build
+        // does when the reservation loses.
+        (void)bbx::platform::ReserveGuestWindows();
         if (!bbx::platform::StorageInit()) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "storage init failed");
         }
