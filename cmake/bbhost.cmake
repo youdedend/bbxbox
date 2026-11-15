@@ -112,7 +112,11 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/hle/fios.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/save_commit.cpp"
 )
-target_include_directories(bbhost_guest PUBLIC "${BBX_BBHOST_ROOT}/src")
+target_include_directories(bbhost_guest PUBLIC
+    "${BBX_BBHOST_ROOT}/src"
+    # bbhost's `core/memory.h` resolves to the port's arena adapter by that
+    # path, so the repository root is on the include path too.
+    "${BBX_BBHOST_ROOT}/../..")
 target_compile_features(bbhost_guest PUBLIC cxx_std_20)
 target_compile_definitions(bbhost_guest PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1)
 target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
