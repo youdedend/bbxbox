@@ -9,6 +9,15 @@
 #endif
 #include "hle/hle.h"
 #include "hle/modules.h"
+// Local change, marked BBX_UWP: saves live under `/data` (the app's own
+// LocalState) and under a USB stick the player granted through a
+// `FutureAccessList` token - and `::stat`/`std::fopen` are `CreateFileW` inside
+// the CRT, which the AppContainer refuses for the second. The host-fs seam is
+// the one thing that opens both.
+#if defined(BBX_UWP)
+#include "xbox/platform/host_fs.h"
+#include <cstring>
+#endif
 #include "core/thunk.h"
 #include "core/write_watch.h"
 #include "engine/camera.h"
@@ -615,8 +624,12 @@ bool save_dir_exists(const std::string& dir_name) {
     if (h.empty()) {
         return false;
     }
+#if defined(BBX_UWP)
+    return bbx::hostfs::IsDir(h);
+#else
     struct stat st{};
     return ::stat(h.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
 bool valid_dir_name(const char* n) {
@@ -945,6 +958,19 @@ bool load_param_at(const std::string& h, SaveParam* p) {
     if (h.empty()) {
         return false;
     }
+#if defined(BBX_UWP)
+    bbx::hostfs::FileStat st{};
+    const int f = bbx::hostfs::Open(h + "/sce_param.bin", bbx::hostfs::kRead);
+    if (f < 0) {
+        // No param: the caller keeps a zeroed one, but the directory's own
+        // timestamp is what a save list shows.
+        if (bbx::hostfs::Stat(h, &st)) p->mtime = st.mtime;
+        return true;
+    }
+    const std::int64_t n = bbx::hostfs::Read(f, p, sizeof(*p));
+    bbx::hostfs::Close(f);
+    return n == static_cast<std::int64_t>(sizeof(*p));
+#else
     std::FILE* f = std::fopen((h + "/sce_param.bin").c_str(), "rb");
     if (!f) {
         struct stat st{};
@@ -956,6 +982,7 @@ bool load_param_at(const std::string& h, SaveParam* p) {
     std::size_t n = std::fread(p, 1, sizeof(*p), f);
     std::fclose(f);
     return n == sizeof(*p);
+#endif
 }
 
 bool load_param(const std::string& dir_name, SaveParam* p) { return load_param_at(save_dir_host(dir_name), p); }
