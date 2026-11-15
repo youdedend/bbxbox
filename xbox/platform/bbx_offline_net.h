@@ -49,6 +49,10 @@ inline constexpr int SOCK_DGRAM = 2;
 inline constexpr int IPPROTO_UDP = 17;
 inline constexpr int SOL_SOCKET = 0xffff;
 inline constexpr int SO_REUSEADDR = 0x0004;
+inline constexpr int SO_EXCLUSIVEADDRUSE = static_cast<int>(0xfffffffb);
+inline constexpr int SO_SNDBUF = 0x1001;
+inline constexpr int SO_RCVBUF = 0x1002;
+inline constexpr unsigned long INADDR_ANY = 0;
 inline constexpr int FIONBIO = 0x8004667e;
 inline constexpr int MSG_DONTWAIT = 0x0001;
 // The Winsock error codes and the poll events are macros in the Windows headers
