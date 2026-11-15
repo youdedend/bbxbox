@@ -88,6 +88,12 @@ struct IID : GUID {};
 struct CLSID : GUID {};
 #endif
 
+// The stubs write `struct DECLSPEC_UUID("...") Name`, not the SDK's
+// `DECLSPEC_UUID("...") struct Name`: clang with -fms-extensions (but without
+// -fms-compatibility, which the syntax check does not want) ignores a declspec
+// written before `struct` and then refuses __uuidof on that type. After `struct`
+// it applies, and __uuidof works, which is what the port's code uses.
+//
 // clang and MSVC have __uuidof; a GCC syntax check does not. There the interface
 // ids are irrelevant (nothing is linked and no QueryInterface runs), so they
 // collapse to a null REFIID, which every stub parameter accepts.

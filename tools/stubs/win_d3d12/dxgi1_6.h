@@ -115,39 +115,33 @@ constexpr UINT DXGI_PRESENT_ALLOW_TEARING = 0x200;
 constexpr UINT DXGI_MAX_SWAP_CHAIN_BUFFERS = 16;
 constexpr UINT DXGI_CREATE_FACTORY_DEBUG = 0x1;
 
-DECLSPEC_UUID("3d12eda4-1416-4809-9a2b-2f7b9c60f8bf")
-struct IDXGIObject : IUnknown {
+struct DECLSPEC_UUID("3d12eda4-1416-4809-9a2b-2f7b9c60f8bf") IDXGIObject : IUnknown {
     virtual HRESULT SetPrivateData(const GUID& name, UINT size, const void* data) = 0;
     virtual HRESULT SetPrivateDataInterface(const GUID& name, const IUnknown* object) = 0;
     virtual HRESULT GetPrivateData(const GUID& name, UINT* size, void* data) = 0;
     virtual HRESULT GetParent(REFIID riid, void** parent) = 0;
 };
 
-DECLSPEC_UUID("aec22fb8-76f3-4639-9be0-28eb43a67a2e")
-struct IDXGIAdapter : IDXGIObject {
+struct DECLSPEC_UUID("aec22fb8-76f3-4639-9be0-28eb43a67a2e") IDXGIAdapter : IDXGIObject {
     virtual HRESULT EnumOutputs(UINT index, void** output) = 0;
     virtual HRESULT GetDesc(DXGI_ADAPTER_DESC1* desc) = 0;
     virtual HRESULT CheckInterfaceSupport(const GUID& name, LARGE_INTEGER* umd_version) = 0;
 };
 
-DECLSPEC_UUID("29038f61-3839-4626-91fd-086879011a05")
-struct IDXGIAdapter1 : IDXGIAdapter {
+struct DECLSPEC_UUID("29038f61-3839-4626-91fd-086879011a05") IDXGIAdapter1 : IDXGIAdapter {
     virtual HRESULT GetDesc1(DXGI_ADAPTER_DESC1* desc) = 0;
 };
 
-DECLSPEC_UUID("3c8d99d1-4fbf-4181-a41a-ef2c0d8cc50e")
-struct IDXGIAdapter4 : IDXGIAdapter1 {
+struct DECLSPEC_UUID("3c8d99d1-4fbf-4181-a41a-ef2c0d8cc50e") IDXGIAdapter4 : IDXGIAdapter1 {
     virtual HRESULT GetDesc3(DXGI_ADAPTER_DESC1* desc) = 0;
 };
 
 struct IDXGIOutput;
 struct IDXGISwapChain1;
 
-DECLSPEC_UUID("1b1a9c2f-3f7f-4b8b-9a3e-2b8a6f5d2d3f")
-struct IDXGIFactory : IDXGIObject {};
+struct DECLSPEC_UUID("1b1a9c2f-3f7f-4b8b-9a3e-2b8a6f5d2d3f") IDXGIFactory : IDXGIObject {};
 
-DECLSPEC_UUID("50c83a1c-e072-4c48-87b0-3630fa36a6d0")
-struct IDXGIFactory2 : IDXGIFactory {
+struct DECLSPEC_UUID("50c83a1c-e072-4c48-87b0-3630fa36a6d0") IDXGIFactory2 : IDXGIFactory {
     virtual HRESULT CreateSwapChainForCoreWindow(IUnknown* queue, IUnknown* window,
                                                 const DXGI_SWAP_CHAIN_DESC1* desc,
                                                 IDXGIOutput* restrict_to_output,
@@ -163,8 +157,7 @@ struct IDXGIFactory2 : IDXGIFactory {
     virtual BOOL IsCurrent() = 0;
 };
 
-DECLSPEC_UUID("c1b6694f-ff09-44a9-b03c-77900a0a1d17")
-struct IDXGISwapChain : IDXGIObject {
+struct DECLSPEC_UUID("c1b6694f-ff09-44a9-b03c-77900a0a1d17") IDXGISwapChain : IDXGIObject {
     virtual HRESULT Present(UINT sync_interval, UINT flags) = 0;
     virtual HRESULT GetBuffer(UINT index, REFIID riid, void** surface) = 0;
     virtual HRESULT SetFullscreenState(BOOL fullscreen, IDXGIOutput* target) = 0;
@@ -178,8 +171,7 @@ struct IDXGISwapChain : IDXGIObject {
     virtual HRESULT GetLastPresentCount(UINT* last_present_count) = 0;
 };
 
-DECLSPEC_UUID("790a45f7-0d42-4876-983a-0a55cfe6f4aa")
-struct IDXGISwapChain1 : IDXGISwapChain {
+struct DECLSPEC_UUID("790a45f7-0d42-4876-983a-0a55cfe6f4aa") IDXGISwapChain1 : IDXGISwapChain {
     virtual HRESULT GetDesc1(DXGI_SWAP_CHAIN_DESC1* desc) = 0;
     virtual HRESULT GetFullscreenDesc(void* desc) = 0;
     virtual HRESULT GetHwnd(HWND* hwnd) = 0;
@@ -193,8 +185,7 @@ struct IDXGISwapChain1 : IDXGISwapChain {
     virtual HRESULT GetRotation(UINT* rotation) = 0;
 };
 
-DECLSPEC_UUID("94d99bdb-f1f8-4ab0-b236-7da0170edab1")
-struct IDXGISwapChain2 : IDXGISwapChain1 {
+struct DECLSPEC_UUID("94d99bdb-f1f8-4ab0-b236-7da0170edab1") IDXGISwapChain2 : IDXGISwapChain1 {
     virtual HRESULT SetSourceSize(UINT width, UINT height) = 0;
     virtual HRESULT GetSourceSize(UINT* width, UINT* height) = 0;
     virtual HRESULT SetMaximumFrameLatency(UINT max_latency) = 0;
@@ -204,8 +195,7 @@ struct IDXGISwapChain2 : IDXGISwapChain1 {
     virtual HRESULT GetMatrixTransform(DXGI_MATRIX_3X2_F* matrix) = 0;
 };
 
-DECLSPEC_UUID("a8be2ac4-199f-4946-b331-79599fb98de7")
-struct IDXGISwapChain3 : IDXGISwapChain2 {
+struct DECLSPEC_UUID("a8be2ac4-199f-4946-b331-79599fb98de7") IDXGISwapChain3 : IDXGISwapChain2 {
     virtual UINT GetCurrentBackBufferIndex() = 0;
     virtual HRESULT CheckColorSpaceSupport(DXGI_FORMAT format, UINT* support) = 0;
     virtual HRESULT SetColorSpace1(DXGI_FORMAT format) = 0;
@@ -213,13 +203,11 @@ struct IDXGISwapChain3 : IDXGISwapChain2 {
                                   UINT flags, const UINT* node_mask, const IUnknown* const* queues) = 0;
 };
 
-DECLSPEC_UUID("1bc6ea02-ef36-464f-bf0c-21ca39e5168a")
-struct IDXGISwapChain4 : IDXGISwapChain3 {
+struct DECLSPEC_UUID("1bc6ea02-ef36-464f-bf0c-21ca39e5168a") IDXGISwapChain4 : IDXGISwapChain3 {
     virtual HRESULT SetHDRMetaData(UINT type, UINT size, void* metadata) = 0;
 };
 
-DECLSPEC_UUID("3c9d1d1a-3f8a-4f4b-8b0f-7a0d0b1c9e2f")
-struct IDXGIFactory6 : IDXGIFactory2 {
+struct DECLSPEC_UUID("3c9d1d1a-3f8a-4f4b-8b0f-7a0d0b1c9e2f") IDXGIFactory6 : IDXGIFactory2 {
     virtual HRESULT EnumAdapterByGpuPreference(UINT index, DXGI_GPU_PREFERENCE preference,
                                                REFIID riid, void** adapter) = 0;
     virtual HRESULT EnumAdapterByLuid(const GUID& luid, REFIID riid, void** adapter) = 0;

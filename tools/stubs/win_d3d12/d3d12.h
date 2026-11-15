@@ -456,20 +456,16 @@ struct D3D12_SAMPLER_DESC {
     float MaxLOD = 3.402823466e+38f;
 };
 
-DECLSPEC_UUID("10ec4d5b-975a-4689-b9e4-d0aac30fe333")
-struct ID3D12Object : IUnknown {
+struct DECLSPEC_UUID("10ec4d5b-975a-4689-b9e4-d0aac30fe333") ID3D12Object : IUnknown {
     virtual HRESULT SetName(LPCWSTR name) = 0;
     virtual HRESULT GetName(UINT size, LPWSTR name) = 0;
 };
 
-DECLSPEC_UUID("905db94b-a00c-4140-9df5-2b64ca9ea357")
-struct ID3D12DeviceChild : ID3D12Object {};
+struct DECLSPEC_UUID("905db94b-a00c-4140-9df5-2b64ca9ea357") ID3D12DeviceChild : ID3D12Object {};
 
-DECLSPEC_UUID("6102e791-8d0a-4869-a8c8-e7293f60efef")
-struct ID3D12Pageable : ID3D12DeviceChild {};
+struct DECLSPEC_UUID("6102e791-8d0a-4869-a8c8-e7293f60efef") ID3D12Pageable : ID3D12DeviceChild {};
 
-DECLSPEC_UUID("189819f1-1db6-4b57-be54-1821339b85f7")
-struct ID3D12Device : ID3D12Object {
+struct DECLSPEC_UUID("189819f1-1db6-4b57-be54-1821339b85f7") ID3D12Device : ID3D12Object {
     virtual UINT GetNodeCount() = 0;
     virtual HRESULT CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                        void** queue) = 0;
@@ -518,8 +514,7 @@ struct ID3D12Device : ID3D12Object {
                                                                     const D3D12_RESOURCE_DESC* descs) = 0;
 };
 
-DECLSPEC_UUID("5d5b7f8a-2f0b-4a6a-9c6c-8e1f0a3d5b11")
-struct ID3D12Device8 : ID3D12Device {
+struct DECLSPEC_UUID("5d5b7f8a-2f0b-4a6a-9c6c-8e1f0a3d5b11") ID3D12Device8 : ID3D12Device {
     virtual void CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* heap_properties,
                                           D3D12_HEAP_FLAGS heap_flags,
                                           const D3D12_RESOURCE_DESC* desc,
@@ -533,8 +528,7 @@ struct ID3D12Device8 : ID3D12Device {
                                                UINT64* sizes) = 0;
 };
 
-DECLSPEC_UUID("8efb471d-616c-4f49-90f7-127bb763fa51")
-struct ID3D12CommandQueue : ID3D12Pageable {
+struct DECLSPEC_UUID("8efb471d-616c-4f49-90f7-127bb763fa51") ID3D12CommandQueue : ID3D12Pageable {
     virtual void UpdateTileMappings(void* resource, UINT region_count, const void* regions,
                                    void* heap, UINT range_count, const void* ranges,
                                    const void* flags, UINT* total) = 0;
@@ -551,27 +545,23 @@ struct ID3D12CommandQueue : ID3D12Pageable {
     virtual HRESULT GetClockCalibration(UINT64* gpu_timestamp, UINT64* cpu_timestamp) = 0;
 };
 
-DECLSPEC_UUID("0a753dcf-c4d8-4b91-adf6-be5a60d95a76")
-struct ID3D12Fence : ID3D12Pageable {
+struct DECLSPEC_UUID("0a753dcf-c4d8-4b91-adf6-be5a60d95a76") ID3D12Fence : ID3D12Pageable {
     virtual UINT64 GetCompletedValue() = 0;
     virtual HRESULT SetEventOnCompletion(UINT64 value, HANDLE event) = 0;
     virtual HRESULT Signal(UINT64 value) = 0;
 };
 
-DECLSPEC_UUID("63ee58fb-1268-4835-8608-f55a00c2d305")
-struct ID3D12CommandAllocator : ID3D12Pageable {
+struct DECLSPEC_UUID("63ee58fb-1268-4835-8608-f55a00c2d305") ID3D12CommandAllocator : ID3D12Pageable {
     virtual HRESULT Reset() = 0;
 };
 
-DECLSPEC_UUID("6b3b2502-6e51-45b3-90ee-9884265e8df3")
-struct ID3D12DescriptorHeap : ID3D12Pageable {
+struct DECLSPEC_UUID("6b3b2502-6e51-45b3-90ee-9884265e8df3") ID3D12DescriptorHeap : ID3D12Pageable {
     virtual void GetDesc(D3D12_DESCRIPTOR_HEAP_DESC* desc) = 0;
     virtual D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandleForHeapStart() = 0;
     virtual D3D12_GPU_DESCRIPTOR_HANDLE GetGPUDescriptorHandleForHeapStart() = 0;
 };
 
-DECLSPEC_UUID("696442be-a72e-4059-bc79-5b5c98040fad")
-struct ID3D12Resource : ID3D12Pageable {
+struct DECLSPEC_UUID("696442be-a72e-4059-bc79-5b5c98040fad") ID3D12Resource : ID3D12Pageable {
     virtual HRESULT Map(UINT subresource, const D3D12_RANGE* read_range, void** data) = 0;
     virtual void Unmap(UINT subresource, const D3D12_RANGE* written_range) = 0;
     virtual HRESULT WriteToSubresource(UINT subresource, const void* region, const void* src,
@@ -581,15 +571,13 @@ struct ID3D12Resource : ID3D12Pageable {
     virtual HRESULT GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) = 0;
 };
 
-DECLSPEC_UUID("7116d91c-e7e4-47ce-b8c6-ec8168f437e5")
-struct ID3D12CommandList : ID3D12DeviceChild {
+struct DECLSPEC_UUID("7116d91c-e7e4-47ce-b8c6-ec8168f437e5") ID3D12CommandList : ID3D12DeviceChild {
     virtual HRESULT Close() = 0;
     virtual HRESULT Reset(ID3D12CommandAllocator* allocator, const void* initial_state) = 0;
     virtual HRESULT GetType() = 0;
 };
 
-DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000")
-struct ID3D12GraphicsCommandList : ID3D12CommandList {
+struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsCommandList : ID3D12CommandList {
     virtual void SetDescriptorHeaps(UINT count, ID3D12DescriptorHeap* const* heaps) = 0;
     virtual void SetRootSignature(void* signature) = 0;
     virtual void ExecuteBundle(ID3D12GraphicsCommandList* bundle) = 0;
@@ -632,15 +620,13 @@ struct ID3D12GraphicsCommandList : ID3D12CommandList {
     virtual void SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) = 0;
 };
 
-DECLSPEC_UUID("c4fec28f-7966-4e95-9f94-f431cb56c3b8")
-struct IDXGIAdapter3;
+struct DECLSPEC_UUID("c4fec28f-7966-4e95-9f94-f431cb56c3b8") IDXGIAdapter3;
 
 struct ID3D12Debug;
 
 HRESULT D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minimum_feature_level,
                           REFIID riid, void** device);
-DECLSPEC_UUID("344488b7-6846-474b-b989-f027448245e0")
-struct ID3D12Debug : IUnknown {
+struct DECLSPEC_UUID("344488b7-6846-474b-b989-f027448245e0") ID3D12Debug : IUnknown {
     virtual void EnableDebugLayer() = 0;
 };
 
