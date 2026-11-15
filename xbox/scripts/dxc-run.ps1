@@ -52,8 +52,19 @@ if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Force
 # -WX, and deliberately not -enable-16bit-types.
 $arguments = @("-nologo", "-T", $Profile, "-E", $Entry, "-O3", "-WX", "-Fo", $Out, $Source)
 Write-Host "dxc: `"$Dxc`" $($arguments -join ' ')"
-$output = & $Dxc @arguments 2>&1
-$code = $LASTEXITCODE
+# Start-Process rather than `& $Dxc 2>&1`: under a console that is not already
+# redirected, PowerShell 7 refuses that call with "StandardOutputEncoding is only
+# supported when standard output is redirected", which is what ninja's console is.
+# Explicit redirection to files also means dxc's own words are never lost.
+$stdout = [System.IO.Path]::GetTempFileName()
+$stderr = [System.IO.Path]::GetTempFileName()
+$quoted = @($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
+$process = Start-Process -FilePath $Dxc -ArgumentList $quoted -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$code = $process.ExitCode
+$output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue) +
+          @(Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue)
+Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
 foreach ($line in @($output)) {
     if ($null -ne $line -and "$line".Length -gt 0) { Write-Host "dxc: $line" }
 }
