@@ -6,4 +6,4 @@
 ; for completeness: the process never unloads itself, so it reports "busy".
 EXPORTS
     DllGetActivationFactory = WINRT_GetActivationFactory PRIVATE
-    DllCanUnloadNow = WINRT_NoUnload PRIVATE
+    DllCanUnloadNow = BbxCanUnloadNow PRIVATE

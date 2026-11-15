@@ -435,7 +435,7 @@ struct AppFactory : winrt::implements<AppFactory, winrt::Windows::Foundation::IA
 
 // Exported as DllGetActivationFactory by bbxbox.def: the packaged launch path
 // asks for "bbxbox.App" and gets the IFrameworkViewSource above.
-extern "C" HRESULT WINAPI WINRT_GetActivationFactory(HSTRING class_id, void** factory) {
+extern "C" HRESULT WINAPI WINRT_GetActivationFactory(HSTRING class_id, void** factory) noexcept {
     try {
         *factory = nullptr;
         const wchar_t* const name = ::WindowsGetStringRawBuffer(class_id, nullptr);
@@ -451,7 +451,7 @@ extern "C" HRESULT WINAPI WINRT_GetActivationFactory(HSTRING class_id, void** fa
 
 // Exported as DllCanUnloadNow by bbxbox.def: a packaged app's image is never
 // unloaded, so the answer is always S_FALSE.
-extern "C" HRESULT WINAPI WINRT_NoUnload() { return S_FALSE; }
+extern "C" HRESULT WINAPI BbxCanUnloadNow() noexcept { return S_FALSE; }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
