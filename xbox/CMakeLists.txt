@@ -119,23 +119,150 @@ add_custom_target(bbx_shaders ALL DEPENDS "${BBX_SHADER_HEADER}")
 # cmake/bbhost.cmake). The guest core and the host stream hooks join as P1 lands.
 option(BBX_BBHOST "compile the vendored bbhost sources" ON)
 if(BBX_BBHOST)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/bbhost.cmake")
+endif()
+
+# The D3D12 console backend: the device, its swapchain and the error/log bridge.
+# They include <d3d12.h>, so they are console-only, and they are compiled here
+# (not merely listed) so CI type-checks and links them on every push.
+set(BBX_D3D12_SOURCES
+    ../src/host/d3d12/bbx_d3d12.cpp
+    ../src/host/d3d12/bbx_budget.cpp
+    ../src/host/d3d12/device.cpp
+    ../src/host/d3d12/swapchain.cpp
+    ../src/host/d3d12/pipeline.cpp
+    ../src/host/d3d12/replay.cpp
+    ../src/host/d3d12/bbx_psocache.cpp
+    ../src/host/d3d12/bbx_cache.cpp
+    ../src/host/d3d12/bbx_stream.cpp
+    ../src/host/d3d12/bbx_untile.cpp
+    ../src/host/d3d12/bbx_barriers.cpp
+)
+
+set(BBX_APP_SOURCES
+    platform/main.cpp
+    platform/log.cpp
+    platform/storage.cpp
+    platform/host_fs_uwp.cpp
+    platform/guest_windows.cpp
+    platform/guest_memory.cpp
+    platform/memory_selftest.cpp
+    platform/dump.cpp
+    platform/ini_file.cpp
+    platform/launcher.cpp
+    platform/ux.cpp
+    platform/display.cpp
+    platform/display_winrt.cpp
+    platform/hud.cpp
+    platform/d3d12_session.cpp
+    platform/shaders.cpp
+    # The one translation unit that includes bbhost's own host headers and
+    # answers them on the console's behalf (see the file's head comment).
+    platform/bbhost_bridge.cpp
+    ${BBX_D3D12_SOURCES}
+)
+
+add_executable(bbxbox WIN32 ${BBX_APP_SOURCES})
+set_target_properties(bbxbox PROPERTIES OUTPUT_NAME "bbxbox")
+
+add_dependencies(bbxbox bbx_shaders)
+
+target_include_directories(bbxbox PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+    "${BBX_SHADER_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src"
+    "${BBX_SDL3_PREFIX}/include"
+    # The winpthreads shim's header, for the boot self-test.
+    "${CMAKE_CURRENT_SOURCE_DIR}/winpthreads_shim"
+)
+
+# The portable core and the platform model are compiled into the app; the D3D12
+# backend objects join from P2 on.
+target_sources(bbxbox PRIVATE
+    # bbhost's virtual-memory layer: the guest's fixed windows are reserved
+    # through it at startup (platform/guest_windows.cpp), and under BBX_UWP its
+    # three entry points are the AppContainer's own.
+    # (`core/host_fs_common.cpp` and `core/win_vm.cpp` used to be listed here
+    # too; they are members of `bbhost_guest`, which is now linked below, so
+    # listing them again would be a duplicate definition.)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_cache.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_quarantine.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_precompile.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_descriptors.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_present.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_stream.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_untile.cpp"
+    # A dumped eboot is a fake SELF, and the guest's loader (core/elf.cpp) asks
+    # this file to unwrap it: the previous reader rejected it with "decrypt SELF
+    # first", which sent the player looking for a step that does not exist.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_self.cpp"
+)
+
+target_compile_features(bbxbox PRIVATE cxx_std_20)
+
+# The bridge answers three hundred declarations copied from bbhost's headers; a
+# default that does not compile should cost one run, not one run per error.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_source_files_properties(platform/bbhost_bridge.cpp PROPERTIES
+        COMPILE_OPTIONS "-ferror-limit=0;-Wno-unused-parameter")
+    # The unwrapper names the fields it parses; without zlib (the app does not
+    # ask for it) the compressed-entry constants are read by no one.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_self.cpp"
+        PROPERTIES COMPILE_OPTIONS "-Wno-unused-const-variable")
+endif()
+target_compile_definitions(bbxbox PRIVATE
+    BBX_UWP=1
+    # windows.h's min/max macros versus std::min/std::max in the same file.
+    NOMINMAX
+    WINAPI_FAMILY=WINAPI_FAMILY_APP
+    # 0x0A00 is Windows 10. `0x10` is a *version*, not a header constant: with it
+    # the SDK compiles out everything newer than NT 3.x and GetTickCount64,
+    # AddVectoredExceptionHandler and friends vanish.
+    _WIN32_WINNT=0x0A00
+    NTDDI_VERSION=NTDDI_WIN10_19H1
+    # The CRT's fopen/strncpy deprecation warnings are noise on a console build
+    # where those calls are the correct ones.
+    _CRT_SECURE_NO_WARNINGS
+    SDL_MAIN_HANDLED=1
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # System V ABI for guest calls, the lesson that forces clang-cl at all.
+    # /WX only on the port's own TUs: upstream's code is built with /W3 and its
+    # warnings are not this port's to fix.
+    target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus
+        # C++/WinRT is written for MSVC's non-conforming two-phase lookup, which
+        # is what -fdelayed-template-parsing restores for clang-cl.
+        -fdelayed-template-parsing
+        # ... and clang calls the flag deprecated in C++20; with /WX that is an
+        # error, and C++/WinRT still needs the behaviour.
+        -Wno-delayed-template-parsing-in-cxx20)
+    target_link_options(bbxbox PRIVATE
+        /STACK:8388608,65536
+        /APPCONTAINER
+        /HIGHENTROPYVA:NO
+        /OPT:REF /OPT:ICF)
+else()
+    message(WARNING "Building the console app with ${CMAKE_CXX_COMPILER_ID}: guest thunks need clang-cl")
+    target_link_options(bbxbox PRIVATE /STACK:8388608,65536)
+endif()
+
+if(BBX_BBHOST)
     # The guest runtime, its host layer and the game's own code are compiled and
-    # ready to run - but the link is behind this switch until the import audit
-    # passes on the result.
+    # ready to run - only the link is behind this switch.
     #
-    # The archives are linked (that is what `BBX_GUEST_LINK=ON` does) and
-    # `main.cpp` then boots the guest (platform/bbhost_bridge.cpp). What still
-    # fails is the audit: the guest's own translation units use
-    # `std::filesystem`, and MSVC's implementation of it imports CreateFile2,
-    # FindFirstFileW/ExW, CreateDirectoryW and MoveFileExW directly - the app's
-    # `bbx::hostfs` seam is bypassed inside the STL. Until those call sites are
-    # routed through the seam, the switch stays off: a green branch says more
-    # than a linked one.
-    #
-    # `core/portable.cpp` and `hle/kernel.cpp` map the guest's memory files with
-    # `MapViewOfFile` (the desktop name); the AppContainer's
-    # `MapViewOfFileFromApp` is the same call, and both files' BBX_UWP branches
-    # use it.
+    # `BBX_GUEST_LINK=ON` links the four archives into the app, and `main.cpp`
+    # then boots the guest (platform/bbhost_bridge.cpp answers the host headers
+    # the archives call). It links today: the exe builds with all four archives
+    # and the census comes back empty. What does not pass yet is the import
+    # audit - the guest's own translation units use `std::filesystem`, and MSVC's
+    # implementation of it imports CreateFile2, FindFirstFileW/ExW,
+    # CreateDirectoryW and MoveFileExW directly, so the app's `bbx::hostfs` seam
+    # is bypassed inside the STL. Those call sites have to move onto the seam
+    # before the switch can stay on: a green branch says more than a linked one.
     #
     # lld-link resolves archives regardless of order, so these may name each
     # other's symbols freely - and it dead-strips an archive member no one
@@ -149,6 +276,7 @@ if(BBX_BBHOST)
         target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
     endif()
 endif()
+
 
 # The Store CRT. A console has vcruntime140_app.dll / msvcp140_app.dll and their
 # siblings, not the desktop vcruntime140.dll: the *_app import libraries have to
