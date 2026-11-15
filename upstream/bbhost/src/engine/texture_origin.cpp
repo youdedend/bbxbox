@@ -31,6 +31,7 @@
 // The map folders arrive on the dump, which the CRT cannot walk through a
 // `FutureAccessList` token: the seam's listing is `FindFirstFileExFromApp`.
 #include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"  // ReadFileAll: the seam's whole-file read
 #else
 #include <filesystem>
 #endif
