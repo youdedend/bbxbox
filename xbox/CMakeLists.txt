@@ -274,6 +274,17 @@ if(BBX_BBHOST)
         target_compile_definitions(bbxbox PRIVATE BBX_GUEST_BOOT=1)
     else()
         target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
+        # With the archives out of the link, the three TUs the app shares with
+        # them are the app's own: the host-fs seam's shared half (the wrappers,
+        # the path helpers and the boot self test), bbhost's virtual-memory layer
+        # (the guest's fixed windows are reserved through it at startup), and the
+        # winpthreads shim (the boot self test calls into it). With the link on,
+        # all three arrive from the archives instead - two copies of either is a
+        # duplicate definition.
+        target_sources(bbxbox PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/winpthreads_shim/winpthreads_shim.cpp")
     endif()
 endif()
 
