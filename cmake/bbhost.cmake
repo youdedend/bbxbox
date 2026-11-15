@@ -229,7 +229,8 @@ add_library(bbhost_host STATIC
     "${BBX_BBHOST_ROOT}/src/host/main_wait.cpp"
     "${BBX_BBHOST_ROOT}/src/host/perf_meter.cpp"
     "${BBX_BBHOST_ROOT}/src/host/pixel_cutaway.cpp"
-    "${BBX_BBHOST_ROOT}/src/host/render_hooks.cpp"
+    # (render_hooks.cpp is out: it includes `bbhost_plugin.h`, which is the
+    # public plugin SDK header and not part of the vendored source.)
     "${BBX_BBHOST_ROOT}/src/host/shader_bundles.cpp"
     "${BBX_BBHOST_ROOT}/src/host/shader_liveness.cpp"
     "${BBX_BBHOST_ROOT}/src/host/shader_overrides.cpp"

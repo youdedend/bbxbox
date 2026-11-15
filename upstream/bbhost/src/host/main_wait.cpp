@@ -3,7 +3,12 @@
 
 #include "host/frame_stats.h"
 
-#if !defined(_WIN32)
+// Local change, marked BBX_UWP: upstream's Windows build gets `pthread_self`
+// and `pthread_getname_np` from winpthreads, which `<windows.h>` does not pull
+// in; the port's shim has to be asked for by name.
+#if defined(BBX_UWP)
+#include <pthread.h>
+#elif !defined(_WIN32)
 #include <pthread.h>
 #endif
 
