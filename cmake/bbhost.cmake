@@ -107,6 +107,13 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/core/elf.cpp"
     "${BBX_BBHOST_ROOT}/src/core/paced_file.cpp"
     "${BBX_BBHOST_ROOT}/src/core/host_fs_common.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/win_vm.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/write_watch.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/win_watch.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/memory.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/portable.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/host_clock.cpp"
+    "${BBX_BBHOST_ROOT}/src/core/thunk.cpp"
     # src/hle: the file system, over the platform seam.
     "${BBX_BBHOST_ROOT}/src/hle/fs.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/fios.cpp"
