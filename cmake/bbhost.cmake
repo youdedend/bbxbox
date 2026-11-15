@@ -79,7 +79,12 @@ add_library(bbhost_gcn STATIC
     "${BBX_BBHOST_ROOT}/src/gcn/hlsl.cpp"
     "${BBX_BBHOST_ROOT}/src/gcn/gs_vertex.cpp"
 )
-target_include_directories(bbhost_gcn PUBLIC "${BBX_BBHOST_ROOT}/src")
+target_include_directories(bbhost_gcn PUBLIC
+    "${BBX_BBHOST_ROOT}/src"
+    # `gcn/container.cpp` reads a `.shaderbnd.dcx` through the port's host-fs
+    # seam (`xbox/platform/host_fs.h`): a dump file arrives through a
+    # `FutureAccessList` token, which `fopen` cannot open on the console.
+    "${BBX_BBHOST_ROOT}/../..")
 target_compile_features(bbhost_gcn PUBLIC cxx_std_20)
 target_compile_definitions(bbhost_gcn PUBLIC
     BBX_UWP=1
