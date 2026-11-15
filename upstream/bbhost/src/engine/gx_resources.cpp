@@ -1679,7 +1679,8 @@ extern "C" void* g_gx_res_after_thunk = nullptr;
 #else
 #define GR_TYPE_(n) ".type " #n ", @function\n"
 #endif
-asm(".text\n.globl gx_res_ret\n" GR_TYPE_(gx_res_ret) "gx_res_ret:\n"
+asm(".att_syntax prefix\n"
+    ".text\n.globl gx_res_ret\n" GR_TYPE_(gx_res_ret) "gx_res_ret:\n"
     "push %rax\n push %rdx\n mov %rax, %rdi\n call *g_gx_res_after_thunk(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 

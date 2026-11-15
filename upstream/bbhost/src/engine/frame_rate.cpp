@@ -2607,7 +2607,8 @@ extern "C" void* g_frame_after_thunk = nullptr;
 #else
 #define FR_TYPE_(n) ".type " #n ", @function\n"
 #endif
-asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
+asm(".att_syntax prefix\n"
+    ".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
     "push %rax\n push %rdx\n call *g_frame_after_thunk(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 

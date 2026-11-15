@@ -347,7 +347,8 @@ extern "C" void dl_alloc_ret();
 #else
 #define DL_TYPE_(n) ".type " #n ", @function\n"
 #endif
-asm(".text\n.globl dl_alloc_ret\n" DL_TYPE_(dl_alloc_ret) "dl_alloc_ret:\n"
+asm(".att_syntax prefix\n"
+    ".text\n.globl dl_alloc_ret\n" DL_TYPE_(dl_alloc_ret) "dl_alloc_ret:\n"
     "push %rax\n push %rdx\n mov %rax, %rdi\n call *g_dl_alloc_result_thunk(%rip)\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 

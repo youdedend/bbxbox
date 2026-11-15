@@ -18,6 +18,7 @@ std::uint8_t bb_mouse_camera_free_now = 0;
 // block stores as the return-to-centre reference. The update is not a leaf,
 // so nothing of its lives below rsp to be pushed over.
 asm(R"(
+    .att_syntax prefix
     .text
     .globl bb_mouse_camera_stub
 bb_mouse_camera_stub:
