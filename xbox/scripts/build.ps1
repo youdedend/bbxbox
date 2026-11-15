@@ -87,7 +87,12 @@ $cfgArgs = @(
     "-DBBX_FFMPEG_PREFIX=$prefix\ffmpeg",
     "-DBBX_BBHOST_ROOT=$Root\upstream\bbhost"
 )
-if (Test-Path $storeLib) { $cfgArgs += "-DCMAKE_LIBRARY_PATH=$storeLib" }
+# CMAKE_LIBRARY_PATH only seeds find_library; the link needs the directory too,
+# which is what BBX_STORE_CRT_DIR does (target_link_directories BEFORE).
+if (Test-Path $storeLib) {
+    $cfgArgs += "-DCMAKE_LIBRARY_PATH=$storeLib"
+    $cfgArgs += "-DBBX_STORE_CRT_DIR=$storeLib"
+}
 & cmake @cfgArgs *> $cfgLog
 if ($LASTEXITCODE -ne 0) {
     $tail = (Get-Content $cfgLog -Tail 80) -join "`n"

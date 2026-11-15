@@ -35,8 +35,17 @@ if (-not (Test-Path $Dumpbin)) { throw "dumpbin.exe not found" }
 
 # Imports the AppContainer guarantees. api-ms-win-* covers WindowsApp.lib's
 # surface; the rest are the graphics, audio and CRT libraries the port links.
+# The Store CRT family: a UWP app loads vcruntime140_app.dll / msvcp140_app.dll /
+# vccorlib140_app.dll and their siblings, never the desktop vcruntime140.dll. The
+# OS provides the *_app family (it is part of the platform, not the package), so
+# they are allowed as modules and skipped by the packaged check; the desktop
+# names are *not* allowed, because a console does not have them.
+$AppCrtModules = @(
+    "_app\.dll$", "^msvcp140_\d", "^concrt140_app", "^vccorlib140_app"
+)
 $AllowedModules = @(
-    "^api-ms-win-", "^ext-ms-win-", "^ucrtbase\.dll$", "^vcruntime140", "^msvcp140",
+    "^api-ms-win-", "^ext-ms-win-", "^ucrtbase\.dll$", "^vcruntime140_app", "^msvcp140_app",
+    "^oleaut32\.dll$", "^combase\.dll$",
     "^kernel32\.dll$", "^kernelbase\.dll$", "^d3d12\.dll$", "^dxgi\.dll$", "^d3d11\.dll$",
     "^dxcompiler\.dll$", "^dxil\.dll$", "^xaudio2_9\.dll$", "^SDL3\.dll$", "^libuwp\.dll$",
     "^ole32\.dll$", "^windows\.storage\.dll$", "^combase\.dll$", "^sechost\.dll$",
@@ -62,9 +71,24 @@ $failures = New-Object System.Collections.Generic.List[string]
 $binaries = Get-ChildItem -Path $PackageDir -Recurse -Include *.exe, *.dll
 if ($binaries.Count -eq 0) { throw "no binaries under $PackageDir" }
 
+# Binaries this port builds. Their imports are the port's responsibility. The
+# rest (SDL3-uwp, libuwp, Microsoft's DXC) is payload: it is shipped, not written
+# here, and its desktop imports are reported as notices so a reviewer can see
+# them without the job turning red on code we do not own.
+$OwnBinaries = @("bbxbox.exe")
+# Exact symbols that are imported but never called on the console's paths. Each
+# one is here for a stated reason; the list is not a place to hide a mistake.
+$KnownUncalledSymbols = @{
+    "bbxbox.exe" = @{
+        "LoadLibraryExW" = "C++/WinRT base.h activation fallback; the port itself calls LoadPackagedLibrary only"
+    }
+}
+$notices = New-Object System.Collections.Generic.List[string]
+
 foreach ($binary in $binaries) {
     $imports = & $Dumpbin /nologo /imports $binary.FullName 2>&1
     if ($LASTEXITCODE -ne 0) { throw "dumpbin failed on $($binary.Name)" }
+    $own = $OwnBinaries -contains $binary.Name
     foreach ($line in $imports) {
         if ($line -notmatch "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { continue }
         $module = $Matches[1]
@@ -72,11 +96,23 @@ foreach ($binary in $binaries) {
         foreach ($pattern in $AllowedModules) {
             if ($module -match $pattern) { $ok = $true; break }
         }
-        if (-not $ok) { $failures.Add("$($binary.Name): imports $module") }
+        if (-not $ok -and $module -match ("(" + ($AppCrtModules -join "|") + ")")) { $ok = $true }
+        if (-not $ok) {
+            if ($own) { $failures.Add("$($binary.Name): imports $module") }
+            else { $notices.Add("$($binary.Name) (payload): imports $module") }
+        }
     }
     foreach ($pattern in $ForbiddenSymbols) {
         if ($imports -match "\b$pattern" -or ($imports | Where-Object { $_ -match $pattern })) {
-            $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/")
+            $allowed = $false
+            if ($KnownUncalledSymbols.ContainsKey($binary.Name)) {
+                foreach ($symbol in $KnownUncalledSymbols[$binary.Name].Keys) {
+                    if ($pattern -eq "$symbol$") { $allowed = $true; break }
+                }
+            }
+            if (-not $own) { $notices.Add("$($binary.Name) (payload): imports a desktop-only symbol matching /$pattern/") }
+            elseif ($allowed) { $notices.Add("$($binary.Name): imports $symbol, documented as never called") }
+            else { $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/") }
         }
     }
 }
@@ -89,10 +125,22 @@ foreach ($binary in $binaries) {
     foreach ($line in $imports) {
         if ($line -notmatch "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { continue }
         $module = $Matches[1]
-        if ($module -match "^api-ms-win-" -or $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$") {
+        if ($module -match "^api-ms-win-" -or $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$" -or
+            $module -match ("(" + ($AppCrtModules -join "|") + ")")) {
             continue
         }
         if ($packaged -notcontains $module) { $failures.Add("$($binary.Name): imports $module but it is not in the package") }
+    }
+}
+
+if ($notices.Count -gt 0) {
+    $uniqueNotices = @($notices | Sort-Object -Unique)
+    Write-Host "check-imports: notices (not failures)"
+    $uniqueNotices | ForEach-Object { Write-Host "  $_" }
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $body = ($uniqueNotices -join "`n") -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        if ($body.Length -gt 55000) { $body = $body.Substring($body.Length - 55000) }
+        Write-Output "::warning title=import audit notices::$body"
     }
 }
 

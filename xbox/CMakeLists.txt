@@ -116,6 +116,21 @@ if(BBX_BBHOST)
     target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
 endif()
 
+# The Store CRT. A console has vcruntime140_app.dll / msvcp140_app.dll and their
+# siblings, not the desktop vcruntime140.dll: the *_app import libraries have to
+# be named explicitly, and the desktop vcruntime140_1.lib (which supplies
+# __CxxFrameHandler4) has to be refused, or the link picks it and the package
+# fails import validation on the console.
+set(BBX_STORE_CRT_DIR "" CACHE PATH "VC\Tools\MSVC\<ver>\lib\x64\store")
+if(BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
+    target_link_directories(bbxbox BEFORE PRIVATE "${BBX_STORE_CRT_DIR}")
+    target_link_libraries(bbxbox PRIVATE vcruntime140_app msvcp140_app vcruntime140_1_app)
+    target_link_options(bbxbox PRIVATE /NODEFAULTLIB:vcruntime140_1.lib)
+    target_compile_definitions(bbxbox PRIVATE _CRT_STDIO_ARBITRARY_WIDE_SPECIFIERS)
+else()
+    message(WARNING "BBX_STORE_CRT_DIR is not set; the link will import the desktop CRT")
+endif()
+
 target_link_libraries(bbxbox PRIVATE
     "${BBX_SDL3_PREFIX}/lib/SDL3.lib"
     WindowsApp
