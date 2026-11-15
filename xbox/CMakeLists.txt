@@ -177,9 +177,14 @@ target_include_directories(bbxbox PRIVATE
 target_sources(bbxbox PRIVATE
     # The host file-system seam's shared half (the wrappers, the path helpers and
     # the boot self test); the AppContainer table is platform/host_fs_uwp.cpp.
+    # Both of these are also members of `bbhost_guest`, so the day the link
+    # switch below is flipped they must come out of this list - two copies of
+    # `bbx::hostfs`'s wrappers is a duplicate definition.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
     # bbhost's virtual-memory layer: the guest's fixed windows are reserved
     # through it at startup (platform/guest_windows.cpp), and under BBX_UWP its
     # three entry points are the AppContainer's own.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
@@ -230,12 +235,6 @@ else()
 endif()
 
 if(BBX_BBHOST)
-    # `bbhost_guest` owns these two as well, so the day the link switch below is
-    # flipped they must come out of this list - two copies of `bbx::hostfs`'s
-    # wrappers is a duplicate definition, and this is the line that would do it.
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
-
     # The guest runtime, its host layer and the game's own code are compiled,
     # and the link is one switch away - but the switch is off: the residue needs
     # `xbox/platform/bbhost_bridge.cpp` (the display/pad/flip surface the omitted
