@@ -12,7 +12,7 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 |---|---|---|
 | P0 | UWP shell, launcher, memory contract, packaging, CI, import audit | **Implemented; not yet run on console.** `.appx` layout, manifest (`codeGeneration` + `removableStorage` only), SDL3-uwp/libuwp cached dependency build, memory self-test, `check-imports.ps1`, `local_precheck.sh`, CI. |
 | P1 | Guest boot + HLE + audio/input, no rendering | **Started.** The portable core (`elf`, `imports`, `thunk`, `tls_rewrite`, `sha256`, `paced_file`, `memory`) is now compiled by the host test build and unit-tested (154 cases), and the UWP arena adapter (`guest_memory_bbhost.h`) is what bbhost's `core/memory.h` resolves to under `BBX_UWP`. `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
-| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Shader half done:** the port's own passes (`present`, `overlay`) compile to SM 6.4 DXIL at build time with `dxc -WX` and are embedded as bytes, and no shader compiler ships in the package. `device.cpp`/`swapchain.cpp`/`replay.cpp` are still unwritten, so no `ID3D12Device` has been created. |
+| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Device and swapchain written and compile-verified; replay not yet.** `bbx_d3d12.cpp` (status/HRESULT mapping, log bridge, object naming), `device.cpp` (11_0 device, high-performance adapter with WARP refused, caps validated against `XboxSeriesCaps()`, UMA, one queue + fence + three frame allocators, bounded descriptor heaps, device-loss capture, no pipeline library) and `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized and inverse-scaled, RTVs, resize, present) are compiled by the Windows job against the real SDK. The shader half is done: `present`/`overlay` are build-time SM 6.4 DXIL and no compiler ships. `replay.cpp`, the root signature and the PSOs are unwritten, so nothing has drawn a frame: no console has run this. |
 | P3 | GX draw path: pipelines, bindless descriptors, vertex fetch, buffer shadow | Design + `bbx_psocache`/`bbx_caps` landed. |
 | P4 | YEBIS, Scaleform, compute tessellation, FSR | Policy landed (`bbx_tess`), kernels pending. |
 | P5 | DXIL precompile + PSO cache + quarantine + USB sync | Cache and quarantine landed and tested; DXIL compile and USB sync pending. |
@@ -78,6 +78,14 @@ imports no desktop-only file, memory or loader API.
   -O3 -WX` (no `-enable-16bit-types`, no `ResourceDescriptorHeap`) runs on the build machine via
   `xbox/scripts/dxc-run.ps1`; the blobs are embedded in `bbx_shaders_generated.h`. The package carries
   no `dxcompiler.dll`/`dxil.dll` at all, and `check-imports.ps1` no longer allows them as modules.
+* **`./tools/syntax_check.sh`** — the Windows-only translation units
+  (`bbx_d3d12.cpp`, `device.cpp`, `swapchain.cpp`, and every future `src/host/d3d12`
+  backend file) are type-checked on Linux against declaration-only stubs of
+  `<windows.h>`, `<d3d12.h>`, `<dxgi1_6.h>` and `<wrl/client.h>` in
+  `tools/stubs/win_d3d12/`. This is a type-and-signature check, not an emulator: it
+  caught `DXGI_CREATE_FACTORY_FLAGS_NONE` (which does not exist), a wrong
+  `GetDesc`/`GetDesc1` pair and an `int` where `D3D12_RTV_DIMENSION` was required
+  before CI did - and the Windows job still compiles the same files with clang-cl.
 * `./tools/local_precheck.sh`: tests, AppContainer API rules (`*FromApp`, no
   `PAGE_EXECUTE_READWRITE`), `/STACK:8388608,65536`, no game files/build output/absolute paths tracked,
   docs/code number agreement.
@@ -88,8 +96,10 @@ imports no desktop-only file, memory or loader API.
   `CN=bbxbox` certificate and the VCLibs framework package is staged beside it, but neither has been
   installed on a console), Game-mode memory limit, the memory self-test's numbers, 4K/HDR output,
   rumble, the virtual keyboard, and D3D12 device creation.
-* `src/host/d3d12`'s device/swapchain/replay half: the policy layer and the build-time DXIL compile,
-  but nothing has created an `ID3D12Device`, a swapchain or a command list.
+* `src/host/d3d12`'s replay half: the device and swapchain are written and compile against the real
+  SDK, but no `ID3D12Device` has actually been created on a console, no swapchain has presented, and
+  `replay.cpp` (clears, copies, barriers, read-only DSV, PSOs, the present and overlay passes) does not
+  exist yet.
 * bbhost's `src/hle` is not linked into the app, so no guest code has run: `load_orbis_elf` is
   compiled and unit-testable but is not called by any boot path yet, and `CUSA03173` has never been
   opened by this port.
