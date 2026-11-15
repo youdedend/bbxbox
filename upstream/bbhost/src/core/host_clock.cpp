@@ -117,6 +117,7 @@ void host_timing_init() {
     // may import (the console partition's headers do not even declare it). It is
     // not needed either: the Game Mode scheduler's tick is fixed, and every wait
     // that matters here is a high-resolution waitable timer.
+    const bool period = false;
 #else
     const bool period = !env_off("BBHOST_TIMER_PERIOD");
     if (period) timeBeginPeriod(1);
