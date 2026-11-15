@@ -103,6 +103,19 @@ if [ -d upstream/bbhost/.git ]; then
   fail "upstream/bbhost/.git must not be vendored"
 fi
 
+# --- 5c. package assets -------------------------------------------------------
+# makeappx fails when the manifest names an image that is not in the layout, and
+# the failure only shows up in the packaging step of the Windows job.
+if [ ! -f tools/make-assets.py ]; then
+  fail "tools/make-assets.py is missing; the package assets have no source"
+fi
+for asset in $(grep -o 'Assets[\\/][A-Za-z0-9]*\.png' xbox/AppxManifest.xml |
+    sed 's#.*[\\/]##' | sort -u); do
+  if [ ! -f "xbox/Assets/$asset" ]; then
+    fail "xbox/Assets/$asset is named by AppxManifest.xml but missing (run tools/make-assets.py)"
+  fi
+done
+
 # --- 6. the console's shader and pipeline rules ------------------------------
 if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
   fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"

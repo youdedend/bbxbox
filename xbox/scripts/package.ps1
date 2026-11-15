@@ -20,6 +20,18 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Fail([string]$Message) {
+    Write-Host "package: FAILED: $Message"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $enc = $Message -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        if ($enc.Length -gt 55000) { $enc = $enc.Substring($enc.Length - 55000) }
+        Write-Output "::error title=package failed::$enc"
+    }
+    exit 1
+}
+
+try {
+
 $build = Join-Path $Root "build\xbox"
 $prefix = Join-Path $Root "build-deps\prefix"
 $layout = Join-Path $Root "build\package"
@@ -76,3 +88,7 @@ if ($Certificate) {
 
 Write-Host "package: $appx"
 Write-Host "install: Add-AppxPackage -Path `"$appx`" (Developer Mode)"
+}
+catch {
+    Fail "$_"
+}
