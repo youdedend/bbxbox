@@ -33,7 +33,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+// Local change, marked BBX_UWP: MinGW's `<sys/time.h>` and its `gmtime_r` /
+// `localtime_r`. The Store SDK has neither; the shim header is the first, and
+// the two reentrant formatters are the `_s` calls behind POSIX names, which is
+// exactly the shape the HLE calls them in (a thread-local `tm`).
+#if defined(BBX_UWP)
 #include <sys/time.h>
+namespace {
+inline struct tm* gmtime_r(const time_t* t, struct tm* out) {
+    return _gmtime64_s(reinterpret_cast<__time64_t*>(const_cast<time_t*>(t)), out) == 0 ? out : nullptr;
+}
+inline struct tm* localtime_r(const time_t* t, struct tm* out) {
+    return _localtime64_s(reinterpret_cast<__time64_t*>(const_cast<time_t*>(t)), out) == 0 ? out : nullptr;
+}
+}  // namespace
+#else
+#include <sys/time.h>
+#endif
 #include <deque>
 #include <memory>
 #include <mutex>
