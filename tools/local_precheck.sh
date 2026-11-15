@@ -116,6 +116,26 @@ for asset in $(grep -o 'Assets[\\/][A-Za-z0-9]*\.png' xbox/AppxManifest.xml |
   fi
 done
 
+# --- 5d. sideload readiness ---------------------------------------------------
+# A console will not install an unsigned package, and Xbox Device Portal refuses
+# one that does not carry the Store CRT framework package. Both facts live in the
+# manifest and the packaging script, so check them here rather than on a console.
+if ! grep -q "Microsoft.VCLibs.140.00" xbox/AppxManifest.xml; then
+  fail "the manifest lost the Microsoft.VCLibs.140.00 PackageDependency (sideloading needs it)"
+fi
+if ! grep -q "CN=Microsoft Corporation" xbox/AppxManifest.xml; then
+  fail "the VCLibs PackageDependency lost Microsoft's publisher string"
+fi
+if ! grep -q "Microsoft.VCLibs.x64.14.00.appx" xbox/scripts/package.ps1; then
+  fail "package.ps1 no longer stages the VCLibs framework package next to the .appx"
+fi
+if ! grep -q "signtool sign" xbox/scripts/package.ps1; then
+  fail "package.ps1 must sign the package; an unsigned .appx will not install on a console"
+fi
+if ! grep -q "bbxbox.cer" xbox/scripts/package.ps1; then
+  fail "package.ps1 must export the signing certificate as bbxbox.cer"
+fi
+
 # --- 6. the console's shader and pipeline rules ------------------------------
 if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
   fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"

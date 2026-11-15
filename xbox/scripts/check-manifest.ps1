@@ -14,6 +14,9 @@
      runFullTrust, no broadFileSystemAccess, no internetClient;
    * every Assets\*.png the manifest names exists on disk.
 
+   * the Microsoft.VCLibs framework package is a dependency, with Microsoft's
+     publisher string exactly as the Device Portal compares it.
+
   It does not replace makeappx: the tool is still the authority on the schema.
 #>
 [CmdletBinding()]
@@ -43,6 +46,23 @@ if ($family.Name -ne "Windows.Universal") {
 }
 if (-not $manifest.Package.PhoneIdentity) {
     $problems.Add("the Windows.Universal family requires mp:PhoneIdentity")
+}
+
+# The Store CRT framework package. A sideloaded console package loads
+# vcruntime140_app.dll from Microsoft.VCLibs, and Xbox Device Portal rejects an
+# upload whose manifest does not depend on it.
+$vclibsPublisher = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+$vclibs = @($manifest.Package.Dependencies.PackageDependency | Where-Object { $_ })
+$vclibs = @($vclibs | Where-Object { $_.Name -eq "Microsoft.VCLibs.140.00" })
+if ($vclibs.Count -eq 0) {
+    $problems.Add("PackageDependency Microsoft.VCLibs.140.00 is required for sideloading on the console")
+} else {
+    if ($vclibs[0].Publisher -ne $vclibsPublisher) {
+        $problems.Add("Microsoft.VCLibs.140.00 Publisher must be exactly '$vclibsPublisher'")
+    }
+    if (-not $vclibs[0].MinVersion) {
+        $problems.Add("Microsoft.VCLibs.140.00 needs a MinVersion (14.0.30704.0 or later)")
+    }
 }
 
 $applications = @($manifest.Package.Applications.Application)

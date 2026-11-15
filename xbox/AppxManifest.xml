@@ -45,6 +45,16 @@
 
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+    <!-- The Store CRT framework package. bbxbox.exe links the app-local CRT
+         (vcruntime140_app.dll and friends), and a sideloaded package on a console
+         gets those from this framework package: the Xbox Device Portal refuses an
+         upload that does not carry it in Dependencies/. package.ps1 copies
+         Microsoft.VCLibs.x64.14.00.appx next to the .appx for exactly this. The
+         publisher string is Microsoft's own and is compared literally. -->
+    <PackageDependency
+      Name="Microsoft.VCLibs.140.00"
+      MinVersion="14.0.30704.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
   </Dependencies>
 
   <Resources>

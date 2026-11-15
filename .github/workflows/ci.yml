@@ -83,6 +83,8 @@ jobs:
           name: bbxbox-appx
           path: |
             build/appx/*.appx
+            build/appx/*.cer
+            build/appx/Dependencies/*.appx
             build/xbox/**/bbxbox.map
             build/xbox/**/bbxbox.pdb
           if-no-files-found: error

@@ -75,12 +75,15 @@ if ($LASTEXITCODE -ne 0) { throw "import audit failed; not packaging" }
 if ($LASTEXITCODE -ne 0) { throw "manifest lint failed; not packaging" }
 
 $appx = Join-Path $out "bbxbox_0.1.0.0_x64.appx"
-# makeappx ships with the Windows SDK.
+# makeappx and signtool ship with the Windows SDK, side by side.
 $makeappx = Get-Command makeappx.exe -ErrorAction SilentlyContinue
-if (-not $makeappx) {
+$sdkBin = ""
+if ($makeappx) { $sdkBin = Split-Path $makeappx.Source -Parent }
+else {
     $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
-    $makeappx = Get-ChildItem -Recurse -Path $sdk -Filter makeappx.exe -ErrorAction SilentlyContinue |
+    $found = Get-ChildItem -Recurse -Path $sdk -Filter makeappx.exe -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+    if ($found) { $makeappx = $found; $sdkBin = $found.DirectoryName }
 }
 if (-not $makeappx) { throw "makeappx.exe not found (Windows SDK)" }
 $makeOut = & $makeappx.FullName pack /d $layout /p $appx /o 2>&1
@@ -90,13 +93,76 @@ if ($LASTEXITCODE -ne 0) {
     throw ("makeappx failed: " + (($makeOut | Out-String).Trim()))
 }
 
+# --- the framework package the manifest depends on --------------------------
+# Xbox Device Portal refuses an upload that does not carry the Store CRT
+# framework package, and the manifest names it. Dependencies/ next to the .appx
+# is the layout the portal expects.
+$dependencies = Join-Path $out "Dependencies"
+New-Item -ItemType Directory -Force -Path $dependencies | Out-Null
+$vclibsDir = "${env:ProgramFiles(x86)}\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64"
+$vclibs = Get-ChildItem -Path $vclibsDir -Filter "Microsoft.VCLibs.x64.14.00.appx" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if (-not $vclibs) {
+    throw ("Microsoft.VCLibs.x64.14.00.appx not found in $vclibsDir; the manifest depends on it, so the package cannot be sideloaded without it")
+}
+Copy-Item $vclibs.FullName (Join-Path $dependencies $vclibs.Name) -Force
+
+# --- signing ----------------------------------------------------------------
+# A console will not install an unsigned package. With -Certificate the caller
+# supplies a .pfx; without it an ephemeral self-signed certificate is created for
+# this build, with the subject the manifest's Publisher states (CN=bbxbox), the
+# package is signed SHA-256, and the certificate is exported as bbxbox.cer so a
+# tester can install it on the console once.
+$signtool = if ($sdkBin) { Join-Path $sdkBin "signtool.exe" } else { "" }
+if (-not $signtool -or -not (Test-Path $signtool)) {
+    $found = Get-ChildItem -Recurse -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+    if ($found) { $signtool = $found.FullName }
+}
+if (-not $signtool -or -not (Test-Path $signtool)) { throw "signtool.exe not found (Windows SDK)" }
+
+$thumbprint = ""
+$cerPath = Join-Path $out "bbxbox.cer"
 if ($Certificate) {
-    & (Join-Path $PSScriptRoot "sign.ps1") -Package $appx -Certificate $Certificate -Password $Password
+    if (-not (Test-Path $Certificate)) { throw "certificate not found: $Certificate" }
+    if ($Password) {
+        $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+        $imported = Import-PfxCertificate -FilePath $Certificate -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+    } else {
+        $imported = Import-PfxCertificate -FilePath $Certificate -CertStoreLocation Cert:\CurrentUser\My
+    }
+    $thumbprint = $imported.Thumbprint
+} else {
+    # Reuse a certificate from an earlier build in this session rather than
+    # collecting one per push; the console only needs the first one installed.
+    $existing = Get-ChildItem Cert:\CurrentUser\My |
+        Where-Object { $_.Subject -eq "CN=bbxbox" -and $_.HasPrivateKey } | Select-Object -First 1
+    if ($existing) {
+        $thumbprint = $existing.Thumbprint
+    } else {
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=bbxbox" `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyUsage DigitalSignature `
+            -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(1) `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+        $thumbprint = $cert.Thumbprint
+    }
+    Export-Certificate -Cert "Cert:\CurrentUser\My\$thumbprint" -FilePath $cerPath -Type CERT -Force | Out-Null
+    Write-Host "package: self-signed certificate CN=bbxbox, thumbprint $thumbprint"
+    Write-Host "package: install bbxbox.cer on the console once (certutil -addstore TrustedPeople bbxbox.cer)"
+}
+
+$signOut = & $signtool sign /fd SHA256 /sha1 $thumbprint $appx 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ("signtool sign failed: " + (($signOut | Out-String).Trim()))
+}
+$verifyOut = & $signtool verify /pa $appx 2>&1
+if ($LASTEXITCODE -ne 0) {
+    # A self-signed chain is untrusted on the runner; the console trusts it after
+    # bbxbox.cer is installed. This is information, not a failure.
+    Write-Warning ("signtool verify /pa: " + (($verifyOut | Out-String).Trim()))
 }
 
 Write-Host "package: $appx"
-Write-Host "install: Add-AppxPackage -Path `"$appx`" (Developer Mode)"
-}
-catch {
-    Fail "$_"
-}
+Write-Host "package: $dependencies\$($vclibs.Name)"
+if (Test-Path $cerPath) { Write-Host "package: $cerPath" }
+Write-Host "install: Add-AppxPackage -Path `"$appx`" -DependencyPath `"$dependencies\$($vclibs.Name)`" (Developer Mode, certificate installed)"
