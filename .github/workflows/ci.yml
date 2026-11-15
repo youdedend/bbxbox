@@ -56,10 +56,28 @@ jobs:
         shell: pwsh
         env:
           GITHUB_ACTIONS: "true"
-        run: ./xbox/scripts/build.ps1
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          & ./xbox/scripts/build.ps1 2>&1 | Tee-Object -FilePath build/build-step.log
+          if ($LASTEXITCODE -ne 0) {
+            # Run logs are not always reachable after the fact; the annotation is.
+            $tail = (Get-Content build/build-step.log -Tail 150 -ErrorAction SilentlyContinue) -join "`n"
+            $enc = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Output "::error title=build step failed::$enc"
+            exit 1
+          }
       - name: package + check imports
         shell: pwsh
         run: ./xbox/scripts/package.ps1
+      - name: upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            build-deps/*.log
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: bbxbox-appx

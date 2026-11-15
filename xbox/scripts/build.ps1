@@ -35,11 +35,12 @@ function Emit-ErrorAnnotation([string]$Title, [string]$Body) {
     }
 }
 
+$prefix = Join-Path $Root "build-deps\prefix"
+
 function Invoke-Build {
 $build = Join-Path $Root "build\xbox"
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 
-$prefix = Join-Path $Root "build-deps\prefix"
 if (-not (Test-Path (Join-Path $prefix "sdl3\include\SDL3\SDL.h"))) {
     throw "dependencies missing; run xbox/scripts/build-deps.ps1 first"
 }
