@@ -98,7 +98,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus
         # C++/WinRT is written for MSVC's non-conforming two-phase lookup, which
         # is what -fdelayed-template-parsing restores for clang-cl.
-        -fdelayed-template-parsing)
+        -fdelayed-template-parsing
+        # ... and clang calls the flag deprecated in C++20; with /WX that is an
+        # error, and C++/WinRT still needs the behaviour.
+        -Wno-delayed-template-parsing-in-cxx20)
     target_link_options(bbxbox PRIVATE
         /STACK:8388608,65536
         /APPCONTAINER
