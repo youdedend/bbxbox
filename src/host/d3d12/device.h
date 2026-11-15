@@ -38,6 +38,18 @@ struct DeviceDesc {
 
 class Device {
 public:
+    // Three frames in flight: enough for a GPU to be a frame behind without the
+    // CPU stalling, and the number the swapchain is built for.
+    static constexpr std::uint32_t kFrameCount = 3;
+    // Bounded descriptor budgets. The console's 5,120 MiB does not stretch to an
+    // unbounded heap: 64K CBV/SRV/UAV is 4 MiB of descriptors and covers a whole
+    // Bloodborne frame with room for the PSO cache, and 2,048 samplers is the
+    // documented cap.
+    static constexpr std::uint32_t kCbvSrvUavDescriptors = 65536;
+    static constexpr std::uint32_t kSamplerDescriptors = 2048;
+    static constexpr std::uint32_t kRtvDescriptors = 64;
+    static constexpr std::uint32_t kDsvDescriptors = 16;
+
     Device() = default;
     ~Device();
     Device(const Device&) = delete;
@@ -49,6 +61,24 @@ public:
     [[nodiscard]] ID3D12Device* Get() const { return device_.Get(); }
     [[nodiscard]] ID3D12Device8* Get8() const { return device8_.Get(); }
     [[nodiscard]] IDXGIAdapter4* Adapter() const { return adapter_.Get(); }
+    [[nodiscard]] IDXGIFactory6* Factory() const { return factory_.Get(); }
+
+    // The three descriptor heaps the frame uses, and their strides. Allocation
+    // policy is `bbx_descriptors`' (portable, tested); this only owns the memory.
+    [[nodiscard]] ID3D12DescriptorHeap* CbvSrvUavHeap() const { return cbv_srv_uav_heap_.Get(); }
+    [[nodiscard]] ID3D12DescriptorHeap* SamplerHeap() const { return sampler_heap_.Get(); }
+    [[nodiscard]] ID3D12DescriptorHeap* RtvHeap() const { return rtv_heap_.Get(); }
+    [[nodiscard]] ID3D12DescriptorHeap* DsvHeap() const { return dsv_heap_.Get(); }
+    [[nodiscard]] std::uint32_t CbvSrvUavStride() const { return cbv_srv_uav_stride_; }
+    [[nodiscard]] std::uint32_t SamplerStride() const { return sampler_stride_; }
+    [[nodiscard]] std::uint32_t RtvStride() const { return rtv_stride_; }
+    [[nodiscard]] std::uint32_t DsvStride() const { return dsv_stride_; }
+
+    // The frame ring: one command allocator per frame in flight, cycled after the
+    // fence proves the GPU is done with the oldest.
+    [[nodiscard]] ID3D12CommandAllocator* FrameAllocator() const { return frames_[frame_].Get(); }
+    [[nodiscard]] std::uint32_t FrameIndex() const { return frame_; }
+    void NextFrame() { frame_ = (frame_ + 1) % kFrameCount; }
     [[nodiscard]] Budget& Memory() { return budget_; }
     [[nodiscard]] const Budget& Memory() const { return budget_; }
     [[nodiscard]] bool IsUma() const { return uma_; }
@@ -82,6 +112,8 @@ public:
 private:
     Status PickAdapter(bool debug_layer);
     Status CreateQueuesAndFence();
+    Status CreateDescriptorHeaps();
+    Status QueryAndValidate(bool debug_layer);
 
     ComPtr<IDXGIFactory6> factory_;
     ComPtr<IDXGIAdapter4> adapter_;
@@ -94,6 +126,17 @@ private:
     bool uma_ = false;
     bool device_lost_ = false;
     Budget budget_;
+    std::array<ComPtr<ID3D12CommandAllocator>, kFrameCount> frames_{};
+    std::uint32_t frame_ = 0;
+    ComPtr<ID3D12DescriptorHeap> cbv_srv_uav_heap_;
+    ComPtr<ID3D12DescriptorHeap> sampler_heap_;
+    ComPtr<ID3D12DescriptorHeap> rtv_heap_;
+    ComPtr<ID3D12DescriptorHeap> dsv_heap_;
+    std::uint32_t cbv_srv_uav_stride_ = 0;
+    std::uint32_t sampler_stride_ = 0;
+    std::uint32_t rtv_stride_ = 0;
+    std::uint32_t dsv_stride_ = 0;
+    HRESULT removed_reason_ = 0;
 };
 
 }  // namespace bbx::d3d12

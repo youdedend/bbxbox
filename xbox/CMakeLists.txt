@@ -120,6 +120,16 @@ if(BBX_BBHOST)
     include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/bbhost.cmake")
 endif()
 
+# The D3D12 console backend: the device, its swapchain and the error/log bridge.
+# They include <d3d12.h>, so they are console-only, and they are compiled here
+# (not merely listed) so CI type-checks and links them on every push.
+set(BBX_D3D12_SOURCES
+    ../src/host/d3d12/bbx_d3d12.cpp
+    ../src/host/d3d12/bbx_budget.cpp
+    ../src/host/d3d12/device.cpp
+    ../src/host/d3d12/swapchain.cpp
+)
+
 set(BBX_APP_SOURCES
     platform/main.cpp
     platform/log.cpp
@@ -131,6 +141,7 @@ set(BBX_APP_SOURCES
     platform/launcher.cpp
     platform/ux.cpp
     platform/shaders.cpp
+    ${BBX_D3D12_SOURCES}
 )
 
 add_executable(bbxbox WIN32 ${BBX_APP_SOURCES})

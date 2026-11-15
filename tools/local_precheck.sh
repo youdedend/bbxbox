@@ -196,6 +196,30 @@ for core in sha256 imports tls_rewrite elf paced_file portable; do
   fi
 done
 
+# --- 5g. the Windows-only code, type-checked without Windows ------------------
+# tools/syntax_check.sh compiles src/host/d3d12/*.cpp against the declaration-only
+# stubs in tools/stubs/win_d3d12/, so a wrong D3D12 signature fails here in about a
+# second instead of on the Windows runner three minutes later.
+if ! ./tools/syntax_check.sh; then
+  fail "the Windows-only translation units do not type-check (tools/syntax_check.sh)"
+fi
+# Rules the console enforces that a compiler cannot: see ARCHITECTURE §2 and §5.
+if grep -rn "CreatePipelineLibrary" src/host/d3d12/*.cpp 2>/dev/null | grep -v '//' >/dev/null; then
+  fail "CreatePipelineLibrary is called somewhere; it removes the device on a console"
+fi
+if ! grep -q "DXGI_SWAP_EFFECT_FLIP_DISCARD" src/host/d3d12/swapchain.cpp; then
+  fail "swapchain.cpp must use DXGI_SWAP_EFFECT_FLIP_DISCARD"
+fi
+if ! grep -q "SetMatrixTransform" src/host/d3d12/swapchain.cpp; then
+  fail "swapchain.cpp must apply the inverse scale with IDXGISwapChain2::SetMatrixTransform (guard G8)"
+fi
+if ! grep -q "D3D_FEATURE_LEVEL_11_0" src/host/d3d12/device.cpp; then
+  fail "device.cpp must create the device at D3D_FEATURE_LEVEL_11_0"
+fi
+if ! grep -q "XboxSeriesCaps()" src/host/d3d12/device.cpp; then
+  fail "device.cpp must validate against bbx_caps::XboxSeriesCaps()"
+fi
+
 # --- 6. the console's shader and pipeline rules ------------------------------
 if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
   fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"
