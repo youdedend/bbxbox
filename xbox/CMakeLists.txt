@@ -157,6 +157,11 @@ target_link_libraries(bbxbox PRIVATE
 
 # Debugging: the .map is what xbox/scripts/symbolicate.py resolves a console
 # crash's module+RVA against.
+# The EntryPoint export: see xbox/bbxbox.def and WINRT_GetActivationFactory.
+if(MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_link_options(bbxbox PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/bbxbox.def")
+endif()
+
 # Bare /MAP: lld-link rejects the quoted CMake /MAP:"path" form ("cannot open
 # ...: invalid argument"). Every driver here is clang-cl -> lld-link, and lld
 # writes <image>.map beside the image, i.e. build/xbox/bbxbox.map, which is what

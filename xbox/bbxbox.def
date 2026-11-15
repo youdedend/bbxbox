@@ -1,0 +1,9 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+; A packaged UWP launch activates the manifest's EntryPoint through the module's
+; DllGetActivationFactory. For a C++ executable that export is not automatic
+; (C++/CX generated it), so it is named here and implemented as
+; WINRT_GetActivationFactory in platform/main.cpp. DllCanUnloadNow is exported
+; for completeness: the process never unloads itself, so it reports "busy".
+EXPORTS
+    DllGetActivationFactory = WINRT_GetActivationFactory PRIVATE
+    DllCanUnloadNow = WINRT_NoUnload PRIVATE

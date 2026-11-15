@@ -23,12 +23,18 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap2="http://schemas.microsoft.com/appx/manifest/uap/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap2 rescap">
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  IgnorableNamespaces="uap uap2 rescap mp">
 
   <Identity Name="bbxbox.Bloodborne"
             Publisher="CN=bbxbox"
             Version="0.1.0.0"
             ProcessorArchitecture="x64" />
+
+  <!-- Required by the schema for the Windows.Universal family, which is what the
+       console's app model is. -->
+  <mp:PhoneIdentity PhoneProductId="6f1c2a10-58b4-4e0f-9a63-2b7f0c94e11d"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 
   <Properties>
     <DisplayName>bbxbox</DisplayName>
@@ -38,7 +44,7 @@
   </Properties>
 
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Resources>
@@ -46,10 +52,11 @@
   </Resources>
 
   <Applications>
-    <!-- No EntryPoint: the EXE is a Win32-style UWP binary whose wWinMain calls
-         CoreApplication::Run, which is the shape prior art shipped and the one
-         C++/WinRT supports without a C++/CX activation class. -->
-    <Application Id="App" Executable="bbxbox.exe">
+    <!-- EntryPoint: the schema requires one whenever Executable* is given, and a
+         packaged launch activates that name through the EXE's exported
+         DllGetActivationFactory (bbxbox.def -> WINRT_GetActivationFactory in
+         main.cpp), which returns bbxbox.App as the IFrameworkViewSource. -->
+    <Application Id="App" Executable="bbxbox.exe" EntryPoint="bbxbox.App">
       <uap:VisualElements
         DisplayName="bbxbox"
         Description="Bloodborne compatibility layer"

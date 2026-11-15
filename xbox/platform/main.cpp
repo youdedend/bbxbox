@@ -20,6 +20,7 @@
 #include <SDL3/SDL.h>
 
 #include <cstdio>
+#include <cwchar>
 #include <memory>
 #include <string>
 #include <vector>
@@ -407,14 +408,46 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
 
 namespace bbxbox {
 
-// The activation object. UWP calls the EXE's WinMain; this is what it runs.
+// The activation object: the view-provider factory. This is what the manifest's
+// EntryPoint="bbxbox.App" names.
 struct App : winrt::implements<App, winrt::Windows::ApplicationModel::Core::IFrameworkViewSource> {
     winrt::Windows::ApplicationModel::Core::IFrameworkView CreateView() {
         return winrt::make<LauncherView>();
     }
 };
 
+// The factory the platform activates through the EntryPoint name. A packaged UWP
+// process is started by activating its entry point, which for a C++ executable
+// means the runtime calls DllGetActivationFactory (exported by bbxbox.def);
+// wWinMain below is the other half, for the paths that run the image directly.
+struct AppFactory : winrt::implements<AppFactory, winrt::Windows::Foundation::IActivationFactory> {
+    winrt::hstring GetRuntimeClassName() const { return L"bbxbox.App"; }
+    winrt::Windows::Foundation::IInspectable ActivateInstance() const {
+        return winrt::make<App>();
+    }
+};
+
 }  // namespace bbxbox
+
+// Exported as DllGetActivationFactory by bbxbox.def: the packaged launch path
+// asks for "bbxbox.App" and gets the IFrameworkViewSource above.
+extern "C" HRESULT WINAPI WINRT_GetActivationFactory(HSTRING class_id, void** factory) {
+    try {
+        *factory = nullptr;
+        const wchar_t* const name = ::WindowsGetStringRawBuffer(class_id, nullptr);
+        if (name != nullptr && std::wcscmp(name, L"bbxbox.App") == 0) {
+            *factory = winrt::detach_abi(winrt::make<bbxbox::AppFactory>());
+            return S_OK;
+        }
+        return winrt::hresult_class_not_available().to_abi();
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+}
+
+// Exported as DllCanUnloadNow by bbxbox.def: a packaged app's image is never
+// unloaded, so the answer is always S_FALSE.
+extern "C" HRESULT WINAPI WINRT_NoUnload() { return S_FALSE; }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
