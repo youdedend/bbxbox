@@ -51,3 +51,16 @@ shipped.
 * [Test-project](https://github.com/youdedend/Test-project) (GPL-2.0-or-later): the eight
   hardware-verified Xbox lessons, `sfo_version.h`, `overlay_index.h` and `dump_panel.h`, adapted
   with SPDX headers.
+
+## Xbox D3D12 hardware rules and the tessellation path
+
+* [KytyPS5](https://github.com/Cosmo/KytyPS5) (branch `xbox-on-upstream-2026-11-14-11d834dd`,
+  `docs/d3d12-backend.md`, `XBOX_CHANGES.md`, commit `988ceea`): the Series X's capability limits,
+  the pipeline-library and PSO-memory rules, guards G1–G20, the HDMI 4K swapchain recipe and the
+  compute tessellation design (`gpu_tess_scan.comp` + `gpu_tess_tessellate.comp`, a port of the D3D11
+  reference tessellator). The kernels are MIT/BSD-licensed upstream code and, when ported here, keep
+  their notices.
+* [ext-ffmpeg-core-xbox](https://github.com/Cosmo/ext-ffmpeg-core-xbox): UWP static FFmpeg with D3D12
+  hardware decode, built with clang-cl.
+* [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v1.1.4 (MIT): FSR 1 and
+  FSR 3.1, compiled into the app; AMD's licence ships beside the binaries.

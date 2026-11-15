@@ -39,6 +39,8 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_present.cpp
     src/host/d3d12/bbx_stream.cpp
     src/host/d3d12/bbx_untile.cpp
+    src/host/d3d12/bbx_psocache.cpp
+    src/host/d3d12/bbx_tess.cpp
 )
 target_include_directories(bbx_d3d12_core PUBLIC src)
 target_compile_features(bbx_d3d12_core PUBLIC cxx_std_20)
@@ -55,6 +57,7 @@ add_library(bbx_platform_core STATIC
     xbox/platform/ini_file.cpp
     xbox/platform/launcher.cpp
     xbox/platform/ux.cpp
+    xbox/platform/display.cpp
 )
 target_include_directories(bbx_platform_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(bbx_platform_core PUBLIC cxx_std_20)
@@ -109,6 +112,10 @@ if(BBX_BUILD_TESTS)
         tests/swap_test.cpp
         tests/guest_memory_test.cpp
         tests/ux_test.cpp
+        tests/caps_test.cpp
+        tests/psocache_test.cpp
+        tests/tess_test.cpp
+        tests/display_test.cpp
     )
     target_link_libraries(bbx_tests PRIVATE bbx_d3d12_core bbx_platform_core)
     target_include_directories(bbx_tests PRIVATE tests "${CMAKE_CURRENT_SOURCE_DIR}")

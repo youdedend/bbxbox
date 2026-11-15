@@ -23,6 +23,9 @@ sources=(
   "$root"/xbox/platform/ini_file.cpp
   "$root"/xbox/platform/launcher.cpp
   "$root"/xbox/platform/ux.cpp
+  "$root"/xbox/platform/display.cpp
+  "$root"/src/host/d3d12/bbx_psocache.cpp
+  "$root"/src/host/d3d12/bbx_tess.cpp
   "$root"/tests/main.cpp
   "$root"/tests/format_test.cpp
   "$root"/tests/budget_test.cpp
@@ -42,6 +45,10 @@ sources=(
   "$root"/tests/swap_test.cpp
   "$root"/tests/guest_memory_test.cpp
   "$root"/tests/ux_test.cpp
+  "$root"/tests/caps_test.cpp
+  "$root"/tests/psocache_test.cpp
+  "$root"/tests/tess_test.cpp
+  "$root"/tests/display_test.cpp
 )
 
 mkdir -p "$(dirname "$out")"

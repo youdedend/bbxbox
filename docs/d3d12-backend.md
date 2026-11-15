@@ -191,3 +191,13 @@ skewed texture that reads as "the port has a memory bug".
 * On any device-removed (`DXGI_ERROR_DEVICE_REMOVED`) the backend writes
   `LocalState\d3d12-device-removed.txt` with the DRED breadcrumbs (`ID3D12DeviceRemovedExtendedData`)
   before the last-chance logger fires.
+
+## The console's device, in one paragraph
+
+On Xbox the device is feature level 11_0 and shader model **6.4**: descriptor tables and `spaceN`
+arrays, never shader model 6.6 `ResourceDescriptorHeap` indexing; no mesh shaders, no barycentrics, no
+native 16-bit arithmetic (`*_6_4` targets, 16-bit math lowered); 32 KiB of group shared memory; no
+`ID3D12PipelineLibrary` (it removes the device) so the disk cache holds signed DXIL blobs and live
+PSOs come from an LRU (`bbx_psocache`); and no working hardware tessellator, so hull/domain draws run
+as compute passes or are skipped and counted. The full rule set, with sources, is
+`docs/ARCHITECTURE_XBOX_D3D12.md`.

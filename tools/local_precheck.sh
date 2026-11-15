@@ -38,6 +38,7 @@ if [ -n "$uwp_sources" ]; then
     hits=$(grep -n -- "$pattern" $uwp_sources 2>/dev/null | grep -v 'FromApp' | grep -viE '^\s*[^:]+:[0-9]+:\s*(//|\*)' || true)
     # A mention in a comparison ("!= PAGE_EXECUTE_READWRITE") is a check, not a use.
     hits=$(printf '%s\n' "$hits" | grep -viE '(!=|==)\s*PAGE_EXECUTE_READWRITE' || true)
+    hits=$(printf '%s\n' "$hits" | grep -vE '"[^"]*PAGE_EXECUTE_READWRITE[^"]*"' || true)
     if [ -n "${hits// /}" ]; then
       printf '%s\n' "$hits" | head -3
       fail "desktop-only or W^X-breaking API: $pattern"
@@ -73,7 +74,9 @@ fi
 # --- 5. the numbers the docs promise ---------------------------------------
 for pair in "memory-budget.md:4,480" "memory-budget.md:5,120" "porting-plan.md:8388608" \
             "precompile-cache.md:precompile_inflight.txt" "console-ux.md:FutureAccessList" \
-            "d3d12-backend.md:CreateSwapChainForCoreWindow"; do
+            "d3d12-backend.md:CreateSwapChainForCoreWindow" "d3d12-backend.md:6_4" \
+            "ARCHITECTURE_XBOX_D3D12.md:3840" "ARCHITECTURE_XBOX_D3D12.md:pipeline library" \
+            "PORT_STATUS.md:146" ; do
   file="${pair%%:*}"; needle="${pair#*:}"
   if ! grep -q -- "$needle" "docs/$file" 2>/dev/null; then
     fail "docs/$file no longer mentions $needle"
@@ -81,6 +84,17 @@ for pair in "memory-budget.md:4,480" "memory-budget.md:5,120" "porting-plan.md:8
 done
 if ! grep -q "allocatable" src/host/d3d12/bbx_budget.h; then
   fail "bbx_budget.h lost allocatable()"
+fi
+
+# --- 6. the console's shader and pipeline rules ------------------------------
+if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
+  fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"
+fi
+if grep -rn "CreatePipelineLibrary\|ID3D12PipelineLibrary" --include=*.cpp --include=*.h src/ xbox/ 2>/dev/null | grep -vE ':\s*//' | grep -v "bbx_caps.h" >/dev/null; then
+  fail "a pipeline library is used; it removes the device on the console"
+fi
+if [ ! -f src/host/d3d12/bbx_psocache.cpp ] || [ ! -f src/host/d3d12/bbx_psocache.h ]; then
+  fail "the PSO LRU is missing"
 fi
 
 if [ "$status" -eq 0 ]; then

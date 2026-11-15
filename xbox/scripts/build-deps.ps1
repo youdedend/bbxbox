@@ -34,6 +34,10 @@ Set-StrictMode -Version Latest
 $SDL3Repo = "https://github.com/XboxEmulationHub/SDL3-uwp.git"
 $SDL3Branch = "uwp-3.4.20"
 $LibUwpRepo = "https://github.com/XboxEmulationHub/libuwp.git"
+# FFmpeg: UWP-clean static libraries with D3D12 hardware decode (H.264/HEVC/VP9),
+# built with clang-cl so its inline assembly is available. Built here once, cached
+# with everything else; the app links the static libs, so nothing is fetched later.
+$FfmpegRepo = "https://github.com/Cosmo/ext-ffmpeg-core-xbox.git"
 
 $deps = Join-Path $Root "build-deps"
 $src = Join-Path $deps "src"
@@ -114,9 +118,28 @@ if (-not $libDll -or -not $libLib) { throw "libuwp.dll/.lib not produced under $
 Copy-Item $libLib.FullName (Join-Path $libPrefix "lib\libuwp.lib")
 Copy-Item $libDll.FullName (Join-Path $libPrefix "bin\libuwp.dll")
 
+Write-Host "build-deps: FFmpeg (ext-ffmpeg-core-xbox)"
+$ffPath = Join-Path $src "ffmpeg-xbox"
+$ffCommit = Sync-Repo $FfmpegRepo "main" $ffPath
+$ffOut = Join-Path $deps "out\ffmpeg"
+$triplet = Join-Path $ffPath "triplets\x64-win-llvm-static-release.cmake"
+& cmake -S $ffPath -B $ffOut -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=$triplet `
+    -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 `
+    -DCMAKE_BUILD_TYPE=$Configuration
+if ($LASTEXITCODE -ne 0) { throw "FFmpeg configure failed" }
+& cmake --build $ffOut --parallel
+if ($LASTEXITCODE -ne 0) { throw "FFmpeg build failed" }
+$ffPrefix = Join-Path $prefix "ffmpeg"
+New-Item -ItemType Directory -Force -Path (Join-Path $ffPrefix "lib"), (Join-Path $ffPrefix "include") | Out-Null
+Get-ChildItem -Recurse -Path $ffOut -Include *.a, *.lib | Where-Object { $_.Name -match "av|sw" } |
+    ForEach-Object { Copy-Item $_.FullName (Join-Path $ffPrefix "lib\$($_.Name)") }
+Get-ChildItem -Path (Join-Path $ffPath "include") -Directory -ErrorAction SilentlyContinue |
+    ForEach-Object { Copy-Item -Recurse $_.FullName (Join-Path $ffPrefix "include\$($_.Name)") }
+
 @(
     "sdl3=$sdlCommit ($SDL3Branch)"
     "libuwp=$libCommit"
+    "ffmpeg=$ffCommit"
     "toolset=v143, sdk=10.0, platform=$Platform, config=$Configuration"
 ) | Set-Content -Encoding utf8 $stamp
 Write-Host "build-deps: done -> $prefix"

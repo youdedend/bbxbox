@@ -125,7 +125,9 @@ Milestone **P0** (UWP shell) is in the tree: the console app (`xbox/`) with the 
 discovery, the guest memory contract (below 1 TiB, strict W^X), the memory self-test, packaging and
 the import audit; the platform layer is [SDL3-uwp](https://github.com/XboxEmulationHub/SDL3-uwp)
 `uwp-3.4.20` plus [libuwp](https://github.com/XboxEmulationHub/libuwp), built once into
-`build-deps/prefix` and cached by CI. The portable D3D12 core and the platform model carry **122
+`build-deps/prefix` and cached by CI. The portable D3D12 core and the platform model carry **146
 host-side tests**, run by `./tools/build_host.sh` and by `./tools/local_precheck.sh` (the same
-script CI runs before every push). The D3D12 device, swapchain and replay are P2; the headers and
+script CI runs before every push). The D3D12 device, swapchain and replay are P2 (their console rules — SM 6.4, no pipeline library,
+PSO LRU, compute tessellation, 4K output — are already recorded in
+`docs/ARCHITECTURE_XBOX_D3D12.md` and `docs/PORT_STATUS.md`); the headers and
 the portable policy they use are already here.
