@@ -70,6 +70,10 @@ if (-not (Get-ChildItem (Join-Path $layout "Assets") -Filter *.png)) {
 & (Join-Path $PSScriptRoot "check-imports.ps1") -PackageDir $layout
 if ($LASTEXITCODE -ne 0) { throw "import audit failed; not packaging" }
 
+# Lint the manifest before makeappx, which reports one schema violation at a time.
+& (Join-Path $PSScriptRoot "check-manifest.ps1") -Root $Root
+if ($LASTEXITCODE -ne 0) { throw "manifest lint failed; not packaging" }
+
 $appx = Join-Path $out "bbxbox_0.1.0.0_x64.appx"
 # makeappx ships with the Windows SDK.
 $makeappx = Get-Command makeappx.exe -ErrorAction SilentlyContinue

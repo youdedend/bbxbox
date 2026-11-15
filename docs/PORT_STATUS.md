@@ -34,6 +34,31 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 | Empty `WaveActiveBallot` (helper lanes) hangs pixel loops at 6.4 | `XBOX_CHANGES.md` | documented rule in `ARCHITECTURE_XBOX_D3D12.md` §6; HLSL emitter obligation |
 | UWP FFmpeg with D3D12 hardware decode builds with clang-cl | `Cosmo/ext-ffmpeg-core-xbox` | `build-deps.ps1` stage (cached) |
 
+## Verified by CI (the console job actually compiles and packages)
+
+The `console` job on `windows-2025` is green end to end: cached dependencies
+(`build-deps.ps1`), the app (`build.ps1`, Ninja + clang-cl + WindowsStore + the
+Store CRT), the import audit and `makeappx`. That means, for the first time, the
+following are compile-verified rather than hoped for:
+
+* every `xbox/platform` translation unit: `main.cpp` (C++/WinRT view, activation
+  factory), `storage.cpp` (WinRT picker + `*FromApp` file APIs), `dump.cpp`,
+  `ux.cpp`, `launcher.cpp`, `log.cpp` (last-chance logger), `display*.cpp`,
+  `guest_memory.cpp` (the arena over `VirtualAlloc2FromApp`), `memory_selftest.cpp`;
+* the D3D12 policy translation units in `src/host/d3d12/` (`bbx_caps`,
+  `bbx_budget`, `bbx_psocache`, `bbx_tess`, `bbx_stream`, `bbx_quarantine`,
+  `bbx_untile`, …);
+* the vendored guest core's GCN library, LibAtrac9, monocypher and zlib;
+* the package: `bbxbox.exe` + `SDL3.dll` + `libuwp.dll` + DXC's two DLLs, the
+  manifest (`EntryPoint="bbxbox.App"`, activated through `bbxbox.def`), the six
+  generated logos, a `.map` and a `.pdb`.
+
+The import audit's own findings are recorded in the run's annotations: the only
+notices are `LoadLibraryExW` (C++/WinRT's activation fallback, never called by
+the port) and the desktop API imports inside the shipped third-party DLLs
+(SDL3-uwp, libuwp, Microsoft's DXC), which the port does not own. `bbxbox.exe`
+imports no desktop-only file, memory or loader API.
+
 ## Verified here (build machine)
 
 * **146 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
@@ -43,14 +68,14 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
   `PAGE_EXECUTE_READWRITE`), `/STACK:8388608,65536`, no game files/build output/absolute paths tracked,
   docs/code number agreement.
 
-## Not verified (no Windows toolchain in this environment)
+## Not verified (no console, no device)
 
-* Everything under `xbox/` compiles nowhere yet: `xbox/CMakeLists.txt`, `main.cpp`, `storage.cpp`,
-  `guest_memory.cpp`, `memory_selftest.cpp`, `display_winrt.cpp`, `log.cpp`.
-* `Device`, `Swapchain`, `Dxil`, `Replay`, `Untile` (D3D12) — not written yet.
-* `xbox/scripts/*.ps1` and the CI `console` job have never executed. Expect the first run to need
-  fixes (toolset retarget, `SDL3.lib` output path, `appmodel.h` availability).
-* Anything requiring a real console: install, Game-mode memory limit, 4K output, DXC on Xbox.
+* Anything requiring a real console: package install, Game-mode memory limit, the memory self-test's
+  numbers, 4K/HDR output, rumble, the virtual keyboard, DXC on Xbox, and D3D12 device creation.
+* `src/host/d3d12`'s device/swapchain/replay/DXIL half is still being written: the policy layer
+  compiles, but nothing has created a `ID3D12Device` yet.
+* bbhost's `src/core` and `src/hle` are not linked into the app yet (P1): only the GCN library, zlib,
+  LibAtrac9 and monocypher are compiled, and the guest arena is the port's own (`guest_memory.cpp`).
 
 ## Rules that must not regress
 
