@@ -181,7 +181,7 @@ Status PipelineSet::CreateRootSignature(PassKind kind) {
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> error;
     const HRESULT hr = D3D12SerializeRootSignature(
-        &desc, D3D12_ROOT_SIGNATURE_VERSION_1, blob.GetAddressOf(), error.GetAddressOf());
+        &desc, D3D_ROOT_SIGNATURE_VERSION_1, blob.GetAddressOf(), error.GetAddressOf());
     if (FAILED(hr)) {
         if (error) {
             Log("root signature (%s) refused: %s", PassName(kind),

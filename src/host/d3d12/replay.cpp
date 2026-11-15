@@ -15,17 +15,12 @@ namespace {
 
 constexpr std::uint64_t kUploadRingBytes = 4ull << 20;  // 4 MiB a frame
 constexpr std::uint64_t kOverlayBytes = 64ull << 10;    // 2,048 quads
-constexpr std::uint32_t kWhite = 0xFFFFFFFFu;
 constexpr std::uint32_t kFrameImageSize = 256;  // the placeholder final image
 
 // The CPU's copy of stream_selftest.hlsl's Pattern(). Both must agree; the
 // arithmetic is pinned by the host test for the shader's contract.
 std::uint32_t SelftestPattern(std::uint32_t index, std::uint32_t seed) {
     return index * 2654435761u + seed;
-}
-
-std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
 }
 
 D3D12_RESOURCE_DESC BufferDesc(std::uint64_t bytes, D3D12_RESOURCE_FLAGS flags) {

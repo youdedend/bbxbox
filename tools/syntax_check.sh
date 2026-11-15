@@ -52,6 +52,10 @@ for file in "${files[@]}"; do
     # are full of constants and helpers that only some translation units use, and
     # -Werror would turn that into a failure that says nothing about the code under
     # test.
+    # The stubs are included with -isystem, so their unused constants and helpers
+    # are not this check's business; the code under test is held to -Werror in
+    # full, which is how an unused local is caught here rather than on CI.
+    #
     # -Wno-ignored-attributes: the SDK (and therefore the stubs) put
     # __declspec(uuid(...)) before `struct`, which plain clang-with-ms-extensions
     # ignores, and -Werror would turn that decoration into a failure. clang-cl
@@ -60,10 +64,9 @@ for file in "${files[@]}"; do
     if "$cxx" --version 2>/dev/null | grep -qi clang; then extra+=(-fms-extensions -fdeclspec); fi
     output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror \
         "${extra[@]}" -fno-exceptions \
-        -Wno-unused-parameter -Wno-unused-const-variable -Wno-unused-function \
-        -Wno-ignored-attributes \
+        -Wno-unused-parameter -Wno-ignored-attributes \
         -D_WIN32 -DBBX_UWP=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \
-        -I"$stubs" -I"$root" -I"$root/src" -I"$root/upstream/bbhost/src" \
+        -isystem "$stubs" -I"$root" -I"$root/src" -I"$root/upstream/bbhost/src" \
         "$file" 2>&1)
     if [ $? -ne 0 ]; then
         echo "syntax_check: FAIL: $(basename "$file")"

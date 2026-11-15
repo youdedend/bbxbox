@@ -320,9 +320,12 @@ enum D3D12_ROOT_SIGNATURE_FLAGS : UINT {
     D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS = 0x10,
     D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS = 0x20,
 };
-enum D3D12_ROOT_SIGNATURE_VERSION : UINT {
-    D3D12_ROOT_SIGNATURE_VERSION_1 = 0x1,
-    D3D12_ROOT_SIGNATURE_VERSION_1_1 = 0x2,
+// The SDK's name is D3D_ROOT_SIGNATURE_VERSION (shared with D3D12CreateRootSignature-
+// Deserializer), not D3D12_ROOT_SIGNATURE_VERSION.
+enum D3D_ROOT_SIGNATURE_VERSION : UINT {
+    D3D_ROOT_SIGNATURE_VERSION_1 = 0x1,
+    D3D_ROOT_SIGNATURE_VERSION_1_0 = 0x1,
+    D3D_ROOT_SIGNATURE_VERSION_1_1 = 0x2,
 };
 enum D3D12_PIPELINE_STATE_FLAGS : UINT {
     D3D12_PIPELINE_STATE_FLAG_NONE = 0,
@@ -745,7 +748,7 @@ struct DECLSPEC_UUID("344488b7-6846-474b-b989-f027448245e0") ID3D12Debug : IUnkn
 
 HRESULT D3D12GetDebugInterface(REFIID riid, void** debug);
 HRESULT D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc,
-                                   D3D12_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
+                                   D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
                                    ID3DBlob** error_blob);
 
 // Feature-query ids the port asks for.
