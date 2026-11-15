@@ -166,7 +166,9 @@ target_compile_definitions(bbhost_guest PUBLIC
     # windows.h (core/elf.cpp: `expected unqualified-id`). The port's own TUs
     # are written without the macros too.
     NOMINMAX)
-target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
+# LibAtrac9 for `hle/ajm.cpp` (the guest's audio decode), monocypher for the
+# network modules' keys; both are upstream's own third-party targets.
+target_link_libraries(bbhost_guest PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
 # `BBHOST_HAVE_SDL3=1` is set above, so `core/portable.cpp` and the audio TUs
 # include SDL3's headers. Only the headers: the app links the DLL.
 if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")

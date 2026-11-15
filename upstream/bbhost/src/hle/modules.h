@@ -212,7 +212,16 @@ void hle_bp_report();
 // and dispatch methods and the Gnm packet emitters, match executed draw and
 // dispatch packets back to them, and log a coverage summary after flip <last>.
 // Diagnostic only.
+// Local change, marked BBX_UWP: this forward declaration introduced `struct
+// GuestMemory` in the global namespace, and the console build's `core/memory.h`
+// names the port's arena with an alias - so a translation unit that includes
+// this header before `core/elf.h` saw two different `GuestMemory`s. Including
+// the real header is what the non-UWP build gets by luck of include order.
+#if defined(BBX_UWP)
+#include "core/memory.h"
+#else
 struct GuestMemory;
+#endif
 void hle_gx_trace_arm(GuestMemory* mem);
 // Command-processor side, for every executed draw / dispatch packet (no-op unless armed).
 // BBHOST_GX_BACKEND=1/2: returns the draw's inputs built from GX state (valid
