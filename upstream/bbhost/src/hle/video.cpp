@@ -312,8 +312,7 @@ void test_requests_read(const std::string& dir) {
     // thread ends here rather than walking a packaged title's directory with the
     // CRT's desktop calls.
     (void)dir;
-    return;
-#endif
+#else
     namespace fs = std::filesystem;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -342,6 +341,7 @@ void test_requests_read(const std::string& dir) {
             g_test_reqs.push_back(std::move(r));
         }
     }
+#endif
 }
 
 void test_requests(std::uint64_t display_va, std::uint64_t count) {
