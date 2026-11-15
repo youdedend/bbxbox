@@ -221,7 +221,8 @@ add_library(bbhost_host STATIC
     "${BBX_BBHOST_ROOT}/src/host/gxvk_heapsnap.cpp"
     "${BBX_BBHOST_ROOT}/src/host/gxvk_lists.cpp"
     "${BBX_BBHOST_ROOT}/src/host/gxvk_lists_leaf.cpp"
-    "${BBX_BBHOST_ROOT}/src/host/gxvk_lists_pool.cpp"
+    # (gxvk_lists_pool.cpp is out: it reaches host/stream_ops.h, which is a
+    # Vulkan type surface. Nothing on the boot path calls it.)
     "${BBX_BBHOST_ROOT}/src/host/host_lists.cpp"
     "${BBX_BBHOST_ROOT}/src/host/label_landing.cpp"
     "${BBX_BBHOST_ROOT}/src/host/list_resolve.cpp"
