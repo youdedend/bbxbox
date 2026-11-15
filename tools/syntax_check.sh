@@ -47,11 +47,16 @@ for file in "${files[@]}"; do
     # are full of constants and helpers that only some translation units use, and
     # -Werror would turn that into a failure that says nothing about the code under
     # test.
+    # -Wno-ignored-attributes: the SDK (and therefore the stubs) put
+    # __declspec(uuid(...)) before `struct`, which plain clang-with-ms-extensions
+    # ignores, and -Werror would turn that decoration into a failure. clang-cl
+    # accepts it, so the Windows job never sees the warning.
     extra=()
     if "$cxx" --version 2>/dev/null | grep -qi clang; then extra+=(-fms-extensions -fdeclspec); fi
     output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror \
         "${extra[@]}" -fno-exceptions \
         -Wno-unused-parameter -Wno-unused-const-variable -Wno-unused-function \
+        -Wno-ignored-attributes \
         -D_WIN32 -DBBX_UWP=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \
         -I"$stubs" -I"$root" -I"$root/src" -I"$root/upstream/bbhost/src" \
         "$file" 2>&1)
