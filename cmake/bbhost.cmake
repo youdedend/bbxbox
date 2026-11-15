@@ -232,7 +232,8 @@ add_library(bbhost_host STATIC
     # (render_hooks.cpp is out: it includes `bbhost_plugin.h`, which is the
     # public plugin SDK header and not part of the vendored source.)
     "${BBX_BBHOST_ROOT}/src/host/shader_bundles.cpp"
-    "${BBX_BBHOST_ROOT}/src/host/shader_liveness.cpp"
+    # (shader_liveness.cpp is out: it includes host/gpu_internal.h, which is the
+    # Vulkan device's own header.)
     "${BBX_BBHOST_ROOT}/src/host/shader_overrides.cpp"
     "${BBX_BBHOST_ROOT}/src/host/shader_patch.cpp"
     "${BBX_BBHOST_ROOT}/src/host/slow_calls.cpp"
