@@ -238,7 +238,8 @@ add_library(bbhost_host STATIC
     "${BBX_BBHOST_ROOT}/src/host/shader_patch.cpp"
     "${BBX_BBHOST_ROOT}/src/host/slow_calls.cpp"
     "${BBX_BBHOST_ROOT}/src/host/tess_lds.cpp"
-    "${BBX_BBHOST_ROOT}/src/host/translation_cache.cpp"
+    # (translation_cache.cpp is out: it includes `translator_fingerprint.h`,
+    # which upstream's build generates from the translator's own hash.)
     "${BBX_BBHOST_ROOT}/src/host/vertex_cutaway.cpp"
     "${BBX_BBHOST_ROOT}/src/host/vertex_snap.cpp"
     # `hle/http.cpp` parses a replay's JSON.
@@ -247,6 +248,8 @@ add_library(bbhost_host STATIC
 target_include_directories(bbhost_host PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim"
     "${BBX_BBHOST_ROOT}/src"
+    # `host/shader_bundles.cpp` includes `bbx_self.h` by bare name.
+    "${BBX_BBHOST_ROOT}/src/host/core"
     "${BBX_BBHOST_ROOT}/../.."
     "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/bbhost_generated")
 if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
