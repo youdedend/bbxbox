@@ -48,7 +48,7 @@ std::string EntryStage(const char* entry) {
 
 TEST(TheShaderManifestNamesEveryEntryPointTheBuildCompiles) {
     const auto manifest = Manifest();
-    CHECK_EQ(manifest.count, 4u);
+    CHECK_EQ(manifest.count, 6u);
     CHECK(manifest.items != nullptr);
     // Present is a fullscreen triangle (no vertex buffer, no input layout);
     // overlay is the telemetry/HUD pass. Both are needed for the first frame.
@@ -56,6 +56,9 @@ TEST(TheShaderManifestNamesEveryEntryPointTheBuildCompiles) {
     CHECK(std::strcmp(manifest.items[1].symbol, "PresentPs") == 0);
     CHECK(std::strcmp(manifest.items[2].symbol, "OverlayVs") == 0);
     CHECK(std::strcmp(manifest.items[3].symbol, "OverlayPs") == 0);
+    // The compute passes: the detile and the boot self-test.
+    CHECK(std::strcmp(manifest.items[4].symbol, "UntileCs") == 0);
+    CHECK(std::strcmp(manifest.items[5].symbol, "SelftestCs") == 0);
     for (std::size_t i = 0; i < manifest.count; ++i) {
         const EntryPoint& point = manifest.items[i];
         CHECK(point.symbol != nullptr);

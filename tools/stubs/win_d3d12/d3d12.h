@@ -23,9 +23,25 @@ struct ID3D12CommandList;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Fence;
 struct ID3D12Resource;
+
+// A GPU virtual address is a plain 64-bit value in the SDK; a typedef keeps the
+// declaration honest without needing the DXGI header's spelling.
+using D3D12_GPU_VIRTUAL_ADDRESS = unsigned long long;
 struct ID3D12DescriptorHeap;
 struct ID3D12RootSignature;
 struct ID3D12PipelineState;
+struct ID3DBlob;
+
+struct D3D12_ROOT_SIGNATURE_DESC;
+struct D3D12_DESCRIPTOR_RANGE;
+struct D3D12_ROOT_PARAMETER;
+struct D3D12_STATIC_SAMPLER_DESC;
+struct D3D12_SHADER_BYTECODE;
+struct D3D12_INPUT_LAYOUT_DESC;
+struct D3D12_BLEND_DESC;
+struct D3D12_RASTERIZER_DESC;
+struct D3D12_DEPTH_STENCIL_DESC;
+struct D3D12_CACHED_PIPELINE_STATE;
 
 struct D3D12_COMMAND_SIGNATURE_DESC;
 struct D3D12_ROOT_SIGNATURE_DESC;
@@ -40,6 +56,7 @@ struct D3D12_DESCRIPTOR_HEAP_DESC;
 struct D3D12_CPU_DESCRIPTOR_HANDLE;
 struct D3D12_GPU_DESCRIPTOR_HANDLE;
 struct D3D12_VERTEX_BUFFER_VIEW;
+struct D3D12_INDEX_BUFFER_VIEW;
 struct D3D12_INDEX_BUFFER_VIEW;
 struct D3D12_VIEWPORT;
 struct D3D12_RECT;
@@ -345,6 +362,18 @@ struct D3D12_CPU_DESCRIPTOR_HANDLE {
     SIZE_T ptr = 0;
 };
 
+struct D3D12_VERTEX_BUFFER_VIEW {
+    D3D12_GPU_VIRTUAL_ADDRESS BufferLocation = 0;
+    UINT SizeInBytes = 0;
+    UINT StrideInBytes = 0;
+};
+
+struct D3D12_INDEX_BUFFER_VIEW {
+    D3D12_GPU_VIRTUAL_ADDRESS BufferLocation = 0;
+    UINT SizeInBytes = 0;
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct D3D12_GPU_DESCRIPTOR_HANDLE {
     UINT64 ptr = 0;
 };
@@ -431,6 +460,12 @@ struct D3D12_RENDER_TARGET_VIEW_DESC {
     D3D12_TEX2D_RTV Texture2D;
 };
 
+// Raw (byte-address) buffers: the format is R32_TYPELESS and this flag says so.
+constexpr UINT D3D12_BUFFER_SRV_FLAG_NONE = 0;
+constexpr UINT D3D12_BUFFER_SRV_FLAG_RAW = 0x1;
+constexpr UINT D3D12_BUFFER_UAV_FLAG_NONE = 0;
+constexpr UINT D3D12_BUFFER_UAV_FLAG_RAW = 0x1;
+
 struct D3D12_SHADER_RESOURCE_VIEW_DESC {
     DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
     UINT ViewDimension = 0;
@@ -441,6 +476,75 @@ struct D3D12_SHADER_RESOURCE_VIEW_DESC {
         UINT PlaneSlice = 0;
         UINT ResourceMinLODClamp = 0;
     } Texture2D;
+    struct {
+        UINT FirstElement = 0;
+        UINT NumElements = 0;
+        UINT StructureByteStride = 0;
+        UINT Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    } Buffer;
+};
+
+struct D3D12_SUBRESOURCE_FOOTPRINT {
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+    UINT Width = 0;
+    UINT Height = 0;
+    UINT Depth = 0;
+    UINT RowPitch = 0;
+};
+
+struct D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+    UINT64 Offset = 0;
+    D3D12_SUBRESOURCE_FOOTPRINT Footprint;
+};
+
+enum D3D12_TEXTURE_COPY_TYPE : UINT {
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX = 0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT = 1,
+};
+
+// One struct for both sides of a copy, exactly as the SDK has it: `Type` says
+// which union arm is live, and the stub keeps both arms as plain members because
+// nothing here reads the inactive one.
+struct D3D12_TEXTURE_COPY_LOCATION {
+    ID3D12Resource* pResource = nullptr;
+    D3D12_TEXTURE_COPY_TYPE Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT PlacedFootprint;
+    UINT SubresourceIndex = 0;
+};
+
+// Not an enum in the SDK (it is a plain UINT), so these are constants: a struct
+// field typed UINT must accept `= D3D12_SRV_DIMENSION_TEXTURE2D` and g++ is happy.
+constexpr UINT D3D12_SRV_DIMENSION_UNKNOWN = 0;
+constexpr UINT D3D12_SRV_DIMENSION_BUFFER = 1;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURE1D = 2;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURE2D = 4;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURE2DARRAY = 5;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURE2DMS = 6;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURE3D = 8;
+constexpr UINT D3D12_SRV_DIMENSION_TEXTURECUBE = 9;
+constexpr UINT D3D12_UAV_DIMENSION_UNKNOWN = 0;
+constexpr UINT D3D12_UAV_DIMENSION_BUFFER = 1;
+constexpr UINT D3D12_UAV_DIMENSION_TEXTURE1D = 2;
+constexpr UINT D3D12_UAV_DIMENSION_TEXTURE2D = 4;
+constexpr UINT D3D12_UAV_DIMENSION_TEXTURE2DARRAY = 5;
+constexpr UINT D3D12_UAV_DIMENSION_TEXTURE3D = 8;
+
+struct D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+    UINT ViewDimension = D3D12_UAV_DIMENSION_UNKNOWN;
+    struct {
+        UINT FirstElement = 0;
+        UINT NumElements = 0;
+        UINT StructureByteStride = 0;
+        UINT64 CounterOffsetInBytes = 0;
+        UINT Flags = 0;
+    } Buffer;
+};
+
+enum D3D12_INDEX_BUFFER_STRIP_CUT_VALUE : UINT {
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED = 0,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF = 1,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF = 2,
 };
 
 struct D3D12_SAMPLER_DESC {
@@ -569,6 +673,7 @@ struct DECLSPEC_UUID("696442be-a72e-4059-bc79-5b5c98040fad") ID3D12Resource : ID
     virtual HRESULT ReadFromSubresource(void* dst, UINT dst_row_pitch, UINT dst_depth_pitch,
                                        UINT subresource, const void* region) = 0;
     virtual HRESULT GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) = 0;
+    virtual D3D12_GPU_VIRTUAL_ADDRESS GetGPUVirtualAddress() = 0;
 };
 
 struct DECLSPEC_UUID("7116d91c-e7e4-47ce-b8c6-ec8168f437e5") ID3D12CommandList : ID3D12DeviceChild {
@@ -588,6 +693,13 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
     virtual void DrawIndexedInstanced(UINT index_count, UINT instance_count, UINT index_offset,
                                       INT base_vertex, UINT instance_offset) = 0;
     virtual void Dispatch(UINT x, UINT y, UINT z) = 0;
+    virtual void IASetVertexBuffers(UINT start_slot, UINT count,
+                                    const D3D12_VERTEX_BUFFER_VIEW* views) = 0;
+    virtual void IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) = 0;
+    // The events the replay emits for the recorder's markers; a no-op without a
+    // debug layer, which is exactly what they are on a retail console.
+    virtual void BeginEvent(UINT metadata, const void* data, UINT size) = 0;
+    virtual void EndEvent() = 0;
     virtual void CopyBufferRegion(ID3D12Resource* destination, UINT64 destination_offset,
                                   ID3D12Resource* source, UINT64 source_offset, UINT64 bytes) = 0;
     virtual void CopyTextureRegion(const void* destination, UINT destination_x, UINT destination_y,
@@ -603,7 +715,6 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
                                               ID3D12Resource* resource, const UINT values[4],
                                               UINT rect_count, const D3D12_RECT* rects) = 0;
     virtual void DiscardResource(ID3D12Resource* resource, const void* region) = 0;
-    virtual void IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) = 0;
     virtual void RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) = 0;
     virtual void RSSetScissorRects(UINT count, const D3D12_RECT* rects) = 0;
     virtual void OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs,
@@ -618,6 +729,8 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
                                               UINT offset) = 0;
     virtual void SetComputeRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) = 0;
     virtual void SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) = 0;
+    virtual void SetComputeRoot32BitConstants(UINT index, UINT count, const void* values,
+                                              UINT offset) = 0;
 };
 
 struct DECLSPEC_UUID("c4fec28f-7966-4e95-9f94-f431cb56c3b8") IDXGIAdapter3;
@@ -632,8 +745,8 @@ struct DECLSPEC_UUID("344488b7-6846-474b-b989-f027448245e0") ID3D12Debug : IUnkn
 
 HRESULT D3D12GetDebugInterface(REFIID riid, void** debug);
 HRESULT D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc,
-                                   D3D12_ROOT_SIGNATURE_VERSION version, void** blob,
-                                   void** error_blob);
+                                   D3D12_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
+                                   ID3DBlob** error_blob);
 
 // Feature-query ids the port asks for.
 enum D3D12_FEATURE : UINT {
@@ -681,3 +794,193 @@ struct D3D12_FEATURE_DATA_D3D12_OPTIONS1 {
 constexpr UINT D3D_SHADER_MODEL_6_4 = 0x64;
 constexpr UINT D3D12_RESOURCE_BINDING_TIER_3 = 3;
 constexpr UINT D3D12_RESOURCE_BINDING_TIER_2 = 2;
+
+// --- root signatures and pipeline state --------------------------------------
+enum D3D12_STATIC_BORDER_COLOR : UINT {
+    D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK = 0,
+    D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK = 1,
+    D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE = 2,
+};
+
+enum D3D12_CONSERVATIVE_RASTERIZATION_MODE : UINT {
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF = 0,
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON = 1,
+};
+
+struct D3D12_DESCRIPTOR_RANGE {
+    D3D12_DESCRIPTOR_RANGE_TYPE RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    UINT NumDescriptors = 1;
+    UINT BaseShaderRegister = 0;
+    UINT RegisterSpace = 0;
+    UINT OffsetInDescriptorsFromTableStart = D3D12_APPEND_ALIGNED_ELEMENT;
+};
+
+struct D3D12_ROOT_DESCRIPTOR_TABLE {
+    UINT NumDescriptorRanges = 0;
+    const D3D12_DESCRIPTOR_RANGE* pDescriptorRanges = nullptr;
+};
+
+struct D3D12_ROOT_CONSTANTS {
+    UINT ShaderRegister = 0;
+    UINT RegisterSpace = 0;
+    UINT Num32BitValues = 0;
+};
+
+struct D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER_TYPE ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    D3D12_ROOT_DESCRIPTOR_TABLE DescriptorTable;
+    D3D12_ROOT_CONSTANTS Constants;
+    D3D12_SHADER_VISIBILITY ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+};
+
+struct D3D12_STATIC_SAMPLER_DESC {
+    D3D12_FILTER Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    D3D12_TEXTURE_ADDRESS_MODE AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    D3D12_TEXTURE_ADDRESS_MODE AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    D3D12_TEXTURE_ADDRESS_MODE AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    float MipLODBias = 0;
+    UINT MaxAnisotropy = 1;
+    D3D12_COMPARISON_FUNC ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    D3D12_STATIC_BORDER_COLOR BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    float MinLOD = 0;
+    float MaxLOD = 3.402823466e+38f;
+    UINT ShaderRegister = 0;
+    UINT RegisterSpace = 0;
+    D3D12_SHADER_VISIBILITY ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+};
+
+struct D3D12_ROOT_SIGNATURE_DESC {
+    UINT NumParameters = 0;
+    const D3D12_ROOT_PARAMETER* pParameters = nullptr;
+    UINT NumStaticSamplers = 0;
+    const D3D12_STATIC_SAMPLER_DESC* pStaticSamplers = nullptr;
+    D3D12_ROOT_SIGNATURE_FLAGS Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+};
+
+struct D3D12_SHADER_BYTECODE {
+    const void* pShaderBytecode = nullptr;
+    SIZE_T BytecodeLength = 0;
+};
+
+struct D3D12_INPUT_ELEMENT_DESC {
+    LPCSTR SemanticName = nullptr;
+    UINT SemanticIndex = 0;
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+    UINT InputSlot = 0;
+    UINT AlignedByteOffset = 0;
+    D3D12_INPUT_CLASSIFICATION InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    UINT InstanceDataStepRate = 0;
+};
+
+struct D3D12_INPUT_LAYOUT_DESC {
+    const D3D12_INPUT_ELEMENT_DESC* pInputElementDescs = nullptr;
+    UINT NumElements = 0;
+};
+
+struct D3D12_RENDER_TARGET_BLEND_DESC {
+    BOOL BlendEnable = FALSE;
+    BOOL LogicOpEnable = FALSE;
+    D3D12_BLEND SrcBlend = D3D12_BLEND_ONE;
+    D3D12_BLEND DestBlend = D3D12_BLEND_ZERO;
+    D3D12_BLEND_OP BlendOp = D3D12_BLEND_OP_ADD;
+    D3D12_BLEND SrcBlendAlpha = D3D12_BLEND_ONE;
+    D3D12_BLEND DestBlendAlpha = D3D12_BLEND_ZERO;
+    D3D12_BLEND_OP BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    UINT8 LogicOp = 0;
+    UINT8 RenderTargetWriteMask = 0x0F;
+};
+
+struct D3D12_BLEND_DESC {
+    BOOL AlphaToCoverageEnable = FALSE;
+    BOOL IndependentBlendEnable = FALSE;
+    D3D12_RENDER_TARGET_BLEND_DESC RenderTarget[8];
+};
+
+struct D3D12_RASTERIZER_DESC {
+    D3D12_FILL_MODE FillMode = D3D12_FILL_MODE_SOLID;
+    D3D12_CULL_MODE CullMode = D3D12_CULL_MODE_BACK;
+    BOOL FrontCounterClockwise = FALSE;
+    INT DepthBias = 0;
+    float DepthBiasClamp = 0;
+    float SlopeScaledDepthBias = 0;
+    BOOL DepthClipEnable = TRUE;
+    BOOL MultisampleEnable = FALSE;
+    BOOL AntialiasedLineEnable = FALSE;
+    UINT ForcedSampleCount = 0;
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE ConservativeRaster =
+        D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+};
+
+struct D3D12_DEPTH_STENCILOP_DESC {
+    D3D12_STENCIL_OP StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    D3D12_STENCIL_OP StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    D3D12_STENCIL_OP StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    D3D12_COMPARISON_FUNC StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+};
+
+struct D3D12_DEPTH_STENCIL_DESC {
+    BOOL DepthEnable = TRUE;
+    D3D12_DEPTH_WRITE_MASK DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    D3D12_COMPARISON_FUNC DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    BOOL StencilEnable = FALSE;
+    UINT8 StencilReadMask = 0xFF;
+    UINT8 StencilWriteMask = 0xFF;
+    D3D12_DEPTH_STENCILOP_DESC FrontFace;
+    D3D12_DEPTH_STENCILOP_DESC BackFace;
+};
+
+struct D3D12_CACHED_PIPELINE_STATE {
+    const void* pCachedBlob = nullptr;
+    SIZE_T CachedBlobSizeInBytes = 0;
+};
+
+struct D3D12_STREAM_OUTPUT_DESC {
+    const void* pSODeclaration = nullptr;
+    UINT NumEntries = 0;
+    const UINT* pBufferStrides = nullptr;
+    UINT NumStrides = 0;
+    UINT RasterizedStream = 0;
+};
+
+struct D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+    ID3D12RootSignature* pRootSignature = nullptr;
+    D3D12_SHADER_BYTECODE VS;
+    D3D12_SHADER_BYTECODE PS;
+    D3D12_SHADER_BYTECODE DS;
+    D3D12_SHADER_BYTECODE HS;
+    D3D12_SHADER_BYTECODE GS;
+    D3D12_STREAM_OUTPUT_DESC StreamOutput;
+    D3D12_BLEND_DESC BlendState;
+    UINT SampleMask = 0xFFFFFFFF;
+    D3D12_RASTERIZER_DESC RasterizerState;
+    D3D12_DEPTH_STENCIL_DESC DepthStencilState;
+    DXGI_FORMAT DSVFormat = DXGI_FORMAT_UNKNOWN;
+    D3D12_INPUT_LAYOUT_DESC InputLayout;
+    // Typed as the SDK types it (an enum, not UINT): an `= 0` would compile here
+    // and fail on the real header, which is the bug class this stub exists for.
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue =
+        D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    UINT NumRenderTargets = 1;
+    DXGI_FORMAT RTVFormats[8] = {DXGI_FORMAT_UNKNOWN};
+    DXGI_SAMPLE_DESC SampleDesc{1, 0};
+    UINT NodeMask = 0;
+    D3D12_CACHED_PIPELINE_STATE CachedPSO;
+    D3D12_PIPELINE_STATE_FLAGS Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+};
+
+struct D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    ID3D12RootSignature* pRootSignature = nullptr;
+    D3D12_SHADER_BYTECODE CS;
+    UINT NodeMask = 0;
+    D3D12_CACHED_PIPELINE_STATE CachedPSO;
+    D3D12_PIPELINE_STATE_FLAGS Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+};
+
+struct ID3DBlob : IUnknown {
+    virtual const void* GetBufferPointer() = 0;
+    virtual SIZE_T GetBufferSize() = 0;
+};
+
+struct DECLSPEC_UUID("c079a9e4-0e4a-4d8b-9f0f-1fd2f6b8a3a1") ID3D12RootSignature : ID3D12DeviceChild {};
+struct DECLSPEC_UUID("765a30f3-f624-4c6f-a828-ace948622445") ID3D12PipelineState : ID3D12Pageable {};

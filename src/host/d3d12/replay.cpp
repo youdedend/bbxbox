@@ -1,0 +1,817 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// The replay, as described in replay.h.
+#include "src/host/d3d12/replay.h"
+
+#include <cstdio>
+#include <cstring>
+
+#include "src/host/d3d12/bbx_barriers.h"
+#include "src/host/d3d12/device.h"
+#include "src/host/d3d12/pipeline.h"
+#include "src/host/d3d12/swapchain.h"
+
+namespace bbx::d3d12 {
+namespace {
+
+constexpr std::uint64_t kUploadRingBytes = 4ull << 20;  // 4 MiB a frame
+constexpr std::uint64_t kOverlayBytes = 64ull << 10;    // 2,048 quads
+constexpr std::uint32_t kWhite = 0xFFFFFFFFu;
+constexpr std::uint32_t kFrameImageSize = 256;  // the placeholder final image
+
+// The CPU's copy of stream_selftest.hlsl's Pattern(). Both must agree; the
+// arithmetic is pinned by the host test for the shader's contract.
+std::uint32_t SelftestPattern(std::uint32_t index, std::uint32_t seed) {
+    return index * 2654435761u + seed;
+}
+
+std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+D3D12_RESOURCE_DESC BufferDesc(std::uint64_t bytes, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+    return desc;
+}
+
+D3D12_HEAP_PROPERTIES HeapProperties(D3D12_HEAP_TYPE type) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = type;
+    if (type == D3D12_HEAP_TYPE_UPLOAD) {
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    } else if (type == D3D12_HEAP_TYPE_DEFAULT) {
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    }
+    return heap;
+}
+
+D3D12_RANGE kNoRead{0, 0};
+
+}  // namespace
+
+Replay::~Replay() { Destroy(); }
+
+// ---------------------------------------------------------------------------
+// Creation
+// ---------------------------------------------------------------------------
+
+Status Replay::Create(Device& device, Swapchain& swapchain, PipelineSet& pipelines) {
+    Destroy();
+    device_ = &device;
+    swapchain_ = &swapchain;
+    pipelines_ = &pipelines;
+    frame_width_ = swapchain.Width();
+    frame_height_ = swapchain.Height();
+    // A freshly gotten swapchain buffer is in RENDER_TARGET; every EndFrame moves
+    // the buffer it presented to PRESENT.
+    buffer_state_.fill(D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    // One command list: bbhost builds the frame on the CPU and submits once, so a
+    // second list would only add a sync point. (P3's draw path keeps this.)
+    const HRESULT list = device.Get()->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, device.FrameAllocator(), nullptr,
+        __uuidof(ID3D12GraphicsCommandList),
+        reinterpret_cast<void**>(command_list_.GetAddressOf()));
+    if (FAILED(list)) {
+        Log("replay: CreateCommandList failed: 0x%08lX", static_cast<unsigned long>(list));
+        return FromHresult(list);
+    }
+    command_list_->Close();
+
+    Status status = CreateUploadRing();
+    if (status != Status::kOk) { return status; }
+    status = CreateOverlayBuffer();
+    if (status != Status::kOk) { return status; }
+    status = CreateFrameImage(kFrameImageSize, kFrameImageSize);
+    if (status != Status::kOk) { return status; }
+    // A 1x1 white texture: the source for solid overlay panels, so the overlay
+    // pass has one pipeline and one descriptor shape whether or not a glyph atlas
+    // was uploaded.
+    status = CreateWhiteTexture();
+    if (status != Status::kOk) { return status; }
+
+    // The pipelines are created lazily by PipelineSet::Ensure; ask for the two the
+    // frame needs now so a missing PSO is reported at boot, not mid-frame.
+    for (const PassKind kind : {PassKind::kPresent, PassKind::kOverlay, PassKind::kUntile,
+                                PassKind::kSelftest}) {
+        if (pipelines_->Ensure(kind) == nullptr) {
+            Log("replay: %s will not be available this run", PassName(kind));
+        }
+    }
+    Log("replay: ready (%ux%u, %llu KiB upload ring)", frame_width_, frame_height_,
+        static_cast<unsigned long long>(kUploadRingBytes >> 10));
+    return Status::kOk;
+}
+
+Status Replay::CreateUploadRing() {
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC desc = BufferDesc(kUploadRingBytes, D3D12_RESOURCE_FLAG_NONE);
+    const HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(upload_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: upload ring failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    const HRESULT mapped = upload_->Map(0, &kNoRead, &upload_mapped_);
+    if (FAILED(mapped)) { return FromHresult(mapped); }
+    upload_capacity_ = kUploadRingBytes;
+    upload_used_ = 0;
+    return Status::kOk;
+}
+
+Status Replay::CreateOverlayBuffer() {
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC desc = BufferDesc(kOverlayBytes, D3D12_RESOURCE_FLAG_NONE);
+    const HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(overlay_vertices_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: overlay vertex buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    const HRESULT mapped = overlay_vertices_->Map(0, &kNoRead, &overlay_mapped_);
+    if (FAILED(mapped)) { return FromHresult(mapped); }
+    overlay_capacity_ = kOverlayBytes / sizeof(OverlayVertex);
+    return Status::kOk;
+}
+
+Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    const HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(frame_image_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: frame image failed: 0x%08lX", static_cast<unsigned long>(hr));
+        // The present pass can still run against the atlas texture; say so.
+        frame_image_.Reset();
+        return FromHresult(hr);
+    }
+    frame_srv_ = AllocateCbvSrvUav();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device_->Get()->CreateShaderResourceView(frame_image_.Get(), &srv, frame_srv_.cpu);
+    return Status::kOk;
+}
+
+Status Replay::CreateWhiteTexture() {
+    constexpr std::uint32_t kWhitePixel = 0xFFFFFFFFu;
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> white;
+    const HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(white.GetAddressOf()));
+    if (FAILED(hr)) { return FromHresult(hr); }
+    void* mapped = nullptr;
+    if (FAILED(white->Map(0, &kNoRead, &mapped)) || mapped == nullptr) {
+        Log("replay: white texture could not be mapped");
+        return Status::kUnavailable;
+    }
+    std::memcpy(mapped, &kWhitePixel, sizeof(kWhitePixel));
+    white->Unmap(0, nullptr);
+    white_ = std::move(white);
+
+    white_srv_ = AllocateCbvSrvUav();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device_->Get()->CreateShaderResourceView(white_.Get(), &srv, white_srv_.cpu);
+    return Status::kOk;
+}
+
+Replay::Slice Replay::AllocateCbvSrvUav(std::uint32_t count) {
+    Slice slice{};
+    ID3D12DescriptorHeap* heap = device_->CbvSrvUavHeap();
+    if (heap == nullptr) { return slice; }
+    const std::uint32_t stride = device_->CbvSrvUavStride();
+    slice.cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    slice.gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    slice.cpu.ptr += static_cast<SIZE_T>(next_cbv_srv_uav_) * stride;
+    slice.gpu.ptr += static_cast<UINT64>(next_cbv_srv_uav_) * stride;
+    next_cbv_srv_uav_ += count;
+    if (next_cbv_srv_uav_ >= Device::kCbvSrvUavDescriptors) {
+        // The permanent descriptors are bounded; a boot that allocated them all is
+        // a bug in the port, not a guest's doing. Wrap and log once.
+        Log("replay: the permanent descriptor block is full (%u used)",
+            Device::kCbvSrvUavDescriptors);
+        next_cbv_srv_uav_ = 0;
+    }
+    return slice;
+}
+
+Replay::Slice Replay::ReserveSamplers(std::uint32_t count) {
+    Slice slice{};
+    ID3D12DescriptorHeap* heap = device_->SamplerHeap();
+    if (heap == nullptr) { return slice; }
+    const std::uint32_t stride = device_->SamplerStride();
+    slice.cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    slice.gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    slice.cpu.ptr += static_cast<SIZE_T>(next_sampler_) * stride;
+    slice.gpu.ptr += static_cast<UINT64>(next_sampler_) * stride;
+    next_sampler_ += count;
+    if (next_sampler_ >= Device::kSamplerDescriptors) { next_sampler_ = 0; }
+    return slice;
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame
+// ---------------------------------------------------------------------------
+
+Status Replay::BeginFrame() {
+    if (command_list_ == nullptr || device_ == nullptr) { return Status::kUnavailable; }
+    if (in_frame_) { return Status::kInvalidArgument; }
+    // The allocator may only be reset once the GPU has finished the frame that
+    // used it; Device::NextFrame already cycled after that proof.
+    const HRESULT reset = device_->FrameAllocator()->Reset();
+    if (FAILED(reset)) {
+        Log("replay: allocator reset failed: 0x%08lX", static_cast<unsigned long>(reset));
+        return FromHresult(reset);
+    }
+    const HRESULT list = command_list_->Reset(device_->FrameAllocator(), nullptr);
+    if (FAILED(list)) { return FromHresult(list); }
+
+    upload_used_ = 0;
+    overlay_count_ = 0;
+    frame_width_ = swapchain_->Width();
+    frame_height_ = swapchain_->Height();
+
+    ID3D12DescriptorHeap* heaps[] = {device_->CbvSrvUavHeap()};
+    command_list_->SetDescriptorHeaps(1, heaps);
+    in_frame_ = true;
+    return Status::kOk;
+}
+
+Status Replay::ExecuteStreamBlock(std::span<const std::uint8_t> block) {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    // WalkStream is callback-driven, so the replay counts as it emits and keeps
+    // the walk's verdict: a block that stops at a structural error is replayed up
+    // to that point and reported, never read past.
+    const WalkResult walk = WalkStream(
+        block, [this](const RecordHeader& header, std::span<const std::uint8_t> payload) {
+            ++stats_.records;
+            switch (header.kind) {
+                case RecordKind::kClearColor:
+                case RecordKind::kClearDepth:
+                    // A colour clear needs the guest's image until P3's resource
+                    // table exists; the count still proves the record was read.
+                    ++stats_.clears;
+                    break;
+                case RecordKind::kFill:
+                case RecordKind::kUpdateBuffer:
+                case RecordKind::kCopyBuffer:
+                    ++stats_.copies;
+                    break;
+                case RecordKind::kCopyImage:
+                case RecordKind::kCopyBufferToImage:
+                case RecordKind::kCopyImageToBuffer:
+                    ++stats_.skipped_images;
+                    break;
+                case RecordKind::kBarrier:
+                case RecordKind::kTransferBarrier:
+                case RecordKind::kCopyOrderBarrier:
+                case RecordKind::kPassBarrier:
+                    ++stats_.barriers;
+                    break;
+                case RecordKind::kMarker: {
+                    // The payload is the marker's ASCII name; a PIX event makes a
+                    // capture on a dev console line up with the breadcrumb log.
+                    const char* name = payload.empty()
+                                           ? RecordKindName(header.kind)
+                                           : reinterpret_cast<const char*>(payload.data());
+                    command_list_->BeginEvent(0, name, static_cast<UINT>(payload.size()));
+                    command_list_->EndEvent();
+                    ++stats_.markers;
+                    break;
+                }
+                case RecordKind::kDispatch:
+                case RecordKind::kDispatchIndirect: ++stats_.dispatches; break;
+                case RecordKind::kTimestamp:
+                case RecordKind::kEndQuery:
+                case RecordKind::kCopyQueryResults:
+                    // Timestamps need a query heap per frame; the HUD's frame time
+                    // comes from the fence instead until P3's label writebacks.
+                    ++stats_.markers;
+                    break;
+                default: break;
+            }
+        });
+    if (!walk.ok()) {
+        ++stats_.walk_errors;
+        Log("replay: stream block did not walk cleanly (%s at byte %zu, %zu record(s) read)",
+            WalkErrorName(walk.error), walk.bad_offset, walk.records);
+        return Status::kUnavailable;
+    }
+    return Status::kOk;
+}
+
+Status Replay::DrawPresent(float red, float green, float blue) {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kPresent);
+    if (pso == nullptr) { return Status::kUnavailable; }
+    ID3D12Resource* buffer = swapchain_->CurrentBackBuffer();
+    if (buffer == nullptr) { return Status::kUnavailable; }
+
+    const std::uint32_t index = swapchain_->CurrentIndex();
+    D3D12_RESOURCE_STATES& state = buffer_state_[index % buffer_state_.size()];
+    const Status transition = TransitionBarrier(buffer, state,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (transition != Status::kOk) { return transition; }
+    state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swapchain_->Rtv(index);
+    const float clear[4] = {red, green, blue, 1.0f};
+    command_list_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    const float present_constants[4] = {red, green, blue, 1.0f};
+    command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kPresent));
+    command_list_->SetPipelineState(pso);
+    command_list_->SetGraphicsRoot32BitConstants(0, 4, present_constants, 0);
+    if (frame_srv_.gpu.ptr != 0) {
+        command_list_->SetGraphicsRootDescriptorTable(1, frame_srv_.gpu);
+    } else if (white_srv_.gpu.ptr != 0) {
+        command_list_->SetGraphicsRootDescriptorTable(1, white_srv_.gpu);
+    }
+    // The fullscreen triangle is generated in present.hlsl from SV_VertexID.
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(frame_width_),
+                                  static_cast<float>(frame_height_), 0.0f, 1.0f};
+    command_list_->RSSetViewports(1, &viewport);
+    command_list_->DrawInstanced(3, 1, 0, 0);
+    return Status::kOk;
+}
+
+Status Replay::UploadGlyphAtlas(const std::uint8_t* coverage, std::uint32_t width,
+                                std::uint32_t height) {
+    if (device_ == nullptr || coverage == nullptr || width == 0 || height == 0) {
+        return Status::kInvalidArgument;
+    }
+    // A placed-footprint upload needs a 256-aligned row pitch (the SDK's
+    // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT); the atlas is 1 byte a pixel, so the
+    // rows are repacked here rather than assumed contiguous.
+    constexpr std::uint32_t kPitchAlignment = 256;
+    const std::uint32_t pitch = ((width + kPitchAlignment - 1) / kPitchAlignment) * kPitchAlignment;
+    const std::uint64_t staging_bytes = static_cast<std::uint64_t>(pitch) * height;
+
+    ComPtr<ID3D12Resource> staging;
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC desc = BufferDesc(staging_bytes, D3D12_RESOURCE_FLAG_NONE);
+    HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(staging.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: atlas staging buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    void* mapped = nullptr;
+    if (FAILED(staging->Map(0, &kNoRead, &mapped)) || mapped == nullptr) {
+        return Status::kUnavailable;
+    }
+    auto* rows = static_cast<std::uint8_t*>(mapped);
+    for (std::uint32_t row = 0; row < height; ++row) {
+        std::memcpy(rows + static_cast<std::uint64_t>(row) * pitch,
+                    coverage + static_cast<std::uint64_t>(row) * width, width);
+    }
+
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = width;
+    texture.Height = height;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R8_UNORM;
+    texture.SampleDesc.Count = 1;
+    const D3D12_HEAP_PROPERTIES default_heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    atlas_.Reset();
+    hr = device_->Get()->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_NONE, &texture, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(atlas_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: glyph atlas texture failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+
+    // The copy gets its own submission, outside the frame: the atlas is uploaded
+    // once, at boot, before the first BeginFrame.
+    ID3D12CommandAllocator* allocator = device_->FrameAllocator();
+    const HRESULT reset = allocator->Reset();
+    if (FAILED(reset)) { return FromHresult(reset); }
+    if (FAILED(command_list_->Reset(allocator, nullptr))) { return Status::kUnavailable; }
+    ID3D12DescriptorHeap* heaps[] = {device_->CbvSrvUavHeap()};
+    command_list_->SetDescriptorHeaps(1, heaps);
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = staging.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = 0;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    source.PlacedFootprint.Footprint.Width = width;
+    source.PlacedFootprint.Footprint.Height = height;
+    source.PlacedFootprint.Footprint.Depth = 1;
+    source.PlacedFootprint.Footprint.RowPitch = pitch;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = atlas_.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    command_list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    (void)TransitionBarrier(atlas_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const Status submitted = CloseAndSubmit();
+    if (submitted != Status::kOk) { return submitted; }
+    // The staging buffer must outlive the copy: wait for the fence that covers it
+    // rather than letting it be released with the frame.
+    if (!device_->WaitFor(device_->SubmittedValue())) {
+        Log("replay: the atlas upload's fence did not pass");
+        return device_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+    }
+    staging->Unmap(0, nullptr);
+    device_->NextFrame();
+
+    atlas_srv_ = AllocateCbvSrvUav();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device_->Get()->CreateShaderResourceView(atlas_.Get(), &srv, atlas_srv_.cpu);
+    Log("replay: glyph atlas %ux%u uploaded (%llu bytes, pitch %u)", width, height,
+        static_cast<unsigned long long>(staging_bytes), pitch);
+    return Status::kOk;
+}
+
+void Replay::ResetOverlay() { overlay_count_ = 0; }
+
+void Replay::AddOverlayQuad(float x, float y, float width, float height, float u0, float v0,
+                            float u1, float v1, const float rgba[4]) {
+    if (overlay_count_ + 4 > overlay_capacity_ || overlay_mapped_ == nullptr) { return; }
+    auto* vertices = static_cast<OverlayVertex*>(overlay_mapped_);
+    auto push = [&](float px, float py, float tu, float tv) {
+        OverlayVertex& vertex = vertices[overlay_count_++];
+        vertex.x = px;
+        vertex.y = py;
+        vertex.u = tu;
+        vertex.v = tv;
+        vertex.r = rgba[0];
+        vertex.g = rgba[1];
+        vertex.b = rgba[2];
+        vertex.a = rgba[3];
+    };
+    push(x, y, u0, v0);
+    push(x + width, y, u1, v0);
+    push(x, y + height, u0, v1);
+    push(x + width, y + height, u1, v1);
+}
+
+void Replay::AddOverlaySolid(float x, float y, float width, float height, const float rgba[4]) {
+    // The white texture is the whole quad, so the UVs do not matter past 0..1.
+    AddOverlayQuad(x, y, width, height, 0.0f, 0.0f, 1.0f, 1.0f, rgba);
+}
+
+Status Replay::DrawOverlay() {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    if (overlay_count_ == 0) { return Status::kOk; }
+    ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kOverlay);
+    if (pso == nullptr) { return Status::kUnavailable; }
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swapchain_->Rtv(swapchain_->CurrentIndex());
+    // The overlay draws with the swapchain's target, not the present pass's: no
+    // scene texture is read, only the atlas (or the white 1x1 as a solid).
+    command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    const float constants[4] = {static_cast<float>(frame_width_),
+                                static_cast<float>(frame_height_), 1.0f, 0.0f};
+    command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kOverlay));
+    command_list_->SetPipelineState(pso);
+    command_list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+    const Slice& texture = atlas_srv_.gpu.ptr != 0 ? atlas_srv_ : white_srv_;
+    if (texture.gpu.ptr != 0) {
+        command_list_->SetGraphicsRootDescriptorTable(1, texture.gpu);
+    }
+    const D3D12_VERTEX_BUFFER_VIEW view{overlay_vertices_->GetGPUVirtualAddress(),
+                                        static_cast<UINT>(overlay_count_ * sizeof(OverlayVertex)),
+                                        static_cast<UINT>(sizeof(OverlayVertex))};
+    command_list_->IASetVertexBuffers(0, 1, &view);
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(frame_width_),
+                                  static_cast<float>(frame_height_), 0.0f, 1.0f};
+    command_list_->RSSetViewports(1, &viewport);
+    command_list_->DrawInstanced(overlay_count_, 1, 0, 0);
+    return Status::kOk;
+}
+
+Status Replay::DispatchUntile(const UntilePlan& plan, ID3D12Resource* tiled_source,
+                              ID3D12Resource* linear_destination, std::uint32_t bytes_per_tile) {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    if (!plan.valid || plan.dispatches.empty()) {
+        Log("untile: no plan (%s); the copy is skipped", plan.reason.c_str());
+        return Status::kInvalidArgument;
+    }
+    if (tiled_source == nullptr || linear_destination == nullptr) {
+        return Status::kInvalidArgument;
+    }
+    ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kUntile);
+    if (pso == nullptr) { return Status::kUnavailable; }
+
+    // Source readable, destination writable: both non-pixel shader resource on one
+    // side and UAV on the other, and a UAV barrier between the pairs.
+    (void)TransitionBarrier(tiled_source, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    (void)TransitionBarrier(linear_destination, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const Slice source = AllocateCbvSrvUav();
+    const Slice destination = AllocateCbvSrvUav();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    // ByteAddressBuffer in untile.hlsl: a raw buffer, so R32_TYPELESS + RAW.
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device_->Get()->CreateShaderResourceView(tiled_source, &srv, source.cpu);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->Get()->CreateUnorderedAccessView(linear_destination, nullptr, &uav, destination.cpu);
+
+    command_list_->SetComputeRootSignature(pipelines_->RootSignature(PassKind::kUntile));
+    command_list_->SetPipelineState(pso);
+    for (const UntileDispatch& dispatch : plan.dispatches) {
+        // b0: tile_counts (x,y,z,0), pixels (w,h,0,0) -- the shader's own packing.
+        const std::uint32_t constants[8] = {dispatch.tiles_x, dispatch.tiles_y,
+                                            dispatch.tiles_z, bytes_per_tile,
+                                            plan.width,      plan.height,
+                                            plan.src_row_pitch, 0};
+        command_list_->SetComputeRoot32BitConstants(0, 8, constants, 0);
+        // Root parameters 1 and 2 are the source and destination tables (b0 is 0).
+        command_list_->SetComputeRootDescriptorTable(1, source.gpu);
+        command_list_->SetComputeRootDescriptorTable(2, destination.gpu);
+        command_list_->Dispatch(dispatch.groups_x, dispatch.groups_y, dispatch.groups_z);
+        (void)TransitionBarrier(linear_destination, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, /*uav=*/true);
+        ++stats_.dispatches;
+    }
+    return Status::kOk;
+}
+
+Status Replay::EndFrame(bool vsync) {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    in_frame_ = false;
+    ID3D12Resource* buffer = swapchain_->CurrentBackBuffer();
+    if (buffer == nullptr) { return Status::kUnavailable; }
+    const std::uint32_t index = swapchain_->CurrentIndex();
+    D3D12_RESOURCE_STATES& state = buffer_state_[index % buffer_state_.size()];
+    const Status transition = TransitionBarrier(buffer, state, D3D12_RESOURCE_STATE_PRESENT);
+    if (transition != Status::kOk) { return transition; }
+    state = D3D12_RESOURCE_STATE_PRESENT;
+    const Status submitted = CloseAndSubmit();
+    if (submitted != Status::kOk) { return submitted; }
+    const Status present = swapchain_->Present(vsync);
+    if (present != Status::kOk) { return present; }
+    ++stats_.frames;
+    device_->NextFrame();
+    return Status::kOk;
+}
+
+Status Replay::CloseAndSubmit() {
+    const HRESULT closed = command_list_->Close();
+    if (FAILED(closed)) {
+        Log("replay: command list close failed: 0x%08lX", static_cast<unsigned long>(closed));
+        return FromHresult(closed);
+    }
+    ID3D12CommandList* lists[] = {command_list_.Get()};
+    device_->GraphicsQueue()->ExecuteCommandLists(1, lists);
+    device_->Signal();
+    return Status::kOk;
+}
+
+Status Replay::TransitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+                                 D3D12_RESOURCE_STATES after, bool uav) {
+    if (resource == nullptr) { return Status::kInvalidArgument; }
+    D3D12_RESOURCE_BARRIER barrier{};
+    if (uav) {
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = resource;
+    } else {
+        // A barrier that changes nothing is elided: the console charges for it.
+        if (before == after) { return Status::kOk; }
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+    }
+    command_list_->ResourceBarrier(1, &barrier);
+    return Status::kOk;
+}
+
+Status Replay::CreateSelftestResources(std::uint32_t elements) {
+    const std::uint64_t bytes = static_cast<std::uint64_t>(elements) * sizeof(std::uint32_t);
+    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_RESOURCE_DESC desc = BufferDesc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    HRESULT hr = device_->Get()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(selftest_uav_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("selftest: UAV buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    const D3D12_HEAP_PROPERTIES readback = HeapProperties(D3D12_HEAP_TYPE_READBACK);
+    const D3D12_RESOURCE_DESC readback_desc = BufferDesc(bytes, D3D12_RESOURCE_FLAG_NONE);
+    hr = device_->Get()->CreateCommittedResource(
+        &readback, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        __uuidof(ID3D12Resource), reinterpret_cast<void**>(selftest_readback_.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("selftest: readback buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    selftest_descriptor_ = AllocateCbvSrvUav();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    // RWByteAddressBuffer in stream_selftest.hlsl: raw, R32_TYPELESS + RAW.
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    uav.Buffer.FirstElement = 0;
+    uav.Buffer.NumElements = elements;
+    uav.Buffer.StructureByteStride = 0;
+    device_->Get()->CreateUnorderedAccessView(selftest_uav_.Get(), nullptr, &uav,
+                                             selftest_descriptor_.cpu);
+    return Status::kOk;
+}
+
+Status Replay::RunStreamSelftest(std::uint32_t elements) {
+    if (device_ == nullptr || command_list_ == nullptr || pipelines_ == nullptr) {
+        selftest_report_ = "not run (no device)";
+        return Status::kUnavailable;
+    }
+    ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kSelftest);
+    if (pso == nullptr) {
+        selftest_report_ = "unavailable (SelftestCs PSO refused)";
+        return Status::kUnavailable;
+    }
+    const Status created = CreateSelftestResources(elements);
+    if (created != Status::kOk) {
+        selftest_report_ = "unavailable (buffer creation failed)";
+        return created;
+    }
+
+    const std::uint32_t seed = 0x9E3779B9u;
+    const HRESULT reset = device_->FrameAllocator()->Reset();
+    if (FAILED(reset)) {
+        selftest_report_ = "failed (allocator reset)";
+        return FromHresult(reset);
+    }
+    if (FAILED(command_list_->Reset(device_->FrameAllocator(), pso))) {
+        selftest_report_ = "failed (command list reset)";
+        return Status::kUnavailable;
+    }
+    ID3D12DescriptorHeap* heaps[] = {device_->CbvSrvUavHeap()};
+    command_list_->SetDescriptorHeaps(1, heaps);
+    command_list_->SetComputeRootSignature(pipelines_->RootSignature(PassKind::kSelftest));
+    command_list_->SetPipelineState(pso);
+    // b0 = { count, seed, 0, 0 }
+    const std::uint32_t constants[4] = {elements, seed, 0, 0};
+    command_list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
+    command_list_->SetComputeRootDescriptorTable(1, selftest_descriptor_.gpu);
+    // 64 threads a group, one dispatch group per 64 elements.
+    command_list_->Dispatch((elements + 63u) / 64u, 1, 1);
+    (void)TransitionBarrier(selftest_uav_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, /*uav=*/true);
+    (void)TransitionBarrier(selftest_uav_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_list_->CopyBufferRegion(selftest_readback_.Get(), 0, selftest_uav_.Get(), 0,
+                                    static_cast<UINT64>(elements) * sizeof(std::uint32_t));
+    const Status submitted = CloseAndSubmit();
+    if (submitted != Status::kOk) {
+        selftest_report_ = "failed (submission)";
+        return submitted;
+    }
+    const std::uint64_t value = device_->SubmittedValue();
+    if (!device_->WaitFor(value)) {
+        selftest_report_ = device_->DeviceLost() ? "failed (device lost)" : "failed (fence timeout)";
+        Log("selftest: %s", selftest_report_.c_str());
+        return Status::kDeviceLost;
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, static_cast<SIZE_T>(elements * sizeof(std::uint32_t))};
+    if (FAILED(selftest_readback_->Map(0, &read_range, &mapped)) || mapped == nullptr) {
+        selftest_report_ = "failed (readback map)";
+        return Status::kUnavailable;
+    }
+    const auto* results = static_cast<const std::uint32_t*>(mapped);
+    std::uint32_t bad_index = 0;
+    std::uint32_t bad_value = 0;
+    std::uint32_t bad_expected = 0;
+    bool match = true;
+    for (std::uint32_t index = 0; index < elements; ++index) {
+        const std::uint32_t expected = SelftestPattern(index, seed);
+        if (results[index] != expected) {
+            match = false;
+            bad_index = index;
+            bad_value = results[index];
+            bad_expected = expected;
+            break;
+        }
+    }
+    const D3D12_RANGE no_write{0, 0};
+    selftest_readback_->Unmap(0, &no_write);
+
+    char text[256];
+    if (match) {
+        std::snprintf(text, sizeof(text),
+                      "passed (%u elements, fence %llu, seed 0x%08X)", elements,
+                      static_cast<unsigned long long>(value), seed);
+    } else {
+        std::snprintf(text, sizeof(text),
+                      "FAILED at element %u: got 0x%08X want 0x%08X (fence %llu)", bad_index,
+                      bad_value, bad_expected, static_cast<unsigned long long>(value));
+    }
+    selftest_report_ = text;
+    selftest_passed_ = match;
+    Log("GPU self-test: %s", selftest_report_.c_str());
+    // Reset for the next real frame; the selftest's list is closed and submitted.
+    device_->NextFrame();
+    return match ? Status::kOk : Status::kUnavailable;
+}
+
+std::string ReplayStats::Describe() const {
+    char text[320];
+    std::snprintf(text, sizeof(text),
+                  "replay: %llu frame(s), %llu record(s): %llu clear(s), %llu copy/copies, "
+                  "%llu barrier(s), %llu dispatch(es), %llu marker(s), %llu image copy(s) deferred, "
+                  "%llu walk error(s)",
+                  static_cast<unsigned long long>(frames), static_cast<unsigned long long>(records),
+                  static_cast<unsigned long long>(clears), static_cast<unsigned long long>(copies),
+                  static_cast<unsigned long long>(barriers),
+                  static_cast<unsigned long long>(dispatches),
+                  static_cast<unsigned long long>(markers),
+                  static_cast<unsigned long long>(skipped_images),
+                  static_cast<unsigned long long>(walk_errors));
+    return text;
+}
+
+std::string Replay::Describe() const { return stats_.Describe(); }
+
+void Replay::Destroy() {
+    in_frame_ = false;
+    if (upload_ && upload_mapped_ != nullptr) {
+        upload_->Unmap(0, nullptr);
+        upload_mapped_ = nullptr;
+    }
+    if (overlay_vertices_ && overlay_mapped_ != nullptr) {
+        overlay_vertices_->Unmap(0, nullptr);
+        overlay_mapped_ = nullptr;
+    }
+    selftest_readback_.Reset();
+    selftest_uav_.Reset();
+    selftest_descriptor_ = Slice{};
+    overlay_vertices_.Reset();
+    atlas_.Reset();
+    white_.Reset();
+    frame_image_.Reset();
+    upload_.Reset();
+    command_list_.Reset();
+    overlay_count_ = 0;
+    overlay_capacity_ = 0;
+    upload_capacity_ = 0;
+    upload_used_ = 0;
+    next_cbv_srv_uav_ = 0;
+    next_sampler_ = 0;
+    device_ = nullptr;
+    swapchain_ = nullptr;
+    pipelines_ = nullptr;
+}
+
+}  // namespace bbx::d3d12

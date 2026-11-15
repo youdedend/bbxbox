@@ -166,7 +166,7 @@ done
 if cmake_code xbox/CMakeLists.txt | grep -q -- "enable-16bit-types"; then
   fail "xbox/CMakeLists.txt enables 16-bit types; the console has no native 16-bit ALU"
 fi
-for symbol in PresentVs PresentPs OverlayVs OverlayPs; do
+for symbol in PresentVs PresentPs OverlayVs OverlayPs UntileCs SelftestCs; do
   if ! grep -q "bbx_shader($symbol " xbox/CMakeLists.txt; then
     fail "bbx_shader($symbol ...) is missing from xbox/CMakeLists.txt"
   fi

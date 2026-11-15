@@ -23,12 +23,15 @@ Blob PresentVs() { return MakeBlob(generated::kPresentVs, "present.vs_6_4"); }
 Blob PresentPs() { return MakeBlob(generated::kPresentPs, "present.ps_6_4"); }
 Blob OverlayVs() { return MakeBlob(generated::kOverlayVs, "overlay.vs_6_4"); }
 Blob OverlayPs() { return MakeBlob(generated::kOverlayPs, "overlay.ps_6_4"); }
+Blob UntileCs() { return MakeBlob(generated::kUntileCs, "untile.cs_6_4"); }
+Blob SelftestCs() { return MakeBlob(generated::kSelftestCs, "stream_selftest.cs_6_4"); }
 
 const char* DescribeBlobs() {
     // Static: the boot log writes it once, and this must not allocate.
     static char text[128];
     if (text[0] == '\0') {
-        const Blob blobs[] = {PresentVs(), PresentPs(), OverlayVs(), OverlayPs()};
+        const Blob blobs[] = {PresentVs(), PresentPs(), OverlayVs(),
+                              OverlayPs(), UntileCs(),  SelftestCs()};
         const std::size_t count = sizeof(blobs) / sizeof(blobs[0]);
         std::size_t total = 0;
         for (const Blob& blob : blobs) { total += blob.size; }

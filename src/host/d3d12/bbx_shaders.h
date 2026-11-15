@@ -45,6 +45,11 @@ inline constexpr EntryPoint kPresentVs{"PresentVs", "PresentVs", "vs_6_4", "pres
 inline constexpr EntryPoint kPresentPs{"PresentPs", "PresentPs", "ps_6_4", "present.hlsl"};
 inline constexpr EntryPoint kOverlayVs{"OverlayVs", "OverlayVs", "vs_6_4", "overlay.hlsl"};
 inline constexpr EntryPoint kOverlayPs{"OverlayPs", "OverlayPs", "ps_6_4", "overlay.hlsl"};
+// The compute passes. `UntileCs` detiles a guest texture's GCN micro tiles into a
+// linear one; `SelftestCs` writes a pattern the CPU verifies, which is how a boot
+// proves the queue, the fence and a readback buffer actually work on a console.
+inline constexpr EntryPoint kUntileCs{"UntileCs", "UntileCs", "cs_6_4", "untile.hlsl"};
+inline constexpr EntryPoint kSelftestCs{"SelftestCs", "SelftestCs", "cs_6_4", "stream_selftest.hlsl"};
 
 struct EntryPointList {
     const EntryPoint* items;
@@ -56,7 +61,8 @@ struct EntryPointList {
 // complete, that no profile is newer than SM 6.4 and that nothing is duplicated,
 // and tools/local_precheck.sh checks it against xbox/CMakeLists.txt.
 [[nodiscard]] inline EntryPointList Manifest() {
-    static constexpr EntryPoint kAll[] = {kPresentVs, kPresentPs, kOverlayVs, kOverlayPs};
+    static constexpr EntryPoint kAll[] = {kPresentVs,   kPresentPs, kOverlayVs,
+                                          kOverlayPs,  kUntileCs,  kSelftestCs};
     return EntryPointList{kAll, sizeof(kAll) / sizeof(kAll[0])};
 }
 
@@ -66,8 +72,10 @@ struct EntryPointList {
 [[nodiscard]] Blob PresentPs();
 [[nodiscard]] Blob OverlayVs();
 [[nodiscard]] Blob OverlayPs();
+[[nodiscard]] Blob UntileCs();
+[[nodiscard]] Blob SelftestCs();
 
-// A one-line summary for the boot log: "4 shaders, 3,412 bytes, SM 6.4".
+// A one-line summary for the boot log: "6 shaders, 21,408 bytes, SM 6.4".
 [[nodiscard]] const char* DescribeBlobs();
 
 }  // namespace bbx::shaders

@@ -86,6 +86,8 @@ bbx_shader(PresentVs PresentVs vs_6_4 present.hlsl)
 bbx_shader(PresentPs PresentPs ps_6_4 present.hlsl)
 bbx_shader(OverlayVs OverlayVs vs_6_4 overlay.hlsl)
 bbx_shader(OverlayPs OverlayPs ps_6_4 overlay.hlsl)
+bbx_shader(UntileCs UntileCs cs_6_4 untile.hlsl)
+bbx_shader(SelftestCs SelftestCs cs_6_4 stream_selftest.hlsl)
 
 get_property(BBX_SHADER_OUTPUTS GLOBAL PROPERTY BBX_SHADER_OUTPUTS)
 get_property(BBX_SHADER_PAIRS GLOBAL PROPERTY BBX_SHADER_PAIRS)
@@ -128,6 +130,9 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_budget.cpp
     ../src/host/d3d12/device.cpp
     ../src/host/d3d12/swapchain.cpp
+    ../src/host/d3d12/pipeline.cpp
+    ../src/host/d3d12/bbx_psocache.cpp
+    ../src/host/d3d12/bbx_cache.cpp
 )
 
 set(BBX_APP_SOURCES
