@@ -223,12 +223,9 @@ int pthread_create_name_np(pthread_t* thread, const pthread_attr_t* attr, void* 
         return EAGAIN;
     }
     rec->handle = h;
-    const bool detached = attr != nullptr && attr->detachstate == PTHREAD_CREATE_DETACHED;
-    if (detached) {
+    *thread = reinterpret_cast<pthread_t>(rec);
+    if (attr != nullptr && attr->detachstate == PTHREAD_CREATE_DETACHED) {
         release(rec);  // the creator is not going to join it
-        *thread = rec;
-    } else {
-        *thread = rec;
     }
     ResumeThread(h);
     return 0;
