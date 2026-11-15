@@ -98,7 +98,14 @@ foreach ($binary in $binaries) {
 
 if ($failures.Count -gt 0) {
     Write-Host "check-imports: FAIL"
-    $failures | Sort-Object -Unique | ForEach-Object { Write-Host "  $_" }
+    $unique = @($failures | Sort-Object -Unique)
+    $unique | ForEach-Object { Write-Host "  $_" }
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        # The annotation is the only channel that survives the run afterwards.
+        $body = ($unique -join "`n") -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        if ($body.Length -gt 55000) { $body = $body.Substring($body.Length - 55000) }
+        Write-Output "::error title=import audit::$body"
+    }
     exit 1
 }
 Write-Host "check-imports: PASS ($($binaries.Count) binaries)"
