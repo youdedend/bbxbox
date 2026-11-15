@@ -197,6 +197,8 @@ target_sources(bbxbox PRIVATE
 target_compile_features(bbxbox PRIVATE cxx_std_20)
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1
+    # windows.h's min/max macros versus std::min/std::max in the same file.
+    NOMINMAX
     WINAPI_FAMILY=WINAPI_FAMILY_APP
     # 0x0A00 is Windows 10. `0x10` is a *version*, not a header constant: with it
     # the SDK compiles out everything newer than NT 3.x and GetTickCount64,

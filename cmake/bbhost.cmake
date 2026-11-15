@@ -118,7 +118,14 @@ target_include_directories(bbhost_guest PUBLIC
     # path, so the repository root is on the include path too.
     "${BBX_BBHOST_ROOT}/../..")
 target_compile_features(bbhost_guest PUBLIC cxx_std_20)
-target_compile_definitions(bbhost_guest PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1)
+target_compile_definitions(bbhost_guest PUBLIC
+    BBX_UWP=1
+    BBHOST_HAVE_SDL3=1
+    # <windows.h> defines `min`/`max` as macros unless this is set, and
+    # upstream's C++ uses std::min/std::max in the same translation unit as
+    # windows.h (core/elf.cpp: `expected unqualified-id`). The port's own TUs
+    # are written without the macros too.
+    NOMINMAX)
 target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Upstream's code is not /W4-clean and its warnings are not this port's to
