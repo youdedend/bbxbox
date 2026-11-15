@@ -12,13 +12,13 @@
 // Layout this module understands (offsets are from the start of the file):
 //
 //   0x00  u32 magic          0x1D3D154F ("4F 15 3D 1D" little-endian)
-//   0x04  u32 version        usually 3
+//   0x04  u32              a build/version word; differs per dumper, never trusted
 //   0x08  u16 sdk_type
 //   0x0A  u16 header_type    1 = fSELF (segments plaintext), 2 = signed/encrypted
 //   0x0C  u32 metadata_offset
 //   0x10  u32 header_len     usually 0x20: where the entry table starts
-//   0x14  u32 elf_filesize   the size of the ELF this file wraps (a hint, not a rule)
-//   0x18  u32 num_entries
+//   0x14  u32              elf_filesize on some dumpers, zero on others (a hint, not a rule)
+//   0x18  u32              entry count on some dumpers, garbage on others (never trusted)
 //   0x1C  u32 flags
 //   0x20  SelfEntry[num_entries], 32 bytes each:
 //           0x00  u64 props   bits 0-3 encrypted, 4-7 compressed, 8-11 blocks

@@ -70,6 +70,16 @@ if [ -n "$banned" ]; then
   echo "$banned"
   fail "game files or dumps are tracked"
 fi
+# A dump that is not committed but sitting in the tree is the same problem one
+# `git add -A` later: the bake tool reads it from a path outside the repo, and this
+# check refuses to let a copy take root inside it.
+untracked_dumps=$(git ls-files --others --exclude-standard 2>/dev/null \
+  | grep -Ei '\.(shaderbnd[^/]*|dcx|bin|self|pkg|sfo)$|(^|/)eboot\.bin$|(^|/)Bb\.zip$|(^|/)bbx_shaders\.cache$' || true)
+if [ -n "$untracked_dumps" ]; then
+  echo "$untracked_dumps" | head -5
+  fail "game dump or bake output is present in the work tree (keep it outside the repo)"
+fi
+
 generated=$(git ls-files | grep -E '^(build|build-deps|out)/|\.(obj|pdb|lib|dll|appx|appxupload)$' || true)
 if [ -n "$generated" ]; then
   echo "$generated"
@@ -85,7 +95,7 @@ for pair in "memory-budget.md:4,480" "memory-budget.md:5,120" "porting-plan.md:8
             "precompile-cache.md:precompile_inflight.txt" "console-ux.md:FutureAccessList" \
             "d3d12-backend.md:CreateSwapChainForCoreWindow" "d3d12-backend.md:6_4" \
             "ARCHITECTURE_XBOX_D3D12.md:3840" "ARCHITECTURE_XBOX_D3D12.md:pipeline library" \
-            "PORT_STATUS.md:154" ; do
+            "PORT_STATUS.md:174 host tests" ; do
   file="${pair%%:*}"; needle="${pair#*:}"
   if ! grep -q -- "$needle" "docs/$file" 2>/dev/null; then
     fail "docs/$file no longer mentions $needle"

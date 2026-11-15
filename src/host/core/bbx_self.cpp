@@ -40,6 +40,9 @@ constexpr std::uint32_t kEntryBlocksShift = 8;
 
 constexpr std::uint32_t PT_LOAD = 1;
 constexpr std::uint32_t PT_DYNAMIC = 2;
+// Orbis: the dynamic-link data segment (nid strings, the NID table, the module's
+// own import table).
+constexpr std::uint32_t kPtSceDynlibData = 0x61000000;
 constexpr std::uint16_t kElfMachineX86_64 = 62;
 constexpr std::uint16_t kElfPhdrSize = 56;
 
@@ -143,21 +146,18 @@ struct SelfEntry {
 // Reads the entry table, when the header's count and the file agree about it.
 // `table_ok` false means the file has no usable table, which is legal: a flat
 // fSELF with no compressed segments needs none.
-bool ReadEntryTable(std::span<const std::uint8_t> data, std::uint32_t declared_entries,
-                    std::size_t elf_base, std::vector<SelfEntry>* entries, std::string* why) {
+// The entry count is derived from the file's own geometry rather than from a header
+// field: the table starts at 0x20 and ends where the embedded ELF begins. A dump of
+// Bloodborne v1.09 puts the ELF at 0x120, which is exactly eight 32-byte entries.
+bool ReadEntryTable(std::span<const std::uint8_t> data, std::size_t elf_base,
+                    std::vector<SelfEntry>* entries) {
     entries->clear();
-    if (declared_entries == 0 || declared_entries > 256) {
-        // No table, or a count no eboot has. Not fatal: the segments may all be
-        // plaintext at their p_offset, which the caller then tries.
-        return false;
-    }
-    const std::uint64_t table_end =
-        static_cast<std::uint64_t>(kSelfHeaderSize) + declared_entries * kSelfEntrySize;
-    if (table_end > data.size() || table_end > elf_base + kSelfEntrySize) {
-        *why = "the entry table does not fit the file";
-        return false;
-    }
-    for (std::uint32_t index = 0; index < declared_entries; ++index) {
+    if (elf_base <= kSelfHeaderSize) { return false; }
+    const std::size_t span = elf_base - kSelfHeaderSize;
+    if (span % kSelfEntrySize != 0) { return false; }
+    const std::size_t count = span / kSelfEntrySize;
+    if (count == 0 || count > 64) { return false; }
+    for (std::size_t index = 0; index < count; ++index) {
         const std::uint8_t* p = data.data() + kSelfHeaderSize + index * kSelfEntrySize;
         SelfEntry entry{};
         entry.props = ReadU64(p + kEntryOffProps);
@@ -179,45 +179,30 @@ bool InflateWhole(const std::uint8_t* src, std::size_t src_size, std::uint8_t* d
 
 bool InflateBlocks(const std::uint8_t* src, std::size_t src_size, std::uint8_t* dst,
                    std::size_t dst_size) {
-    // Blocked: each 16 KiB of output is its own zlib stream, back to back.
+    // Blocked: each 16 KiB of output is its own zlib stream, back to back. The
+    // stream itself says how much input it consumed, so this walks them rather than
+    // guessing where each one ends.
     std::size_t in = 0;
     std::size_t out = 0;
     while (out < dst_size) {
-        if (in + 2 > src_size) { return false; }
-        const std::size_t want = std::min(kBlockSize, dst_size - out);
-        uLongf produced = static_cast<uLongf>(want);
-        const int rc = ::uncompress(dst + out, &produced, src + in,
-                                    static_cast<uLong>(src_size - in));
-        if (rc != Z_OK || produced == 0) { return false; }
+        if (in >= src_size) { return false; }
+        z_stream stream{};
+        if (::inflateInit(&stream) != Z_OK) { return false; }
+        stream.next_in = const_cast<Bytef*>(src + in);
+        stream.avail_in = static_cast<uInt>(std::min<std::size_t>(src_size - in, 0xFFFFFFFFu));
+        stream.next_out = dst + out;
+        stream.avail_out = static_cast<uInt>(std::min<std::size_t>(dst_size - out, 0xFFFFFFFFu));
+        const int rc = ::inflate(&stream, Z_FINISH);
+        const std::size_t consumed = stream.total_in;
+        const std::size_t produced = stream.total_out;
+        ::inflateEnd(&stream);
+        if (rc != Z_STREAM_END || produced == 0) { return false; }
         out += produced;
-        // zlib's uncompress does not report how much input it consumed; a blocked
-        // stream's block is self-delimiting, so the consumed length is found by
-        // inflating again with a running total.
-        std::size_t consumed = src_size - in;
-        {
-            // Re-inflate against a shrinking window to find the block's end.
-            std::size_t lo = 0;
-            std::size_t hi = src_size - in;
-            while (lo < hi) {
-                const std::size_t mid = (lo + hi) / 2;
-                uLongf size = static_cast<uLongf>(want);
-                std::vector<std::uint8_t> scratch(want);
-                const int probe = ::uncompress(scratch.data(), &size, src + in,
-                                               static_cast<uLong>(mid));
-                if (probe == Z_OK && size == produced) {
-                    hi = mid;
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            consumed = lo;
-        }
-        if (consumed == 0) { return false; }
         in += consumed;
-        if (produced < want) { break; }
     }
     return out == dst_size;
 }
+
 #endif
 
 }  // namespace
@@ -247,7 +232,7 @@ std::string FselfInfo::Describe() const {
         return text;
     }
     std::snprintf(text, sizeof(text),
-                  "fSELF v%u (header_type %u): %u/%u segment(s) compressed, ELF at 0x%llx, "
+                  "fSELF (build 0x%x, header_type %u): %u/%u segment(s) compressed, ELF at 0x%llx, "
                   "%llu -> %llu bytes",
                   version, header_type, compressed_entries, num_entries,
                   static_cast<unsigned long long>(elf_base),
@@ -296,12 +281,16 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
 
     const std::uint8_t* header = data.data();
     result.info.was_fself = true;
-    result.info.version = ReadU32(header + kOffVersion);
     result.info.sdk_type = ReadU16(header + kOffSdkType);
     result.info.header_type = ReadU16(header + kOffHeaderType);
+    // The size hint is the one header field this port uses: it says how large the
+    // flat image was, which keeps the reconstruction's size equal to the original's
+    // (a mismatch there would change the digest that gates the patches).
     const std::uint32_t declared_elf_size = ReadU32(header + kOffElfFileSize);
-    const std::uint32_t declared_entries = ReadU32(header + kOffNumEntries);
-    result.info.num_entries = declared_entries;
+    // The word at 0x04 is not a version this port understands: the dump used to
+    // develop this module carries 302055680 there, which is a build id, not "v3".
+    // Reported as an opaque field rather than dressed up as a version number.
+    result.info.version = ReadU32(header + kOffVersion);
 
     // A signed SELF is the retail file. Saying so is the whole point: a player who
     // dumped the payload instead of the fake-signed image gets one clear line, not
@@ -330,42 +319,32 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
     }
     result.info.segments = elf.phnum;
 
+    // The entry table is where a fake SELF keeps the real file offsets of its
+    // segments; the embedded ELF's p_offset values describe the flat image this
+    // function rebuilds. They are not the same numbers: in the v1.09 eboot the text
+    // segment is at 0x28eb0 in the file and at 0x4000 in the image, and reading the
+    // image's offset out of the file yields zeros.
     std::vector<SelfEntry> entries;
-    std::string table_why;
-    const bool have_table = ReadEntryTable(data, declared_entries, elf_base, &entries, &table_why);
-    if (!have_table && !table_why.empty()) {
-        // A count that fits the header but whose table runs into the embedded ELF
-        // is not a table this parser can trust: the entries would describe the ELF's
-        // own bytes. That is a corrupt file, and it is named as one.
-        result.error = FselfError::kBadEntryTable;
-        result.why = table_why;
-        return result;
-    }
-    if (!have_table && declared_entries > 256) {
-        // An absurd count is a corrupt header, not a corrupt image: the segments are
-        // still plaintext at their p_offset, so the unwrap proceeds and says what it
-        // ignored.
-        char text[128];
-        std::snprintf(text, sizeof(text), "header claims %u entry table entries; ignored it",
-                      declared_entries);
-        result.info.warning = text;
-    }
-    // The entry table describes the same segments the ELF's program headers do.
-    // When the counts disagree the table is not about these segments, so it is not
-    // used at all — a wrong entry would place a segment's bytes at the wrong
-    // offset, which is far worse than falling back to plaintext.
-    const bool entries_match = have_table && entries.size() == elf.phnum;
+    ReadEntryTable(data, elf_base, &entries);
+    result.info.num_entries = static_cast<std::uint32_t>(entries.size());
 
     struct Placement {
         std::size_t phdr_index = 0;
         ElfProgramHeader phdr{};
         std::size_t src = 0;
         std::size_t stored = 0;
+        std::size_t entry_index = 0;  // 0: not from the entry table
         bool compressed = false;
         bool blocked = false;
+        bool placed = false;
     };
     std::vector<Placement> placements;
+    std::vector<bool> entry_used(entries.size(), false);
 
+    // First pass: the program headers whose size names an entry are the segments.
+    // Matching by size is what the file itself makes checkable; the entry's props
+    // word encodes the index in a way that differs between dumpers, and a wrong
+    // guess there would silently place a segment's bytes over another's.
     for (std::uint16_t index = 0; index < elf.phnum; ++index) {
         const std::size_t phdr_at = elf_base + static_cast<std::size_t>(elf.phoff) +
                                     static_cast<std::size_t>(index) * elf.phentsize;
@@ -380,74 +359,107 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
         phdr.offset = ReadU64(p + 0x08);
         phdr.filesz = ReadU64(p + 0x20);
         phdr.memsz = ReadU64(p + 0x28);
-        if (phdr.filesz == 0) { continue; }
-
         Placement placement{};
         placement.phdr_index = index;
         placement.phdr = phdr;
+        if (phdr.filesz == 0) {
+            placements.push_back(placement);
+            continue;
+        }
+        for (std::size_t e = 0; e < entries.size(); ++e) {
+            if (entry_used[e]) { continue; }
+            const SelfEntry& entry = entries[e];
+            // Which of the two size words agrees with the program header: the one
+            // that does is the image size, and the other - when it is smaller - is
+            // how many bytes the file actually stores. That is the compressed case,
+            // and it is also why neither word is trusted alone.
+            std::uint64_t stored = 0;
+            if (entry.size == phdr.filesz || entry.size == phdr.memsz) {
+                stored = (entry.size2 != 0 && entry.size2 < entry.size) ? entry.size2 : entry.size;
+            } else if (entry.size2 == phdr.filesz || entry.size2 == phdr.memsz) {
+                stored = entry.size;
+            } else {
+                continue;
+            }
+            if (stored == 0 || entry.offset + stored > data.size()) { continue; }
+            placement.src = static_cast<std::size_t>(entry.offset);
+            placement.stored = static_cast<std::size_t>(stored);
+            placement.entry_index = e;
+            entry_used[e] = true;
+            placement.placed = true;
+            ++result.info.plain_entries;
+            break;
+        }
+        placements.push_back(placement);
+    }
 
-        // Order of preference, each validated against the file:
-        //  1. the entry table's offset (that is what the dumper wrote the table for),
-        //  2. p_offset relative to the embedded ELF (the ELF's own convention, and the
-        //     only one that holds for a 90 MB eboot where both readings fit),
-        //  3. p_offset as a file offset (some dumpers rewrite it).
-        bool placed = false;
-        if (entries_match) {
-            const SelfEntry& entry = entries[index];
-            if (entry.encrypted()) {
-                result.error = FselfError::kRetailEncrypted;
-                result.why = "a segment is marked encrypted: this SELF is not fake-signed";
-                return result;
-            }
-            if (entry.offset != 0 && entry.size != 0 && entry.offset + entry.size <= data.size()) {
-                placement.src = static_cast<std::size_t>(entry.offset);
-                placement.stored = static_cast<std::size_t>(entry.size);
-                placement.compressed = entry.compressed();
-                placement.blocked = entry.blocked();
-                // A "compressed" entry whose stored bytes are already the payload is
-                // what an unblocked dumper writes; inflating it would fail, so the
-                // sizes decide.
-                if (placement.compressed && placement.stored >= phdr.filesz) {
-                    placement.compressed = false;
-                }
-                placed = true;
+    // A segment's payload may be compressed: the entry stores the stream and the
+    // program header declares the inflated size. Recognised by the stream's own
+    // header, not by a flag bit whose meaning differs between dumpers.
+    for (Placement& placement : placements) {
+        if (!placement.placed) { continue; }
+        const bool zlib_header = placement.stored >= 2 && data[placement.src] == 0x78 &&
+                                 (data[placement.src + 1] == 0x01 || data[placement.src + 1] == 0x9C ||
+                                  data[placement.src + 1] == 0xDA || data[placement.src + 1] == 0x5E);
+        if (!zlib_header || placement.stored >= placement.phdr.filesz) { continue; }
+        if (!g_inflate_available) {
+            result.error = FselfError::kDecompressUnavailable;
+            result.why = "a segment is zlib-compressed and this build has no zlib";
+            return result;
+        }
+        placement.compressed = true;
+        ++result.info.compressed_entries;
+        if (result.info.plain_entries > 0) { --result.info.plain_entries; }
+    }
+
+    // Second pass: what is left is either inside a segment already placed (an
+    // Orbis ELF's PT_SCE_PROC_PARAM, PT_DYNAMIC and note segments live inside the
+    // text, data or dynlib segment), or at p_offset from the embedded ELF, or at
+    // p_offset from the start of the file. Each reading is bounds-checked first.
+    for (Placement& placement : placements) {
+        if (placement.placed || placement.phdr.filesz == 0) { continue; }
+        const ElfProgramHeader& phdr = placement.phdr;
+        for (const Placement& outer : placements) {
+            if (!outer.placed || outer.phdr.filesz == 0) { continue; }
+            if (outer.compressed) { continue; }
+            if (phdr.offset >= outer.phdr.offset &&
+                phdr.offset + phdr.filesz <= outer.phdr.offset + outer.phdr.filesz) {
+                placement.src = outer.src + static_cast<std::size_t>(phdr.offset - outer.phdr.offset);
+                placement.stored = static_cast<std::size_t>(phdr.filesz);
+                placement.placed = true;
+                break;
             }
         }
-        if (!placed) {
-            const std::uint64_t absolute = phdr.offset;
-            const std::uint64_t relative = static_cast<std::uint64_t>(elf_base) + phdr.offset;
-            if (relative + phdr.filesz <= data.size()) {
-                placement.src = static_cast<std::size_t>(relative);
-                placement.stored = static_cast<std::size_t>(phdr.filesz);
-                placed = true;
-            } else if (absolute + phdr.filesz <= data.size()) {
-                placement.src = static_cast<std::size_t>(absolute);
-                placement.stored = static_cast<std::size_t>(phdr.filesz);
-                placed = true;
-            }
+        if (placement.placed) { continue; }
+        const std::uint64_t relative = static_cast<std::uint64_t>(elf_base) + phdr.offset;
+        if (relative + phdr.filesz <= data.size()) {
+            placement.src = static_cast<std::size_t>(relative);
+            placement.stored = static_cast<std::size_t>(phdr.filesz);
+            placement.placed = true;
+        } else if (phdr.offset + phdr.filesz <= data.size()) {
+            placement.src = static_cast<std::size_t>(phdr.offset);
+            placement.stored = static_cast<std::size_t>(phdr.filesz);
+            placement.placed = true;
         }
-        if (!placed) {
+    }
+    // Only the segments a loader acts on must be placeable. A note segment that is
+    // not inside anything is left zeroed: nothing reads it.
+    for (const Placement& placement : placements) {
+        if (placement.placed) { continue; }
+        if (placement.phdr.type == PT_LOAD || placement.phdr.type == PT_DYNAMIC ||
+            placement.phdr.type == kPtSceDynlibData) {
             result.error = FselfError::kSegmentOutOfBounds;
-            char text[192];
+            char text[256];
             std::snprintf(text, sizeof(text),
-                          "PT_LOAD %u: p_offset 0x%llx, p_filesz 0x%llx, file is 0x%llx bytes",
-                          index, static_cast<unsigned long long>(phdr.offset),
-                          static_cast<unsigned long long>(phdr.filesz),
+                          "program header %zu (type 0x%08x): p_offset 0x%llx, p_filesz 0x%llx, "
+                          "file is 0x%llx bytes",
+                          placement.phdr_index, placement.phdr.type,
+                          static_cast<unsigned long long>(placement.phdr.offset),
+                          static_cast<unsigned long long>(placement.phdr.filesz),
                           static_cast<unsigned long long>(data.size()));
             result.why = text;
             return result;
         }
-        if (placement.compressed) {
-            if (!g_inflate_available) {
-                result.error = FselfError::kDecompressUnavailable;
-                result.why = "a segment is zlib-compressed and this build has no zlib";
-                return result;
-            }
-            ++result.info.compressed_entries;
-        } else {
-            ++result.info.plain_entries;
-        }
-        placements.push_back(placement);
     }
 
     // The image's size: its own headers, plus every segment at its ELF-relative
@@ -488,9 +500,12 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
             continue;
         }
 #if defined(BBX_HAVE_ZLIB)
-        const bool ok = placement.blocked
-                            ? InflateBlocks(src, placement.stored, dst, want)
-                            : InflateWhole(src, placement.stored, dst, want);
+        // A single stream is the common shape; a blocked one is a run of streams.
+        // Trying whole first and blocked second costs one failed inflate on the
+        // blocked files and removes any dependence on a flag bit whose meaning
+        // differs between dumpers.
+        const bool ok = InflateWhole(src, placement.stored, dst, want) ||
+                        InflateBlocks(src, placement.stored, dst, want);
         if (!ok) {
             result.error = FselfError::kDecompressFailed;
             char text[192];

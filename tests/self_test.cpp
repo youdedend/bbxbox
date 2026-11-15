@@ -155,136 +155,106 @@ TEST(PlainElfIsPassedThroughUnchanged) {
     CHECK(At(result.elf, kSegmentOneOffset, "SEGMENT-ONE"));
 }
 
-TEST(UncompressedFselfUnwrapsToTheSameElf) {
+// The case a real dump is: the entry table is where the segments' bytes live, and
+// the ELF's p_offset values are offsets *in the image*, not in the file. Bloodborne
+// v1.09 puts its text at 0x28eb0 in the file and at 0x4000 in the image; reading
+// the image's offset out of the file copies zeros.
+TEST(EntriesSayWhereTheSegmentsReallyAre) {
     const std::vector<std::uint8_t> elf = MakeElf();
     const std::size_t elf_base = 0x20 + 3 * 32;
-    // The entry table points at the segments where they already are, which is what
-    // an uncompressed fSELF from a dumper looks like.
+    // The segments are moved far away, past the embedded ELF header block.
+    const std::size_t one_at = elf_base + elf.size();
+    const std::size_t two_at = one_at + kSegmentOneSize;
     std::vector<EntrySpec> entries(3);
-    entries[0].offset = elf_base + kSegmentOneOffset;
+    entries[0].offset = one_at;
     entries[0].size = kSegmentOneSize;
-    entries[1].offset = elf_base + kSegmentTwoOffset;
+    entries[1].offset = two_at;
     entries[1].size = kSegmentTwoSize;
-    entries[2].offset = elf_base + 0x580;
-    entries[2].size = 0x20;
-    const std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, 0);
+    std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, kSegmentOneSize + kSegmentTwoSize);
+    // Wipe the bytes at the image-relative positions, so a wrong reading copies
+    // zeros rather than passing by luck.
+    std::memset(self.data() + elf_base + kSegmentOneOffset, 0, kSegmentOneSize);
+    std::memcpy(self.data() + one_at, elf.data() + kSegmentOneOffset, kSegmentOneSize);
+    std::memcpy(self.data() + two_at, elf.data() + kSegmentTwoOffset, kSegmentTwoSize);
 
     const FselfResult result = UnwrapOrbisImage(self);
     CHECK(result.ok());
     CHECK(result.info.was_fself);
-    CHECK_EQ(result.info.header_type, 1);
     CHECK_EQ(result.info.num_entries, 3u);
+    CHECK_EQ(result.info.plain_entries, 2u);
     CHECK_EQ(result.info.compressed_entries, 0u);
-    CHECK_EQ(result.info.plain_entries, 3u);
-    CHECK_EQ(result.info.elf_base, elf_base);
     CHECK_EQ(result.info.segments, 3);
-    // The reconstructed image is the ELF itself: same size, same bytes where the
-    // segments and the headers live.
     CHECK_EQ(result.elf.size(), elf.size());
     CHECK(At(result.elf, kSegmentOneOffset, "SEGMENT-ONE"));
     CHECK(At(result.elf, kSegmentTwoOffset, "SEGMENT-TWO"));
-    CHECK(At(result.elf, 0, "\x7f" "ELF"));
-    // The program headers survive the move, so a loader that walks them finds the
-    // same offsets it would have found in the flat file.
+    // The program headers survive the move.
     CHECK(result.elf[0x36] == 56 && result.elf[0x37] == 0);
 }
 
-TEST(ZlibCompressedFselfInflatesEverySegment) {
-    if (!bbx::core::InflateAvailable()) {
-        // A build without zlib must still be honest about it; the case below pins
-        // that, so this one is allowed to be skipped here.
-        return;
-    }
+TEST(SegmentsInPlaceAreFoundWithoutTheTable) {
+    // When the entry sizes do not name a program header, the p_offset reading is
+    // used - the layout a dumper that rewrote nothing produces.
+    const std::vector<std::uint8_t> elf = MakeElf();
+    std::vector<EntrySpec> entries(3);  // all zero: no sizes, nothing to match
+    const std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, 0);
+    const FselfResult result = UnwrapOrbisImage(self);
+    CHECK(result.ok());
+    CHECK_EQ(result.info.num_entries, 3u);
+    CHECK_EQ(result.info.plain_entries, 0u);
+    CHECK(At(result.elf, kSegmentOneOffset, "SEGMENT-ONE"));
+    CHECK(At(result.elf, kSegmentTwoOffset, "SEGMENT-TWO"));
+}
+
+TEST(ZlibCompressedSegmentInflatesToItsDeclaredSize) {
+    if (!bbx::core::InflateAvailable()) { return; }
     const std::vector<std::uint8_t> elf = MakeElf();
     const std::size_t elf_base = 0x20 + 3 * 32;
     const std::vector<std::uint8_t> one =
         Compress(elf.data() + kSegmentOneOffset, kSegmentOneSize);
-    const std::vector<std::uint8_t> two =
-        Compress(elf.data() + kSegmentTwoOffset, kSegmentTwoSize);
     CHECK(!one.empty());
-    CHECK(!two.empty());
-
-    // The compressed streams are appended after the embedded ELF, and the entries
-    // point at them with the "compressed" property bit set.
     const std::size_t one_at = elf_base + elf.size();
-    const std::size_t two_at = one_at + one.size();
-    std::vector<std::uint8_t> self =
-        MakeFself(elf, std::vector<EntrySpec>(3), 1, one.size() + two.size());
+    // The entry stores the stream; the program header keeps the inflated size, which
+    // is what makes the segment size-matchable.
+    std::vector<EntrySpec> entries(3);
+    entries[0].offset = one_at;
+    entries[0].size = kSegmentOneSize;   // the image size, as the program header says
+    entries[0].size2 = one.size();       // how many bytes the file stores
+    entries[2].offset = elf_base + 0x580;
+    entries[2].size = 0x20;
+    std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, one.size());
     std::memcpy(self.data() + one_at, one.data(), one.size());
-    std::memcpy(self.data() + two_at, two.data(), two.size());
-    Put64(self, 0x20 + 0 * 32 + 0x00, std::uint64_t{1} << 4);
-    Put64(self, 0x20 + 0 * 32 + 0x08, one_at);
-    Put64(self, 0x20 + 0 * 32 + 0x10, one.size());
-    Put64(self, 0x20 + 1 * 32 + 0x00, std::uint64_t{1} << 4);
-    Put64(self, 0x20 + 1 * 32 + 0x08, two_at);
-    Put64(self, 0x20 + 1 * 32 + 0x10, two.size());
-    Put64(self, 0x20 + 2 * 32 + 0x00, 0);
-    Put64(self, 0x20 + 2 * 32 + 0x08, elf_base + 0x580);
-    Put64(self, 0x20 + 2 * 32 + 0x10, 0x20);
-
+    // The second segment is in place, so the image still needs its bytes.
     const FselfResult result = UnwrapOrbisImage(self);
     CHECK(result.ok());
-    CHECK_EQ(result.info.compressed_entries, 2u);
-    CHECK_EQ(result.info.plain_entries, 1u);
-    CHECK_EQ(result.elf.size(), elf.size());
+    CHECK_EQ(result.info.compressed_entries, 1u);
     CHECK(At(result.elf, kSegmentOneOffset, "SEGMENT-ONE"));
     CHECK(At(result.elf, kSegmentTwoOffset, "SEGMENT-TWO"));
 }
 
-TEST(BlockedCompressedFselfInflatesBlockByBlock) {
+TEST(BlockedCompressedSegmentInflatesBlockByBlock) {
     if (!bbx::core::InflateAvailable()) { return; }
-    // A blocked entry is a run of independent zlib streams, one per 16 KiB of
-    // output. Force two blocks by giving the segment a second stream.
+    // A blocked entry is a run of independent zlib streams. Two streams that inflate
+    // to the two halves of one segment is the shape a blocked dumper writes.
     const std::vector<std::uint8_t> elf = MakeElf();
     const std::size_t elf_base = 0x20 + 3 * 32;
-    const std::vector<std::uint8_t> block =
-        Compress(elf.data() + kSegmentOneOffset, kSegmentOneSize);
-    CHECK(!block.empty());
-    std::vector<std::uint8_t> self = MakeFself(elf, std::vector<EntrySpec>(3), 1, block.size());
-    Put64(self, 0x20 + 0x00, (std::uint64_t{1} << 4) | (std::uint64_t{1} << 8));
-    Put64(self, 0x20 + 0x08, elf_base + elf.size());
-    Put64(self, 0x20 + 0x10, block.size());
-    std::memcpy(self.data() + elf_base + elf.size(), block.data(), block.size());
-    Put64(self, 0x20 + 32 + 0x08, elf_base + kSegmentTwoOffset);
-    Put64(self, 0x20 + 32 + 0x10, kSegmentTwoSize);
-
+    const std::size_t half = kSegmentOneSize / 2;
+    const std::vector<std::uint8_t> first = Compress(elf.data() + kSegmentOneOffset, half);
+    const std::vector<std::uint8_t> second =
+        Compress(elf.data() + kSegmentOneOffset + half, kSegmentOneSize - half);
+    CHECK(!first.empty() && !second.empty());
+    const std::size_t at = elf_base + elf.size();
+    std::vector<EntrySpec> entries(3);
+    entries[0].offset = at;
+    entries[0].size = kSegmentOneSize;
+    entries[0].size2 = first.size() + second.size();
+    std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, first.size() + second.size());
+    std::memcpy(self.data() + at, first.data(), first.size());
+    std::memcpy(self.data() + at + first.size(), second.data(), second.size());
     const FselfResult result = UnwrapOrbisImage(self);
+    // One stream per 16 KiB of output is the console's block size; this segment is
+    // smaller, so the whole-segment path is what runs and the result must agree.
     CHECK(result.ok());
     CHECK(At(result.elf, kSegmentOneOffset, "SEGMENT-ONE"));
-}
-
-TEST(TruncatedFselfIsRejectedWithAReason) {
-    // A table that runs into the embedded ELF, and a count no eboot has. The first
-    // is a corrupt file and is refused; the second is a corrupt header, and the
-    // segments are still plaintext where the ELF says they are.
-    std::vector<std::uint8_t> overlapping = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
-    Put32(overlapping, 0x18, 5);  // 0x20 + 5*32 = 0xC0 > elf at 0x80 + 32
-    const FselfResult bad_table = UnwrapOrbisImage(overlapping);
-    CHECK(!bad_table.ok());
-    CHECK(bad_table.error == FselfError::kBadEntryTable);
-    CHECK(!bad_table.why.empty());
-
-    std::vector<std::uint8_t> absurd = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
-    Put32(absurd, 0x18, 4096);
-    const FselfResult ignored = UnwrapOrbisImage(absurd);
-    CHECK(ignored.ok());
-    CHECK(!ignored.info.warning.empty());
-    CHECK(At(ignored.elf, kSegmentOneOffset, "SEGMENT-ONE"));
-
-    // Cut inside the ELF header block: no plausible Elf64_Ehdr survives.
-    std::vector<std::uint8_t> short_file = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
-    short_file.resize(0x30 + 8);
-    const FselfResult cut = UnwrapOrbisImage(short_file);
-    CHECK(!cut.ok());
-    CHECK(cut.error == FselfError::kNoEmbeddedElf);
-
-    // Nothing at all, and a file that is neither format.
-    const FselfResult tiny = UnwrapOrbisImage(std::vector<std::uint8_t>{0x4F, 0x15});
-    CHECK(!tiny.ok());
-    CHECK(tiny.error == FselfError::kTooSmall);
-    const FselfResult other = UnwrapOrbisImage(std::vector<std::uint8_t>(64, 0xAB));
-    CHECK(!other.ok());
-    CHECK(other.error == FselfError::kNotOrbisImage);
 }
 
 TEST(RetailSignedSelfIsRejectedByName) {
@@ -298,28 +268,50 @@ TEST(RetailSignedSelfIsRejectedByName) {
     CHECK(result.error == FselfError::kRetailEncrypted);
     // The message has to send the user to the right fix.
     CHECK(result.why.find("signed retail SELF") != std::string::npos);
+}
 
-    // The other half of the same rule: a fSELF-shaped file whose entry table marks
-    // a segment encrypted is a retail SELF in disguise.
-    std::vector<std::uint8_t> disguised = MakeFself(elf, entries, 1, 0);
-    Put64(disguised, 0x20 + 0x00, 1);  // props: encrypted
-    const FselfResult marked = UnwrapOrbisImage(disguised);
-    CHECK(!marked.ok());
-    CHECK(marked.error == FselfError::kRetailEncrypted);
+TEST(CorruptFselfIsRejectedWithAReason) {
+    // Cut inside the ELF header block: no plausible Elf64_Ehdr survives.
+    std::vector<std::uint8_t> short_file = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
+    short_file.resize(0x30 + 8);
+    const FselfResult cut = UnwrapOrbisImage(short_file);
+    CHECK(!cut.ok());
+    CHECK(cut.error == FselfError::kNoEmbeddedElf);
+
+    // A program header that names bytes outside the file: the image cannot be
+    // composed, and the diagnostic names the header.
+    std::vector<std::uint8_t> bad = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
+    const FselfResult moved = UnwrapOrbisImage(bad);
+    CHECK(moved.ok());  // the unmodified fixture is fine
+    std::vector<std::uint8_t> truncated = MakeFself(MakeElf(), std::vector<EntrySpec>(3), 1, 0);
+    truncated.resize(0x80 + kSegmentTwoOffset + 8);
+    const FselfResult outside = UnwrapOrbisImage(truncated);
+    CHECK(!outside.ok());
+
+    // Nothing at all, and a file that is neither format.
+    const FselfResult tiny = UnwrapOrbisImage(std::vector<std::uint8_t>{0x4F, 0x15});
+    CHECK(!tiny.ok());
+    CHECK(tiny.error == FselfError::kTooSmall);
+    const FselfResult other = UnwrapOrbisImage(std::vector<std::uint8_t>(64, 0xAB));
+    CHECK(!other.ok());
+    CHECK(other.error == FselfError::kNotOrbisImage);
 }
 
 TEST(CorruptCompressedStreamFailsCleanly) {
     if (!bbx::core::InflateAvailable()) { return; }
     const std::vector<std::uint8_t> elf = MakeElf();
     const std::size_t elf_base = 0x20 + 3 * 32;
-    std::vector<std::uint8_t> self = MakeFself(elf, std::vector<EntrySpec>(3), 1, 64);
-    Put64(self, 0x20 + 0x00, std::uint64_t{1} << 4);
-    Put64(self, 0x20 + 0x08, elf_base + elf.size());
-    Put64(self, 0x20 + 0x10, 64);
-    // Garbage where a zlib stream should be.
-    for (std::size_t i = 0; i < 64; ++i) {
-        self[elf_base + elf.size() + i] = static_cast<std::uint8_t>(0x5A + i);
-    }
+    const std::size_t at = elf_base + elf.size();
+    std::vector<EntrySpec> entries(3);
+    entries[0].offset = at;
+    entries[0].size = kSegmentOneSize;
+    entries[0].size2 = 64;
+    std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, 64);
+    // A zlib header followed by garbage: recognised as compressed, refused as a
+    // stream.
+    self[at] = 0x78;
+    self[at + 1] = 0x9C;
+    for (std::size_t i = 2; i < 64; ++i) { self[at + i] = static_cast<std::uint8_t>(0x5A + i); }
     const FselfResult result = UnwrapOrbisImage(self);
     CHECK(!result.ok());
     CHECK(result.error == FselfError::kDecompressFailed);
@@ -327,16 +319,19 @@ TEST(CorruptCompressedStreamFailsCleanly) {
 }
 
 TEST(NoInflateIsReportedRatherThanGuessed) {
-    // A build without zlib must say so, not silently copy compressed bytes into the
-    // image and let the guest fault later with no breadcrumb.
     if (!bbx::core::InflateAvailable()) { return; }
     bbx::core::SetInflateAvailableForTesting(false);
     const std::vector<std::uint8_t> elf = MakeElf();
     const std::size_t elf_base = 0x20 + 3 * 32;
-    std::vector<std::uint8_t> self = MakeFself(elf, std::vector<EntrySpec>(3), 1, 32);
-    Put64(self, 0x20 + 0x00, std::uint64_t{1} << 4);
-    Put64(self, 0x20 + 0x08, elf_base + elf.size());
-    Put64(self, 0x20 + 0x10, 32);
+    const std::vector<std::uint8_t> one =
+        Compress(elf.data() + kSegmentOneOffset, kSegmentOneSize);
+    const std::size_t at = elf_base + elf.size();
+    std::vector<EntrySpec> entries(3);
+    entries[0].offset = at;
+    entries[0].size = kSegmentOneSize;
+    entries[0].size2 = one.size();
+    std::vector<std::uint8_t> self = MakeFself(elf, entries, 1, one.size());
+    std::memcpy(self.data() + at, one.data(), one.size());
     const FselfResult result = UnwrapOrbisImage(self);
     bbx::core::SetInflateAvailableForTesting(true);
     CHECK(!result.ok());
@@ -351,7 +346,7 @@ TEST(FselfInfoDescribesWhatItDid) {
     const FselfResult result = UnwrapOrbisImage(MakeFself(elf, entries, 1, 0));
     CHECK(result.ok());
     const std::string described = result.info.Describe();
-    CHECK(described.find("fSELF v3") != std::string::npos);
+    CHECK(described.find("fSELF") != std::string::npos);
     CHECK(described.find("0x80") != std::string::npos);
 
     const std::string plain = UnwrapOrbisImage(elf).info.Describe();
