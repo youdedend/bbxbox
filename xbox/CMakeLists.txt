@@ -230,11 +230,17 @@ else()
 endif()
 
 if(BBX_BBHOST)
-    # The guest runtime, its host layer and the game's own code. lld-link
-    # resolves archives without regard to their order, so the three can name each
+    # The guest runtime, its host layer and the game's own code are compiled,
+    # and the link is one switch away - but the switch is off: the residue needs
+    # `xbox/platform/bbhost_bridge.cpp` (the display/pad/flip surface the omitted
+    # desktop host TUs would have provided), and a red branch says less than a
+    # green one. Flip this the moment the bridge lands:
+    #
+    #   target_link_libraries(bbxbox PRIVATE bbhost_guest bbhost_host bbhost_engine)
+    #
+    # lld-link resolves archives regardless of order, so the three may name each
     # other's symbols freely.
-    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
-        bbx_atrac9 bbx_monocypher)
+    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
 endif()
 
 # The Store CRT. A console has vcruntime140_app.dll / msvcp140_app.dll and their

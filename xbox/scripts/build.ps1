@@ -120,7 +120,7 @@ if ($LASTEXITCODE -ne 0) {
     # a bare message (dxc, cmd, lld-link). Keep a window around each FAILED.
     $errors = New-Object System.Collections.Generic.List[string]
     for ($i = 0; $i -lt $lines.Count; ++$i) {
-        if ($lines[$i] -match 'FAILED:|error:|fatal error:|undefined symbol|dxc:') {
+        if ($lines[$i] -match 'FAILED:|error:|fatal error:|undefined symbol|dxc:' -and $lines[$i] -notmatch 'warning:') {
             $end = [Math]::Min($i + 12, $lines.Count - 1)
             for ($j = $i; $j -le $end; ++$j) { $errors.Add($lines[$j]) }
             $i = $end
@@ -143,14 +143,19 @@ if ($LASTEXITCODE -ne 0) {
         }
     }
     if ($undefined.Count -gt 0) {
-        $census = New-Object System.Collections.Generic.List[string]
-        $census.Add("$($undefined.Count) undefined symbol(s):")
+        # One annotation per ~60 symbols: GitHub truncates a single annotation's
+        # message at 4 KB, and a census that stops at the letter `b` is not a
+        # census.
+        $chunks = New-Object System.Collections.Generic.List[string]
+        $current = New-Object System.Collections.Generic.List[string]
         foreach ($entry in $undefined.GetEnumerator()) {
-            $census.Add("  " + $entry.Key + $(if ($entry.Value) { "   <- " + $entry.Value } else { "" }))
+            $current.Add("  " + $entry.Key + $(if ($entry.Value) { "   <- " + $entry.Value } else { "" }))
+            if ($current.Count -ge 55) { $chunks.Add(($current -join "`n")); $current.Clear() }
         }
-        $text = ($census -join "`n")
-        if ($text.Length -gt 50000) { $text = $text.Substring(0, 50000) + "`n... (census truncated)" }
-        Emit-ErrorAnnotation 'undefined symbols' $text
+        if ($current.Count -gt 0) { $chunks.Add(($current -join "`n")) }
+        for ($k = 0; $k -lt $chunks.Count; ++$k) {
+            Emit-ErrorAnnotation "undefined symbols $($k + 1)/$($chunks.Count) (of $($undefined.Count))" $chunks[$k]
+        }
     }
     if ($errors.Count -eq 0) { $errors.AddRange([string[]]($lines | Select-Object -Last 80)) }
     $summary = ($errors | Select-Object -First 80) -join "`n"
