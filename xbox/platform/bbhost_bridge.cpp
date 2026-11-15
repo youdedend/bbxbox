@@ -83,6 +83,7 @@ std::uint64_t g_flips = 0;
 namespace bbx::bridge {
 
 void SetPad(SDL_Gamepad* pad) { g_pad = pad; }
+std::uint64_t Flips() { return g_flips; }
 
 }  // namespace bbx::bridge
 
@@ -656,6 +657,7 @@ extern "C" unsigned __int128 __umodti3(unsigned __int128 n, unsigned __int128 d)
 }
 
 // --- the boot --------------------------------------------------------------
+#if defined(BBX_GUEST_BOOT)
 namespace bbx::bridge {
 namespace {
 
@@ -781,6 +783,19 @@ bool StartGuest(const GuestRequest& req) {
 }
 
 bool Running() { return g_running.load(); }
-std::uint64_t Flips() { return g_flips; }
 
 }  // namespace bbx::bridge
+#else
+// The link is off (xbox/CMakeLists.txt, BBX_GUEST_LINK): the archives are
+// compiled but not part of this binary, so there is no loader to call and no
+// guest to start. The launcher says so and stays up.
+namespace bbx::bridge {
+bool StartGuest(const GuestRequest& req) {
+    (void)req;
+    bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                              "boot: the guest runtime is not linked into this build (BBX_GUEST_LINK=OFF)");
+    return false;
+}
+bool Running() { return false; }
+}  // namespace bbx::bridge
+#endif
