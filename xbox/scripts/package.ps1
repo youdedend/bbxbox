@@ -166,6 +166,13 @@ Write-Host "package: $appx"
 Write-Host "package: $dependencies\$($vclibs.Name)"
 if (Test-Path $cerPath) { Write-Host "package: $cerPath" }
 Write-Host "install: Add-AppxPackage -Path `"$appx`" -DependencyPath `"$dependencies\$($vclibs.Name)`" (Developer Mode, certificate installed)"
+}
+catch {
+    # Anything thrown above (including a check-*.ps1 helper) reaches the
+    # annotation, because a bare exit code says nothing after the run.
+    Fail "$_"
+}
+
 # The step's exit code is the script's last native exit code unless it is set
 # explicitly, and `signtool verify /pa` on a self-signed package is expected to
 # fail: without this, a successful package reported failure.
