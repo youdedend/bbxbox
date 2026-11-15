@@ -3,7 +3,11 @@
 extern "C" {
 #endif
 
-#ifdef _MSC_VER
+// Local change: this copy is a static library (CMake target `bbx_atrac9`), not the
+// upstream DLL, so the declarations must not carry an import attribute - a caller
+// of `__declspec(dllimport) Atrac9Decode` asks the linker for `__imp_Atrac9Decode`,
+// which a static archive never defines. Define ATRAC9_STATIC to take the plain path.
+#if defined(_MSC_VER) && !defined(ATRAC9_STATIC)
 #ifdef COMPILING_DLL 
 #define DLLEXPORT __declspec(dllexport)
 #else

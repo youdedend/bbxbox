@@ -50,6 +50,9 @@ endif()
 file(GLOB BBX_ATRAC9_SOURCES "${BBX_BBHOST_ROOT}/third_party/libatrac9/C/src/*.c")
 add_library(bbx_atrac9 STATIC ${BBX_ATRAC9_SOURCES})
 target_include_directories(bbx_atrac9 PUBLIC "${BBX_BBHOST_ROOT}/third_party/libatrac9/C/src")
+# The vendored header imports its entry points when _MSC_VER is set (upstream
+# builds a DLL); this is the static archive, so its callers must not.
+target_compile_definitions(bbx_atrac9 PUBLIC ATRAC9_STATIC)
 set_target_properties(bbx_atrac9 PROPERTIES C_STANDARD 99)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbx_atrac9 PRIVATE /W0)

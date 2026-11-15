@@ -571,6 +571,90 @@ void add_command_row(void* builder, std::uint32_t id, void* open) {  }
 void* section_screen(void* out, void* ctx, void* opener) { return {}; }
 }  // namespace option_rows
 
+
+// --- the second census ------------------------------------------------------
+
+std::uint32_t menu_confirm_button() { return {}; }
+std::uint32_t menu_back_button() { return {}; }
+void hle_watch_arm_reads(std::uint64_t lo, std::uint64_t hi) {  }
+void hle_watch_report() {  }
+bool host_gpu_splice(std::uint64_t id) { return {}; }
+bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) { return {}; }
+bool ingame_menu_open() { return {}; }
+bool host_options_open() { return {}; }
+bool plugin_panel_native_corner_wanted() { return {}; }
+const HostSettings& host_settings_ref() { static const HostSettings none{}; return none; }
+bool host_mouse_relative() { return {}; }
+bool host_plugin_taken_motion() { return {}; }
+bool host_text_entry_open() { return {}; }
+
+namespace gxvk_lists {
+std::string run_duty_report() { return {}; }
+void cp_busy(std::uint64_t ns) {  }
+void cp_held(std::uint64_t ns) {  }
+void cp_thread_note(std::uintptr_t clock) {  }
+void keep_off_pool_cpus() {  }
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed) {  }
+void cp_look_begin(std::uint64_t id) {  }
+void cp_look_end() {  }
+void pool_report(bool at_exit) {  }
+}  // namespace gxvk_lists
+
+namespace option_rows {
+bool ready() { return {}; }
+std::uint64_t addr(std::uint64_t bn) { return {}; }
+int row_count(void* dialog) { return {}; }
+std::uint8_t* row_widget(void* dialog, int row) { return {}; }
+std::uint64_t value_target(std::uint8_t* widget) { return {}; }
+void layout(void* dialog) {  }
+void clear_rows(void* dialog) {  }
+}  // namespace option_rows
+
+// The list pool's sampling interval: every draw, as its `BBHOST_GXVK_LISTS_SAMPLE`
+// default says.
+namespace gxvk_lists {
+const unsigned g_look_every = 1;
+}  // namespace gxvk_lists
+
+// The launcher's text entry has no editable field on the console yet, so the
+// guest's player-name prompt is a widget nobody can type into.
+void TextEntry::begin(const char* initial_utf8, unsigned max, TextCharset cs, bool select_initial) {
+    text = initial_utf8 == nullptr ? std::string() : std::string(initial_utf8);
+    max_chars = max;
+    charset = cs;
+    // The suggestion shows selected, so the first character the guest "types"
+    // replaces it - which is what a name box's preset wants.
+    selected = select_initial;
+}
+
+// --- the 128-bit division the compiler emits --------------------------------
+// One guest translation unit divides a 128-bit value (the GX walk's byte
+// counters), and clang-cl asks the C runtime for `__udivti3`, which MSVC's
+// libraries do not ship. Restoring division, written without any division, so
+// the helper cannot call itself.
+extern "C" unsigned __int128 __udivti3(unsigned __int128 n, unsigned __int128 d) {
+    if (d == 0) return 0;
+    unsigned __int128 q = 0, r = 0;
+    for (int bit = 127; bit >= 0; --bit) {
+        r = (r << 1) | ((n >> bit) & 1);
+        if (r >= d) {
+            r -= d;
+            q |= (static_cast<unsigned __int128>(1) << bit);
+        }
+    }
+    return q;
+}
+
+extern "C" unsigned __int128 __umodti3(unsigned __int128 n, unsigned __int128 d) {
+    if (d == 0) return 0;
+    unsigned __int128 r = 0;
+    for (int bit = 127; bit >= 0; --bit) {
+        r = (r << 1) | ((n >> bit) & 1);
+        if (r >= d) r -= d;
+    }
+    return r;
+}
+
 // --- the boot --------------------------------------------------------------
 namespace bbx::bridge {
 namespace {
