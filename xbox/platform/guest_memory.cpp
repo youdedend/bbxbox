@@ -8,6 +8,12 @@
 // tree needs to know that the console cannot call VirtualAlloc.
 #include "xbox/platform/guest_memory.h"
 
+// The arena implementation itself (Alloc/Free/Protect/KeepWritable/
+// MarkExecutableRange/CommittedMib) is shared with the host tests, so it lives in
+// the header-like .inc; the same ledger runs over VirtualAlloc2FromApp here and
+// over malloc there.
+#include "xbox/platform/guest_memory.inc"
+
 #include "xbox/platform/log.h"
 
 #include <cstddef>

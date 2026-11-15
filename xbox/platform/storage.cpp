@@ -110,7 +110,7 @@ std::string Local(const std::string& relative) {
 bool ReadBinary(const std::string& path, std::vector<std::uint8_t>& out, std::size_t cap) {
     out.clear();
     const std::wstring wide = Widen(path);
-    HANDLE file = ::CreateFile2FromApp(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, nullptr);
+    HANDLE file = ::CreateFile2FromAppW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
     if (!::GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
@@ -138,7 +138,7 @@ bool ReadText(const std::string& path, std::string& out, std::size_t cap) {
 bool WriteBinary(const std::string& path, std::span<const std::uint8_t> bytes) {
     const std::wstring wide = Widen(path);
     const std::wstring temporary = Widen(path + ".tmp");
-    HANDLE file = ::CreateFile2FromApp(temporary.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
+    HANDLE file = ::CreateFile2FromAppW(temporary.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     bool ok = ::WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
