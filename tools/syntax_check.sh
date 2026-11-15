@@ -58,6 +58,11 @@ for file in "${files[@]}"; do
     if [ $? -ne 0 ]; then
         echo "syntax_check: FAIL: $(basename "$file")"
         echo "$output" | head -40
+        if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+            # The run log is not always reachable after the fact; this is.
+            encoded=$(echo "$output" | head -30 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/')
+            echo "::error title=syntax_check $(basename "$file")::$encoded"
+        fi
         status=1
     fi
 done
