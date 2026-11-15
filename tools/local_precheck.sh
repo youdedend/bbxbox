@@ -16,7 +16,14 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 status=0
-fail() { echo "precheck: FAIL: $*"; status=1; }
+fail() {
+  echo "precheck: FAIL: $*"
+  # Run logs are not always reachable after the fact; the annotation is.
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "::error title=precheck::$(echo "$*" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/')"
+  fi
+  status=1
+}
 note() { echo "precheck: $*"; }
 
 # --- 1. host build + tests ---------------------------------------------------

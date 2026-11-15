@@ -20,9 +20,6 @@ constexpr HRESULT kDxgiDeviceHung = static_cast<HRESULT>(0x887A0006L);
 constexpr HRESULT kDxgiDeviceReset = static_cast<HRESULT>(0x887A0007L);
 constexpr HRESULT kDxgiDriverInternalError = static_cast<HRESULT>(0x887A0020L);
 constexpr HRESULT kDxgiOutOfMemory = static_cast<HRESULT>(0x887A0002L);
-// D3D12CreateDevice's "this adapter is not 12_0", which is not a failure of the
-// device but of the pick.
-constexpr HRESULT kDxgiUnsupported = static_cast<HRESULT>(0x887A0004L);
 
 }  // namespace
 

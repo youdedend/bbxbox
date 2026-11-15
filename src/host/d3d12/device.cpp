@@ -110,7 +110,8 @@ Status Device::Create(const DeviceDesc& desc) {
 }
 
 Status Device::PickAdapter(bool debug_layer) {
-    const UINT flags = debug_layer ? DXGI_CREATE_FACTORY_DEBUG : DXGI_CREATE_FACTORY_FLAGS_NONE;
+    // 0 is "no flags": the SDK spells no DXGI_CREATE_FACTORY_FLAGS_NONE.
+    const UINT flags = debug_layer ? DXGI_CREATE_FACTORY_DEBUG : 0u;
     HRESULT hr = CreateDXGIFactory2(flags, __uuidof(IDXGIFactory6),
                                    reinterpret_cast<void**>(factory_.GetAddressOf()));
     if (FAILED(hr)) {
@@ -118,7 +119,7 @@ Status Device::PickAdapter(bool debug_layer) {
         // build never asks for it, and a development machine may not have it.
         Log("CreateDXGIFactory2(debug=%d) failed: 0x%08lX; retrying without the debug flag",
             debug_layer ? 1 : 0, static_cast<unsigned long>(hr));
-        hr = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS_NONE, __uuidof(IDXGIFactory6),
+        hr = CreateDXGIFactory2(0u, __uuidof(IDXGIFactory6),
                                 reinterpret_cast<void**>(factory_.GetAddressOf()));
     }
     if (FAILED(hr)) {
@@ -138,7 +139,7 @@ Status Device::PickAdapter(bool debug_layer) {
     }
 
     DXGI_ADAPTER_DESC1 adapter_desc{};
-    if (SUCCEEDED(adapter_->GetDesc(&adapter_desc)) && adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+    if (SUCCEEDED(adapter_->GetDesc1(&adapter_desc)) && adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
         // WARP would run the game at a few frames a second and hide every timing
         // problem the port exists to fix.
         Log("the selected adapter is the software rasterizer; refusing it");

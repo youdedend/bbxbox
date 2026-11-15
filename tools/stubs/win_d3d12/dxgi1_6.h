@@ -131,7 +131,9 @@ struct IDXGIAdapter : IDXGIObject {
 };
 
 DECLSPEC_UUID("29038f61-3839-4626-91fd-086879011a05")
-struct IDXGIAdapter1 : IDXGIAdapter {};
+struct IDXGIAdapter1 : IDXGIAdapter {
+    virtual HRESULT GetDesc1(DXGI_ADAPTER_DESC1* desc) = 0;
+};
 
 DECLSPEC_UUID("3c8d99d1-4fbf-4181-a41a-ef2c0d8cc50e")
 struct IDXGIAdapter4 : IDXGIAdapter1 {

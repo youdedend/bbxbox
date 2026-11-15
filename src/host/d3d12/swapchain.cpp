@@ -79,7 +79,9 @@ Status Swapchain::CreateRenderTargets() {
         }
         D3D12_RENDER_TARGET_VIEW_DESC view{};
         view.Format = kFormat;
-        view.ViewDimension = 4;  // D3D12_RTV_DIMENSION_TEXTURE2D
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipSlice = 0;
+        view.Texture2D.PlaneSlice = 0;
         D3D12_CPU_DESCRIPTOR_HANDLE handle = rtv_base_;
         handle.ptr += static_cast<SIZE_T>(index) * rtv_stride_;
         device_->Get()->CreateRenderTargetView(buffers_[index].Get(), &view, handle);
