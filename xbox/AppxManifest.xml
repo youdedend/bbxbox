@@ -23,7 +23,6 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap2="http://schemas.microsoft.com/appx/manifest/uap/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
   IgnorableNamespaces="uap uap2 rescap virtualization">
 
   <Identity Name="bbxbox.Bloodborne"
@@ -61,10 +60,10 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\LargeTile.png" />
         <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0C0E12" />
       </uap:VisualElements>
-      <Extensions>
-        <!-- Game mode: keeps the title foreground and the frame paced. -->
-        <uap:Extension Category="windows.gameExplorer" />
-      </Extensions>
+      <!-- No <Extensions>: windows.gameExplorer is a uap/3 category and this
+           manifest targets uap/1, so makeappx rejects it ("violates enumeration
+           constraint"). Game mode on the console comes from the title being
+           launched as a game, not from an extension. -->
     </Application>
   </Applications>
 
