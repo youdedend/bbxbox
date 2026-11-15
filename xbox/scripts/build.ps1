@@ -35,6 +35,7 @@ function Emit-ErrorAnnotation([string]$Title, [string]$Body) {
     }
 }
 
+function Invoke-Build {
 $build = Join-Path $Root "build\xbox"
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 
@@ -113,3 +114,21 @@ if ($LASTEXITCODE -ne 0) {
 $exe = Get-ChildItem -Recurse -Path $build -Filter "bbxbox.exe" | Select-Object -First 1
 if (-not $exe) { throw "bbxbox.exe not produced" }
 Write-Host "built $($exe.FullName)"
+}
+
+try {
+    Invoke-Build
+}
+catch {
+    $message = "$_"
+    Write-Host "build: FAILED: $message"
+    $dump = @($message)
+    if (Test-Path $prefix) {
+        $dump += "--- $prefix ---"
+        $dump += @(Get-ChildItem -Recurse -Depth 2 -Path $prefix -ErrorAction SilentlyContinue |
+            Select-Object -First 60 | ForEach-Object { $_.FullName.Substring($prefix.Length) })
+    }
+    Emit-ErrorAnnotation 'build failed' ($dump -join "`n")
+    if ($env:GITHUB_ACTIONS -eq 'true') { exit 1 }
+    throw
+}
