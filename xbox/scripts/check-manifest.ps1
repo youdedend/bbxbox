@@ -86,12 +86,14 @@ foreach ($forbidden in @("runFullTrust", "broadFileSystemAccess", "internetClien
 }
 
 $text = Get-Content -Raw $manifestPath
-# Asset names are matched by escaping the literal prefix rather than by writing
-# backslash escapes into the pattern: 'Assets\' + name + '.png'.
-$assetPattern = [regex]::Escape('Assets\') + '[A-Za-z0-9]+\.png'
+# A PowerShell single-quoted string keeps backslashes as written, so the prefix
+# is exactly 'Assets' + one backslash; the pattern is escaped from it rather than
+# written with escapes inline.
+$assetPrefix = 'Assets\'
+$assetPattern = [regex]::Escape($assetPrefix) + '[A-Za-z0-9]+\.png'
 $missing = @()
 foreach ($asset in ([regex]::Matches($text, $assetPattern) | ForEach-Object { $_.Value } | Sort-Object -Unique)) {
-    $relative = $asset.Replace('Assets\', '')
+    $relative = $asset.Substring($assetPrefix.Length)
     if (-not (Test-Path (Join-Path $Root (Join-Path 'xbox' $relative)))) { $missing += $asset }
 }
 foreach ($asset in ($missing | Sort-Object -Unique)) {
