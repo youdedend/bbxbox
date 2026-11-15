@@ -158,11 +158,11 @@ if ($LASTEXITCODE -ne 0) {
         # One annotation per ~60 symbols: GitHub truncates a single annotation's
         # message at 4 KB, and a census that stops at the letter `b` is not a
         # census.
-        $chunks = New-Object System.Collections.Generic.List[string]
+        $chunks = New-Object System.Collections.Generic.List[string]  # by characters: 4 K is the runner's cut
         $current = New-Object System.Collections.Generic.List[string]
         foreach ($entry in $undefined.GetEnumerator()) {
             $current.Add("  " + $entry.Key + $(if ($entry.Value) { "   <- " + $entry.Value } else { "" }))
-            if ($current.Count -ge 55) { $chunks.Add(($current -join "`n")); $current.Clear() }
+            if (($current -join "`n").Length -ge 3000) { $chunks.Add(($current -join "`n")); $current.Clear() }
         }
         if ($current.Count -gt 0) { $chunks.Add(($current -join "`n")) }
         for ($k = 0; $k -lt $chunks.Count; ++$k) {

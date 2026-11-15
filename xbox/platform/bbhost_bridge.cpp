@@ -62,8 +62,12 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/hle.h"
+#include "engine/option_rows.h"
+#include "hle/modules.h"
 #include "host/frame_stats.h"
+#include "host/gxvk_lists.h"
 #include "host/perf_meter.h"
+#include "host/settings.h"
 
 
 namespace {
@@ -511,6 +515,61 @@ void host_window_set_mode(int mode, int width, int height) {  }
 void host_window_set_stay_borderless(bool on) {  }
 void host_window_set_vsync(bool on) {  }
 bool host_window_start(int width, int height, const char* title) { return {}; }
+
+
+// The list pool's resting flag (`gxvk_lists_pool.cpp` is not compiled, and the GX
+// walk reads it as "no list is being built", which is what it is here).
+namespace gxvk_lists {
+std::atomic<bool> g_resting{false};
+}  // namespace gxvk_lists
+
+// The event interpreter's registration (`decomp/events/interpreter.cpp` is not
+// compiled: it includes a header the vendored tree does not carry).
+void decomp_event_interpreter_add() {}
+
+
+// --- the rest of the residue ----------------------------------------------
+// What the census found next: the hooks, the option rows' drawing, the list
+// pool, the settings listener and the two arm calls. Same quiet answer.
+
+bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
+bool engine_prologue_hook_exec(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, const std::uint8_t* exec, std::size_t m, void* host, std::uint64_t id) { return {}; }
+bool engine_call_site_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, void* host) { return {}; }
+bool menu_pointer_in_menu() { return {}; }
+void hle_watch_arm(std::uint64_t lo, std::uint64_t hi) {  }
+void hle_bp_arm(std::uint64_t va) {  }
+bool host_gpu_list_committed(std::uint64_t id) { return {}; }
+bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) { return {}; }
+bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes) { return {}; }
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen, std::uint32_t cap_at, std::uint32_t cap_piece) { return {}; }
+bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) { return {}; }
+bool plugin_panel_native_step(int row, int dir) { return {}; }
+bool plugin_panel_native_set(int row, int value) { return {}; }
+bool plugin_panel_native_turn(int dir) { return {}; }
+bool plugin_panel_native_back() { return {}; }
+bool plugins_active(const std::string& name) { return {}; }
+void host_settings_listen(HostSettingsListener fn) {  }
+
+namespace option_rows {
+void* fn(std::uint64_t bn) { return {}; }
+std::int64_t open_section(void* root, void* params, const char* name, void* handler) { return {}; }
+void handler_begin() {  }
+void add_text_row(void* dialog, std::uint8_t* value, std::uint32_t id, const char16_t* label, const char16_t* help, const char16_t* text) {  }
+void add_toggle_row(void* dialog, std::uint8_t* value, std::uint32_t id, std::uint8_t def, const char16_t* label, const char16_t* help) {  }
+void add_pair_row(void* dialog, std::uint8_t* value, std::uint32_t id, const char16_t* first, const char16_t* second, std::uint8_t def, const char16_t* label, const char16_t* help) {  }
+void add_slider_row(void* dialog, std::uint8_t* value, std::uint32_t id, std::uint8_t def, const char16_t* label, const char16_t* help) {  }
+std::uint8_t* rows_list(void* dialog) { return {}; }
+std::uint8_t* value_list(std::uint8_t* widget) { return {}; }
+void redraw(std::uint8_t* list) {  }
+void set_cursor(std::uint8_t* list, int index) {  }
+int cursor_of(std::uint8_t* list) { return {}; }
+const char16_t* dialog_message(std::uint32_t id) { return {}; }
+std::uint64_t ask(std::uint8_t* dialog, std::uint32_t message, void* yes) { return {}; }
+void release(std::uint64_t obj) {  }
+std::int32_t refs(std::uint64_t obj) { return {}; }
+void add_command_row(void* builder, std::uint32_t id, void* open) {  }
+void* section_screen(void* out, void* ctx, void* opener) { return {}; }
+}  // namespace option_rows
 
 // --- the boot --------------------------------------------------------------
 namespace bbx::bridge {

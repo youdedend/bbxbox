@@ -196,6 +196,10 @@ target_sources(bbxbox PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_present.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_stream.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_untile.cpp"
+    # A dumped eboot is a fake SELF, and the guest's loader (core/elf.cpp) asks
+    # this file to unwrap it: the previous reader rejected it with "decrypt SELF
+    # first", which sent the player looking for a step that does not exist.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_self.cpp"
 )
 
 target_compile_features(bbxbox PRIVATE cxx_std_20)
