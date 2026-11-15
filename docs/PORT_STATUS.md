@@ -12,7 +12,8 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 |---|---|---|
 | P0 | UWP shell, launcher, memory contract, packaging, CI, import audit | **Implemented; not yet run on console.** `.appx` layout, manifest (`codeGeneration` + `removableStorage` only), SDL3-uwp/libuwp cached dependency build, memory self-test, `check-imports.ps1`, `local_precheck.sh`, CI. |
 | P1 | Guest boot + HLE + audio/input, no rendering | **Started.** The portable core (`elf`, `imports`, `thunk`, `tls_rewrite`, `sha256`, `paced_file`, `memory`) is now compiled by the host test build and unit-tested (154 cases), and the UWP arena adapter (`guest_memory_bbhost.h`) is what bbhost's `core/memory.h` resolves to under `BBX_UWP`. `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
-| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls. Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |
+| P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls — the app therefore **links and packages** with the
+whole P2 path in it (run `43734984657`). Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |
 | P3 | GX draw path: pipelines, bindless descriptors, vertex fetch, buffer shadow | Design + `bbx_psocache`/`bbx_caps` landed. |
 | P4 | YEBIS, Scaleform, compute tessellation, FSR | Policy landed (`bbx_tess`), kernels pending. |
 | P5 | DXIL precompile + PSO cache + quarantine + USB sync | Cache and quarantine landed and tested; DXIL compile and USB sync pending. |
@@ -44,7 +45,10 @@ following are compile-verified rather than hoped for:
 * every `xbox/platform` translation unit: `main.cpp` (C++/WinRT view, activation
   factory), `storage.cpp` (WinRT picker + `*FromApp` file APIs), `dump.cpp`,
   `ux.cpp`, `launcher.cpp`, `log.cpp` (last-chance logger), `display*.cpp`,
-  `guest_memory.cpp` (the arena over `VirtualAlloc2FromApp`), `memory_selftest.cpp`;
+  `guest_memory.cpp` (the arena over `VirtualAlloc2FromApp`), `memory_selftest.cpp`,
+  `hud.cpp` (the overlay's quads), `d3d12_session.cpp` (device + swapchain +
+  pipelines + replay behind an `IUnknown*`), `display.cpp`/`display_winrt.cpp`
+  (the TV mode query and the output plan);
 * the D3D12 backend translation units in `src/host/d3d12/` (`device.cpp`,
   `swapchain.cpp`, `pipeline.cpp`, `replay.cpp`, `bbx_d3d12.cpp`) and the one
   platform TU that avoids C++/WinRT (`d3d12_session.cpp`);
@@ -53,7 +57,7 @@ following are compile-verified rather than hoped for:
   `bbx_untile`, `bbx_hud`'s model is in `xbox/platform/hud.cpp`, …);
 * the vendored guest core's GCN library, LibAtrac9, monocypher and zlib;
 * the package: `bbxbox.exe` + `SDL3.dll` + `libuwp.dll` (and no shader compiler at
-  all: the four DXIL blobs are compiled on the runner and embedded in the exe), the
+  all: the six DXIL blobs are compiled on the runner and embedded in the exe), the
   manifest (`EntryPoint="bbxbox.App"`, activated through `bbxbox.def`, with the
   `Microsoft.VCLibs.140.00` dependency the console requires), the six generated
   logos, a `.map` and a `.pdb`.
@@ -82,13 +86,17 @@ imports no desktop-only file, memory or loader API.
   `xbox/scripts/dxc-run.ps1`; the blobs are embedded in `bbx_shaders_generated.h`. The package carries
   no `dxcompiler.dll`/`dxil.dll` at all, and `check-imports.ps1` no longer allows them as modules.
 * **`./tools/syntax_check.sh`** — the Windows-only translation units
-  (`bbx_d3d12.cpp`, `device.cpp`, `swapchain.cpp`, and every future `src/host/d3d12`
-  backend file) are type-checked on Linux against declaration-only stubs of
+  (`bbx_d3d12.cpp`, `device.cpp`, `swapchain.cpp`, `pipeline.cpp`, `replay.cpp` and
+  `xbox/platform/d3d12_session.cpp`) are type-checked on Linux against declaration-only stubs of
   `<windows.h>`, `<d3d12.h>`, `<dxgi1_6.h>` and `<wrl/client.h>` in
   `tools/stubs/win_d3d12/`. This is a type-and-signature check, not an emulator: it
   caught `DXGI_CREATE_FACTORY_FLAGS_NONE` (which does not exist), a wrong
-  `GetDesc`/`GetDesc1` pair and an `int` where `D3D12_RTV_DIMENSION` was required
-  before CI did - and the Windows job still compiles the same files with clang-cl.
+  `GetDesc`/`GetDesc1` pair, an `int` where `D3D12_RTV_DIMENSION` was required and
+  a `D3D12_ROOT_SIGNATURE_VERSION_1` the SDK does not have (its name is
+  `D3D_ROOT_SIGNATURE_VERSION_1`) before CI did - and the Windows job still compiles
+  the same files with clang-cl. The stub is included with `-isystem` so its own
+  unused constants are not silenced, which is how an unused constant and an unused
+  helper in `replay.cpp` were caught locally instead of on CI.
 * `./tools/local_precheck.sh`: tests, AppContainer API rules (`*FromApp`, no
   `PAGE_EXECUTE_READWRITE`), `/STACK:8388608,65536`, no game files/build output/absolute paths tracked,
   docs/code number agreement.

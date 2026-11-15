@@ -9,7 +9,7 @@ in this port is "done" because it compiles.
 |---|---|---|
 | Portable core builds | `cmake -S . -B build -DBBX_HOST_ONLY=ON && cmake --build build` | no warnings in the port's own sources (`-Wall -Wextra -Werror`) |
 | Unit tests | `ctest --test-dir build --output-on-failure` | all of `tests/` green |
-| Syntax check of UWP-only sources | `tools/syntax_check.sh` (which now also type-checks `xbox/platform/d3d12_session.cpp`) (clang-cl, Windows runners) | zero errors against the GDK headers |
+| Syntax check of UWP-only sources | `tools/syntax_check.sh`, plus clang-cl on the Windows runners (it also type-checks `xbox/platform/d3d12_session.cpp`) | zero errors against the GDK headers |
 | PE import audit | `xbox/scripts/check-imports.ps1` | `bbxbox.exe` imports only `WindowsApp.lib`'s api sets, the Store CRT (`*_app.dll`), or a DLL in this package, and no desktop-only symbol; shipped third-party DLLs are reported as notices, not failures |
 | Manifest lint | `xbox/scripts/check-manifest.ps1` | `x64`, `Windows.Universal` + `mp:PhoneIdentity`, `Executable`/`EntryPoint` = `bbxbox.exe`/`bbxbox.App`, `codeGeneration` + `removableStorage` + `gamepad`, **no** `runFullTrust`, **no** `broadFileSystemAccess`, every `Assets\*.png` present |
 | Package | `xbox/scripts/package.ps1` | manifest lint passes, `makeappx` writes `.appx` with `bbxbox.map` + `bbxbox.pdb` beside it; the artefact upload fails if the map or pdb is missing |
