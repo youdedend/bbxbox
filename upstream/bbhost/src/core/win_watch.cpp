@@ -65,6 +65,15 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* ep) {
 }  // namespace
 
 bool win_watch_arm(std::uintptr_t lo, std::uintptr_t hi, int max_hits) {
+#if defined(BBX_UWP)
+    // A packaged title may not register a vectored exception handler; the watch
+    // is a development aid (`BBHOST_WIN_WATCH`), so it arms nothing here.
+    (void)lo;
+    (void)hi;
+    (void)max_hits;
+    host_log("win-watch: not available in a packaged title");
+    return false;
+#else
     if (!g_handler) g_handler = AddVectoredExceptionHandler(1, handler);
     if (!g_handler) return false;
     g_lo = lo;
@@ -75,6 +84,7 @@ bool win_watch_arm(std::uintptr_t lo, std::uintptr_t hi, int max_hits) {
     g_max = max_hits;
     g_armed = true;
     protect_pages(PAGE_READONLY);
+#endif
     host_log("win-watch: armed on [0x%llx, 0x%llx) (pages [0x%llx, 0x%llx))", static_cast<unsigned long long>(lo),
              static_cast<unsigned long long>(hi), static_cast<unsigned long long>(g_page_lo.load()),
              static_cast<unsigned long long>(g_page_hi.load()));
