@@ -123,10 +123,24 @@ endif()
 # fails import validation on the console.
 set(BBX_STORE_CRT_DIR "" CACHE PATH "the MSVC lib/x64/store directory (the Store CRT)")
 if(BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
+    # The directory goes first on the search path, so the store CRT wins over the
+    # desktop one for every library name the CRT itself requests.
     target_link_directories(bbxbox BEFORE PRIVATE "${BBX_STORE_CRT_DIR}")
-    target_link_libraries(bbxbox PRIVATE vcruntime140_app msvcp140_app vcruntime140_1_app)
-    target_link_options(bbxbox PRIVATE /NODEFAULTLIB:vcruntime140_1.lib)
     target_compile_definitions(bbxbox PRIVATE _CRT_STDIO_ARBITRARY_WIDE_SPECIFIERS)
+    # Toolchains differ: some name the store import libraries *_app.lib, others
+    # keep the plain names and only the DLL they point at changes. Link the *_app
+    # names when they exist, and refuse the desktop vcruntime140_1.lib, which
+    # supplies __CxxFrameHandler4 but imports VCRUNTIME140_1.dll.
+    foreach(name vcruntime140_app msvcp140_app vcruntime140_1_app)
+        find_library(BBX_${name} ${name} PATHS "${BBX_STORE_CRT_DIR}" NO_DEFAULT_PATH)
+    endforeach()
+    if(BBX_vcruntime140_app AND BBX_msvcp140_app AND BBX_vcruntime140_1_app)
+        target_link_libraries(bbxbox PRIVATE vcruntime140_app msvcp140_app vcruntime140_1_app)
+        target_link_options(bbxbox PRIVATE /NODEFAULTLIB:vcruntime140_1.lib)
+        message(STATUS "store CRT: linking the *_app import libraries")
+    else()
+        message(STATUS "store CRT: only the plain import-library names exist")
+    endif()
 else()
     message(WARNING "BBX_STORE_CRT_DIR is not set; the link will import the desktop CRT")
 endif()

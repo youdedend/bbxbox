@@ -92,6 +92,13 @@ $cfgArgs = @(
 if (Test-Path $storeLib) {
     $cfgArgs += "-DCMAKE_LIBRARY_PATH=$storeLib"
     $cfgArgs += "-DBBX_STORE_CRT_DIR=$storeLib"
+    # Which import libraries the store CRT actually ships decides whether the
+    # _app names can be linked; say it out loud, as a notice, because the run log
+    # is not always reachable.
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $names = (Get-ChildItem -Path $storeLib -Filter *.lib | Select-Object -ExpandProperty Name) -join ", "
+        Write-Output "::notice title=store CRT::$names"
+    }
 }
 & cmake @cfgArgs *> $cfgLog
 if ($LASTEXITCODE -ne 0) {
