@@ -176,7 +176,7 @@ const char* FaultKind(ULONG_PTR code) {
 void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
     const auto* record = info != nullptr ? info->ExceptionRecord : nullptr;
     const auto* context = info != nullptr ? info->ContextRecord : nullptr;
-    const auto fault = static_cast<std::uintptr_t>(
+    const auto fault = reinterpret_cast<std::uintptr_t>(
         record != nullptr ? record->ExceptionAddress : nullptr);
     std::size_t used = 0;
     const std::size_t cap = sizeof(g_report);
@@ -193,6 +193,7 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
         (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
          record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR)) {
         char target[192];
+        // ExceptionInformation[1] is a ULONG_PTR holding the faulting address.
         const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
         DescribeTarget(address, target, sizeof(target));
         wrote = std::snprintf(g_report + used, cap - used, "  %s of 0x%llx%s\n",
