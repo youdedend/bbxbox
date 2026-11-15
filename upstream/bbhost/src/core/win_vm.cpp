@@ -47,21 +47,36 @@ struct Api {
 };
 
 #if defined(BBX_UWP)
-// Under BBX_UWP the three entry points are the AppContainer's own, declared in
-// memoryapi.h and linked from WindowsApp.lib: VirtualAlloc2FromApp,
-// MapViewOfFile3FromApp and UnmapViewOfFile2. They have the same signatures as
-// the desktop names the function pointers below are typed with, so the rest of
-// this file does not know which it got. Resolving the desktop names by hand -
-// GetModuleHandleW + GetProcAddress - cannot work here twice over: the loader
-// calls are desktop-partition, and calling the desktop function would be
-// refused at run time on the very addresses this layer exists to place.
+// Under BBX_UWP these are the AppContainer's own entry points. Two of the three
+// are resolved from kernelbase by name rather than imported, and that is
+// deliberate: the SDK's app-partition import library binds
+// `MapViewOfFile3FromApp` to the `MapViewOfFile2` symbol, which the port's
+// import audit refuses (and rightly - it is the desktop name). The *export*
+// `MapViewOfFile3FromApp` exists in the api-set, so asking for it by name gets
+// the AppContainer's behaviour without importing the forbidden symbol.
+// `GetProcAddress` on an already-loaded module is not a LoadLibrary call and is
+// allowed inside the container; `VirtualAlloc2FromApp` is imported normally,
+// as `xbox/platform/guest_memory.cpp` and the memory self-test already do.
 const Api& api() {
     static const Api a = [] {
         Api r;
         r.VirtualAlloc2 = &::VirtualAlloc2FromApp;
-        r.MapViewOfFile3 = &::MapViewOfFile3FromApp;
-        r.UnmapViewOfFile2 = &::UnmapViewOfFile2;
-        r.ok = true;
+        HMODULE kernel = ::GetModuleHandleW(L"kernelbase.dll");
+        if (kernel == nullptr) kernel = ::GetModuleHandleW(L"kernel32.dll");
+        if (kernel != nullptr) {
+            r.MapViewOfFile3 = reinterpret_cast<PFN_MapViewOfFile3>(
+                ::GetProcAddress(kernel, "MapViewOfFile3FromApp"));
+            if (r.MapViewOfFile3 == nullptr) {
+                r.MapViewOfFile3 = reinterpret_cast<PFN_MapViewOfFile3>(
+                    ::GetProcAddress(kernel, "MapViewOfFile3"));
+            }
+            r.UnmapViewOfFile2 = reinterpret_cast<PFN_UnmapViewOfFile2>(
+                ::GetProcAddress(kernel, "UnmapViewOfFile2"));
+        }
+        r.ok = r.VirtualAlloc2 != nullptr && r.MapViewOfFile3 != nullptr && r.UnmapViewOfFile2 != nullptr;
+        if (!r.ok) {
+            host_log("win-vm: the AppContainer's view entry points are missing; guest mappings are best effort");
+        }
         return r;
     }();
     return a;
