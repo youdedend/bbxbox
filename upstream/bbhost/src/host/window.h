@@ -225,7 +225,15 @@ bool host_text_entry_open();
 // keys held or-ed into the keyboard's as if typed. False when the file holds
 // no key it can play.
 bool host_test_keys_play(const char* path);
+// Local change, marked BBX_UWP: `<rpcndr.h>`, which `<windows.h>` pulls in,
+// defines `small` as `char` - so the parameter cannot carry that name in a
+// translation unit that has seen windows.h. Names only; the signature and the
+// definition (`host/window.cpp`) are unchanged.
+#if defined(BBX_UWP)
+void host_pad_rumble(std::uint8_t small_magnitude, std::uint8_t large_magnitude);
+#else
 void host_pad_rumble(std::uint8_t small, std::uint8_t large);
+#endif
 // A gamepad is open. What the port shows for a button prompt follows it when
 // the setting is on Auto (engine/key_prompts.h).
 bool host_pad_present();

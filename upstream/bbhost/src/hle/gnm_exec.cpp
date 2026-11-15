@@ -19,6 +19,9 @@
 #include "host/gpu.h"
 #include "host/slow_calls.h"
 
+// Local change, marked BBX_UWP: MSVC's standard library does not drag <array>
+// in through another header, and `g_cb_ranges` below is a std::array.
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
