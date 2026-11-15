@@ -25,14 +25,44 @@ the SDK's app-partition import library otherwise pulls in `MapViewOfFile2`,
 which the audit refuses. The page protections in `write_watch.cpp`,
 `win_watch.cpp` and `kernel.cpp` are `VirtualProtectFromApp`, and
 `core/host_clock_shim.h` supplies `clock_gettime` over the Win32 clocks (the
-Store SDK has no `<pthread_time.h>`). The first ten guest translation units
-(`core`: SHA-256, imports, TLS rewrite, the loader, the paced file, host-fs,
-the VM layer; `hle`: `fs`, `fios`, `save_commit`) compile for the console in the
-`bbhost_guest` library on every run. The rest of `src/hle` does not yet: upstream's
-Windows build is a MinGW one, so its `_WIN32` branches assume winpthreads
-(`<pthread.h>`, `<pthread_time.h>`) and, in `core/thunk.cpp`, GNU inline asm —
-both of which clang-cl against the Store SDK lacks. Those are the next two
-files to port, and the reason the library stops where it does.
+Store SDK has no `<pthread_time.h>`). **The guest runtime compiles for the console, all but four files of it.** The
+`bbhost_guest` library is every translation unit of `src/core` (except the
+Linux VM layer and the desktop host-fs backend) and thirty-four of `src/hle`'s
+thirty-eight — the file system, `fios`, save commits, the kernel, pthreads, the
+synchronisation primitives, the variadic shims (asm and all), libc, gnm's
+resource tracking, the audio stack (`audio`, `ajm`, `avplayer`), `dialog`, the
+network modules (`net`, `http`, `np_matching2`, `np_signaling`), `runtime` and
+the guest console — compiled against the Store SDK and the AppContainer on every
+Windows run. Getting there needed three things upstream's MinGW build had for
+free:
+
+  * `xbox/winpthreads_shim/` — `<pthread.h>`, `<sched.h>` and `<sys/time.h>`
+    over `SRWLOCK`, `CONDITION_VARIABLE`, `CreateThread` with an explicit stack
+    *reservation*, and the Win32 clocks. A mutex is one pointer, allocated on
+    first use, so a zero-initialised `pthread_mutex_t` is valid without an
+    initialiser macro; `pthread_self()` makes a record for threads the shim did
+    not create, so `main`, SDL's threads and the D3D12 worker are not special
+    cases;
+  * `thunk.cpp`'s module-level asm and `SYSV_VA_ENTRY` open with
+    `.att_syntax prefix`, because clang-cl hands a module-level `asm("...")` to
+    the assembler in Intel syntax — which is what `unknown token in expression`
+    at `push %rbp` was. The GCC-style extended asm inside functions was always
+    AT&T. `/arch:AVX2` for the vector save area, as the console's Zen 2 is;
+  * strict W^X: `host_page_alloc(size, true)` comes back *writable* on the
+    console (`VirtualAllocFromApp` refuses `PAGE_EXECUTE_READWRITE` even with
+    the `codeGeneration` capability), and `host_page_make_writable` /
+    `host_page_make_executable` are the pair every writer of generated code
+    uses — the thunk stub page flips its pages, stores the bytes, flips to
+    `PAGE_EXECUTE_READ` and flushes the instruction cache.
+
+**What still does not compile for the console:** `hle/video.cpp`,
+`hle/system.cpp`, `hle/gnm_exec.cpp` and `hle/gx_trace.cpp`. Each of them
+includes a host header that carries Vulkan types — `host/ingame_menu.h`,
+`host/gxvk.h`, `host/gxvk_lists.h`, `host/gxvk_homes.h`, `host/cb_capture.h`,
+`host/list_resolve.h` — and those headers have to be fenced under `BBX_UWP`
+before those four files can join the library. `hle/dialog.cpp` and `hle/libc.cpp`
+needed a local patch each for the MinGW-only `<sys/time.h>` and the reentrant
+`gmtime_r`/`localtime_r`; both are marked and one line each.
 `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
 | P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls — the app therefore **links and packages** with the
 whole P2 path in it (run `43734984657`). Six shader entry points are embedded as SM 6.4 DXIL; no compiler ships. **What P2 does not do:** image copies (`kCopyImage`, `kCopyBufferToImage`, `kCopyImageToBuffer`) are counted and deferred to P3's resource table, per-draw state from the stream is not replayed, and the launcher's own UI is still SDL's — the GPU path currently shows the boot report and the self-test row. No console has run any of it. |
