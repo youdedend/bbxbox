@@ -145,6 +145,8 @@ add_library(bbhost_guest STATIC
     "${BBX_BBHOST_ROOT}/src/hle/http.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/np_matching2.cpp"
     "${BBX_BBHOST_ROOT}/src/hle/np_signaling.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/libc.cpp"
+    "${BBX_BBHOST_ROOT}/src/hle/gnm.cpp"
 )
 target_include_directories(bbhost_guest PUBLIC
     # winpthreads for a SDK that has no <pthread.h>; ahead of everything, and
