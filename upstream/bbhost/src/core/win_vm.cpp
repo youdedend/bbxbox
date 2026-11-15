@@ -14,6 +14,26 @@ namespace {
 
 constexpr std::uint64_t kGran = 0x10000;  // the allocation granularity
 
+#if defined(BBX_UWP)
+// The two plain calls this file still makes, through the AppContainer's
+// entry points: `VirtualProtect` and `VirtualAlloc` are refused here, and they
+// are the same request as `VirtualProtectFromApp`/`VirtualAllocFromApp`
+// (memoryapi.h, WindowsApp.lib).
+inline BOOL VmProtect(void* p, SIZE_T len, DWORD prot, DWORD* old) {
+    return ::VirtualProtectFromApp(p, len, prot, old);
+}
+inline void* VmAlloc(void* at, SIZE_T len, DWORD type, DWORD prot) {
+    return ::VirtualAllocFromApp(at, len, type, prot);
+}
+#else
+inline BOOL VmProtect(void* p, SIZE_T len, DWORD prot, DWORD* old) {
+    return ::VirtualProtect(p, len, prot, old);
+}
+inline void* VmAlloc(void* at, SIZE_T len, DWORD type, DWORD prot) {
+    return ::VirtualAlloc(at, len, type, prot);
+}
+#endif
+
 using PFN_VirtualAlloc2 = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
 using PFN_MapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG,
                                           MEM_EXTENDED_PARAMETER*, ULONG);
@@ -153,7 +173,7 @@ bool unmap_view_part_locked(std::uintptr_t vb, const View& v, std::uintptr_t at,
             for (const Part& k : kept) {
                 if (k.base >= run_base && k.base < run_base + run_len && k.protect != PAGE_EXECUTE_READWRITE) {
                     DWORD old = 0;
-                    VirtualProtect(reinterpret_cast<void*>(k.base), k.len, k.protect, &old);
+                    VmProtect(reinterpret_cast<void*>(k.base), k.len, k.protect, &old);
                 }
             }
         }
@@ -301,11 +321,17 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
         host_log("win-vm: view offset 0x%llx is not 64 KiB aligned", static_cast<unsigned long long>(offset));
         return nullptr;
     }
+#if defined(BBX_UWP)
+    // api().ok is true by construction here: the AppContainer's three entry
+    // points are always present, and MapViewOfFileEx is not callable at all.
+    if (!api().ok) return nullptr;
+#else
     if (!api().ok) {  // best effort: MapViewOfFileEx at the hint
         if (place == WinVmPlace::Anywhere && align > kGran) return nullptr;
         return MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE, static_cast<DWORD>(offset >> 32),
                                static_cast<DWORD>(offset), len, place == WinVmPlace::Anywhere ? nullptr : at);
     }
+#endif
     std::lock_guard<std::mutex> lk(g_mu);
     std::uintptr_t base;
     if (place == WinVmPlace::Anywhere) {
@@ -329,7 +355,7 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
     }
     if (protect == PAGE_NOACCESS) {
         DWORD old = 0;
-        VirtualProtect(p, len, PAGE_NOACCESS, &old);
+        VmProtect(p, len, PAGE_NOACCESS, &old);
     }
     g_views[base] = View{section, offset, len, false};
     return p;
@@ -337,10 +363,18 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
 
 void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlace place, std::uint64_t limit) {
     if (!api().ok) {
-        return VirtualAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE | MEM_COMMIT, protect);
+        return VmAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE | MEM_COMMIT, protect);
     }
+#if defined(BBX_UWP)
+    // AppContainer: the FromApp call, and no RWX (a guest mapping that wants
+    // execute is split by the arena's ledger). SEC_RESERVE keeps the section
+    // from charging its whole size against the title's 5,120 MiB.
+    HANDLE s = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
+                                        static_cast<ULONG64>(len), nullptr);
+#else
     HANDLE s = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(len >> 32),
                                   static_cast<DWORD>(len), nullptr);
+#endif
     if (!s) {
         host_log("win-vm: private section of 0x%llx failed: error %lu", static_cast<unsigned long long>(len),
                  GetLastError());
@@ -357,7 +391,7 @@ void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlac
 }
 
 void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uint64_t limit) {
-    if (!api().ok) return VirtualAlloc(at, len, MEM_RESERVE | MEM_COMMIT, protect);
+    if (!api().ok) return VmAlloc(at, len, MEM_RESERVE | MEM_COMMIT, protect);
     std::lock_guard<std::mutex> lk(g_mu);
     if (at) {
         if (!carve_locked(reinterpret_cast<std::uintptr_t>(at), len, true)) return nullptr;
@@ -372,7 +406,7 @@ void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uin
 }
 
 void* win_vm_place(void* at, std::uint64_t len, WinVmPlace place, std::uint64_t limit) {
-    if (!api().ok) return VirtualAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE, PAGE_NOACCESS);
+    if (!api().ok) return VmAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE, PAGE_NOACCESS);
     std::lock_guard<std::mutex> lk(g_mu);
     if (place == WinVmPlace::Anywhere) return place_anywhere_locked(len, limit);
     return carve_locked(reinterpret_cast<std::uintptr_t>(at), len, place == WinVmPlace::Exact) ? at : nullptr;
