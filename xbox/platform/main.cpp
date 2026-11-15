@@ -225,6 +225,8 @@ std::vector<std::string> WrapLines(const std::string& text) {
     return lines;
 }
 
+void DrawLauncher();
+
 // One frame of whichever renderer owns the window. The GPU path draws the boot
 // report; a present that fails (a removed device) falls back to SDL once and logs
 // why, rather than presenting into a dead swapchain every frame.
