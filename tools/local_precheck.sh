@@ -136,6 +136,44 @@ if ! grep -q "bbxbox.cer" xbox/scripts/package.ps1; then
   fail "package.ps1 must export the signing certificate as bbxbox.cer"
 fi
 
+# --- 5e. the shader toolchain -------------------------------------------------
+# The console app carries no shader compiler: every fixed pass is DXIL compiled on
+# the build machine. These rules keep that true, because the failure mode (a
+# packaged desktop dxcompiler.dll that LoadPackagedLibrary refuses on the console)
+# only shows up on the TV.
+if ! ls xbox/shaders/*.hlsl >/dev/null 2>&1; then
+  fail "xbox/shaders has no HLSL: the present and overlay passes are compiled at build time"
+fi
+# Comments explain these rules, so they must not trip them: strip // to end of line
+# and # to end of line before looking for forbidden tokens.
+hlsl_code() { sed -e 's://.*::' "$1"; }
+cmake_code() { sed -e 's:#.*::' "$1"; }
+for hlsl in xbox/shaders/*.hlsl; do
+  if hlsl_code "$hlsl" | grep -q '\[\[vk::'; then
+    fail "$hlsl uses [[vk::*]]: that is SPIR-V flavoured HLSL, rejected at -T *_6_4"
+  fi
+  if hlsl_code "$hlsl" | grep -Eq 'min16(float|int|uint)|\bhalf\b|ResourceDescriptorHeap'; then
+    fail "$hlsl uses 16-bit types or heap indexing: the console lowers 16-bit and has no SM 6.6"
+  fi
+done
+if cmake_code xbox/CMakeLists.txt | grep -q -- "enable-16bit-types"; then
+  fail "xbox/CMakeLists.txt enables 16-bit types; the console has no native 16-bit ALU"
+fi
+for symbol in PresentVs PresentPs OverlayVs OverlayPs; do
+  if ! grep -q "bbx_shader($symbol " xbox/CMakeLists.txt; then
+    fail "bbx_shader($symbol ...) is missing from xbox/CMakeLists.txt"
+  fi
+  if ! grep -q "k$symbol{" src/host/d3d12/bbx_shaders.h; then
+    fail "k$symbol is missing from bbx_shaders.h's manifest"
+  fi
+done
+if grep -Eq 'Copy-Item.*(dxcompiler|dxil)' xbox/scripts/package.ps1; then
+  fail "package.ps1 still copies a shader compiler into the package; DXIL is build-time only"
+fi
+if ! grep -q "spirv_to_dxil" docs/ARCHITECTURE_XBOX_D3D12.md; then
+  fail "docs/ARCHITECTURE_XBOX_D3D12.md must state the SPIR-V -> DXIL plan for guest shaders"
+fi
+
 # --- 6. the console's shader and pipeline rules ------------------------------
 if grep -rn "enable-16bit-types\|enable_16bit_types *= *true" --include=*.cpp --include=*.h --include=*.cmake src/ xbox/ 2>/dev/null | grep -v "bbx_caps.h" | grep -v "^.*//" >/dev/null; then
   fail "16-bit shader types are enabled somewhere (console has no native 16-bit ALU)"

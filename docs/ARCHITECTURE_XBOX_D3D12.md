@@ -55,14 +55,54 @@ can never be produced by the Xbox path.
 
 ## 3. Shader compilation
 
-* Target `*_6_4`, `-enable-16bit-types` never, `lower_16bit_ops` always (§1).
+Two different problems, with two different answers: the port's own passes, and the guest's shaders.
+
+### 3.1 The port's passes: DXIL at build time, no compiler in the package
+
+`xbox/shaders/present.hlsl` and `overlay.hlsl` are compiled by `build-deps/prefix/dxc/dxc.exe` on the
+build machine, at `-T vs_6_4` / `-T ps_6_4`, `-O3 -WX`, and embedded as byte arrays by
+`cmake/embed_shaders.cmake` into `bbx_shaders_generated.h`. `src/host/d3d12/bbx_shaders.h` is the
+manifest of entry points; `tests/shaders_test.cpp` checks it and `tools/local_precheck.sh` checks it
+against `xbox/CMakeLists.txt`. The consequence that matters: **no shader compiler ships**, so
+`LoadPackagedLibrary` on a desktop `dxcompiler.dll` is not a run-time dependency of anything.
+
+That DLL was a real single point of failure, not a hypothetical one: `dxcompiler.dll` imports
+`CreateFileW`, `LoadLibraryA` and `MapViewOfFile`, which the AppContainer refuses, so whether the
+console could load it depended on an OS detail nobody controls. Compiling at build time also moves a
+shader error from the TV to CI.
+
+Rules the compiled passes follow, enforced by `-WX` plus the precheck greps:
+
+* `*_6_4`, `-enable-16bit-types` never (`lower_16bit_ops` always, §1), no `ResourceDescriptorHeap`
+  (SM 6.6), no mesh shaders.
 * Bindings: one SRV/UAV descriptor table per kind in its own `space`, one sampler table; guest
   T#/S# slots become table indices. Non-uniform access goes through `NonUniformResourceIndex`, and
   where the driver needs it a `WaveReadLaneFirst` waterfall.
-* Signed with the SDK's `dxil.dll`, loaded from the package with `LoadPackagedLibrary` (libuwp), never
-  from the working directory.
 * Loops with `break` carry `[loop]` (guard G6); a switch that cannot express the guest's flow is a
   skip with a log line, not a hang.
+
+### 3.2 The guest's shaders: SPIR-V is the IR of record, DXIL is the target
+
+`gcn/lift.cpp` lifts guest GCN to SPIR-V, and all 22 `src/host/shaders/*.spv.h` are SPIR-V.
+`gcn/hlsl.cpp` is **not** on that path: it emits SPIR-V flavoured HLSL (`[[vk::ext_instruction]]`,
+`[[vk::ext_builtin_input]]`, `[[vk::ext_execution_mode]]`) for `dxc -spirv`, and DXC rejects that
+source outright at `-T *_6_4`. Nothing may feed it to a DXIL profile; the precheck asserts the port's
+own HLSL contains no `[[vk::` for the same reason.
+
+The plan for P3 (guest shaders, not yet implemented) follows KytyPS5: translate SPIR-V to DXIL
+in memory with Mesa's MIT-licensed `spirv_to_dxil`, built with `-Db_vscrt=mt
+-Dmin-windows-version=10` and a local patch for
+
+* linked-stage signatures (the guest's VS/PS pair is one SPIR-V module, DXIL wants separate stages
+  with matching signatures),
+* 16-bit half-to-int lowering, because the console has no native 16-bit ALU (§1),
+* `NonUniform` descriptor handles, and
+* SM 6.4 helper-lane wave fixes.
+
+The result is validated in memory with `dxil.dll`'s `IDxcValidator` (present on the console; also
+MIT-adjacent and already part of the platform) — again zero `dxcompiler.dll`. If `spirv_to_dxil`
+proves too lossy for Bloodborne's compute, the fallback is a D3D12-native SM 6.4 emitter from the same
+SPIR-V, not a packaged desktop compiler.
 
 ## 4. Tessellation: zero domain points
 

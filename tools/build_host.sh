@@ -49,6 +49,7 @@ sources=(
   "$root"/tests/psocache_test.cpp
   "$root"/tests/tess_test.cpp
   "$root"/tests/display_test.cpp
+  "$root"/tests/shaders_test.cpp
 )
 
 mkdir -p "$(dirname "$out")"

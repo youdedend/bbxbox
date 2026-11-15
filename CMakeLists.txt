@@ -116,6 +116,7 @@ if(BBX_BUILD_TESTS)
         tests/psocache_test.cpp
         tests/tess_test.cpp
         tests/display_test.cpp
+        tests/shaders_test.cpp
     )
     target_link_libraries(bbx_tests PRIVATE bbx_d3d12_core bbx_platform_core)
     target_include_directories(bbx_tests PRIVATE tests "${CMAKE_CURRENT_SOURCE_DIR}")

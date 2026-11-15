@@ -33,6 +33,65 @@ if(NOT EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
         "Run: pwsh xbox/scripts/build-deps.ps1 (it builds SDL3-uwp once, into build-deps/prefix).")
 endif()
 
+set(BBX_DXC_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/../build-deps/prefix/dxc" CACHE PATH
+    "DXC from xbox/scripts/build-deps.ps1; used at build time only, never shipped")
+
+# --- shaders: DXIL at build time, zero compiler at run time -------------------
+# The console app cannot carry a shader compiler: dxcompiler.dll imports
+# CreateFileW / LoadLibraryA / MapViewOfFile, which the AppContainer refuses, so
+# LoadPackagedLibrary on it is a coin flip. Every fixed pass is therefore compiled
+# here - at the shader model the console supports, with -WX - and embedded as
+# bytes. A shader a console cannot run cannot be built into the package, and a
+# broken shader fails CI instead of failing on the TV.
+set(BBX_DXC "${BBX_DXC_PREFIX}/dxc.exe")
+if(NOT EXISTS "${BBX_DXC}")
+    message(FATAL_ERROR
+        "dxc.exe is not in ${BBX_DXC_PREFIX}.\n"
+        "Run: pwsh xbox/scripts/build-deps.ps1 (it downloads DXC v1.9.2609 into build-deps/prefix/dxc).")
+endif()
+
+set(BBX_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set_property(GLOBAL PROPERTY BBX_SHADER_OUTPUTS "")
+set_property(GLOBAL PROPERTY BBX_SHADER_PAIRS "")
+
+function(bbx_shader symbol entry profile source)
+    set(out "${BBX_SHADER_DIR}/${symbol}.dxil")
+    add_custom_command(OUTPUT "${out}"
+        COMMAND "${BBX_DXC}" -nologo -T "${profile}" -E "${entry}" -O3 -WX
+                -Fo "${out}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${source}"
+        COMMENT "dxc: ${source} -E ${entry} -T ${profile}"
+        VERBATIM)
+    # No -enable-16bit-types: the console has no native 16-bit ALU (guard: SM 6.2
+    # 16-bit types are lowered, and DXC's own lowering is what adds the helper
+    # lane work). No ResourceDescriptorHeap: SM 6.6 is not there.
+    get_property(outputs GLOBAL PROPERTY BBX_SHADER_OUTPUTS)
+    set_property(GLOBAL PROPERTY BBX_SHADER_OUTPUTS ${outputs} "${out}")
+    get_property(pairs GLOBAL PROPERTY BBX_SHADER_PAIRS)
+    set_property(GLOBAL PROPERTY BBX_SHADER_PAIRS "${pairs}" "${symbol}=${out}")
+endfunction()
+
+# Keep this list in step with bbx_shaders.h's Manifest(); tools/local_precheck.sh
+# compares the two.
+bbx_shader(PresentVs PresentVs vs_6_4 present.hlsl)
+bbx_shader(PresentPs PresentPs ps_6_4 present.hlsl)
+bbx_shader(OverlayVs OverlayVs vs_6_4 overlay.hlsl)
+bbx_shader(OverlayPs OverlayPs ps_6_4 overlay.hlsl)
+
+get_property(BBX_SHADER_OUTPUTS GLOBAL PROPERTY BBX_SHADER_OUTPUTS)
+get_property(BBX_SHADER_PAIRS GLOBAL PROPERTY BBX_SHADER_PAIRS)
+set(BBX_SHADER_HEADER "${BBX_SHADER_DIR}/bbx_shaders_generated.h")
+add_custom_command(OUTPUT "${BBX_SHADER_HEADER}"
+    COMMAND "${CMAKE_COMMAND}"
+            "-DOUT=${BBX_SHADER_HEADER}"
+            "-DPAIRS=${BBX_SHADER_PAIRS}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/embed_shaders.cmake"
+    DEPENDS ${BBX_SHADER_OUTPUTS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/embed_shaders.cmake"
+    COMMENT "embedding DXIL into bbx_shaders_generated.h"
+    VERBATIM)
+add_custom_target(bbx_shaders ALL DEPENDS "${BBX_SHADER_HEADER}")
+
 # bbhost: vendored at upstream/bbhost, pinned, and compiled here (see
 # cmake/bbhost.cmake). The guest core and the host stream hooks join as P1 lands.
 option(BBX_BBHOST "compile the vendored bbhost sources" ON)
@@ -50,14 +109,18 @@ set(BBX_APP_SOURCES
     platform/ini_file.cpp
     platform/launcher.cpp
     platform/ux.cpp
+    platform/shaders.cpp
 )
 
 add_executable(bbxbox WIN32 ${BBX_APP_SOURCES})
 set_target_properties(bbxbox PROPERTIES OUTPUT_NAME "bbxbox")
 
+add_dependencies(bbxbox bbx_shaders)
+
 target_include_directories(bbxbox PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
     "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+    "${BBX_SHADER_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src"
     "${BBX_SDL3_PREFIX}/include"
 )

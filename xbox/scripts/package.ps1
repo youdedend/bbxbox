@@ -5,9 +5,10 @@
 
 .DESCRIPTION
   The package contains exactly: bbxbox.exe, its .map and .pdb next to it for
-  symbolication, the dependency DLLs (SDL3.dll, libuwp.dll, and dxcompiler.dll +
-  dxil.dll when the DXIL path is enabled), the manifest and the assets. No game
-  data, ever; the dump is read from wherever the player granted access.
+  symbolication, the dependency DLLs (SDL3.dll, libuwp.dll), the manifest and the
+  assets - and no shader compiler at all: every DXIL blob is built with dxc on
+  the build machine (xbox/shaders/*.hlsl). No game data, ever; the dump is read
+  from wherever the player granted access.
 #>
 [CmdletBinding()]
 param(
@@ -53,11 +54,11 @@ foreach ($dll in @("sdl3\bin\SDL3.dll", "sdl3\bin\SDL3.pdb", "libuwp\bin\libuwp.
     $path = Join-Path $prefix $dll
     if (Test-Path $path) { Copy-Item $path (Join-Path $layout (Split-Path $path -Leaf)) }
 }
-# DXIL: the compiler is a packaged DLL, loaded with LoadPackagedLibrary.
-foreach ($dll in @("dxcompiler.dll", "dxil.dll")) {
-    $path = Join-Path $prefix "dxc\$dll"
-    if (Test-Path $path) { Copy-Item $path (Join-Path $layout $dll) }
-}
+# No shader compiler in the package. Every fixed pass is DXIL compiled at build
+# time (xbox/shaders/*.hlsl -> bbx_shaders_generated.h); shipping
+# dxcompiler.dll and hoping LoadPackagedLibrary accepts its desktop imports was
+# the single point of failure the port is built without. The guest's shaders go
+# SPIR-V -> DXIL in memory (P3), which needs no packaged compiler either.
 
 Copy-Item (Join-Path $Root "xbox\AppxManifest.xml") (Join-Path $layout "AppxManifest.xml")
 $assets = Join-Path $Root "xbox\Assets"

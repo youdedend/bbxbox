@@ -47,7 +47,10 @@ $AllowedModules = @(
     "^api-ms-win-", "^ext-ms-win-", "^ucrtbase\.dll$", "^vcruntime140_app", "^msvcp140_app",
     "^oleaut32\.dll$", "^combase\.dll$",
     "^kernel32\.dll$", "^kernelbase\.dll$", "^d3d12\.dll$", "^dxgi\.dll$", "^d3d11\.dll$",
-    "^dxcompiler\.dll$", "^dxil\.dll$", "^xaudio2_9\.dll$", "^SDL3\.dll$", "^libuwp\.dll$",
+    # No dxcompiler.dll / dxil.dll: the package does not carry a shader compiler
+    # (DXIL is compiled at build time), so importing one is a packaging bug, not
+    # an allowance. An import that is not in this list is a failure.
+    "^xaudio2_9\.dll$", "^SDL3\.dll$", "^libuwp\.dll$",
     "^ole32\.dll$", "^windows\.storage\.dll$", "^combase\.dll$", "^sechost\.dll$",
     "^powrprof\.dll$", "^user32\.dll$", "^gdi32\.dll$", "^advapi32\.dll$", "^shcore\.dll$",
     "^bcrypt\.dll$", "^ntdll\.dll$", "^rpcrt4\.dll$", "^mmdevapi\.dll$", "^avrt\.dll$",
