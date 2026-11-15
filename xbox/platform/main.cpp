@@ -490,7 +490,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         // can read off a console. Proven once here, before the launcher is up.
         {
             char why[64] = {0};
-            const int step = bbxbox::winpthreads::SelfTest(why, sizeof(why));
+            const int step = bbx::winpthreads::SelfTest(why, sizeof(why));
             bbx::platform::LogF("winpthreads: %s%s%s", step == 0 ? "PASS" : "FAILED",
                                 step == 0 ? "" : " at ", step == 0 ? "" : why);
         }

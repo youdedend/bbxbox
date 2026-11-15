@@ -6,6 +6,12 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cxx="${CXX:-g++}"
+# One invocation compiles and links every test unit, so caching only pays on a
+# run that rebuilt something; when ccache is installed it costs nothing to ask.
+cxx_cmd=("$cxx")
+if [ -z "${CXX:-}" ] && command -v ccache >/dev/null 2>&1; then
+  cxx_cmd=(ccache g++)
+fi
 out="${1:-$root/build/bbx_tests}"
 
 sources=(
@@ -96,7 +102,7 @@ for unit in adler32 crc32 inflate inffast inftrees uncompr zutil compress trees 
 done
 ar rcs "$objdir/libbbx_zlib.a" "${zlib_objs[@]}"
 
-"$cxx" -std=c++20 -O2 -Wall -Wextra -Werror \
+"${cxx_cmd[@]}" -std=c++20 -O2 -Wall -Wextra -Werror \
   -I "$root/src" -I "$root/tests" -I "$root" -I "$root/upstream/bbhost/src" \
   -I "$zlib" -DBBX_HAVE_ZLIB=1 \
   -o "$out" "${sources[@]}" "$objdir/libbbx_zlib.a"

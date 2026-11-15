@@ -27,11 +27,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-function Emit-ErrorAnnotation([string]$Title, [string]$Body) {
+function Emit-ErrorAnnotation([string]$Title, [string]$Body, [string]$Level = 'error') {
     if ($env:GITHUB_ACTIONS -eq 'true' -and $Body) {
         $enc = $Body -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
-        if ($enc.Length -gt 55000) { $enc = $enc.Substring($enc.Length - 55000) }
-        Write-Output "::error title=$Title::$enc"
+        if ($enc.Length -gt 4000) { $enc = $enc.Substring(0, 4000) }
+        Write-Output "::$Level title=$Title::$enc"
     }
 }
 
@@ -87,6 +87,18 @@ $cfgArgs = @(
     "-DBBX_FFMPEG_PREFIX=$prefix\ffmpeg",
     "-DBBX_BBHOST_ROOT=$Root\upstream\bbhost"
 )
+# Object caching, when the tool is there. On a hit the 175 translation units of
+# the guest archives compile in seconds, which is what a link iteration needs.
+$cached = Get-Command sccache -ErrorAction SilentlyContinue
+if (-not $cached) { $cached = Get-Command ccache -ErrorAction SilentlyContinue }
+if ($cached) {
+    $launcher = $cached.Source
+    $cfgArgs += "-DCMAKE_C_COMPILER_LAUNCHER=$launcher"
+    $cfgArgs += "-DCMAKE_CXX_COMPILER_LAUNCHER=$launcher"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        Write-Output "::notice title=compiler cache::$launcher"
+    }
+}
 # CMAKE_LIBRARY_PATH only seeds find_library; the link needs the directory too,
 # which is what BBX_STORE_CRT_DIR does (target_link_directories BEFORE).
 if (Test-Path $storeLib) {
@@ -154,7 +166,11 @@ if ($LASTEXITCODE -ne 0) {
         }
         if ($current.Count -gt 0) { $chunks.Add(($current -join "`n")) }
         for ($k = 0; $k -lt $chunks.Count; ++$k) {
-            Emit-ErrorAnnotation "undefined symbols $($k + 1)/$($chunks.Count) (of $($undefined.Count))" $chunks[$k]
+            # GitHub renders at most ten `::error`s per step and silently drops
+            # the rest; a census longer than that finishes as warnings, which
+            # still reach the annotation list.
+            $level = if ($k -lt 8) { 'error' } else { 'warning' }
+            Emit-ErrorAnnotation "undefined symbols $($k + 1)/$($chunks.Count) (of $($undefined.Count))" $chunks[$k] $level
         }
     }
     if ($errors.Count -eq 0) { $errors.AddRange([string[]]($lines | Select-Object -Last 80)) }

@@ -17,9 +17,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
-        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build ccache
+      - name: compiler cache -- restore
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-host-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-host-${{ runner.os }}-
       - name: host build + unit tests + precheck
         run: ./tools/local_precheck.sh
+      - name: compiler cache -- save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-host-${{ runner.os }}-${{ github.sha }}
 
   console:
     name: UWP build + import audit
@@ -32,6 +46,26 @@ jobs:
         with:
           path: build-deps/prefix
           key: deps-${{ runner.os }}-${{ hashFiles('xbox/scripts/build-deps.ps1') }}
+      - name: compiler cache -- restore
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-console-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-console-${{ runner.os }}-
+      - name: install ccache
+        shell: pwsh
+        run: |
+          choco install ccache -y --no-progress
+          $ccache = (Get-Command ccache -ErrorAction SilentlyContinue).Source
+          if (-not $ccache) { Write-Output "::warning title=ccache missing::the build runs uncached"; exit 0 }
+          & $ccache --version | Select-Object -First 1
+          # The default config is 5 GiB of local disk; the runner has room, and a
+          # link iteration should be a cache hit, not a rebuild.
+          & $ccache --set-config=max_size=3G
+          & $ccache --set-config=compiler_check=content
+          Write-Output "::notice title=ccache::$ccache"
       - name: build dependencies when the cache misses
         if: steps.deps.outputs.cache-hit != 'true'
         shell: pwsh
@@ -91,6 +125,12 @@ jobs:
             Write-Output "::error title=package step failed::$enc"
             exit 1
           }
+      - name: compiler cache -- save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-console-${{ runner.os }}-${{ github.sha }}
       - name: upload build logs
         if: always()
         uses: actions/upload-artifact@v4
