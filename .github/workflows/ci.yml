@@ -137,29 +137,35 @@ jobs:
         # The import audit names the symbol; the link names nothing. This step
         # names the translation unit that still refers to it, so a refusal is
         # fenced at its source instead of guessed at. It searches the objects for
-        # the import stub (`__imp_<name>`) and then keeps only the exact name, so
-        # the `*FromApp` calls next to it are not reported. Annotations, not
-        # stdout: a run's log is not always reachable afterwards.
+        # the import stub (`__imp_<name>`) and keeps only the exact name, so the
+        # `*FromApp` calls beside it are not reported. Annotations, not stdout: a
+        # run's log is not always reachable afterwards. A failure here is never
+        # the job's: it only reports.
         run: |
-          $names = @('MapViewOfFile', 'CreateFile2', 'FindFirstFileExW', 'FindFirstFileW',
-                     'CreateDirectoryW', 'MoveFileExW', 'DeleteFileW', 'CreateFileA', 'CreateFileW')
-          $root = Join-Path $PWD 'build/xbox'
-          if (-not (Test-Path $root)) { exit 0 }
-          $prefix = $PWD.Path + [string][char]92
-          foreach ($name in $names) {
-            $candidates = & findstr.exe /S /M /C:("__imp_" + $name) (Join-Path $root '*.obj') 2>$null
-            if (-not $candidates) { continue }
-            $exact = New-Object System.Text.RegularExpressions.Regex(('(?<![A-Za-z0-9_])' + $name + '(?![A-Za-z0-9_])'))
-            $hits = @(foreach ($file in $candidates) {
-              $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($file))
-              if ($exact.IsMatch($text)) { $file -replace [regex]::Escape($prefix), '' }
-            })
-            if ($hits.Count -eq 0) { continue }
-            $message = (($hits | Sort-Object -Unique) -join '; ')
-            if ($message.Length -gt 3000) { $message = $message.Substring(0, 3000) }
-            $enc = $message -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
-            $head = "::warning title=refused import $($name)::"
-            Write-Output ($head + $enc)
+          $ErrorActionPreference = 'Stop'
+          try {
+            $names = @('MapViewOfFile', 'CreateFile2', 'FindFirstFileExW', 'FindFirstFileW',
+                       'CreateDirectoryW', 'MoveFileExW', 'DeleteFileW', 'CreateFileA', 'CreateFileW')
+            $root = Join-Path $PWD 'build/xbox'
+            if (-not (Test-Path $root)) { return }
+            $prefix = $PWD.Path + [string][char]92
+            foreach ($name in $names) {
+              $candidates = & findstr.exe /S /M /C:("__imp_" + $name) (Join-Path $root '*.obj') 2>$null
+              if (-not $candidates) { continue }
+              $exact = [System.Text.RegularExpressions.Regex]::new('(?<![A-Za-z0-9_])' + $name + '(?![A-Za-z0-9_])')
+              $hits = @(foreach ($file in $candidates) {
+                $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($file))
+                if ($exact.IsMatch($text)) { $file -replace [regex]::Escape($prefix), '' }
+              })
+              if ($hits.Count -eq 0) { continue }
+              $message = (($hits | Sort-Object -Unique) -join '; ')
+              if ($message.Length -gt 3000) { $message = $message.Substring(0, 3000) }
+              $enc = $message -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+              Write-Output ("::warning title=refused import $($name)::" + $enc)
+            }
+          } catch {
+            $enc = "$_" -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Output ("::warning title=refused import scan failed::" + $enc)
           }
 
       - name: package + check imports
