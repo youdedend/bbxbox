@@ -61,9 +61,20 @@ jobs:
           & ./xbox/scripts/build.ps1 2>&1 | Tee-Object -FilePath build/build-step.log
           if ($LASTEXITCODE -ne 0) {
             # Run logs are not always reachable after the fact; the annotation is.
-            $tail = (Get-Content build/build-step.log -Tail 150 -ErrorAction SilentlyContinue) -join "`n"
-            $enc = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
-            Write-Output "::error title=build step failed::$enc"
+            $lines = @(Get-Content build/build-step.log -ErrorAction SilentlyContinue)
+            # Compiler and dxc diagnostics first: they are what explains the
+            # failure, and they are not always inside the tail.
+            $diagnostics = @($lines | Where-Object { $_ -match 'error[: ]|warning[: ]|FAILED:' } |
+                Select-Object -Last 40)
+            if ($diagnostics.Count -gt 0) {
+                $diag = ($diagnostics -join "`n")
+                $diagEnc = $diag -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+                Write-Output "::error title=diagnostics::$diagEnc"
+            } else {
+                $tail = ($lines | Select-Object -Last 150) -join "`n"
+                $enc = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+                Write-Output "::error title=build step failed::$enc"
+            }
             exit 1
           }
       - name: package + check imports
