@@ -36,3 +36,16 @@ tools/diff_portable_surface.sh     # what of the port's assumptions moved
 The second script compares the declarations the port depends on (record layouts, `GfxPipeline`'s
 state, `gcn::LiftResult`, the fingerprint macro) against the pinned tree and prints a unified diff,
 so an upstream bump is a reviewable change rather than a surprise at link time.
+
+## Vendoring
+
+`droogie/bbhost` at `a317321c7fea9f34cb002a4796d492f461ff52dd` is **vendored** in
+`upstream/bbhost/` (`src/`, `third_party/libatrac9`, `third_party/monocypher`, both licence
+files, and `UPSTREAM-PIN`). It is compiled by `cmake/bbhost.cmake` on every CI run — no network
+access at build time, no stand-in. zlib 1.3.1 is vendored next to it in `upstream/third_party/zlib`
+(bbhost's `src/gcn/container.cpp` inflates `.shaderbnd.dcx` with it).
+
+Local changes are marked `BBX_UWP`. Today that is `src/core/memory.h` and `src/core/memory.cpp`
+only: on the console the guest arena comes from `xbox/platform/guest_memory_bbhost.h`
+(`VirtualAlloc2FromApp` below 1 TiB, strict W^X). `tools/fetch_upstream.sh` re-copies the pin,
+refuses to overwrite edits outside those two files, and `--diff` lists the markers.

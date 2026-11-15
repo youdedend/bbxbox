@@ -21,6 +21,8 @@ note() { echo "precheck: $*"; }
 
 # --- 1. host build + tests ---------------------------------------------------
 note "building the portable core"
+# A clean checkout has no build directory; the redirect below would fail first.
+mkdir -p "$root/build"
 if ! ./tools/build_host.sh "$root/build/bbx_tests" >"$root/build/precheck-tests.log" 2>&1; then
   tail -30 "$root/build/precheck-tests.log"
   fail "host build or tests failed (see build/precheck-tests.log)"
@@ -84,6 +86,21 @@ for pair in "memory-budget.md:4,480" "memory-budget.md:5,120" "porting-plan.md:8
 done
 if ! grep -q "allocatable" src/host/d3d12/bbx_budget.h; then
   fail "bbx_budget.h lost allocatable()"
+fi
+
+# --- 5b. the vendored guest core ---------------------------------------------
+if [ ! -f upstream/bbhost/UPSTREAM-PIN ]; then
+  fail "upstream/bbhost/UPSTREAM-PIN is missing"
+fi
+if ! grep -q "a317321c7fea9f34cb002a4796d492f461ff52dd" upstream/bbhost/UPSTREAM-PIN 2>/dev/null; then
+  fail "the bbhost pin changed; update UPSTREAM.md and docs/PORT_STATUS.md with it"
+fi
+vendored=$(find upstream/bbhost/src -name '*.cpp' | wc -l)
+if [ "$vendored" -lt 200 ]; then
+  fail "only $vendored vendored bbhost translation units; the tree looks truncated"
+fi
+if [ -d upstream/bbhost/.git ]; then
+  fail "upstream/bbhost/.git must not be vendored"
 fi
 
 # --- 6. the console's shader and pipeline rules ------------------------------

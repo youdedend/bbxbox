@@ -1,0 +1,8 @@
+repository = https://github.com/droogie/bbhost
+commit     = a317321c7fea9f34cb002a4796d492f461ff52dd
+license    = GPL-3.0-or-later, with LICENSE-EXCEPTION (both copied here)
+vendored   = src/ (all), third_party/libatrac9, third_party/monocypher
+not vendored = third_party/{dlss,dxc,fidelityfx,imgui,upscaler_bridge} (SDK payloads the
+               UWP backend does not use), .git, docs, tools, tests, assets
+local edits = every change carries a `BBX_UWP` or `BBX_UWP PORT` marker; see
+               `tools/fetch_upstream.sh --diff` for the list

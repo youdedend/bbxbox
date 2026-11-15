@@ -1,0 +1,311 @@
+#pragma once
+
+// Host shell: SDL3 window, event pump, input state, and a Vulkan presenter.
+// Everything here is optional; when the shell is not started (headless) the
+// HLE keeps working without a display.
+
+#include <cstdint>
+#include <string>
+
+#include "host/text_entry.h"
+
+// The DualShock 4 touchpad surface, in its own pixels. This is what
+// scePadGetControllerInformation reports, so the fingers below are in the same
+// space the game is told to expect.
+constexpr int kPadTouchW = 1920, kPadTouchH = 943;
+
+// A stick at rest, as the game reads it: 127 is its zero - what a centred
+// controller reads through our axis conversion too. 128 is a step off it, and
+// the game reads that step as a push whenever the stick's other axis is held:
+// its analog shaping (DLUI's, which Dark Souls III shares) zeroes a small axis
+// only when its pair is small as well, then pushes what is left outward. With
+// 128 the keyboard's W, with no controller connected, read as forward and a
+// little right, and every turn with A or D cut a sprint short.
+constexpr std::uint8_t kStickRest = 127;
+// A key's full push, the same either way from the rest: 0 and 254. 255 is a
+// step past full on the right and down sides only (0 is 127 below the rest,
+// 255 is 128 above it), and pressing or letting go of D while sprinting
+// dropped the sprint for 8 frames where A did not.
+constexpr std::uint8_t kStickLow = kStickRest - 127, kStickHigh = kStickRest + 127;
+
+struct PadState {
+    std::uint32_t buttons = 0;   // ScePadButtonDataOffset bits
+    std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
+    std::uint8_t l2 = 0, r2 = 0;
+    bool connected = false;
+    std::uint64_t timestamp = 0;
+    // The pad reports up to two fingers. `id` counts up as fingers arrive, the
+    // way the PS4's does, so a game can follow one across frames.
+    struct Touch {
+        std::uint16_t x = 0, y = 0;
+        std::uint8_t id = 0;
+        bool down = false;
+    };
+    Touch touch[2];
+    std::uint8_t touch_count = 0;
+    // The keys that always work a menu, whatever the bindings say: the arrows,
+    // Enter, Backspace and Escape as the d-pad, Circle, Cross and Options. The
+    // pad read adds these only while a menu is open, so rebinding what an
+    // arrow does in play can never leave the menus without a way to move.
+    // The menu actions' keys (Menu Confirm and Back, the menu pages and
+    // options: host/bindings.h) come here too.
+    std::uint32_t menu_buttons = 0;
+    // What the keyboard's play-only actions put in `buttons` and no controller
+    // holds as well: the pad read takes these out while a menu is open, so the
+    // menu reads its pages and options from their own keys, never from Strong
+    // Attack's or the firearm's.
+    std::uint32_t play_buttons = 0;
+};
+
+// Creates the window (and Vulkan presenter when possible). Returns false when
+// no display or SDL is unavailable; the caller then runs headless.
+bool host_window_start(int width, int height, const char* title);
+// Pump events once. Returns false when the user asked to quit.
+bool host_window_pump();
+// Ends the run as closing the window does (the title menu's Quit Game). Any thread.
+void host_window_request_quit();
+void host_window_stop();
+// An error the player has to read before bbhost ends, in a box of its own (not
+// modal to the game's window, whose thread may have stopped pumping). Returns
+// when it is closed; at once without SDL.
+void host_window_error_box(const char* title, const char* text);
+bool host_window_active();
+
+// Snapshot of controller/keyboard state for scePad.
+PadState host_pad_state();
+
+// The pointer, for menus. Bloodborne has no mouse
+// device, so this is a channel of its own rather than part of PadState: a pad
+// cannot carry a position.
+struct MouseState {
+    // Where the pointer is in the game's own display buffer, in pixels - the
+    // presenter stretches that buffer over the whole window, so this is the
+    // window position scaled by it. Both 0 when the window has never presented.
+    float x = 0.0f, y = 0.0f;
+    bool in_window = false;
+    bool moved = false;             // moved since the previous read
+    std::uint32_t buttons = 0;      // held now: bit 0 left, 1 right, 2 middle
+    // Edges since the previous read, *latched*: a click that both arrives and
+    // ends between two reads is still reported, which polling `buttons` alone
+    // would lose.
+    std::uint32_t pressed = 0, released = 0;
+    float wheel = 0.0f;             // notches since the previous read, up positive
+    // Relative motion since the previous read, in window pixels. This is what
+    // a camera wants and the absolute position is not: in camera mode the
+    // pointer is locked, so x/y stop moving while dx/dy keep arriving. DS3
+    // gets the same thing by SetCursorPos-ing back to the middle of the client
+    // rect every frame (CSMouseMan); SDL's relative mode is that without the
+    // round trip through the desktop.
+    float dx = 0.0f, dy = 0.0f;
+};
+// Reads and clears the latched edges, the wheel and `moved`. One consumer.
+MouseState host_mouse_state();
+// The position alone, without consuming anything - for drawing the pointer,
+// which must not eat the edges its real consumer needs. False when the pointer
+// is outside the window or nothing has been presented yet.
+bool host_mouse_position(float& x, float& y);
+// The pointer in the **menu movie's stage** pixels, which is the space the
+// menu's row geometry is in. This is the one place
+// that conversion lives, so a resolution change edits it here rather than
+// everywhere a hit test is written. False when there is no pointer.
+bool host_mouse_stage_position(float& x, float& y);
+
+// Camera mode: the pointer is locked to the window and hidden, and only
+// relative motion is reported. Off in menus, on in play - the caller decides,
+// because nothing in the host can yet tell one from the other.
+void host_mouse_set_relative(bool on);
+bool host_mouse_relative();
+
+// A plugin with controls of its own (plugin API 13): the keys by SDL scancode
+// as the last pad update saw them, the mouse's buttons held, and the presses,
+// motion and wheel since the last call - one reader, the plugins. `playing`
+// while the mouse turns the camera (in the world, no menu or text box up).
+// False without a window.
+struct PluginInput {
+    std::uint8_t key[512] = {};
+    std::uint32_t buttons = 0, pressed = 0;
+    float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
+    bool playing = false;
+};
+// Each reader's presses, motion and wheel are its own: since its own last read
+// ("" for API 13's input, the plugins that do not name themselves).
+bool host_plugin_input(const char* reader, PluginInput& out);
+// What a plugin takes from the game while the mouse turns the camera: these
+// keys no longer press what they are bound to, nor these mouse buttons (bit 0
+// left, 1 right, 2 middle, 3 back, 4 forward), the wheel's notches when
+// `wheel`, and the mouse no longer turns the game's camera when `motion`.
+// Each owner's take is its own - "" for the plugins that do not name
+// themselves (API 13's input_take) - and the game loses what any takes; a
+// call replaces its owner's last. Nothing taken gives the owner's back, but a
+// key held then stays taken until it is let go; a key left out of a take that
+// goes on is the game's again at once.
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel,
+                            bool motion);
+// The controller as a plugin reads it (plugin API 29's pad): its own buttons
+// (BB_PAD_* bits - the menus' bits, whatever the bindings make of them in
+// play), sticks and triggers as the last pad update saw them, before
+// host_plugin_pad_take takes any, and the frame's presses (host_plugin_pad_frame),
+// the same for every reader. Nothing held while bbhost's menus, a binding
+// capture or a text box have the controller. A test's taps join it
+// (host_plugin_pad_test).
+struct PluginPad {
+    std::uint32_t buttons = 0, pressed = 0;
+    std::uint32_t play = 0;  // the buttons held as what each presses in play (the player's bindings)
+    std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
+    std::uint8_t l2 = 0, r2 = 0;
+    bool connected = false;
+};
+void host_plugin_pad(PluginPad& out);
+// A new frame for the plugins (before their on_frame callbacks): the presses
+// latched since the last one become the frame's.
+void host_plugin_pad_frame();
+// What a plugin takes from the game (plugin API 29's pad_take): those buttons
+// read let go, those sticks centred and the triggers at rest - the press
+// they are bound to in play never made. Owners as host_plugin_input_take's:
+// the takes add up, a call replaces its owner's last, a button held as an
+// owner's take ends stays taken until let go, one left out of a take that
+// goes on is the game's at once.
+constexpr std::uint32_t kPadTakeLeftStick = 1, kPadTakeRightStick = 2, kPadTakeTriggers = 4;
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes);
+// Everything an owner takes - keys, mouse, controller - given back (a plugin
+// switched off); a key or button held then stays taken until let go.
+void host_plugin_take_drop(const char* owner);
+std::uint32_t host_plugin_pad_taken_buttons();
+std::uint32_t host_plugin_pad_taken_axes();
+// A test's presses (the pad read's taps and BBHOST_AUTOPRESS, which stand for
+// the controller): `buttons` held and the sticks they hold over (kStickRest
+// where they hold none), joined to the plugin's view of the controller.
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry);
+
+// For the pad read (hle/system.cpp).
+std::uint32_t host_plugin_taken_buttons();
+bool host_plugin_taken_wheel();
+bool host_plugin_taken_motion();
+
+// The strong-attack modifier (Shift by default) - see the key table.
+bool host_key_strong();
+// Whether the host draws its own pointer (the game has no cursor asset), which
+// also hides the window system's.
+void host_mouse_set_visible(bool visible);
+
+// A line of text over the game for `seconds` (plugins' show_message); a new
+// one replaces the last. Any thread.
+void host_message_show(const char* text, float seconds);
+// A line a plugin places (show_text, plugin API 14): its box's corner at
+// (x, y) as fractions of the window, `align` BB_TEXT_* (left, centre or right
+// of the point, | bottom: rising from it), `scale` the overlay text's. A new
+// one replaces the last; separate from the banner. Any thread.
+void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align);
+// The FPS counter's sample: a game frame starts (the main loop's frame-time
+// manager, engine/frame_rate.cpp, as its limiter lets the frame go). Nothing
+// but a flag load while the counter is off.
+void host_fps_frame_start();
+// Text entry for the game's IME dialog: while active the window collects
+// typed text in a box over the game, and the box owns the input - the game
+// sees a connected pad with nothing pressed and no pointer, as a PS4 game
+// does while the system's keyboard is up. Enter (or a controller's confirm)
+// accepts, Escape (or its back) cancels. Safe to call from any thread.
+// hidden: a star per character (a password).
+// label: what the box over the game asks for (the game's own dialog title,
+// "Enter Chalice Glyph"); "Enter name" without one. Ctrl+V (or Shift+Insert)
+// pastes the clipboard.
+// charset: what the box takes (host/text_entry.h); typed characters outside
+// it are left out.
+// select_initial: the starting text is a suggestion that the first key typed
+// replaces (host/text_entry.h).
+void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden = false, const char* label = nullptr,
+                           TextCharset charset = TextCharset::Any, bool select_initial = false);
+// 0 = editing, 1 = accepted, 2 = cancelled (or no window); fills `text`.
+int host_text_entry_poll(std::string& text_utf8);
+void host_text_entry_end();
+// Whether a text entry is open (begun and not yet ended), whoever opened it.
+bool host_text_entry_open();
+// A test harness's keys (the request "keys FILE", hle/video.cpp): the file's
+// "<ms> +<key>" / "<ms> -<key>" lines (SDL key names) played from now on, the
+// keys held or-ed into the keyboard's as if typed. False when the file holds
+// no key it can play.
+bool host_test_keys_play(const char* path);
+void host_pad_rumble(std::uint8_t small, std::uint8_t large);
+// A gamepad is open. What the port shows for a button prompt follows it when
+// the setting is on Auto (engine/key_prompts.h).
+bool host_pad_present();
+// The device the player last used (DS3's switch): the latest key, click,
+// wheel or mouse movement makes it the keyboard and mouse, the latest pad
+// button or stick or trigger past its dead zone a controller. The serial
+// counts the switches, for anything that must redo what it showed.
+enum class InputDevice : int { KeyboardMouse = 0, Pad = 1 };
+InputDevice host_input_device();
+std::uint64_t host_input_serial();
+// The pointer's last window position, the window's size and the display-buffer
+// position they map to, as one line for a log.
+void host_mouse_describe(char* out, std::size_t n);
+
+// Live display settings, driven by the options screen (host/options.h). All
+// are safe before the window exists: they record the wish and the presenter
+// picks it up when it comes up. V-Sync off rebuilds the swapchain on the next
+// present with whichever no-wait mode the surface supports.
+// Window mode: 0 windowed, 1 borderless (fullscreen at the desktop's own
+// resolution, no mode switch), 2 fullscreen (exclusive: the display switched
+// to the mode nearest width x height - the resolution - at the desktop's
+// refresh rate). A width and height of 0 keep the last ones.
+void host_window_set_mode(int mode, int width = 0, int height = 0);
+// Stay borderless (Windows) makes Borderless's swapchain tell the
+// driver it may not take the window as exclusive fullscreen; a change of it,
+// or of the window mode to or from Borderless while it is on, rebuilds the
+// swapchain the same way. Elsewhere it is recorded and does nothing.
+void host_window_set_stay_borderless(bool on);
+// The presenter's swapchain made again at its next frame (frame generation
+// switched: AMD's swapchain or its own).
+void host_window_recreate_swapchain();
+#if defined(BBHOST_HAVE_SDL3)
+// A controller press as one of the bindable buttons (host/bindings.h
+// PadInput): a button down, or a trigger pulled past a quarter; -1 otherwise.
+int host_pad_input_of_event(const union SDL_Event& e);
+#endif
+void host_window_set_vsync(bool on);
+// The presented image's size in pixels (the swapchain: the window, or the
+// display in fullscreen); false before there is one (headless). Any thread.
+bool host_window_pixels(int* w, int* h);
+// The desktop mode of the display the window is on, in pixels - the desktop's
+// own, unchanged by Fullscreen's exclusive mode while it is up - for the game's
+// size with an upscaler (host/options.cpp). False before the window is made.
+bool host_window_desktop_size(int* w, int* h);
+// The same, as the window's thread last saw it - updated when the window is
+// made, moves to another display, or a display's mode changes - for any
+// thread (the game's frame end: engine/live_resolution.cpp). False before the
+// window is made, and with no window (headless).
+bool host_window_display_now(int* w, int* h);
+// `fn` is told the window's pixel size now (if there is a window) and each
+// time it changes - a resize, a fullscreen toggle, a display change - on the
+// window's thread. One listener (the light grid, engine/graphics_patch.cpp).
+void host_window_on_pixels(void (*fn)(int, int));
+// The refresh rate of the display the window is on, in Hz, or 0
+// when there is no window (headless) or the display does not say. The flip
+// clock runs at this rate instead of assuming 59.94 Hz.
+float host_window_refresh_hz();
+// The refresh rate of the display the game is on: the window's
+// (host_window_refresh_hz) once there is one, before that the primary
+// display's, where the window opens (host_desktop_refresh_hz) - Display-Limited
+// and frame generation's limit take it, so a window on a 144 Hz second screen
+// beside a 60 Hz primary runs at 144, not 60. Safe from any thread once the
+// window shell has started: a window whose display does not say its rate
+// then reads the primary display's as it started, never SDL's video brought
+// up and down off the window's thread (0 when neither says).
+float host_display_refresh_hz();
+// The steady-clock time, in nanoseconds, at which the presenting thread last
+// finished a present, and a counter of finished presents. With V-Sync on the
+// present returns on the display's own vblank, which is the phase the flip
+// clock steers towards. `serial` is 0 until the first present.
+std::uint64_t host_present_last_ns(std::uint64_t* serial);
+
+// What the presenter is told of a flip besides its buffer (hle/video.cpp).
+struct PresentFlip {
+    std::uint64_t submit_need = ~0ull;  // host_gpu_work_needs() when the flip arrived; ~0: not known, submit
+    std::uint64_t arrived_ns = 0;       // steady clock when the flip was queued (for the flip-to-present time); 0: not known
+    bool on_arrival = false;            // shown when it arrived, before its vblank completes it (BBHOST_PRESENT_ON_ARRIVAL)
+};
+// Present one frame: copies the render target the game displays (`display_va`
+// from sceVideoOutRegisterBuffers) into the swapchain, or clears when there
+// is none yet. Safe to call from any thread: it hands the frame to the
+// presenting thread, which keeps only the newest.
+void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip = {});

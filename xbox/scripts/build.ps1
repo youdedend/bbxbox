@@ -4,19 +4,36 @@
   Configures and builds bbxbox.exe for Xbox (WindowsStore, x64) with clang-cl.
 
 .DESCRIPTION
-  Dependencies must already be in build-deps/prefix (build-deps.ps1). The build
-  is incremental by design: dependencies are cached, and only the app's own
-  translation units are recompiled, so a CI push costs 2-4 minutes.
+  Ninja, not the Visual Studio generator: `-T ClangCL` with
+  `CMAKE_SYSTEM_NAME=WindowsStore` is refused or silently misconfigured by several
+  CMake versions, while `-G Ninja` with `CMAKE_CXX_COMPILER=clang-cl` is what the
+  prior art's Xbox build uses and what this script follows. The dev shell is
+  entered first so link.exe, the Windows SDK and the **Store CRT**
+  (`VC/Tools/MSVC/<ver>/lib/x64/store`) are on the environment; without that
+  directory the link picks the desktop CRT and the package fails import
+  validation on a console.
+
+  Failures are published as GitHub annotations as well as text: the Actions log
+  endpoint is not always reachable after a run, an annotation always is.
 #>
 [CmdletBinding()]
 param(
     [string]$Root = (Resolve-Path "$PSScriptRoot\..\..").Path,
-    [string]$Configuration = "Release",
-    [switch]$Clean
+    [string]$Configuration = "RelWithDebInfo",
+    [switch]$Clean,
+    [switch]$SyntaxOnly
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+function Emit-ErrorAnnotation([string]$Title, [string]$Body) {
+    if ($env:GITHUB_ACTIONS -eq 'true' -and $Body) {
+        $enc = $Body -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        if ($enc.Length -gt 55000) { $enc = $enc.Substring($enc.Length - 55000) }
+        Write-Output "::error title=$Title::$enc"
+    }
+}
 
 $build = Join-Path $Root "build\xbox"
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
@@ -26,18 +43,72 @@ if (-not (Test-Path (Join-Path $prefix "sdl3\include\SDL3\SDL.h"))) {
     throw "dependencies missing; run xbox/scripts/build-deps.ps1 first"
 }
 
-# clang-cl comes from the VS LLVM component; cmake picks it up with -T ClangCL.
-& cmake -S (Join-Path $Root "xbox") -B $build `
-    -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 `
-    -A x64 -T ClangCL `
-    -DCMAKE_BUILD_TYPE=$Configuration `
-    -DBBX_SDL3_PREFIX="$prefix\sdl3" `
-    -DBBX_LIBUWP_PREFIX="$prefix\libuwp" `
-    -DCMAKE_CXX_FLAGS="/std:c++20 /permissive- /EHsc /W4 /WX /Zc:__cplusplus"
-if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+# --- toolchain --------------------------------------------------------------
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw "vswhere not found" }
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+    Select-Object -First 1
+if (-not $vs) { throw "no Visual Studio with the C++ toolset" }
+& "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
 
-& cmake --build $build --config $Configuration --parallel
-if ($LASTEXITCODE -ne 0) { throw "build failed" }
+$clangCl = "$vs\VC\Tools\Llvm\x64\bin\clang-cl.exe"
+if (-not (Test-Path $clangCl)) {
+    throw "clang-cl missing at $clangCl; install the 'Microsoft.VisualStudio.Component.VC.Llvm.Clang' component"
+}
+$env:CC = $clangCl
+$env:CXX = $clangCl
+$env:PATH = "$vs\VC\Tools\Llvm\x64\bin;$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;$env:PATH"
+
+# The Store CRT lives beside the desktop one; the link must prefer it.
+$msvcRoot = Get-ChildItem -Path (Join-Path $vs "VC\Tools\MSVC") -Directory | Sort-Object Name -Descending |
+    Select-Object -First 1
+$storeLib = Join-Path $msvcRoot.FullName "lib\x64\store"
+if (-not (Test-Path $storeLib)) {
+    Write-Output "::warning title=Store CRT missing::$storeLib not found; the package may fail import validation"
+}
+
+# --- configure --------------------------------------------------------------
+$cfgLog = Join-Path $Root "build\xbox-configure.log"
+$cfgArgs = @(
+    "-S", (Join-Path $Root "xbox"),
+    "-B", $build,
+    "-G", "Ninja",
+    "-DCMAKE_SYSTEM_NAME=WindowsStore",
+    "-DCMAKE_SYSTEM_VERSION=10.0",
+    "-DCMAKE_C_COMPILER=clang-cl",
+    "-DCMAKE_CXX_COMPILER=clang-cl",
+    "-DCMAKE_BUILD_TYPE=$Configuration",
+    "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL",
+    "-DBBX_SDL3_PREFIX=$prefix\sdl3",
+    "-DBBX_LIBUWP_PREFIX=$prefix\libuwp",
+    "-DBBX_DXC_PREFIX=$prefix\dxc",
+    "-DBBX_FFMPEG_PREFIX=$prefix\ffmpeg",
+    "-DBBX_BBHOST_ROOT=$Root\upstream\bbhost"
+)
+if (Test-Path $storeLib) { $cfgArgs += "-DCMAKE_LIBRARY_PATH=$storeLib" }
+& cmake @cfgArgs *> $cfgLog
+if ($LASTEXITCODE -ne 0) {
+    $tail = (Get-Content $cfgLog -Tail 80) -join "`n"
+    Write-Output $tail
+    Emit-ErrorAnnotation 'CMake configure failed' $tail
+    throw "xbox CMake configure failed"
+}
+
+# --- build ------------------------------------------------------------------
+$buildLog = Join-Path $Root "build\xbox-build.log"
+$buildArgs = @("--build", $build, "--parallel", "$([Environment]::ProcessorCount)")
+if ($SyntaxOnly) { $buildArgs += "--target", "bbxbox_syntax" }
+& cmake @buildArgs *> $buildLog
+if ($LASTEXITCODE -ne 0) {
+    $errors = @(Get-Content $buildLog | Where-Object {
+        $_ -match 'error:|fatal error:|FAILED:|undefined symbol|ld\.lld|clang-cl\.exe' } |
+        Where-Object { $_ -notmatch '^\s*$' })
+    if (-not $errors.Count) { $errors = @(Get-Content $buildLog -Tail 80) }
+    $summary = ($errors | Select-Object -First 60) -join "`n"
+    Write-Output $summary
+    Emit-ErrorAnnotation 'CMake build failed' $summary
+    throw "xbox build failed (see build/xbox-build.log)"
+}
 
 $exe = Get-ChildItem -Recurse -Path $build -Filter "bbxbox.exe" | Select-Object -First 1
 if (-not $exe) { throw "bbxbox.exe not produced" }

@@ -1,0 +1,262 @@
+// Resolving draws where their command lists are finished (docs/rendering.md,
+// "Resolving draws where their command lists are finished"; the plan and its
+// measurements are docs/list-resolve.md): the first, measuring step. A list's
+// draws can be resolved ahead of the command processor only between the
+// points where something must run in its order - a wait, a label, a copy, a
+// dispatch, a query, a change of render targets. BBHOST_LIST_RESOLVE=runs
+// counts how the command processor's token stream falls into such runs of
+// GX-native draws: how many draws a run holds, what ends each run, how many
+// draws a GX command list (a GX context's stretch of draws) holds, and how
+// many flips lie between a draw's GX call and the command processor reaching
+// it. GX's pipeline drains (barrier tokens) are counted but end no run: they
+// order the command processor's own writes after the work before them, and
+// no draw's resolution reads them. Off by default (0): nothing is counted and
+// nothing changes.
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+struct GpuDrawInputs;
+struct GxDrawObjects;
+
+namespace list_resolve {
+
+// BBHOST_LIST_RESOLVE: 0 off, 1 (`runs`) the run census.
+extern const int g_mode;
+// BBHOST_RUN_BATCH: 0 off, 1 on (unset: on - since 2026-11-11 also where the
+// run commit is off, Linux's default, and the homes are not on; before, only
+// with the run commit or the homes), 2 (`compare`) today's work with every
+// answer a run would have shared checked against it. What a draw of a run
+// takes from the draw before it: its targets' lookups (render.cpp
+// draw_targets); a constant buffer's copy an earlier draw of the run took,
+// without its lookups (render.cpp resolve_stage_buffers, CbRunEntry); and, on,
+// the lite shadow drains GX's notices once a draw rather than once a vertex
+// record (no answer to check: compare drains as before).
+extern std::atomic<int> g_batch;
+inline int batch_mode() { return g_batch.load(std::memory_order_relaxed); }
+inline bool batching() { return batch_mode() != 0; }
+inline bool batch_compare() { return batch_mode() == 2; }
+inline bool batch_shares() { return batch_mode() == 1; }
+// BBHOST_DRAW_CONTEXT: 0 off (the default), 1 (`chunks`) the command
+// processor's draws take their rings' space through a context of chunks
+// (gpu_internal.h DrawCtx), and the census below counts what they still take
+// outside it; 2 (`compare`) as 1, and every chunk checked against the others
+// its ring gave the same recording, and every constant-buffer copy a context's
+// memo binds against the game's bytes.
+extern const int g_draw_ctx;
+inline bool draw_ctx_compare() { return g_draw_ctx == 2; }
+// Compare mode: a chunk [lo, hi) of ring `ring` (0 the GX ring, 1 the
+// constant-buffer copies', 2 the vertex copies') taken for recording
+// `recording`, its ring [ring_lo, ring_hi); counted when it overlaps another
+// of that recording's or leaves the ring. Under the GPU mutex.
+void check_chunk(int ring, std::uint64_t recording, std::uint64_t lo, std::uint64_t hi, std::uint64_t ring_lo, std::uint64_t ring_hi);
+// BBHOST_RUN_COMMIT (docs/list-resolve.md, "Workers commit runs"): 0 (`off`)
+// every draw committed in order; 1 (`fork`) the machinery priced with nothing moved - at a run's
+// first draw the command processor looks ahead for the run's other draws, and
+// a run of BBHOST_RUN_COMMIT_MIN draws or more (8) is forked to a pool of
+// BBHOST_RUN_COMMIT_THREADS workers (3) and joined, the workers given nothing
+// to do; 2 (`on`) the run's draws after its first committed in parts by the
+// workers and the command processor (render.cpp run_commit), spliced in their
+// order at the join - the default on Windows since 2026-10-29 (unset, or
+// `on`) but where the constant buffers' homes are bound - by their rule
+// (commit_give_way, since 2026-11-04) or by BBHOST_GXVK_HOMES=1 (since
+// 2026-11-09) - and off by default on
+// Linux since 2026-10-31; 3 (`compare`) as 2, and each forked run also committed in
+// order as before, the parts' packets compared with those and dropped. The
+// workers spin BBHOST_RUN_COMMIT_SPIN_US (50) after a part before they sleep
+// on the fork's word. On (2, 3) turns BBHOST_RUN_BATCH on unless it is set.
+// Read from the environment at the start; the default's give-way changes it
+// once, with the device, before any draw.
+extern std::atomic<int> g_commit;
+// The default's one line in the log, with why, when BBHOST_RUN_COMMIT is
+// unset (gpu.cpp init_locked). Off on Linux: on an RTX 4070 with two Xeon Gold
+// 6230 the commit lost 14-21% of the frame rate where the command processor
+// limits (1080p, uncapped and 120; 2026-10-30). The runs are ~1 ms apart, so
+// the workers are asleep at nearly every fork, and the join waits for all
+// three to wake: 562 us from fork to join a run against 266 with them kept
+// spinning, which won the loss back. On Windows a run took 288-290 us from
+// fork to join on an RTX 3070 Ti Laptop GPU, where the commit gained 2%, and
+// a Radeon 8060S gained 12%. Where it gave way (commit_give_way) the line
+// says so.
+void log_commit_default();
+inline bool committing() { return g_commit.load(std::memory_order_relaxed) != 0; }
+inline bool commit_draws() { return g_commit.load(std::memory_order_relaxed) >= 2; }
+inline bool commit_compare() { return g_commit.load(std::memory_order_relaxed) == 3; }
+// Whether BBHOST_RUN_COMMIT turns the run commit on (set, and not 0 or off).
+bool commit_by_setting();
+// Whether it is on by the platform's default alone (unset: Windows;
+// BBHOST_TEST_RUN_COMMIT_DEFAULT=on takes Windows' default on any platform,
+// =off Linux's, for a test of the give-way).
+bool commit_by_default();
+// The run commit on by the platform's default alone gives way, at the device's
+// choice before any draw (host/gxvk_homes.h run_commit_gives_way: wherever the
+// homes are bound, by their rule or BBHOST_GXVK_HOMES=1): every draw committed
+// in order but for the pool's splices; log_commit_default says why. Nothing
+// where BBHOST_RUN_COMMIT is set.
+void commit_give_way();
+// The run commit's duty (host/gxvk_rest.h, the draw pool's rule, driven once a
+// frame by gxvk_lists::frame_paced): where it is on by the platform's default
+// and has not given way - Windows with the constant buffers' homes off, on an
+// integrated GPU, with tight memory or a card under 5,000 MiB free - it forks a
+// run's parts only where that shortens the frame. Resting, no run is forked:
+// the command processor draws every draw in order and the workers sleep (a run
+// forked before the rest began is taken as it was). It rests while a frame cap
+// holds the frame, while the frame is the GPU's, and wherever an experiment
+// finds resting costs the frame nothing; it works where the command processor
+// in order holds the game back. Under Windows on an RTX 3070 Ti Laptop GPU held
+// to a 4 GB card's 2,950 MiB (BBHOST_TEST_VRAM_MB; 1080p, a true 60) the run
+// commit took 29 points of CPU more than none at Central Yharnam, which met its
+// cap either way, and ran the GPU-bound Nightmare of Mensis 12.6% slower (29.3
+// against 33.0 fps), while at Old Yharnam - the command processor 99% busy and
+// the game held back by it 60% of the time - it held 53.5 fps against 49.3.
+// BBHOST_RUN_COMMIT set keeps its own answer (no duty); BBHOST_RUN_COMMIT_REST=0:
+// it never rests (as before 2026-11-11), =always: it rests from the first frame;
+// BBHOST_GXVK_LISTS_REST_LOG=1 logs every window of the rule.
+extern std::atomic<bool> g_run_resting;
+inline bool run_resting() { return g_run_resting.load(std::memory_order_relaxed); }
+// Whether the duty decides the run commit: the default on and not given way,
+// BBHOST_RUN_COMMIT unset, BBHOST_RUN_COMMIT_REST not 0. Fixed once the device
+// is made (commit_give_way comes before any draw).
+bool duty_on();
+// duty_on's rule: on by the platform's default alone (commit_by_default), still
+// forking runs (commit_draws: not given way to the homes), and the switch's
+// mode (BBHOST_RUN_COMMIT_REST: 0 never rests, 1 the rule, 2 always) not 0.
+constexpr bool duty_wanted(bool by_default, bool forking, int rest_mode) { return by_default && forking && rest_mode != 0; }
+// BBHOST_RUN_COMMIT_REST=always.
+bool duty_always();
+// Whether draws are committed off the order at all: a run's parts (the
+// commit on or compare) or stage 4b.1b's pool committing draws ahead of the
+// command processor (BBHOST_GXVK_LISTS=splice or splice-compare,
+// host/gxvk_lists.h). The part machinery (render.cpp RunDraw, run_part_stop,
+// the draw contexts, the counters' sinks) reads it; the run commit's own
+// fork and join read commit_draws().
+extern std::atomic<bool> g_parts;
+inline bool parts() { return g_parts.load(std::memory_order_relaxed); }
+// committing() || parts() in one load: whether a counter's bump looks for its
+// thread's sink (gpu_internal.h bump).
+extern std::atomic<bool> g_sinks;
+inline bool sinks() { return g_sinks.load(std::memory_order_relaxed); }
+// The constant buffers' homes on by default (host/gxvk_homes.h homes_decide,
+// with the device, before any draw): with BBHOST_GXVK_LISTS unset the pool's
+// segments follow them, so the batching (unless BBHOST_RUN_BATCH says) and the
+// part machinery go on as BBHOST_GXVK_HOMES=1 turns them on at the start.
+void follow_homes();
+// Whether the command processor tells this module what it walks.
+inline bool on() { return g_mode != 0 || batch_mode() != 0 || committing(); }
+// Whether the run census counts.
+inline bool census() { return g_mode != 0; }
+// This command-processor thread's run: moves at every split, so two draws
+// that see the same value had nothing done in order between them.
+std::uint64_t run_serial();
+
+// What the batching and the draw context count, always under the GPU mutex
+// (exit report, and every 1,000 flips with tooling).
+enum Count : int {
+    kBatchTargetsAsked,     // draws whose targets it looked at
+    kBatchTargetsShared,    // ... that took the draw before's
+    kBatchMissSplit,        // not shared: something done in order since that draw
+    kBatchMissLock,         // not shared: the GPU mutex taken by another since
+    kBatchMissRemade,       // not shared: a target made or resized since (g_rt_gen)
+    kBatchMissFill,         // not shared: an HTILE fill noted or taken since
+    kBatchMissInputs,       // not shared: other targets, scissors or depth state
+    kBatchMissKind,         // not shared: a draw that does not share (tessellation, a geometry shader, YEBIS, a packet draw)
+    kBatchCompared,         // compare mode: shared answers checked against the lookup
+    kBatchDiffered,         // ... that differed
+    kBatchDrains,           // lite drains at a draw's first vertex record
+    kBatchCbShared,         // constant-buffer bindings that took the copy an earlier draw of their run took
+    kBatchCbCompared,       // compare mode: such bindings resolved as before and checked against that copy
+    kBatchCbDiffered,       // ... that bound something else
+    kCtxDraws,              // draws committed through a draw context
+    kCtxGxChunks,           // chunks it took of the GX ring
+    kCtxCbChunks,           // ... of the constant-buffer copies' ring
+    kCtxSnapChunks,         // ... of the vertex copies' ring
+    kCtxGxBytes,            // bytes it placed in the GX ring
+    kCtxCbBytes,            // ... copied into the constant-buffer copies' ring
+    kCtxSnapBytes,          // ... copied into the vertex copies' ring
+    kCtxCbShared,           // constant-buffer snapshots bound from its memo
+    kCtxOutParams,          // still taken outside it: params slots
+    kCtxOutSets,            // ... descriptor sets allocated
+    kCtxOutPackets,         // ... draw packets
+    kCtxChunksChecked,      // compare: chunks checked against their recording's others
+    kCtxChunksBad,          // ... that overlapped one or left their ring
+    kCtxMemoChecked,        // compare: copies bound from a context's memo checked
+    kCtxMemoChanged,        // ... whose bytes the game had changed since
+    kCounts
+};
+void count(Count k, std::uint64_t n = 1);
+
+// What ends a run: the draw after it renders into other targets, or the
+// command processor meets something it must do in order first.
+enum Split : int {
+    kSplitTargets,         // the next draw's colour or depth targets (or a clearing draw)
+    kSplitWait,            // WAIT_REG_MEM
+    kSplitLabel,           // EVENT_WRITE_EOP / EOS, RELEASE_MEM
+    kSplitCopy,            // a GX copy, fill, upload, image copy, clear or CopyStructureCount token
+    kSplitDispatch,        // a dispatch token or packet
+    kSplitQuery,           // an occlusion query's token, a pixel-pipe dump
+    kSplitOtherDraw,       // a YEBIS or Scaleform draw token
+    kSplitCpWrite,         // WRITE_DATA, DMA_DATA
+    kSplitPredication,     // SET_PREDICATION
+    kSplitConstantEngine,  // the constant engine's RAM and counters
+    kSplitCall,            // INDIRECT_BUFFER(_CONST)
+    kSplitPacketDraw,      // a draw packet the hooks did not take
+    kSplitSubmission,      // the end of a submission's walk
+    kSplits
+};
+
+// The command processor met `why` (any packet it acts on that is not a
+// GX-native draw token).
+void split(Split why);
+// The command processor's last split's kind (kSplits before any): what stage
+// 4b's splice census (BBHOST_GXVK_LISTS_TIMES) counts a split run by.
+int last_split();
+// A GX pipeline drain's barrier token (no split).
+void note_barrier();
+// A GX-native draw token's draw, with its inputs and objects.
+void note_draw(const GpuDrawInputs& in, const GxDrawObjects& o);
+// Every few seconds while the game runs (host tooling), and at the exit.
+void report(bool at_exit);
+
+// The render pass a draw's inputs draw in, as the census tells runs apart: two
+// draws with the same value draw into the same targets.
+std::uint64_t targets_of(const GpuDrawInputs& in);
+// Why the run look ahead stopped (gnm_exec.cpp run_following).
+enum LookStop : int {
+    kLookSplit,     // a packet the command processor does in order (split)
+    kLookTargets,   // a draw token into other targets
+    kLookNotReady,  // a draw token whose slot is not stored yet
+    kLookEnd,       // the end of the command buffer, or a packet it cannot read
+    kLookKind,      // BBHOST_RUN_COMMIT=on: a draw a part does not take (tessellated, a geometry shader's, indirect)
+    kLookStops
+};
+// BBHOST_RUN_COMMIT, at a GX-native draw token on the command processor,
+// before it is drawn. run_left(): draws of the run a fork covered still to
+// come on this thread - a draw token with some left calls run_take(); with
+// none it looks ahead and calls run_fork with the run's draws after this
+// one, why the look stopped, and the look's time. A split ends the run.
+std::uint32_t run_left();
+void run_take();
+void run_fork(std::uint32_t following, LookStop stop, std::uint64_t look_ns);
+// BBHOST_RUN_COMMIT=on: the look's census (note_look); a run committed in
+// parts or, too short or refused, not (note_commit); the draws a commit
+// covered after the run's first, which the walk then passes over (run_set);
+// and the line every 1,000 flips with tooling (report_commit).
+void note_look(LookStop stop, std::uint64_t look_ns);
+void note_commit(std::uint32_t draws, std::uint64_t ns, bool forked);
+void run_set(std::uint32_t following);
+// A run that was not forked: its `following` draws are drawn as the walk
+// reaches them, and none of them looks ahead again (run_held takes one).
+void run_hold(std::uint32_t following);
+bool run_held();
+void report_commit();
+// The run workers (BBHOST_RUN_COMMIT_THREADS) and the shortest run forked.
+int run_workers();
+std::uint32_t run_min();
+// Runs fn(job, k) for k = 0 .. parts - 1 - part 0 on the calling thread, the
+// others on the run workers (parts <= run_workers() + 1) - and returns once
+// every worker is done.
+void run_parts(void (*fn)(void* job, int part), void* job, int parts);
+
+}  // namespace list_resolve

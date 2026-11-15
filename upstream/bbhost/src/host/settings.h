@@ -1,0 +1,161 @@
+// The host's settings as one object: what the options
+// screen (F10), the port's rows in the game's System menu and
+// bbhost-options.toml edit by name (host/options.h), read back by every
+// consumer as typed, already-scaled fields. The table in options.cpp is the
+// single source; it publishes a new snapshot on every change
+// (host/settings_store.h) and tells the consumers that registered a listener
+// (host_settings_listen), which keep what they act on - so no consumer asks
+// for the settings every frame or view. A reader that wants one now takes the
+// newest snapshot without a lock (host_settings_ref, host_settings).
+//
+// The graphics half is shaped after what DS3 keeps in its CSGraphicsConfig
+// (the released PC binary's RTTI names the class): per-effect switches and
+// strengths the renderer applies each frame, held in one place instead of
+// a copy in each consumer.
+#pragma once
+
+#include <cstdint>
+
+struct HostSettings {
+    std::uint64_t serial = 0;  // host_opt_serial() when this was built
+
+    // Display
+    bool fullscreen = false;
+    // Stay borderless (Windows): Borderless is never made exclusive by the
+    // driver (host/window.cpp); elsewhere it does nothing.
+    bool stay_borderless = false;
+    bool vsync = true;
+    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 10 to 960; 0 is Display-Limited (the display's rate)
+    // The Native frame clock (experimental, off): read once as the game starts
+    // (engine/frame_rate.cpp, config_frame_clock; BBHOST_FRAME_CLOCK=0|1 wins).
+    bool frame_clock = false;
+    // Effect timing's choice as the frame rate reads it: "smooth", "30", "auto"
+    // or "fps" (core/config.h's config_effect_timing), read once as the game
+    // starts; null until the options are loaded.
+    const char* effect_timing = nullptr;
+    bool fps_counter = false;
+    bool memory_counter = false;  // video memory and shared GPU memory, under the FPS counter (host/window.cpp)
+    bool perf_overlay = false;    // the bottleneck meter's verdict under them (host/window.cpp, host/perf_meter.h)
+    int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
+
+    // Camera: multipliers on LockCamParam's values (engine/camera.cpp)
+    float fov_scale = 1.0f;              // 1.0 the game's own; +5% a step
+    float camera_distance_scale = 1.0f;  // 1.0 the game's own; 10% a step either way
+    float camera_height_scale = 1.0f;
+    // The follow camera's tuning above 30 fps, read when the game starts
+    // (engine/frame_rate.cpp): false FPS++, Kyo's 60 fps retune; true
+    // Original, the game's own values. At 30 the camera is the game's either way.
+    bool camera_original = false;
+
+    // Controls
+    bool mouse_menu = true;     // the pointer drives the menus through the pad
+    bool mouse_camera = true;   // the mouse turns the camera outside menus
+    float mouse_sens = 5.0f;    // 0..10 in tenths: 0.005 to 0.4 degrees a count (engine/mouse_camera_step.h)
+    bool mouse_invert_x = false, mouse_invert_y = false;
+    // While the mouse turns the camera (the keyboard and mouse used last): off
+    // holds the camera's own turns as the character moves (engine/mouse_camera.h).
+    bool mouse_auto_rotation = false;
+    bool draw_cursor = true;    // the host draws its own pointer
+    // What the game's own button prompts show: 0 follows whether a pad is
+    // plugged in, 1 always the bound key, 2 always the pad's glyph
+    // (engine/key_prompts.h).
+    int button_prompts = 0;
+    // The controller sticks' deadzones, left then right (host/window.cpp
+    // stick_deadzone): inside `inner` of the full travel the stick is at
+    // rest, from `outer` out it is pushed all the way.
+    float stick_inner[2] = {0.0f, 0.0f};
+    float stick_outer[2] = {1.0f, 1.0f};
+
+    // Graphics (the CSGraphicsConfig-shaped part; engine/graphics_patch.cpp,
+    // host/shader_patch.cpp apply them)
+    bool ssao = true;
+    bool motion_blur = true;
+    bool anti_alias = true;
+    bool depth_of_field = true;
+    bool chromatic_aberration = true;
+    bool vignette = true;
+    float bloom = 1.0f;         // 1.0 the area's own glare, 0 none
+    float saturation = 1.0f;    // 1.0 the area's own, 0 black and white, 2 twice
+    float fog = 1.0f;           // 1.0 the area's own opacities, 0 clear
+    float ao_strength = 1.0f;   // 1.0 the area's own, 0 none, 2 twice
+    int lod_bias = 0;           // the game's model detail bias: -2 finest always, 0 its own, 2 coarsest
+    // Texture quality (host/textures.cpp quality_drop): the top levels of each
+    // texture's mip chain its image leaves out - 0 full size (High, 1.0x), 1
+    // half each way (Medium, 0.5x), 2 a quarter (Low, 0.25x), 3 an eighth
+    // (Lowest, 0.125x). Followed live.
+    int texture_quality = 0;
+    int sfx_texture_quality = 0;  // the same for the effects' textures (sfx/)
+    // Anisotropic filtering for the 3D's textures: 0 the game's own, else
+    // 2, 4, 8 or 16 at least (host/render.cpp anisotropy_samplers). Live.
+    int anisotropy = 0;
+    float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
+    // The game's text, 0.5 to 1.0: MenuFont_01's scale in the game's font
+    // map (engine/graphics_patch.cpp, map_font_hook).
+    float text_scale = 1.0f;
+    bool dynamic_shadows = true;  // the dynamic lights' shadows (graphics_patch.cpp, +0x296e)
+    // Shadow resolution (engine/patch_manifest.cpp's shadow-resolution, read once as
+    // the game starts): 0 Lowest, 1 Low, 2 Default (the game's sizes), 3 High,
+    // 4 Ultra, 5 Giga; Performance mode's sizes over them.
+    int shadow_resolution = 2;
+    // Screen space reflections (engine/patch_manifest.cpp's ssr, read once as
+    // the game starts): the reflection pass on, its Fade To Viewer at -10000.
+    bool ssr = false;
+    // Reflection quality: the reflection pass's two targets at half the render
+    // size each way (the game's own) instead of a quarter (the default since
+    // 2026-11-05: ~1 ms a frame at 1080p on the Radeon 8060S against 3.9).
+    bool ssr_half = false;
+    // HD motion blur (engine/patch_manifest.cpp's hd-motion-blur, read once as
+    // the game starts): motion blur's velocity map and the depth it blurs
+    // with at a share of the render size - 0 a quarter, 1 half (the game's
+    // own), 2 full - in place of the performance patch's 640x360, and the
+    // camera blur on.
+    bool hd_motion_blur = false;
+    int hd_motion_blur_res = 2;
+    // The temporal upscaler (host/upscaler.h): 0 off, 1 DLSS, 2 FSR (4 where
+    // it can run), 3 FSR 3, 4 TAA (bbhost's own, at the Resolution's size); and its quality, 0 native AA (DLAA, FSR native
+    // AA), 1 Quality, 2 Balanced, 3 Performance. Follow the settings live.
+    int upscaler = 0;
+    int upscale_quality = 1;
+    // DLSS's render preset (NGX's number: 11 K, 10 J, 12 L, 13 M).
+    int dlss_preset = 11;
+    // Sharpness: RCAS over the upscaler's picture (host/upscale_pass.cpp),
+    // 0 none to 1 the most (AMD's scale). Followed live.
+    float sharpness = 0.0f;
+    // TAA strength: how much of each new frame TAA keeps, 0 (a fifth) to 1
+    // (a twenty-fifth); 0.5 a tenth. Followed live.
+    float taa_strength = 0.5f;
+    // Frame generation (host/framegen.h): AMD's frame generation swapchain,
+    // read once as the presenter makes its swapchain.
+    bool frame_generation = false;
+    // The upscaler's motion for what moves of itself (host/upscale_pass.cpp):
+    // 0 the game's velocity map, 1-3 rebuilt at 8, 16 or 32 bits. Read once.
+    int motion_vectors = 0;
+    // Character motion (host/upscale_pass.cpp's capture): true Precise - each
+    // character's own positions this frame and the last drawn into the
+    // motion; false Off, the game's velocity map alone. Followed live.
+    bool char_motion = true;
+
+    // Startup (read once by the loader)
+    bool skip_logos = false;
+    bool performance_mode = false;  // the post-effects and YEBIS passes off (engine/patch_manifest.cpp)
+    bool debug_menu = false;
+    // The PC enhancements (also read once, through config_set_enhancements)
+    bool change_appearance = true;
+    bool rebirth = true;
+    bool five_players = true;
+    bool skill_issue = false;
+    bool full_phantom_hp = true;
+    bool auto_replenish = true;
+};
+
+// A copy of the current settings (no lock: the snapshot published last).
+HostSettings host_settings();
+// The same without the copy, for a path that reads a field or two: a
+// published snapshot is never written again and is kept for the run, so the
+// reference stays good; the next change publishes another.
+const HostSettings& host_settings_ref();
+// Tells `fn` the current settings at once and then the new ones after every
+// change, on the thread that made it (host/settings_store.h has the rules: be
+// quick, keep what is needed, change nothing). Up to 32 listeners.
+using HostSettingsListener = void (*)(const HostSettings&);
+void host_settings_listen(HostSettingsListener fn);

@@ -1,0 +1,222 @@
+#pragma once
+
+// The PC port's own settings (F10): a menu over the game drawn with the F9
+// menu's frame (host/ingame_menu.h), in the setup window's look.
+//
+// These settings configure *bbhost*, not the game: resolution, pacing, what
+// the pointer does. The PS4 build has nowhere to put them and the dump is
+// never written, so the host draws the menu and owns the file it saves to.
+//
+// The menu is modal: while it is open the game sees no pad and no pointer.
+
+#include <cstdint>
+#include <functional>
+#include <string>
+
+// Reads the saved settings and applies the ones that take effect at startup.
+// Safe to call before the window exists.
+void host_options_load();
+// Re-applies every setting. Called once the window exists, since the display
+// ones could only be recorded before that.
+void host_options_apply();
+
+bool host_options_open();
+// The window's thread (F10, host/ingame_menu.cpp). Opening drains the latched
+// pointer edges, so a click from before it opened reaches nothing. Closing saves.
+void host_options_set_open(bool open);
+// The same close from the presenter (the menu's Close, Escape): saved at the
+// window's next pump.
+void host_options_close();
+
+// F10's settings as pages of the in-game menu (host/ingame_menu.cpp): drawn on
+// the presenter's thread into the current ImGui window, in the setup window's
+// look. A change is handed to the window's thread, which applies it at its
+// next pump (host_options_frame); the file is written when the menu closes.
+int host_options_page_count();
+const char* host_options_page_name(int page);
+const char* host_options_page_blurb(int page);
+void host_options_draw_page(int page);
+// The same page in the setup window (host/launcher.cpp), before the game:
+// every setting applies as the game starts, so none says "next start", and
+// Resolution and Shaders - the setup window's own rows on its Game and Shaders
+// pages - are left out. Its changes are the setup window's to apply
+// (host_options_frame) and to save.
+void host_options_draw_setup_page(int page);
+// Runs `fn` on the window's thread at its next pump: the menus' changes to
+// settings and to bbhost.toml, which can touch the window or write files.
+void host_options_post(std::function<void()> fn);
+
+// One pump of the window's thread: runs what the menus posted, and answers
+// the resolution's keep-or-revert question.
+void host_options_frame(float display_w, float display_h);
+
+// The live settings are one object, host/settings.h (host_settings()), with
+// typed fields; the calls below are the front ends' way in, by name.
+// Read one by the same name host_opt_set() takes. Unknown names read false.
+bool host_opt_get(const char* key);
+// Whether the setting is the player's own: the options file held a value for
+// it when it was read, or it was set since. False, it is its default (the
+// table's, or what bbhost.toml sets for it).
+bool host_opt_saved(const char* key);
+// The render resolution the player chose, or what BBHOST_RES says. False when
+// neither parses. Read once by the loader - it is a patch on the image.
+bool host_opt_resolution(int* w, int* h);
+// The game's own size - its post chain, the HUD and the menus, and the
+// upscaler's output: the Resolution, or with a Resolution smaller than the
+// window, the window's size (Borderless and Fullscreen: the screen's;
+// Windowed: [video] width x height). The 3D is then drawn at the Resolution
+// (engine/render_scale.cpp) and upscaled - by the upscaler, or with Upscaling
+// Off by YEBIS's copy - so a low Resolution keeps the UI sharp. Only with
+// render scale off (BBHOST_RENDER_SCALE=0, BBHOST_LIVE_RESOLUTION=0) and no
+// upscaler is the game the Resolution's size. A plugin's 3D at a size of its own
+// (plugin API 18 scene_scale, host/scene_look.h: the Bloodborne PS1's) is the same
+// with no upscaler, the 3D brought up nearest - and with a height of its own
+// the game is the window's size whatever the Resolution. False as
+// host_opt_resolution.
+bool host_opt_output_size(int* w, int* h);
+// Whether an upscaler is chosen (the setting, or BBHOST_UPSCALE) - none while a
+// plugin draws the 3D at a size of its own (host/scene_look.h scene_look_scale).
+bool host_opt_upscaler_chosen();
+// The settings published again as they are, so their listeners follow what
+// they read beside them (host/scene_look.h: a plugin's look changed). The
+// options' own thread: from elsewhere, through host_options_post.
+void host_opt_republish();
+// Whether anything takes the frame's motion: an upscaler chosen, or frame
+// generation on (which runs without one).
+bool host_opt_motion_wanted();
+// The rebuilt motion vectors (the Motion vectors setting, as it is now - it
+// changes live; BBHOST_MOTION_VECTORS=velomap|8|16|32 for tests): 8, 16 or
+// 32 bits, or 0 for the game's velocity map - and 0 while nothing takes the
+// motion (host_opt_motion_wanted).
+int host_opt_motion_rebuilt_bits();
+int host_opt_resolution_index();
+void host_opt_set_resolution_index(int i);
+// The Resolution list as its row shows it - "(16:9) 1920x1080", each size
+// after its aspect ratio - its length in *n, and the row's help text: for
+// the setup window's Display card, the same setting as the Graphics page's.
+const char* const* host_opt_resolution_labels(int* n);
+const char* host_opt_resolution_note();
+// The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
+// 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
+// file's key is still frame_cap. Same setting, same file.
+int host_opt_frame_cap();
+// A rate from the list: Custom limit is unticked with it.
+void host_opt_set_frame_cap(int fps);
+// Frame rate's Custom limit: its tick box and the number typed beside it (30
+// to 960, frame_cap_custom and frame_cap_custom_fps in the file). Ticked, the
+// game runs at that number in place of the list's rate.
+bool host_opt_frame_cap_custom();
+int host_opt_frame_cap_custom_fps();
+void host_opt_set_frame_cap_custom(bool on, int fps);
+// The rate the game runs at: Custom limit's number when it is ticked, else
+// Frame rate's (0 Display-Limited).
+int host_opt_frame_rate();
+// Custom limit's bubble, the setup window's and F10's.
+extern const char* const kHostFrameRateCustomNote;
+// Frame rate's control as the setup window and F10 both draw it, in `width`:
+// the list (`cap_index` into its rates, 30 to Display-Limited) - or, with
+// Custom limit ticked, a field to type the number into - and the Custom
+// limit tick box after it. True when one of the three changed.
+bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, float width);
+// With frame generation on the game runs at most half the display's refresh
+// rate (engine/frame_rate.cpp): the Custom limit's number is held to that and
+// Frame rate says so under its control. Frame generation's row says so too
+// when the rate is above it - the setup window's row with its own unsaved
+// Frame rate (F10's rows draw theirs). The count: how many such lines the two
+// rows show now, for the setup window's card height.
+void host_frame_generation_warning(int cap_index, bool custom, int custom_fps);
+// Frame generation turned on brings a Frame rate above half the refresh rate
+// down to it (the setting's own when it changes; this for the setup window's
+// unsaved values): a Custom limit's number to it, a listed rate to the list's
+// entry for it, or Custom limit at it when the list has none. True when changed.
+bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps);
+int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps);
+
+// Set one by name, from the rows the port adds to the game's own System menu
+// (engine/option_menu.h). The two front ends drive the same settings and the
+// same file, so a change made in game is the change the F10 screen shows and
+// bbhost-options.toml keeps. Unknown names are ignored.
+void host_opt_set(const char* key, bool on);
+// A setting as the index of its value (mouse_sens: 0..10), and setting it;
+// -1 for an unknown name. Saved at once, like host_opt_set.
+int host_opt_index(const char* key);
+// Menu text size (menu_text_size) as a factor: 1.0 at 100%, 4.0 at 400%.
+float host_opt_menu_text_scale();
+void host_opt_set_index(const char* key, int index);
+// Menu hue and Menu vibrance (menu_hue, menu_vibrance): degrees round the
+// colour wheel (0 their own blue and violet) and -1 (black and white) to +1.
+void host_opt_menu_colour(float* hue_degrees, float* vibrance);
+// Writes the options file now: the key bindings changed (host/bindings.h).
+void host_options_save_now();
+// `bbhost --options-selftest DIR` (the options_file_test): an options file
+// from an earlier version read and written back the way a run reads and
+// writes it, in DIR's own file - BBHOST_OPTIONS_PATH is set to it, so the
+// player's is never touched. Character motion's Off was saved as Velocity map
+// until 2026-11-10: it reads as Off and is written back as Off. 0: passed.
+int host_options_selftest(const std::string& dir);
+
+// A Steam Deck - Valve's Jupiter or Galileo, from /sys/devices/virtual/dmi/id
+// on Linux and the BIOS registry key on Windows - where the System menu has a
+// Steam Deck section (engine/option_menu.cpp). BBHOST_STEAM_DECK=1 or 0 says
+// so instead.
+bool host_steam_deck();
+// Its two configurations as one choice: 0 is 30 fps at the screen's own
+// 1280x800, 1 is 60 fps rendering at 960x600 (upscaled by FSR 1) with Model
+// detail Low, which holds the heaviest views at 60. Read from the frame cap:
+// 60 or more, or none, is 1. Setting one
+// sets the frame cap, the resolution and the model detail together - the
+// resolution without the keep-or-revert question, both sizes being known to
+// fit - and saves. The frame rate itself changes on the next start, as the
+// frame cap's does.
+int host_deck_profile();
+int host_deck_default_profile();  // the same, read from the frame cap's default
+void host_set_deck_profile(int profile);
+
+// Changes whenever any setting does: something that applies a setting live
+// reads it again only when this has moved.
+std::uint64_t host_opt_serial();
+
+// What the Shaders setting's HLSL and Lifted mean, in a player's words: the
+// setup window's bubbles and F10's.
+extern const char* const kHostShaderModeTips[2];
+// The Effect timing setting's choices (30 fps, 60 fps, Frame rate-dependent),
+// what the row says and what each choice means, for the setup window's row and
+// F10's.
+extern const char* const kHostEffectTimingLabels[3];
+extern const char* const kHostEffectTimingNote;
+extern const char* const kHostEffectTimingTips[3];
+// The Effect timing row as the setup window and F10 show it: the choice that
+// will run (`index`, 0 to 2), or 3 when none of the three is it - bbhost.toml's
+// [video] effect_steps or BBHOST_SFX_STEP asking for a number of steps or for
+// frame - with `custom` that fifth entry ("Custom: 5 (bbhost.toml)") and `tip`
+// its bubble.
+struct HostEffectTimingRow {
+    int index = 0;
+    std::string custom, tip;
+};
+HostEffectTimingRow host_effect_timing_row();
+// Effect timing picked in a menu (0 to 3): the setting, and the player's own
+// from then on even when it already held that choice (the row showed what
+// bbhost.toml asks for), written to the options file at once.
+void host_opt_choose_effect_timing(int index);
+
+// What each setting ships with - the table's own values, whatever the files
+// say - for the game's Defaults row (engine/option_menu.cpp). Read the way
+// host_opt_get / host_opt_index / host_opt_frame_cap read the current value.
+bool host_opt_default_get(const char* key);
+int host_opt_default_index(const char* key);
+int host_opt_default_frame_cap();
+int host_opt_default_resolution_index();
+
+// The F10 screen's ACCOUNT actions, for the setup window (host/launcher.cpp):
+// 0 link with Discord (a code approved on the website, opened in the
+// browser), 1 create an account held by this PC (name), 2 recover one (name,
+// recovery code), 3 a website sign-in code, 4 sign out. Each runs on a thread
+// of its own; the lines say how it went. A sign-in or sign-out asks for the
+// options file, which holds the token, to be saved: host_account_take_save.
+void host_account_action(int which, const std::string& name, const std::string& code);
+bool host_account_busy();
+std::string host_account_signed_in();  // "Signed in as NAME" or "Not signed in"
+std::string host_account_outcome();    // the last action's outcome, "" before one
+std::string host_account_detail();     // a code the player needs (link, recovery, website), or ""
+bool host_account_take_save();         // true once after a sign-in or sign-out

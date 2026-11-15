@@ -11,7 +11,7 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 | Phase | Work | State |
 |---|---|---|
 | P0 | UWP shell, launcher, memory contract, packaging, CI, import audit | **Implemented; not yet run on console.** `.appx` layout, manifest (`codeGeneration` + `removableStorage` only), SDL3-uwp/libuwp cached dependency build, memory self-test, `check-imports.ps1`, `local_precheck.sh`, CI. |
-| P1 | Guest boot + HLE + audio/input, no rendering | Not started. Next. |
+| P1 | Guest boot + HLE + audio/input, no rendering | In progress: bbhost is **vendored and compiled** (`upstream/bbhost` @ `a317321`, `cmake/bbhost.cmake`: zlib, LibAtrac9, monocypher, the GCN library). Wiring `src/core` + `src/hle` into the app is the next step. |
 | P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | Headers and portable policy in place; `device.cpp`/`swapchain.cpp`/`replay.cpp` next. |
 | P3 | GX draw path: pipelines, bindless descriptors, vertex fetch, buffer shadow | Design + `bbx_psocache`/`bbx_caps` landed. |
 | P4 | YEBIS, Scaleform, compute tessellation, FSR | Policy landed (`bbx_tess`), kernels pending. |

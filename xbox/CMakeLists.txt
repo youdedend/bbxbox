@@ -30,6 +30,13 @@ if(NOT EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
         "Run: pwsh xbox/scripts/build-deps.ps1 (it builds SDL3-uwp once, into build-deps/prefix).")
 endif()
 
+# bbhost: vendored at upstream/bbhost, pinned, and compiled here (see
+# cmake/bbhost.cmake). The guest core and the host stream hooks join as P1 lands.
+option(BBX_BBHOST "compile the vendored bbhost sources" ON)
+if(BBX_BBHOST)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/bbhost.cmake")
+endif()
+
 set(BBX_APP_SOURCES
     platform/main.cpp
     platform/log.cpp
@@ -48,6 +55,7 @@ set_target_properties(bbxbox PROPERTIES OUTPUT_NAME "bbxbox")
 target_include_directories(bbxbox PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
     "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src"
     "${BBX_SDL3_PREFIX}/include"
 )
 
@@ -75,21 +83,30 @@ target_compile_definitions(bbxbox PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # System V ABI for guest calls, the lesson that forces clang-cl at all.
+    # /WX only on the port's own TUs: upstream's code is built with /W3 and its
+    # warnings are not this port's to fix.
     target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus)
-    target_link_options(bbxbox PRIVATE /STACK:8388608,65536)
+    target_link_options(bbxbox PRIVATE
+        /STACK:8388608,65536
+        /APPCONTAINER
+        /HIGHENTROPYVA:NO
+        /OPT:REF /OPT:ICF)
 else()
     message(WARNING "Building the console app with ${CMAKE_CXX_COMPILER_ID}: guest thunks need clang-cl")
     target_link_options(bbxbox PRIVATE /STACK:8388608,65536)
 endif()
 
+if(BBX_BBHOST)
+    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
+endif()
+
 target_link_libraries(bbxbox PRIVATE
     "${BBX_SDL3_PREFIX}/lib/SDL3.lib"
-    windowsapp
+    WindowsApp
     d3d12
     dxgi
     dxguid
     xaudio2_9
-    "windowsapp.lib"
 )
 
 # Debugging: the .map is what xbox/scripts/symbolicate.py resolves a console

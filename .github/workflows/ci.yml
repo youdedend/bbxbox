@@ -31,13 +31,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build-deps/prefix
-          key: deps-${{ runner.os }}-sdl3-uwp-3.4.20-${{ hashFiles('xbox/scripts/build-deps.ps1') }}
+          key: deps-${{ runner.os }}-${{ hashFiles('xbox/scripts/build-deps.ps1') }}
       - name: build dependencies when the cache misses
         if: steps.deps.outputs.cache-hit != 'true'
         shell: pwsh
         run: ./xbox/scripts/build-deps.ps1
       - name: configure and build
         shell: pwsh
+        env:
+          GITHUB_ACTIONS: "true"
         run: ./xbox/scripts/build.ps1
       - name: package + check imports
         shell: pwsh
