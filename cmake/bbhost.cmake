@@ -262,3 +262,87 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbhost_host PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
         -Wno-delayed-template-parsing-in-cxx20)
 endif()
+
+# --- the guest's own code: decomp, engine patches, the network stack ----------
+# `engine` is what makes the title run at 60 fps and what the HLE's `runtime`
+# calls into; `decomp` is the reimplemented game code the patches stand on;
+# `net` is the P2P stack (offline: nothing here opens a socket until the guest
+# asks, and the console's manifest grants no `internetClient`). Eight engine
+# files are not here - four reach `host/framegen.h`/`host/upscaler.h`/
+# `host/ingame_menu.h` (frame generation and the two upscalers are Vulkan
+# passes) and four include `.inc` tables upstream's build generates.
+add_library(bbhost_engine STATIC
+    "${BBX_BBHOST_ROOT}/src/decomp/areas.cpp"
+    "${BBX_BBHOST_ROOT}/src/decomp/decomp.cpp"
+    "${BBX_BBHOST_ROOT}/src/decomp/insn.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/auto_replenish.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/camera.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/change_appearance.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/chara_id.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/debug_menu.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/dream_mirror_layout.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/esd.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/event_flags.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/five_players.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/fmod_probe.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/fmod_ring.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/font_handle_set.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/frame_pool.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/frame_tick.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/guest.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/gx_resources.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/gx_state.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/image_text.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/key_prompts.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/live_resolution.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/loading.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/lua_events.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/maiden_events.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/matching_region.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/menu_close.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/menu_memory.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/menu_steps.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/mouse_camera.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/mouse_camera_stubs.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/np_test.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/paramdef.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/params.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/patch_manifest_file.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/phantom_hp.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/player_data.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/playlog.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/plugin_dialog.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/rebirth.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/rebirth_script.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/sf_heap_probe.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/sf_text_layout.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/sos_signs.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/sound_wake.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/summon_invite.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/texture_origin.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/world_chr.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/world_pause.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/yebis.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/yebis_bind.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/account.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/http.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/nat_job.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/nat_probe.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/session.cpp"
+    "${BBX_BBHOST_ROOT}/src/net/stun.cpp"
+)
+target_include_directories(bbhost_engine PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim"
+    "${BBX_BBHOST_ROOT}/src"
+    "${BBX_BBHOST_ROOT}/../.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/bbhost_generated")
+if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
+    target_include_directories(bbhost_engine PUBLIC "${BBX_SDL3_PREFIX}/include")
+endif()
+target_compile_features(bbhost_engine PUBLIC cxx_std_20)
+target_compile_definitions(bbhost_engine PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1 NOMINMAX)
+target_link_libraries(bbhost_engine PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(bbhost_engine PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
+        -Wno-delayed-template-parsing-in-cxx20)
+endif()
