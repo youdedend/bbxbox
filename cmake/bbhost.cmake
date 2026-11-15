@@ -192,3 +192,67 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
         -Wno-delayed-template-parsing-in-cxx20)
 endif()
+
+# --- the portable host layer, for the console --------------------------------
+# `src/hle` reaches into its host (`src/host`) for the GPU executor, the audio
+# device, the bindings, the stats and the list plumbing. Most of that layer is
+# Vulkan-free already, and `host/gpu_stub.cpp` is upstream's own
+# no-Vulkan-at-build-time implementation of the whole `host_gpu_*` surface - the
+# single largest piece of the link. What is *not* here is desktop furniture the
+# console does not want: the window/launcher (SDL3 window shell + ImGui), the
+# plugin loader (`dlopen`/`LoadLibrary`), the shader compiler host, the updater
+# and the Windows crash reporter.
+add_library(bbhost_host STATIC
+    "${BBX_BBHOST_ROOT}/src/host/gpu_stub.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/audio.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/audio_crush.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/bindings.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/cache_rw.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/cb_capture.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/cb_proof.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/draw_digest.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/foreign_hooks.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/frame_stats.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gpu_mutex.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gs_emit_gate.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_arena.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_buffers.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_census.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_heapsnap.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_lists.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_lists_leaf.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/gxvk_lists_pool.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/host_lists.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/label_landing.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/list_resolve.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/main_wait.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/perf_meter.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/pixel_cutaway.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/render_hooks.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/shader_bundles.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/shader_liveness.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/shader_overrides.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/shader_patch.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/slow_calls.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/tess_lds.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/translation_cache.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/vertex_cutaway.cpp"
+    "${BBX_BBHOST_ROOT}/src/host/vertex_snap.cpp"
+    # `hle/http.cpp` parses a replay's JSON.
+    "${BBX_BBHOST_ROOT}/src/replay/json.cpp"
+)
+target_include_directories(bbhost_host PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/winpthreads_shim"
+    "${BBX_BBHOST_ROOT}/src"
+    "${BBX_BBHOST_ROOT}/../.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbox/bbhost_generated")
+if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
+    target_include_directories(bbhost_host PUBLIC "${BBX_SDL3_PREFIX}/include")
+endif()
+target_compile_features(bbhost_host PUBLIC cxx_std_20)
+target_compile_definitions(bbhost_host PUBLIC BBX_UWP=1 BBHOST_HAVE_SDL3=1 NOMINMAX)
+target_link_libraries(bbhost_host PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(bbhost_host PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
+        -Wno-delayed-template-parsing-in-cxx20)
+endif()

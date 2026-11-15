@@ -286,6 +286,10 @@ endif()
 # writes <image>.map beside the image, i.e. build/xbox/bbxbox.map, which is what
 # package.ps1 and symbolicate.py expect.
 target_link_options(bbxbox PRIVATE /MAP)
+# Every unresolved symbol in one run, not the first twenty: the CI annotation is
+# the port's only view of the link census (the job log is not reachable from a
+# sandbox), and a link that names one symbol at a time costs a run each.
+target_link_options(bbxbox PRIVATE /ERRORLIMIT:0)
 if(MSVC)
     target_link_options(bbxbox PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()

@@ -126,6 +126,32 @@ if ($LASTEXITCODE -ne 0) {
             $i = $end
         }
     }
+    # A link failure is a census, not a diagnostic: `lld-link` prints every
+    # unresolved symbol once `/ERRORLIMIT:0` is set, and the annotation holds
+    # 50 KB. So the undefined symbols get their own deduplicated list with the
+    # object that wanted each one, and the compile errors keep the summary.
+    $undefined = [ordered]@{}
+    foreach ($line in $lines) {
+        if ($line -match 'undefined symbol:\s*(.+)$') {
+            $name = $Matches[1].Trim()
+            if (-not $undefined.Contains($name)) { $undefined[$name] = $null }
+        } elseif ($line -match 'referenced by|referenced from') {
+            $referrer = $line.Trim()
+            foreach ($key in @($undefined.Keys)) {
+                if ($null -eq $undefined[$key]) { $undefined[$key] = $referrer; break }
+            }
+        }
+    }
+    if ($undefined.Count -gt 0) {
+        $census = New-Object System.Collections.Generic.List[string]
+        $census.Add("$($undefined.Count) undefined symbol(s):")
+        foreach ($entry in $undefined.GetEnumerator()) {
+            $census.Add("  " + $entry.Key + $(if ($entry.Value) { "   <- " + $entry.Value } else { "" }))
+        }
+        $text = ($census -join "`n")
+        if ($text.Length -gt 50000) { $text = $text.Substring(0, 50000) + "`n... (census truncated)" }
+        Emit-ErrorAnnotation 'undefined symbols' $text
+    }
     if ($errors.Count -eq 0) { $errors.AddRange([string[]]($lines | Select-Object -Last 80)) }
     $summary = ($errors | Select-Object -First 80) -join "`n"
     Write-Output $summary
