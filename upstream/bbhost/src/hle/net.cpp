@@ -8,8 +8,15 @@
 #include "net/stun.h"
 
 #if defined(_WIN32)
+// Local change, marked BBX_UWP: the console's Winsock stand-in (see the
+// header) - the manifest grants no internetClient and the import audit refuses
+// WS2_32.dll, so these calls resolve to offline failures.
+#if defined(BBX_UWP)
+#include "xbox/platform/bbx_offline_net.h"
+#else
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#endif
 #else
 #include <fcntl.h>
 #include <netdb.h>

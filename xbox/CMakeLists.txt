@@ -177,11 +177,9 @@ target_include_directories(bbxbox PRIVATE
 target_sources(bbxbox PRIVATE
     # The host file-system seam's shared half (the wrappers, the path helpers and
     # the boot self test); the AppContainer table is platform/host_fs_uwp.cpp.
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
     # bbhost's virtual-memory layer: the guest's fixed windows are reserved
     # through it at startup (platform/guest_windows.cpp), and under BBX_UWP its
     # three entry points are the AppContainer's own.
-    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/win_vm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
@@ -232,7 +230,11 @@ else()
 endif()
 
 if(BBX_BBHOST)
-    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbx_atrac9 bbx_monocypher)
+    # The guest runtime, its host layer and the game's own code. lld-link
+    # resolves archives without regard to their order, so the three can name each
+    # other's symbols freely.
+    target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
+        bbx_atrac9 bbx_monocypher)
 endif()
 
 # The Store CRT. A console has vcruntime140_app.dll / msvcp140_app.dll and their

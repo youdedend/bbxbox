@@ -6,8 +6,12 @@
 #include "net/http.h"
 
 #if defined(_WIN32)
+#if defined(BBX_UWP)
+#include "xbox/platform/bbx_offline_net.h"
+#else
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#endif
 #else
 #include <netdb.h>
 #include <netinet/in.h>

@@ -10,7 +10,9 @@
 #include "net/http.h"
 #include "net/poll_pacing.h"
 
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+#include "xbox/platform/bbx_offline_net.h"
+#elif defined(_WIN32)
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
