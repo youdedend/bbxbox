@@ -146,6 +146,11 @@ target_compile_definitions(bbhost_guest PUBLIC
     # are written without the macros too.
     NOMINMAX)
 target_link_libraries(bbhost_guest PUBLIC bbx_zlib)
+# `BBHOST_HAVE_SDL3=1` is set above, so `core/portable.cpp` and the audio TUs
+# include SDL3's headers. Only the headers: the app links the DLL.
+if(EXISTS "${BBX_SDL3_PREFIX}/include/SDL3/SDL.h")
+    target_include_directories(bbhost_guest PUBLIC "${BBX_SDL3_PREFIX}/include")
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # Upstream's code is not /W4-clean and its warnings are not this port's to
     # fix; the port's own TUs keep /W4 /WX.
