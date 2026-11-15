@@ -23,7 +23,7 @@ jobs:
 
   console:
     name: UWP build + import audit
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: dependencies (SDL3-uwp, libuwp) -- cached
@@ -35,7 +35,23 @@ jobs:
       - name: build dependencies when the cache misses
         if: steps.deps.outputs.cache-hit != 'true'
         shell: pwsh
+        env:
+          GITHUB_ACTIONS: "true"
         run: ./xbox/scripts/build-deps.ps1
+      - name: ensure clang-cl (LLVM component)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath | Select-Object -First 1
+          $clang = "$vs\VC\Tools\Llvm\x64\bin\clang-cl.exe"
+          if (-not (Test-Path $clang)) {
+            Write-Output "clang-cl missing; adding Microsoft.VisualStudio.Component.VC.Llvm.Clang"
+            Start-Process -Wait -FilePath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" -ArgumentList `
+              'modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang', '--quiet', '--norestart', '--nocache'
+          }
+          if (-not (Test-Path $clang)) { Write-Output "::error title=clang-cl missing::$clang"; exit 1 }
+          & $clang --version | Select-Object -First 1
+
       - name: configure and build
         shell: pwsh
         env:

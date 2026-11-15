@@ -77,16 +77,17 @@ function Enter-Vs {
     $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
         Select-Object -First 1
     if (-not $vs) { throw "no Visual Studio with the C++ toolset found" }
-    # The dev shell is what puts cl.exe, link.exe, the Windows SDK and the UWP
-    # libs (lib/x64/store) on PATH; CMake with Ninja needs it, MSBuild needs its
-    # own environment but tolerates this one.
+    # The dev shell puts cl.exe, link.exe, the Windows SDK and the UWP libs
+    # (lib/x64/store) on PATH; CMake needs it. clang-cl is build.ps1's business,
+    # not this script's: nothing here is compiled by it.
     & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
-    $clang = "$vs\VC\Tools\Llvm\x64\bin\clang-cl.exe"
-    if (-not (Test-Path $clang)) {
-        throw "clang-cl not found at $clang; the runner needs the 'Microsoft.VisualStudio.Component.VC.Llvm.Clang' component"
-    }
-    & $clang --version | Select-Object -First 1 | Write-Host
     return $vs
+}
+
+function Step([string]$Name, [scriptblock]$Action) {
+    Write-Host "build-deps: $Name"
+    & $Action
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "$Name failed (exit $LASTEXITCODE)" }
 }
 
 if (-not $Force -and (Test-Path $stamp)) {
@@ -95,6 +96,7 @@ if (-not $Force -and (Test-Path $stamp)) {
     exit 0
 }
 
+try {
 Get-CommandOrFail git | Out-Null
 $vs = Enter-Vs
 $msbuild = Get-ChildItem -Path (Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe") -ErrorAction SilentlyContinue |
@@ -112,10 +114,17 @@ Write-Host "build-deps: SDL3-uwp $sdlCommit ($SDL3Branch)"
 $sdlProject = Join-Path $sdlPath "VisualC-WinRT\SDL-UWP.vcxproj"
 $sdlOut = Join-Path $deps "out\sdl3"
 New-Item -ItemType Directory -Force -Path $sdlOut | Out-Null
+# The fork pins PlatformToolset v145 and SDK 10.0; retarget to what the runner
+# has, and if the retarget itself is refused, let the project choose.
 & $msbuild $sdlProject /m /p:Configuration=$Configuration /p:Platform=$Platform `
     /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 `
     /p:OutDir="$sdlOut\" /p:IntDir="$sdlOut\obj\" /v:minimal
-if ($LASTEXITCODE -ne 0) { throw "SDL3-uwp build failed" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "build-deps: SDL3 retargeted build failed; retrying with the project's own toolset"
+    & $msbuild $sdlProject /m /p:Configuration=$Configuration /p:Platform=$Platform `
+        /p:OutDir="$sdlOut\" /p:IntDir="$sdlOut\obj\" /v:minimal
+    if ($LASTEXITCODE -ne 0) { throw "SDL3-uwp build failed" }
+}
 
 $sdlPrefix = Join-Path $prefix "sdl3"
 New-Item -ItemType Directory -Force -Path (Join-Path $sdlPrefix "lib"), (Join-Path $sdlPrefix "bin") | Out-Null
@@ -134,11 +143,15 @@ Write-Host "build-deps: libuwp"
 $libPath = Join-Path $src "libuwp"
 $libCommit = Sync-Repo $LibUwpRepo $LibUwpBranch $libPath
 $libOut = Join-Path $deps "out\libuwp"
-& cmake -S $libPath -B $libOut -G Ninja `
-    -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 `
-    -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
-    -DCMAKE_BUILD_TYPE=$Configuration
-if ($LASTEXITCODE -ne 0) { throw "libuwp configure failed" }
+# libuwp is C++/WinRT and sets WindowsStore in its own CMakeLists; the Visual
+# Studio generator with the default MSVC toolset is the combination its project
+# was written for (the app stays clang-cl; this is a dependency, built once).
+& cmake -S $libPath -B $libOut -A $Platform -DCMAKE_BUILD_TYPE=$Configuration
+if ($LASTEXITCODE -ne 0) {
+    & cmake -S $libPath -B $libOut -A $Platform -DCMAKE_SYSTEM_NAME=WindowsStore `
+        -DCMAKE_SYSTEM_VERSION=10.0 -DCMAKE_BUILD_TYPE=$Configuration
+    if ($LASTEXITCODE -ne 0) { throw "libuwp configure failed" }
+}
 & cmake --build $libOut --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw "libuwp build failed" }
 
@@ -200,6 +213,17 @@ if (-not (Test-Path (Join-Path $dxcPrefix "dxcompiler.dll"))) {
     if (-not (Test-Path (Join-Path $dxcPrefix "dxil.dll"))) { throw "dxil.dll missing from the DXC zip" }
     $license = Get-ChildItem -Recurse -Path $dxcPrefix -Filter "LICENSE*" | Select-Object -First 1
     if ($license) { Copy-Item $license.FullName (Join-Path $dxcPrefix "LICENSE-DXC.txt") -Force }
+}
+
+}
+catch {
+    $message = "$_"
+    Write-Host "build-deps: FAILED: $message"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $enc = $message -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        Write-Output "::error title=build-deps failed::$enc"
+    }
+    exit 1
 }
 
 @(
