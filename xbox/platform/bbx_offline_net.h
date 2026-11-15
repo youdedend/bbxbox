@@ -51,11 +51,32 @@ inline constexpr int SOL_SOCKET = 0xffff;
 inline constexpr int SO_REUSEADDR = 0x0004;
 inline constexpr int FIONBIO = 0x8004667e;
 inline constexpr int MSG_DONTWAIT = 0x0001;
-inline constexpr int WSAEWOULDBLOCK = 10035;
-inline constexpr int WSAENETDOWN = 10050;
-inline constexpr int WSAHOST_NOT_FOUND = 11001;
+// The Winsock error codes and the poll events are macros in the Windows headers
+// (definitions come in through <windows.h>'s error tables), so they are taken as
+// they are rather than redeclared.
+#ifndef WSAEWOULDBLOCK
+#define WSAEWOULDBLOCK 10035
+#endif
+#ifndef WSAENETDOWN
+#define WSAENETDOWN 10050
+#endif
+#ifndef WSAHOST_NOT_FOUND
+#define WSAHOST_NOT_FOUND 11001
+#endif
+#ifndef POLLIN
+#define POLLIN 0x0001
+#endif
+#ifndef POLLOUT
+#define POLLOUT 0x0004
+#endif
+#ifndef POLLERR
+#define POLLERR 0x0008
+#endif
 
+#if !defined(_SOCKLEN_T_DEFINED)
+#define _SOCKLEN_T_DEFINED
 using socklen_t = int;
+#endif
 
 struct sockaddr {
     u_short sa_family;
@@ -79,7 +100,7 @@ struct timeval {
 };
 
 struct fd_set {
-    u_int fd_count;
+    unsigned int fd_count;
     SOCKET fd_array[64];
 };
 
