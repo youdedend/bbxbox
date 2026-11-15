@@ -55,6 +55,53 @@ $prefix = Join-Path $deps "prefix"
 $stamp = Join-Path $prefix "STAMP.txt"
 New-Item -ItemType Directory -Force -Path $src, $prefix | Out-Null
 
+function Get-PeMachine([string]$Path) {
+    # 0x8664 is x64. The DXC zip holds bin/arm64, bin/x64 and bin/x86, and a
+    # recursive search for "dxc.exe" finds the arm64 one first - which then fails
+    # on a runner with "This version of %1 is not compatible with the version of
+    # Windows you're running", a message that names neither the file nor the cause.
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $buffer = New-Object byte[] 1024
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        $stream.Close()
+        if ($read -lt 64) { return 0 }
+        $peOffset = [System.BitConverter]::ToInt32($buffer, 0x3C)
+        if ($peOffset -lt 0 -or $peOffset + 6 -ge $read) { return 0 }
+        if ($buffer[$peOffset] -ne 0x50 -or $buffer[$peOffset + 1] -ne 0x45) { return 0 }
+        return [System.BitConverter]::ToUInt16($buffer, $peOffset + 4)
+    } catch {
+        return 0
+    }
+}
+
+function Install-DxcFlatten([string]$Prefix) {
+    # The compiler and its two DLLs, side by side at the prefix root, from the x64
+    # subdirectory only - and never trusting a previous flatten: a cached prefix
+    # can hold a copy from before this rule existed.
+    $archDir = Join-Path $Prefix "bin\x64"
+    foreach ($name in @("dxc.exe", "dxcompiler.dll", "dxil.dll")) {
+        $source = Join-Path $archDir $name
+        if (-not (Test-Path $source)) {
+            $source = (Get-ChildItem -Recurse -Path $Prefix -Filter $name -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -replace '/', '\\' -match '\\x64\\' } |
+                Select-Object -First 1).FullName
+        }
+        if (-not $source -or -not (Test-Path $source)) { throw "$name is missing from the DXC package" }
+        $destination = Join-Path $Prefix $name
+        $arch = Get-PeMachine $source
+        if ($arch -ne 0x8664) {
+            throw "$source is not x64 (PE machine 0x$($arch.ToString('X4'))); the build machine cannot run it"
+        }
+        Copy-Item $source $destination -Force
+        $flattened = Get-PeMachine $destination
+        if ($flattened -ne 0x8664) {
+            throw "$destination is not x64 after copying (PE machine 0x$($flattened.ToString('X4')))"
+        }
+    }
+    Write-Host "build-deps: dxc.exe, dxcompiler.dll and dxil.dll flattened (x64)"
+}
+
 function Get-CommandOrFail([string]$Name) {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if (-not $cmd) { throw "$Name not found on PATH" }
@@ -234,16 +281,16 @@ if (-not (Test-Path (Join-Path $dxcPrefix "dxcompiler.dll"))) {
     Remove-Item -Recurse -Force $dxcPrefix -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $dxcPrefix | Out-Null
     Expand-Archive -Path $zip -DestinationPath $dxcPrefix -Force
-    # dxc_2026_09_29.zip holds bin/x64/*; the package wants the DLLs flat.
-    foreach ($name in @("dxcompiler.dll", "dxil.dll", "dxc.exe")) {
-        $found = Get-ChildItem -Recurse -Path $dxcPrefix -Filter $name | Select-Object -First 1
-        if ($found -and $found.DirectoryName -ne $dxcPrefix) {
-            Copy-Item $found.FullName (Join-Path $dxcPrefix $name) -Force
-        }
-    }
+    # dxc_2026_09_29.zip holds bin/x64/*; the build wants the three files flat,
+    # and only from bin/x64 (see Install-DxcFlatten).
+    Install-DxcFlatten $dxcPrefix
     if (-not (Test-Path (Join-Path $dxcPrefix "dxil.dll"))) { throw "dxil.dll missing from the DXC zip" }
     $license = Get-ChildItem -Recurse -Path $dxcPrefix -Filter "LICENSE*" | Select-Object -First 1
     if ($license) { Copy-Item $license.FullName (Join-Path $dxcPrefix "LICENSE-DXC.txt") -Force }
+} else {
+    # A cached prefix: re-flatten anyway. It costs three local copies and it means
+    # a cache that predates a fix cannot keep the build broken.
+    Install-DxcFlatten $dxcPrefix
 }
 
 }
@@ -261,7 +308,7 @@ catch {
     "sdl3=$sdlCommit ($SDL3Branch)"
     "libuwp=$libCommit"
     "ffmpeg=$ffCommit ($FfmpegAsset)"
-    "dxc=v1.9.2609 ($DxcSha256)"
+    "dxc=v1.9.2609 ($DxcSha256, flattened from bin/x64)"
     "toolset=v143, sdk=10.0, platform=$Platform, config=$Configuration"
 ) | Set-Content -Encoding utf8 $stamp
 Write-Host "build-deps: done -> $prefix"
