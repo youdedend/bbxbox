@@ -4,6 +4,10 @@
 #include "hle/common.h"
 #include "host/frame_stats.h"
 #include "hle/hle.h"
+// Local change, marked BBX_UWP: the POSIX clock ids and `clock_gettime` come
+// from MinGW's `<pthread_time.h>` in upstream's Windows build; this is the same
+// contract over the Win32 clocks (see the header).
+#include "core/host_clock_shim.h"
 
 #include <algorithm>
 #include <atomic>
