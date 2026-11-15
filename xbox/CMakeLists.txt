@@ -122,7 +122,8 @@ target_link_libraries(bbxbox PRIVATE
     d3d12
     dxgi
     dxguid
-    xaudio2_9
+    # No xaudio2: audio is SDL3's (which links XAudio2 itself). Importing it here
+    # also asks for xaudio2_9.lib, which the SDK ships only for desktop targets.
 )
 
 # Debugging: the .map is what xbox/scripts/symbolicate.py resolves a console
