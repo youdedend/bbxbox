@@ -26,9 +26,10 @@ which the audit refuses. The page protections in `write_watch.cpp`,
 `win_watch.cpp` and `kernel.cpp` are `VirtualProtectFromApp`, and
 `core/host_clock_shim.h` supplies `clock_gettime` over the Win32 clocks (the
 Store SDK has no `<pthread_time.h>`). **The guest runtime compiles for the console, all but four files of it.** The
-`bbhost_guest` library is every translation unit of `src/core` (except the
-Linux VM layer and the desktop host-fs backend) and thirty-four of `src/hle`'s
-thirty-eight — the file system, `fios`, save commits, the kernel, pthreads, the
+`bbhost_guest` library is forty translation units: all twenty of `src/core` that
+a console build uses (every one except the Linux VM layer and the desktop host-fs
+backend), the winpthreads shim, and nineteen of the twenty-three in `src/hle` —
+the file system, `fios`, save commits, the kernel, pthreads, the
 synchronisation primitives, the variadic shims (asm and all), libc, gnm's
 resource tracking, the audio stack (`audio`, `ajm`, `avplayer`), `dialog`, the
 network modules (`net`, `http`, `np_matching2`, `np_signaling`), `runtime` and
