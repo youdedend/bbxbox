@@ -532,8 +532,15 @@ bool write_watch_install() {
         g_host_lo = reinterpret_cast<std::uintptr_t>(base);
         g_host_hi = g_host_lo + nt->OptionalHeader.SizeOfImage;
     }
+#if defined(BBX_UWP)
+    // A packaged title may not register a vectored exception handler (the
+    // console partition's headers do not declare the call): the watch is a
+    // development aid, and off means the writes go through unwatched.
+    return false;
+#else
     static PVOID h = AddVectoredExceptionHandler(1, write_watch_veh);
     return h != nullptr;
+#endif
 }
 #endif
 

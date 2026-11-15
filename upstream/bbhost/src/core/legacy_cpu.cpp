@@ -515,8 +515,15 @@ bool legacy_cpu_on_sigill(void*) { return false; }
 bool legacy_cpu_on_sigtrap(void*) { return false; }
 
 void legacy_cpu_install_handler() {
+#if defined(BBX_UWP)
+    // `AddVectoredExceptionHandler` is not declared for a packaged title (the
+    // console partition's headers leave it out). It is a development aid here -
+    // a rewritten site that still executes logs what it was - and the app's own
+    // LastChance handler covers a fault in the packaged build.
+#else
     static PVOID h = AddVectoredExceptionHandler(1, legacy_veh);
     (void)h;
+#endif
 }
 #else
 __attribute__((no_stack_protector)) bool legacy_cpu_on_sigill(void* ctx) {
