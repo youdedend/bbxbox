@@ -434,8 +434,10 @@ struct AppFactory : winrt::implements<AppFactory, winrt::Windows::Foundation::IA
 }  // namespace bbxbox
 
 // Exported as DllGetActivationFactory by bbxbox.def: the packaged launch path
-// asks for "bbxbox.App" and gets the IFrameworkViewSource above.
-extern "C" HRESULT WINAPI WINRT_GetActivationFactory(HSTRING class_id, void** factory) noexcept {
+// asks for "bbxbox.App" and gets the IFrameworkViewSource above. The symbol is
+// port-owned rather than C++/WinRT's WINRT_GetActivationFactory, whose declared
+// signature in winrt/base.h differs (it takes an opaque class id).
+extern "C" HRESULT WINAPI BbxGetActivationFactory(HSTRING class_id, void** factory) noexcept {
     try {
         *factory = nullptr;
         const wchar_t* const name = ::WindowsGetStringRawBuffer(class_id, nullptr);
