@@ -32,6 +32,7 @@
 #include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
+#include "xbox/platform/host_fs.h"
 #include "xbox/platform/ini_file.h"
 #include "xbox/platform/launcher.h"
 #include "xbox/platform/log.h"
@@ -418,6 +419,16 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             // OutputDebugStringA path remains.
         }
         bbx::platform::LogMessage(bbx::platform::Level::kInfo, "bbxbox launcher starting");
+        // The guest's file system, exercised once at boot: the HLE's reads and
+        // saves go through this seam (`xbox/platform/host_fs.h`), and an
+        // AppContainer that refuses one of its calls refuses it here, in one
+        // logged line, instead of in the game's first save.
+        {
+            std::string why;
+            const bool fs_ok = bbx::hostfs::SelfTest(bbx::platform::Local("guestfs"), &why);
+            bbx::platform::LogF("host fs: %s (%s)", fs_ok ? "ok" : "FAILED",
+                                fs_ok ? bbx::hostfs::Table().name : why.c_str());
+        }
         LoadSettings();
         RestoreDump();
         RefreshLauncher();

@@ -53,6 +53,8 @@ sources=(
   "$root"/tests/display_test.cpp
   "$root"/tests/hud_test.cpp
   "$root"/tests/self_test.cpp
+  "$root"/tests/host_fs_test.cpp
+  "$root"/tests/save_commit_test.cpp
   "$root"/tests/shaders_test.cpp
   "$root"/tests/guest_core_test.cpp
   "$root"/tests/guest_core_stubs.cpp
@@ -66,6 +68,13 @@ sources=(
   "$root"/upstream/bbhost/src/core/paced_file.cpp
   "$root"/upstream/bbhost/src/core/portable.cpp
   "$root"/upstream/bbhost/src/core/memory.cpp
+  # The host file-system seam the HLE gets its file system from: the shared half
+  # and the desktop table (the console links host_fs_uwp.cpp instead).
+  "$root"/upstream/bbhost/src/core/host_fs_common.cpp
+  "$root"/upstream/bbhost/src/core/host_fs_desktop.cpp
+  # The save commit protocol, over that seam: the moves, the listing and the
+  # flush are the seam's now, so its test runs here.
+  "$root"/upstream/bbhost/src/hle/save_commit.cpp
 )
 
 mkdir -p "$(dirname "$out")"

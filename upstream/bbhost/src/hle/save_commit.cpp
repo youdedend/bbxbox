@@ -1,6 +1,12 @@
 // A save written whole or not at all: see hle/save_commit.h.
 #include "hle/save_commit.h"
 
+// The file system itself: the CRT on a desktop build, `*FromApp` in the
+// AppContainer (xbox/platform/host_fs.h). `std::filesystem` is not used: it
+// reaches `CreateFileW` underneath, which an AppContainer is refused on a path
+// it reached through a `FutureAccessList` token.
+#include "xbox/platform/host_fs.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -9,7 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -17,10 +23,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -30,7 +33,7 @@
 namespace save_commit {
 namespace {
 
-namespace fs = std::filesystem;
+namespace hostfs = bbx::hostfs;
 
 std::atomic<Hook> g_hook{nullptr};
 std::atomic<bool> g_no_exchange{false};
@@ -54,12 +57,79 @@ void step(const char* name) {
     if (const Hook h = g_hook.load(std::memory_order_relaxed)) h(name);
 }
 
-bool exists(const std::string& p) {
-    std::error_code ec;
-    return fs::exists(fs::path(p), ec);
+bool exists(const std::string& p) { return hostfs::Exists(p); }
+
+std::string parent_of(const std::string& p) { return hostfs::DirName(p); }
+
+// A directory tree, walked depth first: a directory before its entries.
+struct TreeEntry {
+    std::string path;  // the host path
+    std::string rel;   // relative to the walk's root, '/'-separated
+    bool is_dir = false;
+    bool is_regular = false;
+};
+
+// Calls `visit` for every entry under `root`; the visitor may set `recurse` to
+// false to skip a directory's children. False when a directory could not be
+// listed (the walk is then incomplete, and every caller treats that as the
+// operation failing halfway).
+bool walk_tree(const std::string& root, const std::function<bool(const TreeEntry&, bool*)>& visit) {
+    std::function<bool(const std::string&, const std::string&)> descend =
+        [&](const std::string& dir, const std::string& rel) -> bool {
+        std::vector<hostfs::DirEntry> entries;
+        if (!hostfs::ListDir(dir, &entries)) return false;
+        for (const hostfs::DirEntry& entry : entries) {
+            TreeEntry item;
+            item.path = hostfs::JoinPath(dir, entry.name);
+            item.rel = rel.empty() ? entry.name : rel + "/" + entry.name;
+            item.is_dir = entry.is_dir;
+            item.is_regular = !entry.is_dir;
+            bool recurse = true;
+            if (!visit(item, &recurse)) return false;
+            if (item.is_dir && recurse && !descend(item.path, item.rel)) return false;
+        }
+        return true;
+    };
+    return descend(root, std::string());
 }
 
-std::string parent_of(const std::string& p) { return fs::path(p).parent_path().string(); }
+bool make_dirs(const std::string& p) { return hostfs::MkDir(p, true); }
+
+// A file copied whole into a new one, flushed before it is closed: the caller
+// renames it into place afterwards.
+bool copy_file(const std::string& from, const std::string& to) {
+    const int src = hostfs::Open(from, hostfs::kRead);
+    if (src < 0) return false;
+    const int dst = hostfs::Open(to, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+    if (dst < 0) {
+        (void)hostfs::Close(src);
+        return false;
+    }
+    std::vector<char> buffer(1u << 20);
+    bool ok = true;
+    for (;;) {
+        const std::int64_t got = hostfs::Read(src, buffer.data(), buffer.size());
+        if (got < 0) {
+            ok = false;
+            break;
+        }
+        if (got == 0) break;
+        std::int64_t put = 0;
+        while (put < got) {
+            const std::int64_t n = hostfs::Write(dst, buffer.data() + put, static_cast<std::uint64_t>(got - put));
+            if (n <= 0) {
+                ok = false;
+                break;
+            }
+            put += n;
+        }
+        if (!ok) break;
+    }
+    ok = hostfs::Flush(dst) && ok;
+    ok = hostfs::Close(dst) && ok;
+    ok = hostfs::Close(src) && ok;
+    return ok;
+}
 
 bool refused_in_test(const std::string& rel) {
     std::lock_guard<std::mutex> lock(g_refused_mu);
@@ -80,125 +150,101 @@ void sync_dir(const std::string& dir) {
 #endif
 }
 
-#if defined(_WIN32)
-// Another process holding a file for a moment (an antivirus scan, OneDrive,
-// Explorer making a thumbnail) refuses a move, a delete or an open: tried
-// again for ~5 s.
+// Another process holding a file for a moment refuses a move or a delete: the
+// seam reports it as EACCES/EBUSY and this tries again for ~5 s. The console
+// has the same problem (a save scanned while it is replaced).
 template <class Op>
 bool retried(Op op) {
     for (int i = 0;; ++i) {
         if (op()) return true;
-        const DWORD e = GetLastError();
-        if (i >= 50 || (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION)) return false;
+        const int e = hostfs::LastError();
+        if (i >= 50 || (e != EACCES && e != EBUSY && e != EPERM)) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
-// A read-only file (copied from a disc or an archive) refuses to be replaced
-// or removed: it loses the attribute first.
-void make_writable(const std::wstring& w) {
-    const DWORD a = GetFileAttributesW(w.c_str());
-    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY) && !(a & FILE_ATTRIBUTE_DIRECTORY))
-        SetFileAttributesW(w.c_str(), a & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY));
-}
-#endif
-
-bool flush_file(const fs::path& p) {
-#if defined(_WIN32)
-    HANDLE h = INVALID_HANDLE_VALUE;
-    retried([&] {
-        h = CreateFileW(p.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return h != INVALID_HANDLE_VALUE;
-    });
-    if (h == INVALID_HANDLE_VALUE) return false;
-    const bool ok = FlushFileBuffers(h) != FALSE;
-    CloseHandle(h);
-    return ok;
-#else
-    const int fd = ::open(p.c_str(), O_RDONLY);
+bool flush_file(const std::string& p) {
+    const int fd = hostfs::Open(p, hostfs::kRead);
     if (fd < 0) return false;
-    const bool ok = ::fsync(fd) == 0;
-    ::close(fd);
-    return ok;
-#endif
+    const bool ok = hostfs::Flush(fd);
+    return hostfs::Close(fd) && ok;
 }
 
 // Every file under `dir` and every directory's entries on the disk.
 bool flush_tree(const std::string& dir) {
-    std::error_code ec;
     bool ok = true;
-    for (fs::recursive_directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
-        if (it->is_regular_file(ec)) ok = flush_file(it->path()) && ok;
-        else if (it->is_directory(ec)) sync_dir(it->path().string());
-    }
+    const bool walked = walk_tree(dir, [&](const TreeEntry& entry, bool*) {
+        if (entry.is_regular) {
+            ok = flush_file(entry.path) && ok;
+        } else if (entry.is_dir) {
+            sync_dir(entry.path);
+        }
+        return true;
+    });
     sync_dir(dir);
-    return ok && !ec;
+    return ok && walked;
 }
 
 // One file moved over another in one step (the target replaced, never
 // missing in between). Windows: written through, a read-only target made
 // writable, and tried again while another process holds either file.
 bool move_file(const std::string& from, const std::string& to) {
-#if defined(_WIN32)
-    const std::wstring a = fs::path(from).wstring(), b = fs::path(to).wstring();
-    make_writable(b);
-    return retried([&] { return MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE; });
-#else
-    return ::rename(from.c_str(), to.c_str()) == 0;
-#endif
+    // One step, the target replaced: the seam's rename is MoveFileFromApp on
+    // the console (and ReplaceFileFromApp where the target exists), which
+    // carries the write-through with it.
+    return retried([&] { return hostfs::Rename(from, to, true); });
 }
 
 void remove_file(const std::string& path) {
-#if defined(_WIN32)
-    const std::wstring w = fs::path(path).wstring();
-    make_writable(w);
-    retried([&] { return DeleteFileW(w.c_str()) != FALSE; });
-#else
-    ::unlink(path.c_str());
-#endif
+    retried([&] { return hostfs::Unlink(path); });
     sync_dir(parent_of(path));
 }
 
 void remove_tree(const std::string& path) {
-    std::error_code ec;
-    fs::remove_all(fs::path(path), ec);
-#if defined(_WIN32)
-    for (int i = 0; i < 50 && exists(path); ++i) {  // a file in it held a moment
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        fs::remove_all(fs::path(path), ec);
+    if (!hostfs::IsDir(path)) {
+        if (exists(path)) remove_file(path);
+        return;
     }
-#endif
+    // Every child first, then the directory itself, then once more for the
+    // parent's entries on the disk.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<TreeEntry> entries;
+        if (!walk_tree(path, [&](const TreeEntry& entry, bool*) {
+                entries.push_back(entry);
+                return true;
+            })) {
+            break;
+        }
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->is_dir) {
+                (void)hostfs::RmDir(it->path);
+            } else {
+                (void)hostfs::Unlink(it->path);
+            }
+        }
+        if (hostfs::RmDir(path) || !exists(path)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // a file in it held a moment
+    }
     sync_dir(parent_of(path));
 }
 
 // The marker written whole under a name of its own and flushed, then renamed
 // into place: the marker in place is the old one or the new one, never a part.
 bool write_marker(const Paths& p, const std::string& text) {
-#if defined(_WIN32)
-    HANDLE h = INVALID_HANDLE_VALUE;
+    int fd = -1;
     retried([&] {
-        h = CreateFileW(fs::path(p.marker_new).wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
-        return h != INVALID_HANDLE_VALUE;
+        fd = hostfs::Open(p.marker_new, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+        return fd >= 0;
     });
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD put = 0;
-    const bool ok = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &put, nullptr) && put == text.size() &&
-                    FlushFileBuffers(h);
-    CloseHandle(h);
-#else
-    const int fd = ::open(p.marker_new.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return false;
     bool ok = true;
     for (std::size_t at = 0; ok && at < text.size();) {
-        const ssize_t n = ::write(fd, text.data() + at, text.size() - at);
+        const std::int64_t n = hostfs::Write(fd, text.data() + at, text.size() - at);
         if (n <= 0) ok = false;
         else at += static_cast<std::size_t>(n);
     }
-    ok = ok && ::fsync(fd) == 0;
-    ::close(fd);
-#endif
+    ok = ok && hostfs::Flush(fd);
+    ok = hostfs::Close(fd) && ok;
     if (!ok) {
         remove_file(p.marker_new);
         return false;
@@ -211,11 +257,16 @@ bool write_marker(const Paths& p, const std::string& text) {
 
 std::string read_marker(const std::string& path) {
     std::string text;
-    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
-        char buf[4096];
-        for (std::size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0 && text.size() < (4u << 20);) text.append(buf, n);
-        std::fclose(f);
+    const int fd = hostfs::Open(path, hostfs::kRead);
+    if (fd < 0) return text;
+    char buf[4096];
+    for (;;) {
+        const std::int64_t n = hostfs::Read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        text.append(buf, static_cast<std::size_t>(n));
+        if (text.size() >= (4u << 20)) break;
     }
+    (void)hostfs::Close(fd);
     return text;
 }
 
@@ -224,14 +275,9 @@ std::string read_marker(const std::string& path) {
 // ~5 s while another process holds a file in it - Windows refuses a rename
 // over an open file's directory.
 bool rename_dir(const std::string& from, const std::string& to) {
-#if defined(_WIN32)
-    const std::wstring a = fs::path(from).wstring(), b = fs::path(to).wstring();
-    return retried([&] { return MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE; });
-#else
-    if (::rename(from.c_str(), to.c_str()) != 0) return false;
+    if (!retried([&] { return hostfs::Rename(from, to, false); })) return false;
     sync_dir(parent_of(to));
     return true;
-#endif
 }
 
 // The two directories swapped in one step (renameat2 RENAME_EXCHANGE): 0, or
@@ -263,22 +309,19 @@ std::uint64_t inode_of(const std::string& p) {
 
 // A directory tree copied file by file (a test may end the process between two).
 bool copy_tree(const std::string& from, const std::string& to) {
-    std::error_code ec;
-    fs::create_directories(fs::path(to), ec);
-    if (ec) return false;
-    for (fs::recursive_directory_iterator it(fs::path(from), ec), end; !ec && it != end; it.increment(ec)) {
-        const fs::path rel = fs::relative(it->path(), fs::path(from), ec);
-        if (ec) return false;
-        const fs::path dst = fs::path(to) / rel;
-        if (it->is_directory(ec)) {
-            fs::create_directories(dst, ec);
-        } else if (it->is_regular_file(ec)) {
-            fs::copy_file(it->path(), dst, fs::copy_options::overwrite_existing, ec);
+    if (!hostfs::MkDir(to, true)) return false;
+    bool ok = true;
+    const bool walked = walk_tree(from, [&](const TreeEntry& entry, bool*) {
+        const std::string dst = hostfs::JoinPath(to, entry.rel);
+        if (entry.is_dir) {
+            ok = hostfs::MkDir(dst, true) && ok;
+        } else if (entry.is_regular) {
+            ok = copy_file(entry.path, dst) && ok;
             step("copy");
         }
-        if (ec) return false;
-    }
-    return !ec;
+        return ok;
+    });
+    return ok && walked;
 }
 
 // ---- File by file.
@@ -291,8 +334,8 @@ bool ends_with(const std::string& s, const char* tail) {
 }
 
 // An entry's place under `dir`.
-fs::path in(const std::string& dir, const std::string& entry) {
-    return fs::path(dir) / fs::path(is_dir_entry(entry) ? entry.substr(0, entry.size() - 1) : entry);
+std::string in(const std::string& dir, const std::string& entry) {
+    return hostfs::JoinPath(dir, is_dir_entry(entry) ? entry.substr(0, entry.size() - 1) : entry);
 }
 
 std::uint64_t fnv1a(const std::string& s) {
@@ -315,17 +358,17 @@ bool entry_ok(const std::string& e) {
 // one cannot be listed.
 bool list_stage(const std::string& stage, std::vector<std::string>* out) {
     out->clear();
-    std::error_code ec;
-    const fs::path root(stage);
-    for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-        const fs::file_status st = it->symlink_status(ec);
-        if (ec) return false;
-        const std::string rel = it->path().lexically_relative(root).generic_string();
-        if (!entry_ok(rel)) return false;
-        if (fs::is_directory(st)) out->push_back(rel + "/");
-        else if (fs::is_regular_file(st) && !ends_with(rel, kCopyTail)) out->push_back(rel);
-    }
-    if (ec) return false;
+    bool ok = true;
+    const bool walked = walk_tree(stage, [&](const TreeEntry& entry, bool*) {
+        if (!entry_ok(entry.rel)) {
+            ok = false;
+            return false;
+        }
+        if (entry.is_dir) out->push_back(entry.rel + "/");
+        else if (entry.is_regular && !ends_with(entry.rel, kCopyTail)) out->push_back(entry.rel);
+        return true;
+    });
+    if (!ok || !walked) return false;
     std::sort(out->begin(), out->end());
     return true;
 }
@@ -365,21 +408,17 @@ bool parse_files(const std::string& text, std::vector<std::string>* entries) {
 void remove_extras(const std::string& live, const std::vector<std::string>& entries) {
     const std::set<std::string> listed(entries.begin(), entries.end());
     std::vector<std::string> files, dirs;
-    std::error_code ec;
-    const fs::path root(live);
-    for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-        const fs::file_status st = it->symlink_status(ec);
-        if (ec) break;
-        const std::string rel = it->path().lexically_relative(root).generic_string();
-        if (fs::is_directory(st)) {
-            if (!listed.count(rel + "/")) {
-                dirs.push_back(it->path().string());
-                it.disable_recursion_pending();
+    (void)walk_tree(live, [&](const TreeEntry& entry, bool* recurse) {
+        if (entry.is_dir) {
+            if (!listed.count(entry.rel + "/")) {
+                dirs.push_back(entry.path);
+                *recurse = false;  // the whole subtree goes with it
             }
-        } else if (!listed.count(rel)) {
-            files.push_back(it->path().string());
+        } else if (!listed.count(entry.rel)) {
+            files.push_back(entry.path);
         }
-    }
+        return true;
+    });
     for (const std::string& f : files) remove_file(f);
     for (const std::string& d : dirs) remove_tree(d);
 }
@@ -391,31 +430,30 @@ void remove_extras(const std::string& live, const std::vector<std::string>& entr
 // and a recovery; false (a move refused) leaves the marker, the stage and the
 // files not yet moved for the next recovery.
 bool finish_files(const Paths& p, const std::vector<std::string>& entries, std::string* why) {
-    std::error_code ec;
     if (!exists(p.live)) {
-        fs::create_directories(fs::path(p.live), ec);
+        (void)make_dirs(p.live);
         sync_dir(parent_of(p.live));
     }
     std::set<std::string> touched;  // the directories whose entries changed
     std::string refused;
     for (const std::string& e : entries) {
-        const fs::path dst = in(p.live, e);
+        const std::string dst = in(p.live, e);
         if (is_dir_entry(e)) {
-            if (!exists(dst.string())) {
-                fs::create_directories(dst, ec);
-                touched.insert(dst.parent_path().string());
+            if (!exists(dst)) {
+                (void)make_dirs(dst);
+                touched.insert(parent_of(dst));
             }
             continue;
         }
-        const fs::path src = in(p.stage, e);
-        if (!exists(src.string())) continue;
-        if (!exists(dst.parent_path().string())) fs::create_directories(dst.parent_path(), ec);
-        if (refused_in_test(e) || !move_file(src.string(), dst.string())) {
+        const std::string src = in(p.stage, e);
+        if (!exists(src)) continue;
+        if (!exists(parent_of(dst))) (void)make_dirs(parent_of(dst));
+        if (refused_in_test(e) || !move_file(src, dst)) {
             if (refused.empty()) refused = e;
             continue;
         }
-        touched.insert(src.parent_path().string());
-        touched.insert(dst.parent_path().string());
+        touched.insert(parent_of(src));
+        touched.insert(parent_of(dst));
         step("moved");
     }
     for (const std::string& d : touched) sync_dir(d);
@@ -437,35 +475,36 @@ bool finish_files(const Paths& p, const std::vector<std::string>& entries, std::
 // from the save, each under a name of its own and renamed into place - a copy
 // cut short is never taken for the file. False when one cannot be.
 bool copy_back(const Paths& p, const std::vector<std::string>& entries) {
-    std::error_code ec;
     std::set<std::string> touched;
     for (const std::string& e : entries) {
-        const fs::path s = in(p.stage, e);
+        const std::string s = in(p.stage, e);
         if (is_dir_entry(e)) {
-            fs::create_directories(s, ec);
-            if (ec) return false;
+            if (!make_dirs(s)) return false;
             continue;
         }
-        const fs::path l = in(p.live, e);
-        if (exists(s.string()) || !exists(l.string())) continue;  // still there; or in neither, nothing to copy
-        fs::create_directories(s.parent_path(), ec);
-        const std::string tmp = s.string() + kCopyTail;
-        fs::copy_file(l, fs::path(tmp), fs::copy_options::overwrite_existing, ec);
-        if (ec || !flush_file(fs::path(tmp))) return false;
+        const std::string l = in(p.live, e);
+        if (exists(s) || !exists(l)) continue;  // still there; or in neither, nothing to copy
+        if (!make_dirs(parent_of(s))) return false;
+        const std::string tmp = s + kCopyTail;
+        if (!copy_file(l, tmp) || !flush_file(tmp)) return false;
         step("copied-back");
-        if (!move_file(tmp, s.string())) return false;
-        touched.insert(s.parent_path().string());
+        if (!move_file(tmp, s)) return false;
+        touched.insert(parent_of(s));
     }
     for (const std::string& d : touched) sync_dir(d);
     return true;
 }
 
 bool has_files(const std::string& dir) {
-    std::error_code ec;
-    for (fs::recursive_directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
-        if (!it->is_directory(ec)) return true;
-    }
-    return false;
+    bool any = false;
+    (void)walk_tree(dir, [&](const TreeEntry& entry, bool*) {
+        if (!entry.is_dir) {
+            any = true;
+            return false;
+        }
+        return true;
+    });
+    return any;
 }
 
 // ---- v0.2.32-v0.2.34's renames, for the recovery of what they left.
@@ -504,11 +543,11 @@ bool finish_by_renames(const Paths& p, std::string* why) {
 }  // namespace
 
 Paths paths_of(const std::string& live) {
-    const fs::path l(live);
-    const fs::path dir = l.parent_path();
-    const std::string name = l.filename().string();
-    return Paths{live, (dir / ("." + name + ".stage")).string(), (dir / ("." + name + ".old")).string(),
-                 (dir / ("." + name + ".commit")).string(), (dir / ("." + name + ".commit.new")).string()};
+    const std::string dir = parent_of(live);
+    const std::size_t cut = live.find_last_of("/\\");
+    const std::string name = cut == std::string::npos ? live : live.substr(cut + 1);
+    return Paths{live, hostfs::JoinPath(dir, "." + name + ".stage"), hostfs::JoinPath(dir, "." + name + ".old"),
+                 hostfs::JoinPath(dir, "." + name + ".commit"), hostfs::JoinPath(dir, "." + name + ".commit.new")};
 }
 
 std::string recover(const std::string& live, std::string* did) {
@@ -593,8 +632,7 @@ std::string begin(const std::string& live) {
     const Paths p = paths_of(live);
     if (exists(p.marker)) return {};  // a commit the recovery could not finish: its stage is the save
     if (exists(p.stage)) remove_tree(p.stage);
-    std::error_code ec;
-    const bool ok = exists(p.live) ? copy_tree(p.live, p.stage) : fs::create_directories(fs::path(p.stage), ec) && !ec;
+    const bool ok = exists(p.live) ? copy_tree(p.live, p.stage) : make_dirs(p.stage);
     if (!ok) {
         remove_tree(p.stage);
         return {};

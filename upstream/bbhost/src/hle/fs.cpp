@@ -6,6 +6,11 @@
 #include "core/portable.h"
 #include "hle/platform.h"
 
+// The file system itself: the CRT on a desktop build, the `*FromApp` calls in
+// the AppContainer (xbox/platform/host_fs.h). Nothing below this include knows
+// which one it got, so the path policy is one piece of code.
+#include "xbox/platform/host_fs.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -43,6 +48,8 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+namespace hostfs = bbx::hostfs;
 
 namespace {
 
@@ -168,25 +175,9 @@ struct HostFile {
 std::unordered_map<int, HostFile> g_files;
 int g_fd_next = 3;
 
-bool is_dir_path(const char* p) {
-#if defined(_WIN32)
-    struct _stat64 st{};
-    return _stat64(p, &st) == 0 && (st.st_mode & _S_IFDIR);
-#else
-    struct stat st{};
-    return ::stat(p, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
-}
+bool is_dir_path(const char* p) { return p != nullptr && hostfs::IsDir(p); }
 
-bool path_exists(const char* p) {
-#if defined(_WIN32)
-    struct _stat64 st{};
-    return _stat64(p, &st) == 0;
-#else
-    struct stat st{};
-    return ::stat(p, &st) == 0;
-#endif
-}
+bool path_exists(const char* p) { return p != nullptr && hostfs::Exists(p); }
 
 std::string join_path(std::string a, std::string b) {
     while (!a.empty() && (a.back() == '/' || a.back() == '\\')) {
@@ -405,8 +396,10 @@ std::string resolve_confined(const std::string& n) {
             return {};
         }
 #if defined(_WIN32)
-        struct _stat64 st{};
-        if (_stat64(next.c_str(), &st) != 0) {
+        // The lexical form does not need to know what kind of entry it is,
+        // only whether it is there: a path the dump does not have is left for
+        // the caller to fail on, with the whole path in one piece.
+        if (!hostfs::Exists(next)) {
             for (std::size_t j = i + 1; j < parts.size(); ++j) {
                 next = join_path(next, parts[j]);
             }
@@ -464,11 +457,6 @@ std::string confine(const std::string& path) {
 // dump and the overlay, which nothing writes, so the answers are cached, the
 // misses as well.
 std::string resolve_nocase(const std::string& root, const std::string& rest) {
-#if defined(_WIN32)
-    (void)root;
-    (void)rest;
-    return {};
-#else
     static std::mutex mu;
     static std::unordered_map<std::string, std::string> cache;
     const std::string key = root + '\0' + rest;
@@ -487,14 +475,19 @@ std::string resolve_nocase(const std::string& root, const std::string& rest) {
         std::string next = join_path(cur, comp);
         if (!path_exists(next.c_str())) {
             next.clear();
-            if (DIR* d = opendir(cur.c_str())) {
-                while (dirent* e = readdir(d)) {
-                    if (strcasecmp(e->d_name, comp.c_str()) == 0) {
-                        next = join_path(cur, e->d_name);
+            std::vector<hostfs::DirEntry> entries;
+            if (hostfs::ListDir(cur, &entries)) {
+                for (const hostfs::DirEntry& entry : entries) {
+#if defined(_WIN32)
+                    const int same = _stricmp(entry.name.c_str(), comp.c_str());
+#else
+                    const int same = strcasecmp(entry.name.c_str(), comp.c_str());
+#endif
+                    if (same == 0) {
+                        next = join_path(cur, entry.name);
                         break;
                     }
                 }
-                closedir(d);
             }
             if (next.empty()) {
                 cur.clear();
@@ -506,7 +499,6 @@ std::string resolve_nocase(const std::string& root, const std::string& rest) {
     std::lock_guard<std::mutex> lock(mu);
     cache.emplace(key, cur);
     return cur;
-#endif
 }
 
 std::atomic<int> g_nocase_hits{0};
@@ -693,30 +685,17 @@ void mkdir_confined(const std::string& path) {
     if (path.empty()) {
         return;
     }
-#if defined(_WIN32)
-    _mkdir(path.c_str());
-#else
-    ::mkdir(path.c_str(), 0777);
-#endif
+    (void)hostfs::MkDir(path, true);
 }
 
 std::string canonical_dir(const std::string& p) {
     if (p.empty()) {
         return {};
     }
-#if defined(_WIN32)
-    char buf[4096];
-    if (!_fullpath(buf, p.c_str(), sizeof(buf))) {
+    std::string out;
+    if (!hostfs::Canonical(p, &out)) {
         return {};
     }
-    std::string out = buf;
-#else
-    char buf[PATH_MAX];
-    if (!realpath(p.c_str(), buf)) {
-        return {};
-    }
-    std::string out = buf;
-#endif
     slashify(out);
     while (out.size() > 1 && out.back() == '/') {
         out.pop_back();
@@ -787,100 +766,43 @@ int stat_host(const char* host, void* sb) {
     if (!sb) {
         return sce_err(EINVAL);
     }
-#if defined(_WIN32)
-    struct _stat64 st{};
-    if (_stat64(host, &st) != 0) {
-        return sce_err(errno);
+    hostfs::FileStat st{};
+    if (!hostfs::Stat(host, &st)) {
+        return sce_err(hostfs::LastError());
     }
-    fill_orbis_stat(sb, static_cast<std::uint64_t>(st.st_size), (st.st_mode & _S_IFDIR) != 0,
-                    static_cast<std::int64_t>(st.st_mtime));
-#else
-    struct stat st{};
-    if (::stat(host, &st) != 0) {
-        return sce_err(errno);
-    }
-    fill_orbis_stat(sb, static_cast<std::uint64_t>(st.st_size), S_ISDIR(st.st_mode),
-                    static_cast<std::int64_t>(st.st_mtime));
-#endif
+    fill_orbis_stat(sb, st.size, st.is_dir, st.mtime);
     return 0;
 }
 
 int host_open_flags(int orbis) {
-#if defined(_WIN32)
-    int f = _O_BINARY;
+    // Orbis flags to the seam's neutral set. The two backends turn these into
+    // `_O_*`/`O_*` and `CreateFile2FromApp`'s disposition, so the guest's open
+    // semantics are decided once, here.
+    int f = 0;
     switch (orbis & 3) {
-        case 1:
-            f |= _O_WRONLY;
-            break;
-        case 2:
-            f |= _O_RDWR;
-            break;
-        default:
-            f |= _O_RDONLY;
-            break;
+        case 1: f |= hostfs::kWrite; break;
+        case 2: f |= hostfs::kRead | hostfs::kWrite; break;
+        default: f |= hostfs::kRead; break;
     }
-    if (orbis & kOrbisOCreat) {
-        f |= _O_CREAT;
-    }
-    if (orbis & kOrbisOTrunc) {
-        f |= _O_TRUNC;
-    }
-    if (orbis & kOrbisOExcl) {
-        f |= _O_EXCL;
-    }
-    if (orbis & kOrbisOAppend) {
-        f |= _O_APPEND;
-    }
+    if (orbis & kOrbisOCreat) f |= hostfs::kCreate;
+    if (orbis & kOrbisOTrunc) f |= hostfs::kTruncate;
+    if (orbis & kOrbisOExcl) f |= hostfs::kExclusive;
+    if (orbis & kOrbisOAppend) f |= hostfs::kAppend;
+    if (orbis & kOrbisODir) f |= hostfs::kDirectory;
     return f;
-#else
-    int f = orbis & 3;
-    if (orbis & kOrbisOCreat) {
-        f |= O_CREAT;
-    }
-    if (orbis & kOrbisOTrunc) {
-        f |= O_TRUNC;
-    }
-    if (orbis & kOrbisOExcl) {
-        f |= O_EXCL;
-    }
-    if (orbis & kOrbisOAppend) {
-        f |= O_APPEND;
-    }
-    if (orbis & 4) {
-        f |= O_NONBLOCK;
-    }
-    if (orbis & kOrbisODir) {
-        f |= O_DIRECTORY;
-    }
-    return f;
-#endif
 }
 
 void snapshot_dir(HostFile& hf) {
     hf.dents.clear();
     hf.dent_pos = 0;
-#if defined(_WIN32)
-    std::string pat = hf.host_path + "\\*";
-    WIN32_FIND_DATAA fd{};
-    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) {
+    std::vector<hostfs::DirEntry> entries;
+    if (!hostfs::ListDir(hf.host_path, &entries)) {
         return;
     }
-    do {
-        uint8_t ty = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
-        hf.dents.emplace_back(fd.cFileName, ty);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-#else
-    DIR* d = opendir(hf.host_path.c_str());
-    if (!d) {
-        return;
+    for (const hostfs::DirEntry& entry : entries) {
+        // The guest's d_type alphabet: 4 for a directory, 8 for a file.
+        hf.dents.emplace_back(entry.name, static_cast<std::uint8_t>(entry.is_dir ? 4 : 8));
     }
-    while (dirent* e = readdir(d)) {
-        hf.dents.emplace_back(e->d_name, e->d_type);
-    }
-    closedir(d);
-#endif
 }
 
 bool fs_trace() {
@@ -952,18 +874,12 @@ GUEST_ABI int hle_kernel_open(const char* path, int flags, int mode) {
         return log_open(path, host, flags, sce_err(ENOENT));
     }
     const bool want_dir = (flags & kOrbisODir) != 0;
-#if defined(_WIN32)
-    struct _stat64 st{};
-    const int st_ok = _stat64(host.c_str(), &st);
-    const bool is_dir = st_ok == 0 && (st.st_mode & _S_IFDIR) != 0;
-#else
-    struct stat st{};
-    const int st_ok = ::stat(host.c_str(), &st);
-    const bool is_dir = st_ok == 0 && S_ISDIR(st.st_mode);
-#endif
+    hostfs::FileStat st{};
+    const bool st_ok = hostfs::Stat(host, &st);
+    const bool is_dir = st_ok && st.is_dir;
     if (want_dir) {
-        if (st_ok != 0) {
-            return log_open(path, host, flags, sce_err(errno));
+        if (!st_ok) {
+            return log_open(path, host, flags, sce_err(hostfs::LastError()));
         }
         if (!is_dir) {
             return log_open(path, host, flags, sce_err(ENOTDIR));
@@ -975,19 +891,15 @@ GUEST_ABI int hle_kernel_open(const char* path, int flags, int mode) {
     if (hf.is_dir) {
         snapshot_dir(hf);
     } else {
-#if defined(_WIN32)
-        int fd = _open(host.c_str(), host_open_flags(flags), mode ? mode : 0666);
-#else
-        int fd = ::open(host.c_str(), host_open_flags(flags), mode ? mode : 0666);
-#endif
+        const int fd = hostfs::Open(host, host_open_flags(flags), mode ? mode : 0666);
         if (fd < 0) {
-            return log_open(path, host, flags, sce_err(errno));
+            return log_open(path, host, flags, sce_err(hostfs::LastError()));
         }
         hf.host_fd = fd;
         // No file of a PS4 game is empty: a dump with one is incomplete.
-        if (st_ok == 0 && st.st_size == 0) note_problem(path, host, "is empty (0 bytes)");
+        if (st_ok && st.size == 0) note_problem(path, host, "is empty (0 bytes)");
     }
-    const long long size = st_ok == 0 && !is_dir ? static_cast<long long>(st.st_size) : -1;
+    const long long size = st_ok && !is_dir ? static_cast<long long>(st.size) : -1;
     std::lock_guard<std::mutex> lock(g_fs_mu);
     int id = g_fd_next++;
     g_files[id] = std::move(hf);
@@ -1007,11 +919,7 @@ GUEST_ABI int hle_kernel_close(int fd) {
         return sce_err(EBADF);
     }
     if (it->second.host_fd >= 0) {
-#if defined(_WIN32)
-        _close(it->second.host_fd);
-#else
-        ::close(it->second.host_fd);
-#endif
+        (void)hostfs::Close(it->second.host_fd);
     }
     g_files.erase(it);
     return 0;
@@ -1042,27 +950,19 @@ GUEST_ABI std::int64_t hle_kernel_read(int fd, void* buf, std::uint64_t n) {
     write_watch_release(p, static_cast<std::size_t>(n));
     int efaults = 0;
     while (got < n) {
-#if defined(_WIN32)
-        unsigned chunk = static_cast<unsigned>(std::min<std::uint64_t>(n - got, 0x7fffffff));
-        int r = _read(f->host_fd, p + got, chunk);
-#else
-        ssize_t r = ::read(f->host_fd, p + got, static_cast<std::size_t>(n - got));
-#endif
+        const std::int64_t r = hostfs::Read(f->host_fd, p + got, n - got);
         if (r < 0) {
-            if (errno == EINTR) {
+            const int err = hostfs::LastError();
+            if (err == EINTR) {
                 continue;
             }
-#if defined(_WIN32)
-            // ReadFile into a read-only page fails with ERROR_NOACCESS, which
-            // the CRT maps to EINVAL.
-            const bool fault = errno == EFAULT || GetLastError() == ERROR_NOACCESS;
-#else
-            const bool fault = errno == EFAULT;
-#endif
-            if (fault && efaults++ < 8 && write_watch_release(p + got, static_cast<std::size_t>(n - got))) {
+            // A read into a page the texture cache has write-protected fails
+            // rather than faulting (ERROR_NOACCESS on the console, EFAULT on
+            // Linux); releasing the pages and retrying is the caller's answer.
+            if (err == EFAULT && efaults++ < 8 && write_watch_release(p + got, static_cast<std::size_t>(n - got))) {
                 continue;
             }
-            return got ? static_cast<std::int64_t>(got) : sce_err(errno);
+            return got ? static_cast<std::int64_t>(got) : sce_err(err);
         }
         if (r == 0) {
             break;
@@ -1088,17 +988,13 @@ GUEST_ABI std::int64_t hle_kernel_write(int fd, const void* buf, std::uint64_t n
     auto* p = static_cast<const unsigned char*>(buf);
     std::uint64_t put = 0;
     while (put < n) {
-#if defined(_WIN32)
-        unsigned chunk = static_cast<unsigned>(std::min<std::uint64_t>(n - put, 0x7fffffff));
-        int r = _write(f->host_fd, p + put, chunk);
-#else
-        ssize_t r = ::write(f->host_fd, p + put, static_cast<std::size_t>(n - put));
-#endif
+        const std::int64_t r = hostfs::Write(f->host_fd, p + put, n - put);
         if (r < 0) {
-            if (errno == EINTR) {
+            const int err = hostfs::LastError();
+            if (err == EINTR) {
                 continue;
             }
-            return put ? static_cast<std::int64_t>(put) : sce_err(errno);
+            return put ? static_cast<std::int64_t>(put) : sce_err(err);
         }
         if (r == 0) {
             break;
@@ -1124,13 +1020,9 @@ GUEST_ABI std::int64_t hle_kernel_lseek(int fd, std::int64_t off, int whence) {
         }
         return static_cast<std::int64_t>(f->dent_pos);
     }
-#if defined(_WIN32)
-    std::int64_t r = _lseeki64(f->host_fd, off, whence);
-#else
-    std::int64_t r = ::lseek(f->host_fd, static_cast<off_t>(off), whence);
-#endif
+    const std::int64_t r = hostfs::Seek(f->host_fd, off, whence);
     if (r < 0) {
-        return sce_err(errno);
+        return sce_err(hostfs::LastError());
     }
     return r;
 }
@@ -1221,12 +1113,8 @@ GUEST_ABI int hle_kernel_mkdir(const char* path, int mode) {
     if (host.empty()) {
         return sce_err(ENOENT);
     }
-#if defined(_WIN32)
-    (void)mode;
-    return _mkdir(host.c_str()) == 0 ? 0 : sce_err(errno);
-#else
-    return ::mkdir(host.c_str(), static_cast<mode_t>(mode ? mode : 0777)) == 0 ? 0 : sce_err(errno);
-#endif
+    (void)mode;  // the host's directory permissions are the AppContainer's
+    return hostfs::MkDir(host, false) ? 0 : sce_err(hostfs::LastError());
 }
 
 GUEST_ABI int hle_kernel_rmdir(const char* path) {
@@ -1235,11 +1123,7 @@ GUEST_ABI int hle_kernel_rmdir(const char* path) {
     if (host.empty()) {
         return sce_err(ENOENT);
     }
-#if defined(_WIN32)
-    return _rmdir(host.c_str()) == 0 ? 0 : sce_err(errno);
-#else
-    return ::rmdir(host.c_str()) == 0 ? 0 : sce_err(errno);
-#endif
+    return hostfs::RmDir(host) ? 0 : sce_err(hostfs::LastError());
 }
 
 GUEST_ABI int hle_kernel_unlink(const char* path) {
@@ -1248,7 +1132,7 @@ GUEST_ABI int hle_kernel_unlink(const char* path) {
     if (host.empty()) {
         return sce_err(ENOENT);
     }
-    return std::remove(host.c_str()) == 0 ? 0 : sce_err(errno);
+    return hostfs::Unlink(host) ? 0 : sce_err(hostfs::LastError());
 }
 
 GUEST_ABI int hle_kernel_rename(const char* a, const char* b) {
@@ -1258,7 +1142,8 @@ GUEST_ABI int hle_kernel_rename(const char* a, const char* b) {
     if (ha.empty() || hb.empty()) {
         return sce_err(ENOENT);
     }
-    return std::rename(ha.c_str(), hb.c_str()) == 0 ? 0 : sce_err(errno);
+    // sceKernelRename replaces: the game renames a save over its previous one.
+    return hostfs::Rename(ha, hb, true) ? 0 : sce_err(hostfs::LastError());
 }
 
 GUEST_ABI int hle_kernel_truncate(const char* path, std::int64_t len) {
@@ -1267,17 +1152,13 @@ GUEST_ABI int hle_kernel_truncate(const char* path, std::int64_t len) {
     if (host.empty()) {
         return sce_err(ENOENT);
     }
-#if defined(_WIN32)
-    int fd = _open(host.c_str(), _O_RDWR | _O_BINARY);
+    const int fd = hostfs::Open(host, hostfs::kRead | hostfs::kWrite);
     if (fd < 0) {
-        return sce_err(errno);
+        return sce_err(hostfs::LastError());
     }
-    int r = _chsize_s(fd, len) == 0 ? 0 : sce_err(errno);
-    _close(fd);
+    const int r = hostfs::Truncate(fd, len) ? 0 : sce_err(hostfs::LastError());
+    (void)hostfs::Close(fd);
     return r;
-#else
-    return ::truncate(host.c_str(), static_cast<off_t>(len)) == 0 ? 0 : sce_err(errno);
-#endif
 }
 
 GUEST_ABI int hle_kernel_ftruncate(int fd, std::int64_t len) {
@@ -1287,11 +1168,7 @@ GUEST_ABI int hle_kernel_ftruncate(int fd, std::int64_t len) {
     if (!f || f->host_fd < 0) {
         return sce_err(EBADF);
     }
-#if defined(_WIN32)
-    return _chsize_s(f->host_fd, len) == 0 ? 0 : sce_err(errno);
-#else
-    return ::ftruncate(f->host_fd, static_cast<off_t>(len)) == 0 ? 0 : sce_err(errno);
-#endif
+    return hostfs::Truncate(f->host_fd, len) ? 0 : sce_err(hostfs::LastError());
 }
 
 }  // namespace

@@ -143,6 +143,7 @@ set(BBX_APP_SOURCES
     platform/main.cpp
     platform/log.cpp
     platform/storage.cpp
+    platform/host_fs_uwp.cpp
     platform/guest_memory.cpp
     platform/memory_selftest.cpp
     platform/dump.cpp
@@ -173,6 +174,9 @@ target_include_directories(bbxbox PRIVATE
 # The portable core and the platform model are compiled into the app; the D3D12
 # backend objects join from P2 on.
 target_sources(bbxbox PRIVATE
+    # The host file-system seam's shared half (the wrappers, the path helpers and
+    # the boot self test); the AppContainer table is platform/host_fs_uwp.cpp.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/bbhost/src/core/host_fs_common.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"

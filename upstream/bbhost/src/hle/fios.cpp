@@ -8,6 +8,10 @@
 #include "hle/modules.h"
 #include "hle/platform.h"
 
+// The file system itself: the CRT on a desktop build, `*FromApp` in the
+// AppContainer (xbox/platform/host_fs.h).
+#include "xbox/platform/host_fs.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +27,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+
+namespace hostfs = bbx::hostfs;
 
 namespace {
 
@@ -77,7 +83,9 @@ struct FiosDirEntry {
 };
 
 struct File {
-    std::FILE* f = nullptr;
+    // The seam's handle, not a FILE*: a CRT stream is a CreateFileW stream
+    // underneath, which the AppContainer refuses on the dump. -1 is closed.
+    int fd = -1;
     std::string path;
 };
 
@@ -106,19 +114,19 @@ std::uint64_t to_fios_date(std::int64_t unix_sec) {
 }
 
 bool host_stat(const std::string& host, FiosStat* out) {
-    struct stat st{};
-    if (::stat(host.c_str(), &st) != 0) {
+    hostfs::FileStat st{};
+    if (!hostfs::Stat(host, &st)) {
         return false;
     }
     std::memset(out, 0, sizeof(*out));
-    out->file_size = S_ISDIR(st.st_mode) ? 0 : static_cast<std::int64_t>(st.st_size);
-    out->access_date = to_fios_date(st.st_atime);
-    out->modification_date = to_fios_date(st.st_mtime);
-    out->creation_date = to_fios_date(st.st_ctime);
-    out->stat_flags = S_ISDIR(st.st_mode) ? 1u : 0u;
-    out->dev = static_cast<std::int64_t>(st.st_dev);
-    out->ino = static_cast<std::int64_t>(st.st_ino);
-    out->mode = static_cast<std::int64_t>(st.st_mode);
+    out->file_size = st.is_dir ? 0 : static_cast<std::int64_t>(st.size);
+    out->access_date = to_fios_date(st.mtime);
+    out->modification_date = to_fios_date(st.mtime);
+    out->creation_date = to_fios_date(st.mtime);  // the seam knows one time
+    out->stat_flags = st.is_dir ? 1u : 0u;
+    out->dev = 0;
+    out->ino = 0;
+    out->mode = st.is_dir ? 0040755 : 0100644;
     return true;
 }
 
@@ -129,19 +137,14 @@ int make_op(int result, std::int64_t actual) {
     return id;
 }
 
-std::string mode_for(std::uint32_t flags) {
-    const bool w = flags & kOpenWrite;
-    const bool r = flags & kOpenRead;
-    if (flags & kOpenAppend) {
-        return r ? "a+b" : "ab";
-    }
-    if (w && ((flags & kOpenTruncate) || !r)) {
-        return r ? "w+b" : "wb";
-    }
-    if (w) {
-        return "r+b";
-    }
-    return "rb";
+int mode_for(std::uint32_t flags) {
+    const bool w = (flags & kOpenWrite) != 0;
+    const bool r = (flags & kOpenRead) != 0;
+    int out = r && w ? (hostfs::kRead | hostfs::kWrite) : (w ? hostfs::kWrite : hostfs::kRead);
+    if ((flags & kOpenAppend) != 0) out |= hostfs::kAppend;
+    if (w && ((flags & kOpenTruncate) != 0 || !r)) out |= hostfs::kCreate | hostfs::kTruncate;
+    if ((flags & kOpenCreate) != 0) out |= hostfs::kCreate;
+    return out;
 }
 
 // int sceFiosFHOpenSync(const SceFiosOpAttr*, SceFiosFH* out, const char* path, const SceFiosOpenParams*)
@@ -155,15 +158,8 @@ GUEST_ABI int hle_fios_fh_open_sync(const void*, int* out, const char* path, con
         return kFiosErrBadPath;
     }
     const std::uint32_t flags = params ? params->open_flags : kOpenRead;
-    if ((flags & kOpenWrite) && (flags & kOpenCreate) == 0) {
-        std::FILE* probe = std::fopen(host.c_str(), "rb");
-        if (!probe) {
-            return kFiosErrBadPath;
-        }
-        std::fclose(probe);
-    }
-    std::FILE* f = std::fopen(host.c_str(), mode_for(flags).c_str());
-    if (!f) {
+    const int fd = hostfs::Open(host, mode_for(flags));
+    if (fd < 0) {
         static int logs = 0;
         if (logs < 16) {
             ++logs;
@@ -175,7 +171,7 @@ GUEST_ABI int hle_fios_fh_open_sync(const void*, int* out, const char* path, con
     {
         std::lock_guard<std::mutex> lock(g_mu);
         id = g_next_fh++;
-        g_files[id] = File{f, host};
+        g_files[id] = File{fd, host};
     }
     *out = id;
     static int logs = 0;
@@ -187,81 +183,81 @@ GUEST_ABI int hle_fios_fh_open_sync(const void*, int* out, const char* path, con
 }
 
 GUEST_ABI int hle_fios_fh_close_sync(const void*, int fh) {
-    std::FILE* f = nullptr;
+    int fd = -1;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_files.find(fh);
         if (it == g_files.end()) {
             return kFiosErrBadFh;
         }
-        f = it->second.f;
+        fd = it->second.fd;
         g_files.erase(it);
     }
-    std::fclose(f);
+    if (fd >= 0) (void)hostfs::Close(fd);
     return kFiosOk;
 }
 
-std::FILE* file_of(int fh) {
+int file_of(int fh) {
     std::lock_guard<std::mutex> lock(g_mu);
     auto it = g_files.find(fh);
-    return it == g_files.end() ? nullptr : it->second.f;
+    return it == g_files.end() ? -1 : it->second.fd;
 }
 
 // SceFiosSize sceFiosFHReadSync(attr, fh, void* buf, SceFiosSize len)
 GUEST_ABI std::int64_t hle_fios_fh_read_sync(const void*, int fh, void* buf, std::int64_t len) {
-    std::FILE* f = file_of(fh);
-    if (!f) {
+    const int fd = file_of(fh);
+    if (fd < 0) {
         return kFiosErrBadFh;
     }
     if (!buf || len < 0) {
         return kFiosErrBadArg;
     }
-    std::size_t n = write_watch_fread(buf, 1, static_cast<std::size_t>(len), f);
-    return static_cast<std::int64_t>(n);
+    // The kernel writes this buffer, so a page the texture cache has
+    // write-protected fails the read rather than faulting: release first, and
+    // again if an upload protected one in the meantime.
+    write_watch_release(buf, static_cast<std::size_t>(len));
+    const std::int64_t n = hostfs::Read(fd, buf, static_cast<std::uint64_t>(len));
+    if (n < 0) {
+        const int err = hostfs::LastError();
+        if (err == EFAULT && write_watch_release(buf, static_cast<std::size_t>(len))) {
+            const std::int64_t retry = hostfs::Read(fd, buf, static_cast<std::uint64_t>(len));
+            return retry < 0 ? kFiosErrAccess : retry;
+        }
+        return kFiosErrAccess;
+    }
+    return n;
 }
 
 GUEST_ABI std::int64_t hle_fios_fh_write_sync(const void*, int fh, const void* buf, std::int64_t len) {
-    std::FILE* f = file_of(fh);
-    if (!f) {
+    const int fd = file_of(fh);
+    if (fd < 0) {
         return kFiosErrBadFh;
     }
     if (!buf || len < 0) {
         return kFiosErrBadArg;
     }
-    std::size_t n = std::fwrite(buf, 1, static_cast<std::size_t>(len), f);
-    return static_cast<std::int64_t>(n);
+    const std::int64_t n = hostfs::Write(fd, buf, static_cast<std::uint64_t>(len));
+    return n < 0 ? kFiosErrAccess : n;
 }
 
 // SceFiosOffset sceFiosFHSeek(fh, offset, whence)  whence: 0 set, 1 cur, 2 end
 GUEST_ABI std::int64_t hle_fios_fh_seek(int fh, std::int64_t off, int whence) {
-    std::FILE* f = file_of(fh);
-    if (!f) {
+    const int fd = file_of(fh);
+    if (fd < 0) {
         return kFiosErrBadFh;
     }
-    int w = whence == 0 ? SEEK_SET : (whence == 1 ? SEEK_CUR : SEEK_END);
-#if defined(_WIN32)
-    if (_fseeki64(f, off, w) != 0) {
-        return kFiosErrBadArg;
-    }
-    return _ftelli64(f);
-#else
-    if (fseeko(f, static_cast<off_t>(off), w) != 0) {
-        return kFiosErrBadArg;
-    }
-    return static_cast<std::int64_t>(ftello(f));
-#endif
+    const int w = whence == 0 ? hostfs::kSeekSet : (whence == 1 ? hostfs::kSeekCur : hostfs::kSeekEnd);
+    const std::int64_t at = hostfs::Seek(fd, off, w);
+    return at < 0 ? kFiosErrBadArg : at;
 }
 
 GUEST_ABI std::int64_t hle_fios_fh_tell(int fh) {
-    std::FILE* f = file_of(fh);
-    if (!f) {
+    const int fd = file_of(fh);
+    if (fd < 0) {
         return kFiosErrBadFh;
     }
-#if defined(_WIN32)
-    return _ftelli64(f);
-#else
-    return static_cast<std::int64_t>(ftello(f));
-#endif
+    const std::int64_t at = hostfs::Seek(fd, 0, hostfs::kSeekCur);
+    return at < 0 ? kFiosErrBadArg : at;
 }
 
 GUEST_ABI int hle_fios_stat_sync(const void*, const char* path, FiosStat* out) {
@@ -283,7 +279,7 @@ GUEST_ABI int hle_fios_file_delete_sync(const void*, const char* path) {
     if (host.empty()) {
         return kFiosErrBadPath;
     }
-    return std::remove(host.c_str()) == 0 ? kFiosOk : kFiosErrBadPath;
+    return hostfs::Unlink(host) ? kFiosOk : kFiosErrBadPath;
 }
 
 // SceFiosOp sceFiosDirectoryCreate(attr, path): async; completes immediately.
@@ -295,15 +291,10 @@ GUEST_ABI int hle_fios_directory_create(const void*, const char* path) {
     if (host.empty()) {
         return make_op(kFiosErrBadPath, 0);
     }
-#if defined(_WIN32)
-    int r = _mkdir(host.c_str());
-#else
-    int r = ::mkdir(host.c_str(), 0777);
-#endif
-    if (r != 0 && errno == EEXIST) {
-        return make_op(kFiosErrExists, 0);
+    if (hostfs::MkDir(host, false)) {
+        return make_op(kFiosOk, 0);
     }
-    return make_op(r == 0 ? kFiosOk : kFiosErrAccess, 0);
+    return make_op(hostfs::LastError() == EEXIST ? kFiosErrExists : kFiosErrAccess, 0);
 }
 
 int dh_open_impl(int* out, const char* path) {
@@ -317,30 +308,13 @@ int dh_open_impl(int* out, const char* path) {
     }
     Dir d;
     d.guest_path = path;
-#if defined(_WIN32)
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA((host + "\\*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) {
+    std::vector<hostfs::DirEntry> entries;
+    if (!hostfs::ListDir(host, &entries)) {
         return kFiosErrBadPath;
     }
-    do {
-        if (std::strcmp(fd.cFileName, ".") && std::strcmp(fd.cFileName, "..")) {
-            d.names.push_back(fd.cFileName);
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-#else
-    DIR* dir = ::opendir(host.c_str());
-    if (!dir) {
-        return kFiosErrBadPath;
+    for (const hostfs::DirEntry& entry : entries) {
+        d.names.push_back(entry.name);
     }
-    while (dirent* e = ::readdir(dir)) {
-        if (std::strcmp(e->d_name, ".") && std::strcmp(e->d_name, "..")) {
-            d.names.push_back(e->d_name);
-        }
-    }
-    ::closedir(dir);
-#endif
     std::lock_guard<std::mutex> lock(g_mu);
     int id = g_next_dh++;
     g_dirs[id] = std::move(d);

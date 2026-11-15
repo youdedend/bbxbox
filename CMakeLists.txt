@@ -149,6 +149,8 @@ if(BBX_BUILD_TESTS)
         tests/display_test.cpp
         tests/hud_test.cpp
         tests/self_test.cpp
+        tests/host_fs_test.cpp
+        tests/save_commit_test.cpp
         tests/shaders_test.cpp
         tests/guest_core_test.cpp
         tests/guest_core_stubs.cpp
@@ -157,6 +159,13 @@ if(BBX_BUILD_TESTS)
     # SHA-256, NID table, TLS rewrite and paced file, not copies of them.
     # tools/build_host.sh builds the same list for CI; a compiler that cannot build
     # bbhost's core on the host leaves the five cases out rather than failing.
+    # The host file-system seam is portable on both: the shared half plus the
+    # desktop table (the console links xbox/platform/host_fs_uwp.cpp instead).
+    target_sources(bbx_tests PRIVATE
+        upstream/bbhost/src/core/host_fs_common.cpp
+        upstream/bbhost/src/core/host_fs_desktop.cpp
+        upstream/bbhost/src/hle/save_commit.cpp)
+    target_include_directories(bbx_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/bbhost/src")
     if(NOT WIN32)
         set(BBX_GUEST_CORE_TEST_SOURCES
             upstream/bbhost/src/core/sha256.cpp
