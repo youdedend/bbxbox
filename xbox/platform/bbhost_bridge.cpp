@@ -22,6 +22,7 @@
 //     `d3d12_session` presents the launcher's HUD, and putting the guest's
 //     display buffer on the television is the D3D12 backend's slice.
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -47,6 +48,22 @@
 
 #include "xbox/platform/log.h"
 #include "xbox/platform/host_fs.h"
+#include "xbox/platform/bbhost_bridge.h"
+
+// The guest runtime. `main.cpp` is not compiled on this target - it opens a
+// desktop window and a Vulkan presenter - so the boot it performs is here,
+// step for step and in the same order (upstream/bbhost/src/main.cpp:1366-1442).
+#include "core/elf.h"
+#include "core/imports.h"
+#include "core/legacy_cpu.h"
+#include "core/portable.h"
+#include "engine/addr.h"
+#include "engine/debug_menu.h"
+#include "guest_abi.h"
+#include "hle/fs.h"
+#include "hle/hle.h"
+#include "host/frame_stats.h"
+#include "host/perf_meter.h"
 
 
 namespace {
@@ -62,7 +79,6 @@ std::uint64_t g_flips = 0;
 namespace bbx::bridge {
 
 void SetPad(SDL_Gamepad* pad) { g_pad = pad; }
-std::uint64_t Flips() { return g_flips; }
 
 }  // namespace bbx::bridge
 
@@ -166,23 +182,12 @@ void host_window_stop() {}
 bool host_window_active() { return true; }
 
 // --- the seam's quiet half ------------------------------------------------
-// Everything below answers "this machine has none of that": no options
-// page, no plugin panel, no capture, no translation cache, no overlays, no
-// second window. Each returns the declaration's own neutral value, so a
-// guest that asks a question about one gets an answer it can act on
-// instead of an unresolved symbol at load.
-
-
-// engine/graphics_patch.h
-bool engine_prologue_hook_variadic(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
-std::uint64_t engine_scene_view_flip() { return {}; }
-bool engine_site_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* bytes, std::size_t n, void* host, std::uint64_t id) { return {}; }
-std::string graphics_glare_report() { return {}; }
-std::uint32_t graphics_look_available() { return {}; }
-void graphics_look_set(const GraphicsLook& look) {  }
-void graphics_patch_install(ElfImage* image) {  }
-void graphics_scene_context_made(std::uint64_t ctx) {  }
-void graphics_ssr_live_in() {  }
+// Everything below answers "this machine has none of that": no options page, no
+// plugin panel, no capture, no overlay, no translation cache, no second window.
+// Each returns the value its own declaration calls neutral, so a guest that asks
+// about one is answered instead of stopped at load. The declarations are copied
+// from bbhost's headers and the bodies are the quiet answer; when a slice of the
+// port needs one of them for real, it is implemented here and the entry is gone.
 
 // engine/frame_rate.h
 void frame_rate_atk_params_loaded() {  }
@@ -197,41 +202,114 @@ bool frame_rate_request(int fps) { return {}; }
 void frame_rate_retime() {  }
 void frame_rate_set_time_scale(float scale) {  }
 
-// host/translation_cache.h
-void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons) {  }
-void hlsl_lane(int lane) {  }
-int hlsl_lane_now() { return {}; }
-bool hlsl_lift_of(const std::vector<std::uint32_t>& module, std::vector<std::uint32_t>& lift) { return {}; }
-int hlsl_mode() { return {}; }
-void hlsl_name_next(std::string name, std::uint64_t salt) {  }
-void hlsl_note_drawn(std::uint64_t stage_key) {  }
-void hlsl_note_lift_again(int stages) {  }
-void hlsl_note_override_refused(const std::vector<std::uint32_t>& module) {  }
-void hlsl_note_refused(const char* what, int stages, bool rebuilt) {  }
-bool hlsl_on() { return {}; }
-void hlsl_set_busy_probe(bool (*busy)()) {  }
-void hlsl_set_folders(const std::string& bbhost_dir) {  }
-void hlsl_set_inline(bool on) {  }
-void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name)) {  }
-void hlsl_set_overrides(bool on, const std::string& why_off) {  }
-void hlsl_set_setting(bool hlsl) {  }
-void hlsl_tag_stage(std::uint64_t stage_key) {  }
-bool hlsl_took_override() { return {}; }
-gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) { return {}; }
-gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) { return {}; }
-gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference, const gcn::GsLift& gs) { return {}; }
-gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference, const gcn::TessLift& tess) { return {}; }
-gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, TranslationUse use) { return {}; }
-void translation_cache_bounded(bool on) {  }
-std::uint64_t translation_cache_bounded_left_out() { return {}; }
-bool translation_cache_cold() { return {}; }
-void translation_cache_load(const std::string& path) {  }
-void translation_cache_report() {  }
-void translation_cache_save(const std::string& path, bool force) {  }
-void translation_cache_save_async(const std::string& path) {  }
-std::string translation_cache_window() { return {}; }
-const char* translator_fingerprint() { return {}; }
-bool velo_cloth_vs(const std::string& name) { return {}; }
+// engine/graphics_patch.h
+bool engine_prologue_hook_variadic(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
+std::uint64_t engine_scene_view_flip() { return {}; }
+bool engine_site_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* bytes, std::size_t n, void* host, std::uint64_t id) { return {}; }
+std::string graphics_glare_report() { return {}; }
+std::uint32_t graphics_look_available() { return {}; }
+void graphics_look_set(const GraphicsLook& look) {  }
+void graphics_patch_install(ElfImage* image) {  }
+void graphics_scene_context_made(std::uint64_t ctx) {  }
+void graphics_ssr_live_in() {  }
+
+// engine/menu_pointer.h
+void menu_pointer_click() {  }
+void menu_pointer_install(ElfImage* image) {  }
+std::uint32_t menu_pointer_take_press() { return {}; }
+std::uint64_t menu_pointer_tick() { return {}; }
+void menu_pointer_wheel() {  }
+std::uint32_t menu_region_confirm_button() { return {}; }
+void menu_sound_post(int id, int priority) {  }
+
+// engine/option_menu.h
+bool option_menu_click_decides(void* list, int index) { return {}; }
+void option_menu_confirm_ask(std::uint32_t message) {  }
+void option_menu_confirm_close() {  }
+void option_menu_install(ElfImage* image) {  }
+void option_menu_list_update(void* comp, bool focused) {  }
+void option_menu_poll() {  }
+
+// engine/patch_manifest.h
+PatchLiveState patch_manifest_live_state(const std::string& name) { return {}; }
+bool patch_manifest_off(const std::string& name) { return {}; }
+bool patch_manifest_on(const std::string& name, bool enabled) { return {}; }
+bool patch_manifest_option_known(const std::string& option) { return {}; }
+const char* patch_manifest_owner(std::uint64_t address, std::size_t n) { return {}; }
+bool patch_manifest_set_live(const std::string& name, bool on, std::string* why) { return {}; }
+void patch_manifests_apply(ElfImage* image) {  }
+bool patch_manifests_done() { return {}; }
+std::vector<std::string> patch_manifests_gameplay() { return {}; }
+std::vector<PatchListing> patch_manifests_list(const std::string& mods) { return {}; }
+bool shadow_resolution_known(bool* applied) { return {}; }
+std::uint64_t shadow_resolution_more_mib(int tier) { return {}; }
+ShadowMapSizes shadow_resolution_sizes(int tier) { return {}; }
+
+// engine/render_scale.h
+bool render_scale_applied() { return {}; }
+int render_scale_blur_shift(int shift) { return {}; }
+void render_scale_flip(std::uint64_t flip) {  }
+void render_scale_gx_init(std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip) {  }
+void render_scale_install(ElfImage* image) {  }
+bool render_scale_on(RenderScale* out) { return {}; }
+bool render_scale_plan(RenderScale* out) { return {}; }
+bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip, RenderScale* before, RenderScale* after) { return {}; }
+std::vector<patch_file::Site> render_scale_sites(const RenderScale& rs) { return {}; }
+void render_scale_size(int quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t* render_w, std::uint32_t* render_h) {  }
+
+// host/gpu.h
+void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {  }
+std::uint64_t host_gpu_completed_submits() { return {}; }
+std::uint64_t host_gpu_completed_submits_seen() { return {}; }
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at, std::uint32_t piece, std::size_t n) { return {}; }
+bool host_gpu_copy_image_region(const GpuImageCopy& c) { return {}; }
+void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {  }
+bool host_gpu_device_lost() { return {}; }
+std::uint32_t host_gpu_dispatch_user_reads() { return {}; }
+void host_gpu_explain_value(std::uint64_t va, std::uint64_t value) {  }
+bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) { return {}; }
+std::string host_gpu_fill_stats() { return {}; }
+void host_gpu_hang_report() {  }
+void host_gpu_lists_arrival(std::uint64_t id) {  }
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks) { return {}; }
+void host_gpu_pipeline_time_us(std::uint64_t out[5]) {  }
+void host_gpu_pipeline_work(std::uint64_t out[14]) {  }
+void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out) {  }
+void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {  }
+void host_gpu_refill_selftest() {  }
+std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) { return {}; }
+bool host_gpu_segment_flags_needed() { return {}; }
+void host_gpu_segment_follows(bool follows) {  }
+const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count, std::uint64_t* word) { return {}; }
+void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word) {  }
+std::string host_gpu_segment_report(bool spliced_part) { return {}; }
+void host_gpu_segment_skipped(std::uint64_t ns, bool lost) {  }
+void host_gpu_splice_compare(std::uint64_t id) {  }
+void host_gpu_splice_compare_begin(std::uint64_t id) {  }
+std::string host_gpu_splice_report(bool window) { return {}; }
+bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) { return {}; }
+void host_gpu_splice_unfed(std::uint32_t n) {  }
+void host_gpu_stall_test(unsigned ms) {  }
+std::uint64_t host_gpu_surface_replacements() { return {}; }
+std::uint64_t host_gpu_texture_hash_us() { return {}; }
+std::uint64_t host_gpu_texture_hashes() { return {}; }
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {  }
+void host_gpu_texture_time_us(std::uint64_t out[5]) {  }
+std::uint64_t host_gpu_texture_uploads() { return {}; }
+bool host_gpu_upload_region(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) { return {}; }
+std::uint32_t host_gpu_vendor_id() { return {}; }
+const char* host_gpu_vs_why_name(int why) { return {}; }
+void host_gpu_wait_work_submitted(std::uint64_t need) {  }
+void host_gpu_watch_display(std::uint64_t display_va) {  }
+const char* host_present_step(double& seconds) { return {}; }
+
+// host/ingame_menu.h
+bool ingame_menu_event(const SDL_Event& e, float pixel_ratio) { return {}; }
+bool ingame_menu_init(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t family, VkQueue queue, VkFormat format, std::uint32_t image_count) { return {}; }
+void ingame_menu_pump() {  }
+void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent) {  }
+bool ingame_menu_record_in_pass(VkCommandBuffer cmd, VkExtent2D extent) { return {}; }
+void ingame_menu_shutdown() {  }
 
 // host/options.h
 void host_account_action(int which, const std::string& name, const std::string& code) {  }
@@ -292,137 +370,6 @@ void host_options_set_open(bool open) {  }
 void host_set_deck_profile(int profile) {  }
 bool host_steam_deck() { return {}; }
 
-// host/window.h
-float host_display_refresh_hz() { return {}; }
-void host_fps_frame_start() {  }
-InputDevice host_input_device() { return {}; }
-std::uint64_t host_input_serial() { return {}; }
-bool host_key_strong() { return {}; }
-void host_message_show(const char* text, float seconds) {  }
-void host_mouse_describe(char* out, std::size_t n) {  }
-bool host_mouse_position(float& x, float& y) { return {}; }
-void host_mouse_set_relative(bool on) {  }
-void host_mouse_set_visible(bool visible) {  }
-bool host_mouse_stage_position(float& x, float& y) { return {}; }
-MouseState host_mouse_state() { return {}; }
-void host_pad_rumble(std::uint8_t small_magnitude, std::uint8_t large_magnitude) {  }
-bool host_plugin_input(const char* reader, PluginInput& out) { return {}; }
-void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {  }
-void host_plugin_pad(PluginPad& out) {  }
-void host_plugin_pad_frame() {  }
-void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {  }
-std::uint32_t host_plugin_pad_taken_axes() { return {}; }
-std::uint32_t host_plugin_pad_taken_buttons() { return {}; }
-void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {  }
-void host_plugin_take_drop(const char* owner) {  }
-std::uint32_t host_plugin_taken_buttons() { return {}; }
-bool host_plugin_taken_wheel() { return {}; }
-std::uint64_t host_present_last_ns(std::uint64_t* serial) { return {}; }
-bool host_test_keys_play(const char* path) { return {}; }
-void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label, TextCharset charset, bool select_initial) {  }
-void host_text_entry_end() {  }
-int host_text_entry_poll(std::string& text_utf8) { return {}; }
-void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {  }
-bool host_window_desktop_size(int* w, int* h) { return {}; }
-void host_window_error_box(const char* title, const char* text) {  }
-void host_window_on_pixels(void (*fn)(int, int)) {  }
-bool host_window_pixels(int* w, int* h) { return {}; }
-void host_window_recreate_swapchain() {  }
-float host_window_refresh_hz() { return {}; }
-void host_window_request_quit() {  }
-void host_window_set_mode(int mode, int width, int height) {  }
-void host_window_set_stay_borderless(bool on) {  }
-void host_window_set_vsync(bool on) {  }
-bool host_window_start(int width, int height, const char* title) { return {}; }
-
-// host/gpu.h
-void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {  }
-std::uint64_t host_gpu_completed_submits() { return {}; }
-std::uint64_t host_gpu_completed_submits_seen() { return {}; }
-std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at, std::uint32_t piece, std::size_t n) { return {}; }
-bool host_gpu_copy_image_region(const GpuImageCopy& c) { return {}; }
-void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {  }
-bool host_gpu_device_lost() { return {}; }
-std::uint32_t host_gpu_dispatch_user_reads() { return {}; }
-void host_gpu_explain_value(std::uint64_t va, std::uint64_t value) {  }
-bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) { return {}; }
-std::string host_gpu_fill_stats() { return {}; }
-void host_gpu_hang_report() {  }
-void host_gpu_lists_arrival(std::uint64_t id) {  }
-std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks) { return {}; }
-void host_gpu_pipeline_time_us(std::uint64_t out[5]) {  }
-void host_gpu_pipeline_work(std::uint64_t out[14]) {  }
-void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out) {  }
-void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {  }
-void host_gpu_refill_selftest() {  }
-std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) { return {}; }
-bool host_gpu_segment_flags_needed() { return {}; }
-void host_gpu_segment_follows(bool follows) {  }
-const std::uint64_t* host_gpu_segment_ids(std::uint64_t id, std::uint32_t* count, std::uint64_t* word) { return {}; }
-void host_gpu_segment_refused(std::uint64_t id, std::uint64_t word) {  }
-std::string host_gpu_segment_report(bool spliced_part) { return {}; }
-void host_gpu_segment_skipped(std::uint64_t ns, bool lost) {  }
-void host_gpu_splice_compare(std::uint64_t id) {  }
-void host_gpu_splice_compare_begin(std::uint64_t id) {  }
-std::string host_gpu_splice_report(bool window) { return {}; }
-bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) { return {}; }
-void host_gpu_splice_unfed(std::uint32_t n) {  }
-void host_gpu_stall_test(unsigned ms) {  }
-std::uint64_t host_gpu_surface_replacements() { return {}; }
-std::uint64_t host_gpu_texture_hash_us() { return {}; }
-std::uint64_t host_gpu_texture_hashes() { return {}; }
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {  }
-void host_gpu_texture_time_us(std::uint64_t out[5]) {  }
-std::uint64_t host_gpu_texture_uploads() { return {}; }
-bool host_gpu_upload_region(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) { return {}; }
-std::uint32_t host_gpu_vendor_id() { return {}; }
-const char* host_gpu_vs_why_name(int why) { return {}; }
-void host_gpu_wait_work_submitted(std::uint64_t need) {  }
-void host_gpu_watch_display(std::uint64_t display_va) {  }
-const char* host_present_step(double& seconds) { return {}; }
-void next(int p) { if (weight) { const auto t = std::chrono::steady_clock::now() {  }
- static_assert(offsetof(GxStageRecords, desc) <= 64, "what the constructor clears is one line") {  }
-
-// host/ingame_menu.h
-bool ingame_menu_event(const SDL_Event& e, float pixel_ratio) { return {}; }
-bool ingame_menu_init(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t family, VkQueue queue, VkFormat format, std::uint32_t image_count) { return {}; }
-void ingame_menu_pump() {  }
-void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent) {  }
-bool ingame_menu_record_in_pass(VkCommandBuffer cmd, VkExtent2D extent) { return {}; }
-void ingame_menu_shutdown() {  }
-
-// engine/menu_pointer.h
-void menu_pointer_click() {  }
-void menu_pointer_install(ElfImage* image) {  }
-std::uint32_t menu_pointer_take_press() { return {}; }
-std::uint64_t menu_pointer_tick() { return {}; }
-void menu_pointer_wheel() {  }
-std::uint32_t menu_region_confirm_button() { return {}; }
-void menu_sound_post(int id, int priority) {  }
-
-// engine/option_menu.h
-bool option_menu_click_decides(void* list, int index) { return {}; }
-void option_menu_confirm_ask(std::uint32_t message) {  }
-void option_menu_confirm_close() {  }
-void option_menu_install(ElfImage* image) {  }
-void option_menu_list_update(void* comp, bool focused) {  }
-void option_menu_poll() {  }
-
-// engine/patch_manifest.h
-PatchLiveState patch_manifest_live_state(const std::string& name) { return {}; }
-bool patch_manifest_off(const std::string& name) { return {}; }
-bool patch_manifest_on(const std::string& name, bool enabled) { return {}; }
-bool patch_manifest_option_known(const std::string& option) { return {}; }
-const char* patch_manifest_owner(std::uint64_t address, std::size_t n) { return {}; }
-bool patch_manifest_set_live(const std::string& name, bool on, std::string* why) { return {}; }
-void patch_manifests_apply(ElfImage* image) {  }
-bool patch_manifests_done() { return {}; }
-std::vector<std::string> patch_manifests_gameplay() { return {}; }
-std::vector<PatchListing> patch_manifests_list(const std::string& mods) { return {}; }
-bool shadow_resolution_known(bool* applied) { return {}; }
-std::uint64_t shadow_resolution_more_mib(int tier) { return {}; }
-ShadowMapSizes shadow_resolution_sizes(int tier) { return {}; }
-
 // host/plugin_panel.h
 std::uint32_t plugin_panel_dialog_buttons() { return {}; }
 void plugin_panel_draw(float scale, bool pad) {  }
@@ -476,18 +423,6 @@ std::vector<PluginEntry> plugins_scan() { return {}; }
 void plugins_set_enabled(const std::string& name, bool on) {  }
 void plugins_set_option(const std::string& name, const std::string& key, const std::string& value) {  }
 
-// engine/render_scale.h
-bool render_scale_applied() { return {}; }
-int render_scale_blur_shift(int shift) { return {}; }
-void render_scale_flip(std::uint64_t flip) {  }
-void render_scale_gx_init(std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip) {  }
-void render_scale_install(ElfImage* image) {  }
-bool render_scale_on(RenderScale* out) { return {}; }
-bool render_scale_plan(RenderScale* out) { return {}; }
-bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::uint32_t display_w, std::uint32_t display_h, std::uint64_t flip, RenderScale* before, RenderScale* after) { return {}; }
-std::vector<patch_file::Site> render_scale_sites(const RenderScale& rs) { return {}; }
-void render_scale_size(int quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t* render_w, std::uint32_t* render_h) {  }
-
 // host/sampler.h
 void sampler_note_exit(const char* step) {  }
 void sampler_note_main_thread() {  }
@@ -495,3 +430,214 @@ void sampler_note_pump() {  }
 void sampler_recover() {  }
 void sampler_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {  }
 void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {  }
+
+// host/translation_cache.h // namespace gpu
+namespace gpu {
+void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons) {  }
+void hlsl_lane(int lane) {  }
+int hlsl_lane_now() { return {}; }
+bool hlsl_lift_of(const std::vector<std::uint32_t>& module, std::vector<std::uint32_t>& lift) { return {}; }
+int hlsl_mode() { return {}; }
+void hlsl_name_next(std::string name, std::uint64_t salt) {  }
+void hlsl_note_drawn(std::uint64_t stage_key) {  }
+void hlsl_note_lift_again(int stages) {  }
+void hlsl_note_override_refused(const std::vector<std::uint32_t>& module) {  }
+void hlsl_note_refused(const char* what, int stages, bool rebuilt) {  }
+bool hlsl_on() { return {}; }
+void hlsl_set_busy_probe(bool (*busy)()) {  }
+void hlsl_set_folders(const std::string& bbhost_dir) {  }
+void hlsl_set_inline(bool on) {  }
+void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name)) {  }
+void hlsl_set_overrides(bool on, const std::string& why_off) {  }
+void hlsl_set_setting(bool hlsl) {  }
+void hlsl_tag_stage(std::uint64_t stage_key) {  }
+bool hlsl_took_override() { return {}; }
+gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) { return {}; }
+gcn::LiftResult lift_compute_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) { return {}; }
+gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference, const gcn::GsLift& gs) { return {}; }
+gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference, const gcn::TessLift& tess) { return {}; }
+gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::TranslateOptions& o, TranslationUse use) { return {}; }
+void translation_cache_bounded(bool on) {  }
+std::uint64_t translation_cache_bounded_left_out() { return {}; }
+bool translation_cache_cold() { return {}; }
+void translation_cache_load(const std::string& path) {  }
+void translation_cache_report() {  }
+void translation_cache_save(const std::string& path, bool force) {  }
+void translation_cache_save_async(const std::string& path) {  }
+std::string translation_cache_window() { return {}; }
+const char* translator_fingerprint() { return {}; }
+bool velo_cloth_vs(const std::string& name) { return {}; }
+}  // namespace gpu
+
+// host/window.h
+float host_display_refresh_hz() { return {}; }
+void host_fps_frame_start() {  }
+InputDevice host_input_device() { return {}; }
+std::uint64_t host_input_serial() { return {}; }
+bool host_key_strong() { return {}; }
+void host_message_show(const char* text, float seconds) {  }
+void host_mouse_describe(char* out, std::size_t n) {  }
+bool host_mouse_position(float& x, float& y) { return {}; }
+void host_mouse_set_relative(bool on) {  }
+void host_mouse_set_visible(bool visible) {  }
+bool host_mouse_stage_position(float& x, float& y) { return {}; }
+MouseState host_mouse_state() { return {}; }
+void host_pad_rumble(std::uint8_t small, std::uint8_t large) {  }
+bool host_plugin_input(const char* reader, PluginInput& out) { return {}; }
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {  }
+void host_plugin_pad(PluginPad& out) {  }
+void host_plugin_pad_frame() {  }
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {  }
+std::uint32_t host_plugin_pad_taken_axes() { return {}; }
+std::uint32_t host_plugin_pad_taken_buttons() { return {}; }
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {  }
+void host_plugin_take_drop(const char* owner) {  }
+std::uint32_t host_plugin_taken_buttons() { return {}; }
+bool host_plugin_taken_wheel() { return {}; }
+std::uint64_t host_present_last_ns(std::uint64_t* serial) { return {}; }
+bool host_test_keys_play(const char* path) { return {}; }
+void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label, TextCharset charset, bool select_initial) {  }
+void host_text_entry_end() {  }
+int host_text_entry_poll(std::string& text_utf8) { return {}; }
+void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {  }
+bool host_window_desktop_size(int* w, int* h) { return {}; }
+void host_window_error_box(const char* title, const char* text) {  }
+void host_window_on_pixels(void (*fn)(int, int)) {  }
+bool host_window_pixels(int* w, int* h) { return {}; }
+void host_window_recreate_swapchain() {  }
+float host_window_refresh_hz() { return {}; }
+void host_window_request_quit() {  }
+void host_window_set_mode(int mode, int width, int height) {  }
+void host_window_set_stay_borderless(bool on) {  }
+void host_window_set_vsync(bool on) {  }
+bool host_window_start(int width, int height, const char* title) { return {}; }
+
+// --- the boot --------------------------------------------------------------
+namespace bbx::bridge {
+namespace {
+
+// The guest's memory, the entry point and the argv block all outlive this call:
+// `_start` runs on its own thread until the game either finishes or the player
+// closes the window, so none of it may live in a stack frame.
+ElfImage g_image;
+std::string g_eboot_path;
+alignas(16) std::uint64_t g_argv[4] = {0, 0, 0, 0};
+std::atomic<bool> g_running{false};
+
+// The guest's main thread. Eight MiB, reserved rather than committed (the
+// launcher's own stack budget), and entered through the thunk that puts the
+// guest's TCB in this thread's TLS slot - the rewritten `fs:[0]` reads it.
+constexpr std::size_t kGuestStack = 8ull * 1024 * 1024;
+
+struct GuestLaunch {
+    GuestStart fn = nullptr;
+    void* argv = nullptr;
+};
+
+DWORD WINAPI GuestMain(void* p) {
+    auto* launch = static_cast<GuestLaunch*>(p);
+    void* tcb = hle_thread_enter_guest();
+    launch->fn(launch->argv, nullptr);
+    hle_thread_leave_guest(tcb);
+    g_running.store(false);
+    bbx::platform::LogF("guest: _start returned");
+    return 0;
+}
+
+}  // namespace
+
+bool StartGuest(const GuestRequest& req) {
+    if (req.eboot.empty()) {
+        bbx::platform::LogMessage(bbx::platform::Level::kError, "boot: no eboot.bin in the dump");
+        return false;
+    }
+    if (g_running.load()) {
+        bbx::platform::LogMessage(bbx::platform::Level::kWarn, "boot: already running");
+        return true;
+    }
+    g_eboot_path = req.eboot;
+
+    // The HLE's file system: which folder is app0, which overlay is the update,
+    // where saves and temporaries go, and where the player's loose files are.
+    bbx::platform::LogCrumb("boot:roots");
+    hle_fs_set_roots(req.app0.c_str(), req.data.empty() ? nullptr : req.data.c_str(),
+                     req.tmp.empty() ? nullptr : req.tmp.c_str(), g_eboot_path.c_str(),
+                     req.mods.empty() ? nullptr : req.mods.c_str());
+    // The import table: every sce* the guest can call, bound to the HLE.
+    bbx::platform::LogCrumb("boot:register_hle");
+    register_hle();
+
+    bbx::platform::LogCrumb("boot:load_elf");
+    g_image = ElfImage{};
+    // The loader unwraps the dump's fake SELF (4F 15 3D 1D) itself, so a dumped
+    // eboot.bin and a flat ELF both work.
+    if (!load_orbis_elf(g_eboot_path.c_str(), &g_image, legacy_cpu_arena_size())) {
+        bbx::platform::LogMessage(bbx::platform::Level::kError, "boot: %s did not load", g_eboot_path.c_str());
+        return false;
+    }
+    bbx::platform::LogF("image: sha256 %s entry 0x%llx base 0x%llx size 0x%zx",
+                        g_image.sha256.c_str(), static_cast<unsigned long long>(g_image.entry),
+                        static_cast<unsigned long long>(g_image.mem.slide),
+                        static_cast<std::size_t>(g_image.mem.size));
+    const bool is_109 = g_image.sha256 == kEboot109Sha256;
+    if (!is_109 && !req.modded_eboot_ok) {
+        // Every patch, hook and engine address below is an address in 1.09; a
+        // different build would fail far from the cause, on a pointer read out
+        // of a struct that moved. Refused here, with the digest in the log.
+        bbx::platform::LogMessage(bbx::platform::Level::kError,
+                                  "boot: this eboot is not 1.09 (sha256 %s, expected %s); enable "
+                                  "\"Allow modded v1.09 eboot\" in the launcher to start it anyway",
+                                  g_image.sha256.c_str(), kEboot109Sha256);
+        unload_elf(&g_image);
+        return false;
+    }
+    if (!is_109) {
+        bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                  "boot: starting an eboot that is not 1.09; the patches may write "
+                                  "into the wrong places");
+    }
+
+    bbx::platform::LogCrumb("boot:patch_guest");
+    // The instructions this processor cannot run (BMI1, LZCNT, MOVBE), rewritten
+    // before anything else touches the code.
+    legacy_cpu_rewrite(&g_image);
+    perf_meter_start(g_image.mem.slide, g_image.mem.slide + g_image.mem.size, is_109);
+    main_wait_guest_base(g_image.mem.slide);
+    // The launcher has the window: the guest must not try to open one, and the
+    // display buffers are sized for the television the launcher already has.
+    host_set_headless(false);
+    hle_patch_guest(&g_image);
+    debug_menu_install(&g_image);
+    legacy_cpu_verify("before the guest starts");
+
+    // The guest sees no host flags: argc = 1, argv[0] = the eboot's path, and
+    // the 16-byte alignment the SysV ABI's prologues assume.
+    g_argv[0] = 1;
+    g_argv[1] = reinterpret_cast<std::uint64_t>(g_eboot_path.c_str());
+    g_argv[2] = 0;
+
+    static GuestLaunch launch;
+    launch.fn = reinterpret_cast<GuestStart>(g_image.entry);
+    launch.argv = g_argv;
+    bbx::platform::LogCrumb("boot:guest_start");
+    bbx::platform::LogF("guest: calling _start 0x%llx on an %zu MiB stack",
+                        static_cast<unsigned long long>(g_image.entry), kGuestStack >> 20);
+    g_running.store(true);
+    const HANDLE thread = CreateThread(nullptr, kGuestStack, GuestMain, &launch,
+                                       STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (thread == nullptr) {
+        g_running.store(false);
+        bbx::platform::LogMessage(bbx::platform::Level::kError,
+                                  "guest: CreateThread with an %zu MiB stack failed (error %lu)",
+                                  kGuestStack >> 20, static_cast<unsigned long>(GetLastError()));
+        unload_elf(&g_image);
+        return false;
+    }
+    CloseHandle(thread);  // the guest runs to _start's return; the handle is not needed
+    return true;
+}
+
+bool Running() { return g_running.load(); }
+std::uint64_t Flips() { return g_flips; }
+
+}  // namespace bbx::bridge

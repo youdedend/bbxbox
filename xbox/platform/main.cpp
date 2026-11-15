@@ -32,6 +32,7 @@
 #include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
+#include "xbox/platform/bbhost_bridge.h"
 #include "xbox/platform/guest_windows.h"
 #include "pthread.h"  // the winpthreads shim: bbxbox::winpthreads::SelfTest
 #include "xbox/platform/host_fs.h"
@@ -518,6 +519,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 if (event.type == SDL_EVENT_QUIT) g_session.quit = true;
                 if (event.type == SDL_EVENT_GAMEPAD_ADDED && g_session.pad == nullptr) {
                     g_session.pad = SDL_OpenGamepad(event.gdevice.which);
+                    // The same pad the launcher draws its menus with is the one
+                    // the game reads (platform/bbhost_bridge.cpp).
+                    bbx::bridge::SetPad(g_session.pad);
                 }
                 if (event.type == SDL_EVENT_KEY_DOWN && g_session.keyboard_open) {
                     if (event.key.key == SDLK_BACKSPACE) g_session.keyboard.Backspace();
@@ -542,10 +546,22 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             if (g_session.start_requested) {
                 bbx::platform::LogF("launcher: start requested (version %s)",
                                     g_session.layout.EffectiveVersion().c_str());
-                // P1 replaces this with bbhost's guest boot on this thread.
-                bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                          "guest boot is P1: the launcher stays up");
                 g_session.start_requested = false;
+                // The guest boots on its own thread and the launcher keeps
+                // drawing: `_start` runs until the game exits, and the window
+                // that presents it is this one (platform/bbhost_bridge.cpp).
+                bbx::bridge::GuestRequest req;
+                req.app0 = g_session.layout.base_path;
+                if (g_session.layout.Patched()) req.data = g_session.layout.patch_path;
+                req.eboot = g_session.layout.base_path + "\\eboot.bin";
+                if (g_session.model.mods_enabled && g_session.model.mods_present) {
+                    req.mods = g_session.layout.base_path + "\\mods";
+                }
+                req.modded_eboot_ok = g_session.model.modded_eboot_ok;
+                if (!bbx::bridge::StartGuest(req)) {
+                    bbx::platform::LogMessage(bbx::platform::Level::kError,
+                                              "launcher: the guest did not start; staying in the launcher");
+                }
             }
             SDL_Delay(8);
         }
