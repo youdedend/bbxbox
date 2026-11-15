@@ -247,9 +247,11 @@ bool PickFolderGrant(std::string& path_out, std::string& token_out) {
                     AccessCache::StorageItemAccessList recent =
                         AccessCache::StorageApplicationPermissions::FutureAccessList();
                     const winrt::Windows::Storage::IStorageItem item = folder;
-                    // The metadata argument is optional in the projection but
-                    // naming it keeps clang on the two-argument overload.
-                    result.token = winrt::to_string(recent.AddOrReplace(item, winrt::hstring{}));
+                    // Add, not AddOrReplace: clang's C++/WinRT projection does not
+                    // resolve the two-argument AddOrReplace overload here, and an
+                    // extra entry in a 1,000-entry list costs nothing. The list is
+                    // pruned on load (see RestoreDump's ContainsItem check).
+                    result.token = winrt::to_string(recent.Add(item));
                 }
             } catch (const winrt::hresult_error& error) {
                 LogMessage(Level::kWarn, "storage: folder picker failed (0x%08x)",

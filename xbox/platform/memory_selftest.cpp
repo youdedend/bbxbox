@@ -7,7 +7,7 @@
 
 #include <windows.h>
 
-#include <winrt/Windows.System.Diagnostics.h>
+#include <winrt/Windows.System.h>
 
 #include <cstdio>
 #include <cstring>
@@ -15,20 +15,17 @@
 namespace bbx::platform {
 namespace {
 
-// The app's commitment, via Windows.System.Diagnostics: the supported UWP way to
-// ask what Game Mode has handed the title and what it is using. The desktop
+// The app's commitment, via Windows.System.MemoryManager: the supported UWP way
+// to ask what Game Mode has handed the title and what it is using. The desktop
 // GetAppMemoryUsage/GetAppMemoryUsageLimit are not in the APP partition's
 // appmodel.h, and psapi is desktop-only.
 bool QueryAppMemory(std::uint64_t& used, std::uint64_t& limit) {
     used = 0;
     limit = 0;
     try {
-        namespace Diagnostics = winrt::Windows::System::Diagnostics;
-        const Diagnostics::ProcessDiagnosticInfo self = Diagnostics::ProcessDiagnosticInfo::TryGetForCurrentProcess();
-        if (!self) return false;
-        const Diagnostics::ProcessMemoryUsageReport report = self.MemoryUsage().GetReport();
-        used = report.PrivateCommitUsage();
-        limit = report.TotalCommitLimit();
+        // MemoryManager is the UWP surface built for exactly this question.
+        used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+        limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
     } catch (const winrt::hresult_error&) {
         return false;
     }
