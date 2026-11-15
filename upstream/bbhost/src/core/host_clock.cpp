@@ -112,8 +112,15 @@ void host_timing_init() {
     // timers are high-resolution and do not need it; Sleep, the timed waits
     // (WaitOnAddress, winpthreads' condition variables) and the driver's own
     // waits do.
+#if defined(BBX_UWP)
+    // `timeBeginPeriod` is winmm.dll, and winmm is not an API a packaged title
+    // may import (the console partition's headers do not even declare it). It is
+    // not needed either: the Game Mode scheduler's tick is fixed, and every wait
+    // that matters here is a high-resolution waitable timer.
+#else
     const bool period = !env_off("BBHOST_TIMER_PERIOD");
     if (period) timeBeginPeriod(1);
+#endif
     // Power throttling off for the process (HighQoS): EXECUTION_SPEED keeps
     // Windows from running its threads at efficiency clocks (EcoQoS) when it
     // judges the window unimportant, IGNORE_TIMER_RESOLUTION keeps the 1 ms
