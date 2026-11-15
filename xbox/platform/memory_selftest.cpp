@@ -7,7 +7,7 @@
 
 #include <windows.h>
 
-#include <appmodel.h>
+#include <winrt/Windows.System.Diagnostics.h>
 
 #include <cstdio>
 #include <cstring>
@@ -15,13 +15,24 @@
 namespace bbx::platform {
 namespace {
 
-// AppMemoryUsage / AppMemoryUsageLimit, via the documented UWP APIs. The Xbox
-// build exposes them through the same names as desktop UWP.
+// The app's commitment, via Windows.System.Diagnostics: the supported UWP way to
+// ask what Game Mode has handed the title and what it is using. The desktop
+// GetAppMemoryUsage/GetAppMemoryUsageLimit are not in the APP partition's
+// appmodel.h, and psapi is desktop-only.
 bool QueryAppMemory(std::uint64_t& used, std::uint64_t& limit) {
     used = 0;
     limit = 0;
-    if (FAILED(::GetAppMemoryUsage(&used)) || FAILED(::GetAppMemoryUsageLimit(&limit))) return false;
-    return true;
+    try {
+        namespace Diagnostics = winrt::Windows::System::Diagnostics;
+        const Diagnostics::ProcessDiagnosticInfo self = Diagnostics::ProcessDiagnosticInfo::TryGetForCurrentProcess();
+        if (!self) return false;
+        const Diagnostics::ProcessMemoryUsageReport report = self.MemoryUsage().GetReport();
+        used = report.PrivateCommitUsage();
+        limit = report.TotalCommitLimit();
+    } catch (const winrt::hresult_error&) {
+        return false;
+    }
+    return used != 0 && limit != 0;
 }
 
 struct SysvProbe {
