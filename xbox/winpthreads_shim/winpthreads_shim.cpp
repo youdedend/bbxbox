@@ -565,7 +565,14 @@ int sched_getaffinity(pid_t pid, std::size_t cpusetsize, cpu_set_t* mask) {
     // The console reports 8 cores to a title (Series X, 3.8 GHz, with SMT the
     // guest sees 8 threads), and the count asked of the OS here is the
     // process's allowed set: what the scheduler will actually run us on.
-    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    //
+    // `GetActiveProcessorCount` is not among the exports a packaged title may
+    // link against (the link audit caught it), and it is not needed: every
+    // console in this family has one processor group, and `GetSystemInfo`
+    // answers for that group.
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const DWORD n = info.dwNumberOfProcessors;
     DWORD_PTR process_mask = 0, system_mask = 0;
     const BOOL queried = GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
     for (DWORD i = 0; i < n && i < CPU_SETSIZE; ++i) {

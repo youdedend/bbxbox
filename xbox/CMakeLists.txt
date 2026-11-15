@@ -156,6 +156,9 @@ set(BBX_APP_SOURCES
     platform/hud.cpp
     platform/d3d12_session.cpp
     platform/shaders.cpp
+    # The one translation unit that includes bbhost's own host headers and
+    # answers them on the console's behalf (see the file's head comment).
+    platform/bbhost_bridge.cpp
     ${BBX_D3D12_SOURCES}
 )
 
@@ -177,14 +180,12 @@ target_include_directories(bbxbox PRIVATE
 # The portable core and the platform model are compiled into the app; the D3D12
 # backend objects join from P2 on.
 target_sources(bbxbox PRIVATE
-    # The host file-system seam's shared half (the wrappers, the path helpers and
-    # the boot self test); the AppContainer table is platform/host_fs_uwp.cpp.
-    # Both of these are also members of `bbhost_guest`, so the day the link
-    # switch below is flipped they must come out of this list - two copies of
-    # `bbx::hostfs`'s wrappers is a duplicate definition.
     # bbhost's virtual-memory layer: the guest's fixed windows are reserved
     # through it at startup (platform/guest_windows.cpp), and under BBX_UWP its
     # three entry points are the AppContainer's own.
+    # (`core/host_fs_common.cpp` and `core/win_vm.cpp` used to be listed here
+    # too; they are members of `bbhost_guest`, which is now linked below, so
+    # listing them again would be a duplicate definition.)
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_format.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
@@ -198,6 +199,13 @@ target_sources(bbxbox PRIVATE
 )
 
 target_compile_features(bbxbox PRIVATE cxx_std_20)
+
+# The bridge answers three hundred declarations copied from bbhost's headers; a
+# default that does not compile should cost one run, not one run per error.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_source_files_properties(platform/bbhost_bridge.cpp PROPERTIES
+        COMPILE_OPTIONS "-ferror-limit=0")
+endif()
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1
     # windows.h's min/max macros versus std::min/std::max in the same file.
@@ -235,16 +243,15 @@ else()
 endif()
 
 if(BBX_BBHOST)
-    # The guest runtime, its host layer and the game's own code are compiled,
-    # and the link is one switch away - but the switch is off: the residue needs
-    # `xbox/platform/bbhost_bridge.cpp` (the display/pad/flip surface the omitted
-    # desktop host TUs would have provided), and a red branch says less than a
-    # green one. Flip this the moment the bridge lands:
+    # The guest runtime, its host layer and the game's own code, linked into the
+    # app. The desktop host TUs that are not compiled (window.cpp, the Vulkan
+    # presenter, the plugin and options panels) are answered by
+    # `platform/bbhost_bridge.cpp` instead.
     #
-    #   target_link_libraries(bbxbox PRIVATE bbhost_guest bbhost_host bbhost_engine)
-    #
-    # lld-link resolves archives regardless of order, so the three may name each
-    # other's symbols freely.
+    # lld-link resolves archives regardless of order, so these may name each
+    # other's symbols freely - but it also dead-strips an archive member no one
+    # references, so `main.cpp` has to call into the guest runtime (register_hle,
+    # load_orbis_elf, hle_patch_guest) or none of it is pulled in at all.
     target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
         bbx_atrac9 bbx_monocypher)
 endif()
