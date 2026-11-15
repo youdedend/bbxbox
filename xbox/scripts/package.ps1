@@ -79,8 +79,12 @@ if (-not $makeappx) {
         Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
 }
 if (-not $makeappx) { throw "makeappx.exe not found (Windows SDK)" }
-& $makeappx.FullName pack /d $layout /p $appx /o
-if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+$makeOut = & $makeappx.FullName pack /d $layout /p $appx /o 2>&1
+if ($LASTEXITCODE -ne 0) {
+    # makeappx's own words are the only description of why a package was
+    # refused; pass them to the annotation.
+    throw ("makeappx failed: " + (($makeOut | Out-String).Trim()))
+}
 
 if ($Certificate) {
     & (Join-Path $PSScriptRoot "sign.ps1") -Package $appx -Certificate $Certificate -Password $Password
