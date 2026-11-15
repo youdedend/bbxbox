@@ -121,7 +121,7 @@ endif()
 # be named explicitly, and the desktop vcruntime140_1.lib (which supplies
 # __CxxFrameHandler4) has to be refused, or the link picks it and the package
 # fails import validation on the console.
-set(BBX_STORE_CRT_DIR "" CACHE PATH "VC\Tools\MSVC\<ver>\lib\x64\store")
+set(BBX_STORE_CRT_DIR "" CACHE PATH "the MSVC lib/x64/store directory (the Store CRT)")
 if(BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
     target_link_directories(bbxbox BEFORE PRIVATE "${BBX_STORE_CRT_DIR}")
     target_link_libraries(bbxbox PRIVATE vcruntime140_app msvcp140_app vcruntime140_1_app)
