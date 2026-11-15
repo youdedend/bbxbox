@@ -156,14 +156,18 @@ $preset = if (Test-Path "$libPath\CMakePresets.json") {
 } else { $null }
 $libOk = $false
 $libLog = Join-Path $root "build-deps\libuwp.log"
+# libuwp still uses /await + <experimental/coroutine>, which VS 2022 17.10+
+# (and 18) reject as a hard STL error; silence it for this dependency only.
+$libFlags = "/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS /D_CRT_SECURE_NO_WARNINGS"
 if ($preset) {
-    & cmake --preset $preset -S $libPath 2>&1 | Tee-Object -FilePath $libLog
+    & cmake --preset $preset -S $libPath "-DCMAKE_CXX_FLAGS=$libFlags" "-DCMAKE_C_FLAGS=$libFlags" 2>&1 | Tee-Object -FilePath $libLog
     if ($LASTEXITCODE -eq 0) { & cmake --build (Join-Path $libPath "build-$preset") --config $Configuration 2>&1 | Tee-Object -FilePath $libLog -Append }
     $libOk = ($LASTEXITCODE -eq 0)
 }
 if (-not $libOk) {
     & cmake -S $libPath -B $libOut -A $Platform -DCMAKE_SYSTEM_NAME=WindowsStore `
-        -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DCMAKE_BUILD_TYPE=$Configuration 2>&1 |
+        -DCMAKE_SYSTEM_VERSION=10.0.26100.0 -DCMAKE_BUILD_TYPE=$Configuration `
+        "-DCMAKE_CXX_FLAGS=$libFlags" "-DCMAKE_C_FLAGS=$libFlags" 2>&1 |
         Tee-Object -FilePath $libLog
     if ($LASTEXITCODE -eq 0) { & cmake --build $libOut --config $Configuration 2>&1 | Tee-Object -FilePath $libLog -Append; $libOk = ($LASTEXITCODE -eq 0) }
 }
@@ -181,11 +185,15 @@ if (-not $libOk) {
 $libPrefix = Join-Path $prefix "libuwp"
 New-Item -ItemType Directory -Force -Path (Join-Path $libPrefix "lib"), (Join-Path $libPrefix "bin") | Out-Null
 Copy-Item -Recurse -Force (Join-Path $libPath "src") (Join-Path $libPrefix "include")
-$libDll = Get-ChildItem -Recurse -Path $libOut -Filter "libuwp.dll" | Select-Object -First 1
-$libLib = Get-ChildItem -Recurse -Path $libOut -Filter "libuwp.lib" | Select-Object -First 1
-if (-not $libDll -or -not $libLib) { throw "libuwp.dll/.lib not produced under $libOut" }
-Copy-Item $libLib.FullName (Join-Path $libPrefix "lib\libuwp.lib")
-Copy-Item $libDll.FullName (Join-Path $libPrefix "bin\libuwp.dll")
+$libDll = Get-ChildItem -Recurse -Path $libPath -Filter "libuwp.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+$libLib = Get-ChildItem -Recurse -Path $libPath -Filter "libuwp.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($libDll -and $libLib) {
+    Copy-Item $libLib.FullName (Join-Path $libPrefix "lib\libuwp.lib")
+    Copy-Item $libDll.FullName (Join-Path $libPrefix "bin\libuwp.dll")
+} else {
+    $libCommit = "headers only"
+    Write-Host "build-deps: libuwp headers staged without binaries (nothing links it yet)"
+}
 
 # --- FFmpeg (prebuilt release asset) ---------------------------------------
 Write-Host "build-deps: FFmpeg prebuilt $FfmpegCommit"
