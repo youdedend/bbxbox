@@ -371,7 +371,8 @@ add_library(bbhost_engine STATIC
     "${BBX_BBHOST_ROOT}/src/net/account.cpp"
     "${BBX_BBHOST_ROOT}/src/net/http.cpp"
     "${BBX_BBHOST_ROOT}/src/net/nat_job.cpp"
-    "${BBX_BBHOST_ROOT}/src/net/nat_probe.cpp"
+    # (net/nat_probe.cpp is out: it includes <mswsock.h>, whose own definitions
+    # need the real <winsock2.h> that the console does not link.)
     "${BBX_BBHOST_ROOT}/src/net/session.cpp"
     "${BBX_BBHOST_ROOT}/src/net/stun.cpp"
 )

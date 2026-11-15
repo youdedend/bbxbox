@@ -37,6 +37,7 @@ using SOCKET = std::uintptr_t;
 using UINT_PTR = std::uintptr_t;
 using u_long = unsigned long;
 using u_short = unsigned short;
+using BYTE = unsigned char;
 using WORD = unsigned short;
 using ULONG = unsigned long;
 using INT = int;
@@ -66,6 +67,9 @@ inline constexpr int MSG_DONTWAIT = 0x0001;
 #endif
 #ifndef WSAHOST_NOT_FOUND
 #define WSAHOST_NOT_FOUND 11001
+#endif
+#ifndef MAKEWORD
+#define MAKEWORD(a, b) ((WORD)(((BYTE)((a) & 0xff)) | ((WORD)((BYTE)((b) & 0xff))) << 8))
 #endif
 #ifndef POLLIN
 #define POLLIN 0x0001
