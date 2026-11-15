@@ -43,11 +43,15 @@ for file in "${files[@]}"; do
     # -fms-extensions brings __declspec(uuid()) and __uuidof, which is what the
     # COM code uses through IID_PPV_ARGS; -fno-exceptions matches the console build.
     # -fms-extensions/-fdeclspec only exist on clang; GCC reads the stubs' own
-    # __uuidof shim instead.
+    # __uuidof shim instead. The unused-* warnings are off because the stub headers
+    # are full of constants and helpers that only some translation units use, and
+    # -Werror would turn that into a failure that says nothing about the code under
+    # test.
     extra=()
     if "$cxx" --version 2>/dev/null | grep -qi clang; then extra+=(-fms-extensions -fdeclspec); fi
     output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror \
-        "${extra[@]}" -fno-exceptions -Wno-unused-parameter \
+        "${extra[@]}" -fno-exceptions \
+        -Wno-unused-parameter -Wno-unused-const-variable -Wno-unused-function \
         -D_WIN32 -DBBX_UWP=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \
         -I"$stubs" -I"$root" -I"$root/src" -I"$root/upstream/bbhost/src" \
         "$file" 2>&1)
