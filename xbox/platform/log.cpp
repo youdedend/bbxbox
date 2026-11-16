@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "src/host/core/bbx_fault_filter.h"
 #include "xbox/platform/log.h"
 
 #include <windows.h>
@@ -254,7 +255,29 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
     if (wrote < 0) g_report[used] = '\0';
 }
 
+// The first-chance handler. The console run at 954a97c died here: it logged
+// DBG_PRINTEXCEPTION_C (what OutputDebugString raises), logging raised another,
+// and the nesting ended in a stack overflow. So the rules are bbx_fault_filter's
+// and they are applied before anything is written: a debug print, a breakpoint, a
+// C++ throw or a fault while this handler is already running is passed straight
+// on; at most 32 faults are logged and then one line says the rest were dropped.
+// Nothing here calls OutputDebugString, WinRT or LogMessage - one bounded write to
+// the raw report and the crash mirror, and out.
 LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
+    static bbx::core::FaultGate gate;
+    const auto* record = info != nullptr ? info->ExceptionRecord : nullptr;
+    const std::uint32_t code = record != nullptr ? record->ExceptionCode : 0u;
+    if (!gate.Enter()) return EXCEPTION_CONTINUE_SEARCH;  // re-entered: never log
+    const bbx::core::FaultAction action = gate.Admit(code);
+    if (action == bbx::core::FaultAction::kPass) {
+        gate.Leave();
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (action == bbx::core::FaultAction::kSuppressed) {
+        WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n");
+        gate.Leave();
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     ReportFault(info, "fault");
     WriteRaw(g_report);
     if (g_crash >= 0) {
@@ -264,7 +287,8 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
             (void)hostfs::Flush(g_crash);
         }
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    gate.Leave();
+    return EXCEPTION_CONTINUE_SEARCH;  // a caught fault never ends the process
 }
 
 void OnTerminate() {

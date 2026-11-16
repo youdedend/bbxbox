@@ -249,6 +249,10 @@ target_sources(bbxbox PRIVATE
     # this file to unwrap it: the previous reader rejected it with "decrypt SELF
     # first", which sent the player looking for a step that does not exist.
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_self.cpp"
+    # The first-chance handler's rules (xbox/platform/log.cpp calls them): the
+    # console run at 954a97c died of the handler re-entering itself, and these are
+    # the same functions the host tests hold to.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_fault_filter.cpp"
 )
 
 target_compile_features(bbxbox PRIVATE cxx_std_20)

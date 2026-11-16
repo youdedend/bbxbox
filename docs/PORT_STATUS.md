@@ -279,6 +279,19 @@ turn into real bindings.
 Every dispatch that cannot run says so once by key, with the reason in the log
 (`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
+## The first console run's fault storm (fixed)
+
+The first Series X run at 954a97c logged 3.2 MB of `code=0x40010006` and died in
+`0xC00000FD`. 0x40010006 is `DBG_PRINTEXCEPTION_C`, which is what
+`OutputDebugString` raises: the first-chance handler logged it, logging raised
+another, and the recursion ended in a stack overflow. `src/host/core/bbx_fault_filter.{h,cpp}`
+now owns the rule and `xbox/platform/log.cpp`'s handler is written to it: the
+debug-print, breakpoint, single-step and C++-throw codes are passed on untouched;
+a fault that arrives while the handler is running is passed on and never logged; at
+most 32 faults are written, then one suppression line; and a caught fault always
+ends in `EXCEPTION_CONTINUE_SEARCH`, never in a process that stops. Five host
+tests hold the three rules and the counter.
+
 ## Downloads
 
 Every push to the active branch publishes one rolling prerelease:
@@ -439,7 +452,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **312 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **317 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

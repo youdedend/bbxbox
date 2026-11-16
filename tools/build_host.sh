@@ -43,6 +43,7 @@ sources=(
   "$root"/src/host/d3d12/bbx_psocache.cpp
   "$root"/src/host/d3d12/bbx_tess.cpp
   "$root"/src/host/core/bbx_self.cpp
+  "$root"/src/host/core/bbx_fault_filter.cpp
   "$root"/tests/main.cpp
   "$root"/tests/format_test.cpp
   "$root"/tests/budget_test.cpp
@@ -59,6 +60,7 @@ sources=(
   "$root"/tests/path_table_test.cpp
   "$root"/tests/guest_binding_test.cpp
   "$root"/tests/guest_draw_test.cpp
+  "$root"/tests/fault_filter_test.cpp
   "$root"/tests/precompile_test.cpp
   "$root"/tests/barriers_test.cpp
   "$root"/tests/sfo_test.cpp
