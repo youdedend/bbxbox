@@ -40,6 +40,28 @@ enum class PassKind : std::uint8_t {
     kCount,
 };
 
+// The console's guest memory, as the baked DXIL declares it (gcn/hlsl.cpp
+// console_memory_prelude; ARCHITECTURE_XBOX_D3D12.md §3.3). A compute shader
+// that touches a guest buffer binds two tables in space 3, and Slice 5B's root
+// signature must hand them out at exactly these registers - the numbers are in
+// the shaders, so a disagreement is a silent wrong read, not a compile error.
+//
+// A guest VA is two dwords: the page table (t0, space3) gives the page's slab
+// and its offset in that slab, and the access is a Load/Store/Interlocked* on
+// g_guest_slabs[slab] (u0..u31, space3). One buffer cannot span the VA space,
+// because a D3D12 raw buffer is addressed by a 32-bit byte offset.
+inline constexpr std::uint32_t kGuestSpace = 3;
+inline constexpr std::uint32_t kGuestPageTableRegister = 0;  // t0: ByteAddressBuffer, the walk
+inline constexpr std::uint32_t kGuestSlabRegister = 0;       // u0..u31: RWByteAddressBuffer, the data
+inline constexpr std::uint32_t kGuestSlabCount = 32;
+inline constexpr std::uint32_t kGuestSlabBytes = 256u << 20;  // 32 x 256 MiB = the 8 GiB a guest sees
+inline constexpr std::uint32_t kPageL1Entries = 4096;    // one dword per 4 GiB region, min(hi, n - 1)
+inline constexpr std::uint32_t kPageL2Entries = 65536;   // one 8-byte entry per 64 KiB page, per table
+inline constexpr std::uint32_t kPageShift = 16;          // 64 KiB pages: the console's own granularity
+// The bindings those constants name, spelled the way the shaders spell them: a
+// root signature parameter per table, and one range of kGuestSlabCount
+// descriptors at kGuestSlabRegister in the slab table.
+
 [[nodiscard]] const char* PassName(PassKind kind);
 
 class PipelineSet {

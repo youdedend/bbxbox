@@ -246,7 +246,12 @@ public:
     // Compiles `source` to a DXBC container holding DXIL, with the console's
     // profile for `stage` and Shader Model 6.4's ceiling. False with `error`
     // holding DXC's own messages.
-    bool Compile(Stage stage, const std::string& source, std::vector<std::uint8_t>& object, std::string& error) const {
+    // `strict` adds -WX: the self-test compiles every container a second time
+    // with it, so a warning in the console's dialect is a failure there and not a
+    // surprise in a run the console cannot explain. The bake itself does not pass
+    // it - one warning in a guest shader must not lose the whole shader.
+    bool Compile(Stage stage, const std::string& source, std::vector<std::uint8_t>& object, std::string& error,
+                 bool strict = false) const {
         object.clear();
         error.clear();
         const std::string profile = stage == Stage::kVertex      ? "vs_6_4"
@@ -260,6 +265,7 @@ public:
         // The console's ceiling: -HV 2021 (SM 6.4's language), -O3, and no
         // -spirv, so the output is the driver's own container.
         std::vector<std::string> args = {"-T", profile, "-E", "main", "-HV", "2021", "-O3"};
+        if (strict) args.push_back("-WX");
         std::vector<std::wstring> wide;
         wide.reserve(args.size());
         for (const std::string& a : args) wide.push_back(std::wstring(a.begin(), a.end()));
@@ -337,6 +343,48 @@ bool IsSignedDxbc(const std::vector<std::uint8_t>& object, std::string& why) {
         return false;
     }
     return true;
+}
+
+// The console's dialect may not ask for a 64-bit integer: the console has no
+// Int64ShaderOps, and a shader that needs one is one the driver refuses. The
+// generated HLSL is ours and the types have names, so the text answers for it.
+bool Has64BitInteger(const std::string& hlsl, std::string& what) {
+    for (const char* name : {"uint64_t", "int64_t", "uint64_t(", "double"}) {
+        const std::size_t at = hlsl.find(name);
+        if (at != std::string::npos) {
+            const std::size_t from = at > 60 ? at - 60 : 0;
+            what = std::string(name) + " in \"" + hlsl.substr(from, 100) + "\"";
+            return true;
+        }
+    }
+    return false;
+}
+
+// The DXIL container's own feature flags, when it carries them: the SFI0 part's
+// first dword. Bit 1 is Int64ShaderOps and bit 7 the 16-bit types (DXC's
+// DxilContainer.h, ShaderFeatureInfo); a signed blob from DXIL 1.8 has the part.
+struct DxilFeatures {
+    bool present = false;
+    std::uint32_t flags = 0;
+};
+DxilFeatures DxilFeatureFlags(const std::vector<std::uint8_t>& object) {
+    DxilFeatures out;
+    if (object.size() < 28 || std::memcmp(object.data(), "DXBC", 4) != 0) return out;
+    const auto u32 = [&object](std::size_t at) {
+        std::uint32_t v = 0;
+        if (at + 4 <= object.size()) std::memcpy(&v, object.data() + at, 4);
+        return v;
+    };
+    const std::uint32_t parts = u32(28);
+    for (std::uint32_t k = 0; k < parts && 32 + 4 * k + 4 <= object.size() && k < 64; ++k) {
+        const std::uint32_t off = u32(32 + 4 * static_cast<std::size_t>(k));
+        if (static_cast<std::size_t>(off) + 12 > object.size()) continue;
+        if (std::memcmp(object.data() + off, "SFI0", 4) != 0) continue;
+        out.present = true;
+        out.flags = u32(off + 8);
+        return out;
+    }
+    return out;
 }
 
 // ---- zlib ------------------------------------------------------------------
@@ -523,6 +571,13 @@ gcn::TranslateOptions MakeOptions(const Program& program) {
     t.bindless = ConsoleStageOptions::kBindless;
     t.cb_ssbo = ConsoleStageOptions::kCbSsbo;
     t.cb_no_fallback = ConsoleStageOptions::kNoFallback;
+    // The console's guest memory: a compute shader's every load, store and
+    // atomic goes to two space-3 bindings (the page table and the slab table)
+    // with a guest VA as two dwords, not to a physical-storage pointer - DXIL
+    // 6.4 has no 64-bit integers and the root signature binds the two tables.
+    // The other stages reach guest memory only for oob counting and position
+    // capture, which the console's dialect refuses by name instead.
+    t.console_memory = o.stage == Stage::kCompute;
     for (const std::uint32_t d : o.image_dims) t.image_dims.emplace_back(d >> 1, (d & 1) != 0);
     for (const std::uint8_t m : o.sampler_unnormalized) t.sampler_force_unnormalized.push_back(m != 0);
     if (o.stage == Stage::kVertex) {
@@ -693,6 +748,23 @@ Compiled Build(const Program& program, const Compiler* compiler) {
     }
     if (!IsSignedDxbc(object, why)) {
         out.reason = "signature: " + why;
+        return out;
+    }
+    // The same two questions the self-test asks, asked of every blob: a shader
+    // the console's dialect asked for a 64-bit integer in, and a DXIL that wants
+    // Int64ShaderOps (or the 16-bit types) the console does not have. A refusal
+    // here is a shader the driver would refuse, counted by name.
+    if (Has64BitInteger(hlsl.source, why)) {
+        out.reason = "hlsl: a 64-bit integer on the console (" + why + ")";
+        return out;
+    }
+    const DxilFeatures features = DxilFeatureFlags(object);
+    if (!features.present) {
+        out.reason = "signature: the blob carries no SFI0 feature flags";
+        return out;
+    }
+    if ((features.flags & 0x82u) != 0) {
+        out.reason = "dxil: feature flags 0x" + std::to_string(features.flags) + " (Int64ShaderOps or 16-bit ops)";
         return out;
     }
     out.object = std::move(object);
@@ -958,6 +1030,31 @@ int SelfTest(const Options& options) {
         // A compute shader: the end is the whole program, which is also the
         // program that says the least about its stage's params.
         {"cs_end", 4, {0xbf810000u}, {0xa1u, 0xc0u, 0u, {8, 8, 1}, 0x43533031u}, Stage::kCompute},
+        // A compute shader that reads and writes guest memory, the way the
+        // console must reach it: a V# in s[0:3] (base 0x1000, 4096 records), an
+        // offen dword load at 0x1000, a waitcnt, and a store of what it loaded
+        // at 0x1004. Both accesses walk the page table - the lift's xlate - so
+        // this container proves the console's two space-3 bindings, the two-dword
+        // address and the prelude's load and store all reach DXIL. Encoding by
+        // hand, as the three above: s_mov_b32 is SOP1 (op 3, dst 16..22, src0
+        // 0xff is the literal), v_mov_b32 is VOP1 (op 1), buffer_load_dword is
+        // MUBUF op 12 and buffer_store_dword op 28 (offen is bit 12, the 12-bit
+        // offset is bits 0..11, and word 1 is vaddr/vdata/srsrc).
+        {"cs_mem",
+         4,
+         {
+             0xbe8003ffu, 0x00001000u,  // s_mov_b32 s0, 0x1000   the V#'s base, low dword
+             0xbe8103ffu, 0x00000000u,  // s_mov_b32 s1, 0        the V#'s base, high dword
+             0xbe8203ffu, 0x00001000u,  // s_mov_b32 s2, 0x1000   num_records
+             0xbe8303ffu, 0x00000000u,  // s_mov_b32 s3, 0        the V#'s format/id words
+             0x7e0202ffu, 0x00000000u,  // v_mov_b32 v1, 0        the offen offset
+             0xe0301000u, 0x00000201u,  // buffer_load_dword v2, v1, s[0:3], 0 offen
+             0xbf8c0000u,               // s_waitcnt vmcnt(0) lgkmcnt(0)
+             0xe0701004u, 0x00000201u,  // buffer_store_dword v2, v1, s[0:3], 4 offen
+             0xbf810000u,               // s_endpgm
+         },
+         {0xa1u, 0xc0u, 0u, {8, 8, 1}, 0x43533032u},
+         Stage::kCompute},
     };
     std::printf("bbx_bake_cache: self-test, %zu console container(s)\n", cases.size());
     Compiler compiler;
@@ -1012,6 +1109,12 @@ int SelfTest(const Options& options) {
             ++failures;
             continue;
         }
+        std::string sixty_four;
+        if (Has64BitInteger(built.source, sixty_four)) {
+            std::fprintf(stderr, "  FAIL %-8s the console's HLSL needs a 64-bit integer: %s\n", c.name, sixty_four.c_str());
+            ++failures;
+            continue;
+        }
         if (built.source.find("[[vk::") != std::string::npos) {
             std::fprintf(stderr, "  FAIL %-8s the HLSL carries a [[vk::...]] attribute\n", c.name);
             ++failures;
@@ -1029,10 +1132,35 @@ int SelfTest(const Options& options) {
                               static_cast<unsigned>(built.object[4 + k]));
             }
         }
-        std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s, digest %s\n", c.name,
+        // The blob's own answer when it carries one: Int64ShaderOps and the
+        // 16-bit types both refused, and printed either way, so a log says what
+        // the DXIL asked for rather than what we hoped.
+        const DxilFeatures features = DxilFeatureFlags(built.object);
+        if (have_compiler && !built.object.empty()) {
+            // The same source again with -WX: a warning is a failure here.
+            std::vector<std::uint8_t> strict;
+            std::string why;
+            if (!compiler.Compile(c.stage, built.source, strict, why, /*strict=*/true)) {
+                std::fprintf(stderr, "  FAIL %-8s -WX: %s\n", c.name, why.substr(0, why.find('\n')).c_str());
+                ++failures;
+                continue;
+            }
+            if (!features.present) {
+                std::fprintf(stderr, "  FAIL %-8s the blob carries no SFI0 feature flags\n", c.name);
+                ++failures;
+                continue;
+            }
+            if ((features.flags & 0x82u) != 0) {
+                std::fprintf(stderr, "  FAIL %-8s the DXIL needs 64-bit or 16-bit shader ops (flags 0x%x)\n", c.name, features.flags);
+                ++failures;
+                continue;
+            }
+        }
+        std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s, digest %s, flags %s\n", c.name,
                     static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
                     built.source.size(), built.object.size(),
-                    built.object.empty() ? "unsigned (no compiler)" : "signed", digest);
+                    built.object.empty() ? "unsigned (no compiler)" : "signed", digest,
+                    features.present ? ("0x" + std::to_string(features.flags)).c_str() : "none");
         if (std::getenv("GITHUB_ACTIONS") != nullptr) {
             std::printf("::notice title=prebake %s::key %016llx %s, %zu bytes, digest %s\n", c.name,
                         static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
@@ -1053,7 +1181,7 @@ int SelfTest(const Options& options) {
     if (compiled.empty()) {
         // No compiler: the file's plumbing on blobs shaped like DXC's, so the
         // serialisation, the stamp, the zlib and the look-up are still walked.
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < static_cast<int>(cases.size()); ++k) {
             Compiled c;
             c.key = ConsoleStageKeyOf(cases[k].words, ConsoleStageKey{});
             c.stage = cases[k].stage;
@@ -1114,7 +1242,8 @@ void Usage() {
         "  --jobs <n>       threads (default: the machine's)\n"
         "  --limit <n>      stop after n containers (to try one bundle first)\n"
         "  --check-compiler compile one trivial ps_6_4 and report whether it signed\n"
-        "  --self-test      three console containers (VS, PS, CS) through the\n"
+        "  --self-test      four console containers (VS, PS, CS, and a CS that loads\n"
+        "                   and stores guest memory through the page table) through the\n"
         "                   pipeline and the file; no dump. With --dxc the blobs\n"
         "                   must be signed, so the run exercises the whole thing\n"
         "  --help           this text\n");

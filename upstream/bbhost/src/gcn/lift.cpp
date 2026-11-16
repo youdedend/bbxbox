@@ -2648,7 +2648,50 @@ private:
     // atomics and partial-dword writes made only where the invocation's EXEC
     // bit is set, as GCN performs them only for the lanes EXEC holds.
     std::size_t guest_loads = 0, guest_stores = 0, guest_atomics = 0, image_stores = 0;
+    // ---- the console's guest memory (TranslateOptions::console_memory) ---------------
+    // DXIL 6.4 on the console has no 64-bit integers and no physical-storage
+    // pointers, and a D3D12 raw buffer is addressed by a 32-bit byte offset, so
+    // no one buffer spans the guest's 5 GiB of RAM plus the GPU's 0xff00000000
+    // alias. A guest VA is therefore two dwords - (lo, hi) - and every add
+    // carries by hand; the page-table walk and the slab access are calls into
+    // the printer's prelude (gcn/hlsl.cpp console_memory_prelude), which prints
+    // the bodies and the two space-3 bindings. The functions declared below are
+    // placeholders: consistent types for the calls, bodies the printer replaces.
+    Id t_va = 0, fn_guest_load = 0, fn_guest_store = 0, fn_atomic_add = 0, fn_atomic_and = 0, fn_atomic_or = 0;
+    bool console() const { return opt.console_memory; }
+    Id console_fn(Id& slot, const char* name, Id ret, const std::vector<Id>& params) {
+        slot = m.begin_function(ret, m.type_function(ret, params));
+        std::vector<Id> args;
+        for (const Id pt : params) args.push_back(m.emit(spv::OpFunctionParameter, pt, {}));
+        m.label();
+        if (ret == t_void) {
+            m.emit_void(spv::OpReturn, {});
+        } else {
+            m.emit_void(spv::OpReturnValue, {ret == t_va ? args.at(0) : cu(0)});
+        }
+        m.end_function();
+        m.name(slot, name);
+        return slot;
+    }
+    // The accessors, declared at module level with the rest of the console's
+    // guest memory: a compute shader that reaches none (cs_end) declares them and
+    // never calls them, and the printer then prints neither them nor the two
+    // bindings - no prelude for a stage that touches no memory.
+    void console_fns() {
+        t_va = m.type_vector(t_u32, 2);
+        fn_xlate = console_fn(fn_xlate, "xlate", t_va, {t_va});
+        fn_guest_load = console_fn(fn_guest_load, "guest_load", t_u32, {t_va});
+        fn_guest_store = console_fn(fn_guest_store, "guest_store", t_void, {t_va, t_u32});
+        fn_atomic_add = console_fn(fn_atomic_add, "guest_atomic_add", t_u32, {t_va, t_u32});
+        fn_atomic_and = console_fn(fn_atomic_and, "guest_atomic_and", t_u32, {t_va, t_u32});
+        fn_atomic_or = console_fn(fn_atomic_or, "guest_atomic_or", t_u32, {t_va, t_u32});
+    }
     void declare_guest_memory() {
+        if (console()) {
+            console_fns();
+            return;
+        }
+
         p_uni_u64 = m.type_pointer(spv::ScUniform, t_u64);
         const Id t_block = m.type_struct({t_u32});
         m.decorate(t_block, spv::DecBlock);
@@ -2678,15 +2721,74 @@ private:
         m.name(fn_xlate, "xlate");
     }
     Id make_u64(Id lo, Id hi) {
+        if (console()) return m.emit(spv::OpCompositeConstruct, t_va, {lo, hi});
         return m.emit(spv::OpBitwiseOr, t_u64, {m.emit(spv::OpUConvert, t_u64, {lo}),
                                                 m.emit(spv::OpShiftLeftLogical, t_u64, {m.emit(spv::OpUConvert, t_u64, {hi}), m.const_u64(32)})});
     }
-    Id addr_add(Id base64, Id off32) { return m.emit(spv::OpIAdd, t_u64, {base64, m.emit(spv::OpUConvert, t_u64, {off32})}); }
-    Id addr_addc(Id base64, std::uint32_t off) { return off ? m.emit(spv::OpIAdd, t_u64, {base64, m.const_u64(off)}) : base64; }
+    // The low dword of a VA (console), or the whole of one (Vulkan, where a VA
+    // is one 64-bit integer).
+    Id va_low(Id va) {
+        if (console()) return m.emit(spv::OpCompositeExtract, t_u32, {va, 0u});
+        return m.emit(spv::OpUConvert, t_u32, {va});
+    }
+    Id va_high(Id va) {
+        if (console()) return m.emit(spv::OpCompositeExtract, t_u32, {va, 1u});
+        return m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpShiftRightLogical, t_u64, {va, m.const_u64(32)})});
+    }
+    Id addr_add(Id base64, Id off32) {
+        if (!console()) return m.emit(spv::OpIAdd, t_u64, {base64, m.emit(spv::OpUConvert, t_u64, {off32})});
+        // lo + off, the carry into hi: DXIL 6.4 has no 64-bit integer to add in.
+        const Id lo = m.emit(spv::OpIAdd, t_u32, {va_low(base64), off32});
+        const Id carry = m.emit(spv::OpULessThan, t_bool, {lo, va_low(base64)});
+        return m.emit(spv::OpCompositeConstruct, t_va, {lo, m.emit(spv::OpIAdd, t_u32, {va_high(base64), m.emit(spv::OpSelect, t_u32, {carry, cu(1), cu(0)})})});
+    }
+    Id addr_addc(Id base64, std::uint32_t off) {
+        if (!off) return base64;
+        return console() ? addr_add(base64, cu(off)) : m.emit(spv::OpIAdd, t_u64, {base64, m.const_u64(off)});
+    }
+    // A VA's low dword masked, as a dword: a byte address's alignment bits.
+    Id va_mask(Id va, std::uint32_t mask) {
+        if (console()) return ibin(spv::OpBitwiseAnd, va_low(va), cu(mask));
+        return m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(mask)})});
+    }
+    // A VA aligned down to a dword, still two dwords.
+    Id va_align(Id va, std::uint32_t mask) {
+        if (!console()) return m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(mask)});
+        return m.emit(spv::OpCompositeConstruct, t_va, {ibin(spv::OpBitwiseAnd, va_low(va), cu(mask)), va_high(va)});
+    }
     Id host_dword(Id host) { return m.access_chain(p_psb_u32, m.emit(spv::OpConvertUToPtr, p_psb_block, {host}), {cu(0)}); }
-    Id guest_ptr(Id va) { return host_dword(m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, va})); }
-    Id load_u32_at(Id va) { return m.emit(spv::OpLoad, t_u32, {guest_ptr(va), 2u /* Aligned */, 4u}); }
-    void store_u32_at(Id va, Id v) { m.emit_void(spv::OpStore, {guest_ptr(va), v, 2u, 4u}); }
+    Id guest_ptr(Id va) {
+        if (console()) {
+            // No caller reaches this: load_u32_at, store_u32_at and guest_atomic
+            // take the console's branch, and the two places that still name a
+            // host pointer (a GDS counter, a captured position) refuse by name
+            // before asking. Reject all the same, so a new caller cannot quietly
+            // print a physical-storage pointer into the console's dialect.
+            reject("a physical-storage pointer, where the console's dialect binds two tables");
+            return cu(0);
+        }
+        return host_dword(m.emit(spv::OpFunctionCall, t_u64, {fn_xlate, va}));
+    }
+    Id load_u32_at(Id va) {
+        if (console()) return m.emit(spv::OpFunctionCall, t_u32, {fn_guest_load, va});
+        return m.emit(spv::OpLoad, t_u32, {guest_ptr(va), 2u /* Aligned */, 4u});
+    }
+    void store_u32_at(Id va, Id v) {
+        if (console()) {
+            m.emit_void(spv::OpFunctionCall, {fn_guest_store, va, v});
+            return;
+        }
+        m.emit_void(spv::OpStore, {guest_ptr(va), v, 2u, 4u});
+    }
+    // A guest atomic: the prelude's Interlocked* on console, the reference's
+    // physical-storage atomic on Vulkan. Its result is the old value either way.
+    Id guest_atomic(spv::Op op, Id va, Id v) {
+        if (!console()) return m.emit(op, t_u32, {guest_ptr(va), cu(spv::ScopeDevice), cu(spv::MsNone), v});
+        Id fn = fn_atomic_add;
+        if (op == spv::OpAtomicAnd) fn = fn_atomic_and;
+        else if (op == spv::OpAtomicOr) fn = fn_atomic_or;
+        return m.emit(spv::OpFunctionCall, t_u32, {fn, va, v});
+    }
     // A selection on `cond` whose arms compute `n` words each; their values
     // joined at the merge (cur_label follows the blocks emitted).
     std::vector<Id> select_words(Id cond, std::size_t n, const std::function<std::vector<Id>()>& then_arm,
@@ -2711,6 +2813,25 @@ private:
     std::vector<Id> load_u32_run(Id va, int n) {
         ++guest_loads;
         if (n == 1) return {load_u32_at(va)};
+        if (console()) {
+            // One walk covers the n dwords when they sit in one page; the
+            // console's walk is the prelude's xlate, called once per access, so
+            // the run is n calls - the page test only picks the cheap arm.
+            const Id within = va_mask(va, (1u << kPageShift) - 1);
+            const Id one_page = m.emit(spv::OpULessThanEqual, t_bool, {m.emit(spv::OpIAdd, t_u32, {within, cu(static_cast<std::uint32_t>(n) * 4)}), cu(1u << kPageShift)});
+            return select_words(
+                one_page, static_cast<std::size_t>(n),
+                [&] {
+                    std::vector<Id> w;
+                    for (int k = 0; k < n; ++k) w.push_back(load_u32_at(addr_addc(va, static_cast<std::uint32_t>(k) * 4)));
+                    return w;
+                },
+                [&] {
+                    std::vector<Id> w;
+                    for (int k = 0; k < n; ++k) w.push_back(load_u32_at(addr_addc(va, static_cast<std::uint32_t>(k) * 4)));
+                    return w;
+                });
+        }
         const Id within = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64((1ull << kPageShift) - 1)});
         const Id end = m.emit(spv::OpIAdd, t_u64, {within, m.const_u64(static_cast<std::uint64_t>(n) * 4)});
         const Id one_page = m.emit(spv::OpULessThanEqual, t_bool, {end, m.const_u64(1ull << kPageShift)});
@@ -2734,8 +2855,8 @@ private:
     // translate.cpp load_u32_any: n dwords from a byte address of any
     // alignment, the aligned dwords that cover them shifted together.
     std::vector<Id> load_u32_any(Id va, int n) {
-        const Id low = m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
-        const Id aligned = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
+        const Id low = console() ? va_mask(va, 3u) : m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
+        const Id aligned = console() ? va_align(va, ~3u) : m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
         return select_words(
             ieq(low, cu(0)), static_cast<std::size_t>(n), [&] { return load_u32_run(aligned, n); },
             [&] {
@@ -2765,8 +2886,8 @@ private:
     // store, one covered in part an atomic and/or, so the neighbouring bytes
     // other invocations store survive. Inside the caller's EXEC guard.
     void store_masked_any(Id va, Id v0, Id v1, Id m0, Id m1) {
-        const Id low = m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
-        const Id aligned = m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
+        const Id low = console() ? va_mask(va, 3u) : m.emit(spv::OpUConvert, t_u32, {m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(3)})});
+        const Id aligned = console() ? va_align(va, ~3u) : m.emit(spv::OpBitwiseAnd, t_u64, {va, m.const_u64(~3ull)});
         const Id sh = shift(spv::OpShiftLeftLogical, low, cu(3));
         const Id rsh = ibin(spv::OpISub, cu(32), sh);
         const Id whole = ieq(sh, cu(0));
@@ -2780,9 +2901,8 @@ private:
             const Id full = ieq(dm[k], cu(0xffffffffu));
             if_then(full, [&] { store_u32_at(at, dv[k]); });
             if_then(m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpINotEqual, t_bool, {dm[k], cu(0)}), m.emit(spv::OpLogicalNot, t_bool, {full})}), [&] {
-                const Id p = guest_ptr(at);
-                m.emit(spv::OpAtomicAnd, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), m.emit(spv::OpNot, t_u32, {dm[k]})});
-                m.emit(spv::OpAtomicOr, t_u32, {p, cu(spv::ScopeDevice), cu(spv::MsNone), ibin(spv::OpBitwiseAnd, dv[k], dm[k])});
+                guest_atomic(spv::OpAtomicAnd, at, m.emit(spv::OpNot, t_u32, {dm[k]}));
+                guest_atomic(spv::OpAtomicOr, at, ibin(spv::OpBitwiseAnd, dv[k], dm[k]));
             });
         }
     }
@@ -3056,7 +3176,7 @@ private:
         } else {  // buffer_atomic_add: the value before the add where GLC is set
             const Id v = as_u(value(256 + in.vdata));
             const Id r = where_exec_value(e, [&] {
-                return m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(ga.addr), cu(spv::ScopeDevice), cu(spv::MsNone), v});
+                return guest_atomic(spv::OpAtomicIAdd, ga.addr, v);
             });
             if (in.glc) {
                 inst_uniform = false;
@@ -4584,6 +4704,10 @@ private:
                 if (in.tgt == 12) {
                     m.store(out_position(), value);
                     if (capture_base64) {  // translate.cpp's capture_position
+                        if (console()) {  // a host address in the params block, as above
+                            reject("a captured position's host address, which the console's dialect cannot carry");
+                            return;
+                        }
                         const Id base = capture_base64;
                         if_then(m.emit(spv::OpINotEqual, t_bool, {base, m.const_u64(0)}), [&] {
                             if (!in_vertex_index) in_vertex_index = builtin(p_in_u32, spv::BiVertexIndex);
@@ -5592,6 +5716,13 @@ private:
         const Id step = cu(append ? 1u : 0xffffffffu);
         ++res.wave.gds_steps;
         const std::size_t index = static_cast<std::size_t>(&in - prog.insts.data());
+        // The counter's address is a host pointer the params block carries as two
+        // dwords; the console's dialect has no 64-bit integer, so it has no form
+        // for one - a refusal by name, not a silent substitute.
+        if (console()) {
+            reject("a GDS counter (ds_append/ds_consume) whose address is a host pointer, which the console's dialect cannot carry");
+            return;
+        }
         const auto add = [&](Id amount) {
             return m.emit(spv::OpAtomicIAdd, t_u32, {host_dword(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), amount});
         };
@@ -8071,7 +8202,12 @@ private:
     void emit() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        if (compute() || oob_counting() || capturing()) {
+        if (console()) {
+            // The console's guest memory is two bindings, not a pointer: the
+            // memory model stays Logical and no extension is needed. Vulkan
+            // (TranslateOptions::console_memory off) is the branch below.
+            m.memory_model(0 /* Logical */, 1 /* GLSL450 */);
+        } else if (compute() || oob_counting() || capturing()) {
             // Guest memory through physical storage buffer pointers, as the
             // reference reaches it (and the counters, gcn::set_oob_count, and
             // a vertex stage's position capture, capture_position:

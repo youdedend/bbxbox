@@ -253,6 +253,12 @@ private:
     void parse() {
         if (words.size() < 5 || words[0] != 0x07230203u) fail("not a SPIR-V module");
         bool in_function = false;
+        // A call of a void function has no result type and no result id, which
+        // is what SPIR-V spells by putting the callee first; the lift's store of
+        // guest memory is one such call. The callee is always a function defined
+        // earlier, and no type id is ever a function id, so the word after the
+        // opcode says which shape this is.
+        std::map<std::uint32_t, std::uint32_t> fn_ret;  // function -> its return type
         for (std::size_t i = 5; i < words.size();) {
             const std::uint32_t n = words[i] >> 16;
             const std::uint16_t op = static_cast<std::uint16_t>(words[i] & 0xffff);
@@ -260,7 +266,11 @@ private:
             Ins in;
             in.op = op;
             bool has_type, has_id;
-            result_shape(op, in_function, has_type, has_id);
+            if (op == spv::OpFunctionCall && n > 1 && fn_ret.count(words[i + 1])) {
+                has_type = has_id = false;
+            } else {
+                result_shape(op, in_function, has_type, has_id);
+            }
             std::size_t k = i + 1;
             if (has_type) in.type = words[k++];
             if (has_id) in.id = words[k++];
@@ -268,6 +278,7 @@ private:
             i += n;
             if (op == spv::OpFunction) {
                 in_function = true;
+                fn_ret[in.id] = in.type;
                 Function f;
                 f.id = in.id;
                 f.result_type = in.type;
@@ -692,6 +703,9 @@ private:
         std::string decl;  // the declaration line(s)
     };
     std::vector<std::string> resource_decls, spec_decls, struct_decls, helper_decls;
+    // Whether the module calls the console's guest-memory functions: the prelude
+    // (and its two space-3 bindings) is printed only for a stage that does.
+    bool console_memory = false;
     std::set<std::uint32_t> compare_samplers, plain_samplers;  // samplers used for depth-compare / other samples
     std::set<std::uint32_t> written_buffers;
     std::map<std::uint32_t, std::string> buffer_names;  // storage buffer variable -> name
@@ -1299,10 +1313,14 @@ private:
         case spv::OpFunctionCall: {
             const std::uint32_t callee = in.a.at(0);
             if (!global_names.count(callee)) fail("a call of an unknown function");
+            // A call of one of the console's guest-memory accessors is what makes
+            // the prelude (and its two space-3 bindings) part of this shader.
+            if (dxil && console_memory_function(global_names.at(callee))) console_memory = true;
             std::string call = global_names.at(callee) + "(";
             for (std::size_t k = 1; k < in.a.size(); ++k) call += (k > 1 ? ", " : "") + ref(in.a[k]);
             call += ")";
-            if (type(in.type).k == TK::Void) line(call + ";");
+            // A call with no result type is a call of a void function.
+            if (!in.type || type(in.type).k == TK::Void) line(call + ";");
             else define(in, call);
             return;
         }
@@ -1721,7 +1739,9 @@ private:
         case spv::OpLogicalNotEqual: return define(in, ref(in.a.at(0)) + " != " + ref(in.a.at(1)));
         case spv::OpSelect: {
             if (type(type_of(in.a.at(0))).k == TK::Vector && lanes_of(in.type) != lanes_of(type_of(in.a.at(0)))) fail("a select of mixed widths");
-            return define(in, "select(" + ref(in.a.at(0)) + ", " + as(in.a.at(1), rk) + ", " + as(in.a.at(2), rk) + ")");
+            // HLSL spells it as the ternary: with a vector condition the arms
+            // are selected component by component, which is SPIR-V's select.
+            return define(in, "(" + ref(in.a.at(0)) + " ? " + as(in.a.at(1), rk) + " : " + as(in.a.at(2), rk) + ")");
         }
         case spv::OpBitcast: {
             const std::uint32_t from = type_of(in.a.at(0));
@@ -2449,10 +2469,97 @@ private:
         return top;
     }
     // The helper functions, prototypes first (one may call another declared after it).
+    // The console's guest-memory lowering (gcn/lift.cpp declare_guest_memory with
+    // TranslateOptions::console_memory): the lift emits these four as calls and
+    // declares them, and the console dialect prints the bodies below instead of
+    // the SPIR-V ones, because their bodies are two bindings and 32-bit
+    // arithmetic that SPIR-V cannot spell (a raw buffer is a Vulkan extension
+    // there, and this is not Vulkan).
+    //
+    // Why the two dwords: a D3D12 ByteAddressBuffer is addressed by a 32-bit
+    // byte offset, so one buffer cannot cover the guest's address space (5 GiB
+    // of RAM plus the GPU's 0xff00000000 alias, in sparse 64 KiB pages). A guest
+    // VA is therefore a pair - (lo, hi) - and every add carries by hand.
+    static bool console_memory_function(const std::string& name) {
+        return name == "xlate" || name == "guest_load" || name == "guest_store" || name == "guest_atomic_add" ||
+               name == "guest_atomic_and" || name == "guest_atomic_or";
+    }
+
+    // The root signature Slice 5B binds: t0 in space 3 is the page table (one
+    // dword per L1 region, eight bytes per L2 entry), u0 in space 3 is the slab
+    // table, 32 buffers of at most 4 GiB each.
+    std::string console_memory_prelude() const {
+        return std::string(
+            "// ---- the console's guest memory (space 3) ------------------------------------\n"
+            "// A guest virtual address is two dwords, never one 64-bit integer: DXIL 6.4 on the\n"
+            "// console has no Int64ShaderOps, and a D3D12 raw buffer is 32 bits of byte offset\n"
+            "// wide, so one buffer cannot span the guest's 5 GiB of RAM plus the GPU's\n"
+            "// 0xff00000000 alias. The page table gives the page's slab and its offset in it.\n"
+            "static const uint kL1Entries = 4096u;    // one dword per 4 GiB region of the VA\n"
+            "static const uint kL2Entries = 65536u;   // one 8-byte entry per 64 KiB page\n"
+            "ByteAddressBuffer g_page_table : register(t0, space3);\n"
+            "// 32 slabs of 256 MiB: the 8 GiB a guest sees, each buffer under 4 GiB.\n"
+            "RWByteAddressBuffer g_guest_slabs[32] : register(u0, space3);\n"
+            "\n"
+            "// xlate(va) -> (slab, byte offset of the page inside it), the reference's walk:\n"
+            "// l1[min(va_hi, kL1Entries - 1)] is the L2 table's dword base; l2[(va_lo >> 16)]\n"
+            "// is the page's (slab, offset). A VA above the last L1 entry - the GPU's alias -\n"
+            "// reads the last entry, as the console's own walk does.\n"
+            "uint2 xlate(uint2 va) {\n"
+            "    const uint l2_base = g_page_table.Load(min(va.y, kL1Entries - 1u) * 4u);\n"
+            "    return g_page_table.Load2((l2_base + ((va.x >> 16u) & (kL2Entries - 1u))) * 8u);\n"
+            "}\n"
+            "\n"
+            "// The page's slab and the byte within it this address lands on.\n"
+            "uint2 cb_guest_slot(uint2 va) {\n"
+            "    const uint2 page = xlate(va);\n"
+            "    return uint2(page.x, page.y + (va.x & 0xffffu));\n"
+            "}\n"
+            "\n"
+            "uint guest_load(uint2 va) {\n"
+            "    const uint2 slot = cb_guest_slot(va);\n"
+            "    return g_guest_slabs[NonUniformResourceIndex(slot.x)].Load(slot.y);\n"
+            "}\n"
+            "\n"
+            "void guest_store(uint2 va, uint v) {\n"
+            "    const uint2 slot = cb_guest_slot(va);\n"
+            "    g_guest_slabs[NonUniformResourceIndex(slot.x)].Store(slot.y, v);\n"
+            "}\n"
+            "\n"
+            "// An atomic's result is its operand's old value, as GCN's is.\n"
+            "uint guest_atomic_add(uint2 va, uint v) {\n"
+            "    const uint2 slot = cb_guest_slot(va);\n"
+            "    uint old;\n"
+            "    g_guest_slabs[NonUniformResourceIndex(slot.x)].InterlockedAdd(slot.y, v, old);\n"
+            "    return old;\n"
+            "}\n"
+            "\n"
+            "// A partial dword store is these two, so the bytes other invocations own\n"
+            "// survive: the same pair the Vulkan path makes of it.\n"
+            "uint guest_atomic_and(uint2 va, uint v) {\n"
+            "    const uint2 slot = cb_guest_slot(va);\n"
+            "    uint old;\n"
+            "    g_guest_slabs[NonUniformResourceIndex(slot.x)].InterlockedAnd(slot.y, v, old);\n"
+            "    return old;\n"
+            "}\n"
+            "\n"
+            "uint guest_atomic_or(uint2 va, uint v) {\n"
+            "    const uint2 slot = cb_guest_slot(va);\n"
+            "    uint old;\n"
+            "    g_guest_slabs[NonUniformResourceIndex(slot.x)].InterlockedOr(slot.y, v, old);\n"
+            "    return old;\n"
+            "}\n"
+            "\n");
+    }
+
     std::string helper_functions() {
         std::string protos, bodies;
         for (Function& f : functions) {
             if (f.id == entry_fn) continue;
+            // The console's guest memory is two bindings and 32-bit arithmetic,
+            // printed once (console_memory_prelude) rather than as the lift's
+            // placeholder bodies.
+            if (dxil && console_memory_function(f.name)) continue;
             const std::string ret = type(f.result_type).k == TK::Void ? std::string("void") : type_name(f.result_type);
             std::string sig = ret + " " + f.name + "(";
             for (std::size_t k = 0; k < f.params.size(); ++k) {
@@ -2558,6 +2665,7 @@ private:
         for (const std::string& d : struct_decls) s += d + "\n";
         for (const std::string& d : resource_decls) s += d + "\n";
         if (!resource_decls.empty()) s += "\n";
+        if (dxil && console_memory) s += console_memory_prelude();
         for (const std::string& d : spec_decls) s += d + "\n";
         if (!spec_decls.empty()) s += "\n";
 

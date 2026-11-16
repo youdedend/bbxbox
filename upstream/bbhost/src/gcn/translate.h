@@ -220,6 +220,15 @@ struct TranslateOptions {
     bool bindless = false;
     std::uint32_t bindless_set = 3;
     std::vector<std::string> cb_ssbo_exclude;  // ResourcePath::str() of V#s that stay on the page-table path
+    // The console's dialect (DXC -T cs_6_4, gcn/hlsl.cpp HlslOptions::dxil_sm64):
+    // guest memory as two space-3 bindings - the page table and a bounded slab
+    // table - with a guest virtual address as two dwords (lo, hi), because DXIL
+    // 6.4 on the console has neither 64-bit integers (Int64ShaderOps) nor
+    // physical-storage-buffer pointers, and a D3D12 raw buffer's byte offset is
+    // 32 bits wide, so no one buffer spans the guest's address space. Off is the
+    // Vulkan path: a 64-bit VA and a PhysicalStorageBuffer pointer per access.
+    // See ARCHITECTURE_XBOX_D3D12.md, "the console's guest memory".
+    bool console_memory = false;
     // The host binds every one of this shader's constant buffers: emit the
     // storage-buffer reads alone, without the page-table fallback (the walks
     // and the V# loads that only fed them become dead code).

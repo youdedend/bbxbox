@@ -89,6 +89,11 @@ Rules the compiled passes follow, enforced by `-WX` plus the precheck greps:
 source outright at `-T *_6_4`. Nothing may feed it to a DXIL profile; the precheck asserts the port's
 own HLSL contains no `[[vk::` for the same reason.
 
+One exception to that rule exists and is measured: `gcn/hlsl.cpp`'s console dialect
+(`HlslOptions::dxil_sm64`, §3.3), which the prebake bakes to DXIL with `-T *_6_4`. It carries no
+`[[vk::` attribute and no inline SPIR-V, and the precheck and the bake both refuse a source that
+does.
+
 The plan for P3 (guest shaders, not yet implemented) follows KytyPS5: translate SPIR-V to DXIL
 in memory with Mesa's MIT-licensed `spirv_to_dxil`, built with `-Db_vscrt=mt
 -Dmin-windows-version=10` and a local patch for
@@ -103,6 +108,54 @@ The result is validated in memory with `dxil.dll`'s `IDxcValidator` (present on 
 MIT-adjacent and already part of the platform) — again zero `dxcompiler.dll`. If `spirv_to_dxil`
 proves too lossy for Bloodborne's compute, the fallback is a D3D12-native SM 6.4 emitter from the same
 SPIR-V, not a packaged desktop compiler.
+
+### 3.3 The console's dialect and its guest memory
+
+The prebake (`tools/bbx_bake_cache.cpp`) compiles guest shaders on the desktop, through
+`gcn/hlsl.cpp` with `dxil_sm64`, and ships the DXIL. Two of §1's rules shape that dialect:
+
+* **no 64-bit integers.** `Int64ShaderOps` is not something the console's shader compiler provides
+  for a title that could have used it, so every `uint64_t` in the generated source is a refusal; a
+  `uint64_t`/`int64_t` block member the shader never reads is rewritten to `uint2` (the standing
+  64-bit rule), and a shader that *reads* one is refused by name.
+* **no `float16_t`.** `-enable-16bit-types` is never passed, and a module that needs it is refused.
+
+A compute shader's guest memory is the case that forces this. The Vulkan path walks the page table
+itself and dereferences a `PhysicalStorageBuffer` pointer (`gcn/lift.cpp`, `declare_guest_memory`);
+DXIL has neither those pointers nor a 64-bit integer to hold a VA in, and a D3D12 `RWByteAddressBuffer`
+is addressed by a **32-bit** byte offset, so no single buffer covers the guest's address space (5 GiB
+of RAM plus the GPU's `0xff00000000` alias, in sparse 64 KiB pages). `TranslateOptions::console_memory`
+therefore lowers a guest VA to **two dwords** - `(lo, hi)` - with the carry made by hand:
+
+```hlsl
+uint lo2 = lo + off;
+uint hi2 = hi + (lo2 < lo ? 1u : 0u);   // DXIL 6.4 has no 64-bit add
+```
+
+and every load, store and atomic to a call into a prelude that `gcn/hlsl.cpp` prints once per shader
+(`console_memory_prelude`). The root signature contract, which Slice 5B implements:
+
+| binding | contents |
+|---|---|
+| `t0, space3` — `ByteAddressBuffer g_page_table` | L1: one dword per 4 GiB region, `4096` entries, `min(va_hi, 4095) * 4 -> l2_base` |
+| | L2: one 8-byte entry per 64 KiB page, `65536` per table, `(l2_base + ((va_lo >> 16) & 0xffff)) * 8 -> uint2(slab, byte offset of the page)` |
+| `u0..u31, space3` — `RWByteAddressBuffer g_guest_slabs[32]` | 32 slabs of 256 MiB (8 GiB), each under 4 GiB, indexed with `NonUniformResourceIndex(slab)` |
+
+A shader's address is the page's slab and offset plus `va_lo & 0xffff`, and the access is `.Load`,
+`.Store`, `InterlockedAdd`, `InterlockedAnd` or `InterlockedOr` on that slab. The constants live in
+`src/host/d3d12/pipeline.h` (`kGuestSpace`, `kGuestPageTableRegister`, `kGuestSlabRegister`,
+`kGuestSlabCount`, `kGuestSlabBytes`, `kPageL1Entries`, `kPageL2Entries`) so Slice 5B and the bake
+cannot disagree about them.
+
+Two sites still name a *host* address in the params block, and cannot be spelled on the console: a GDS
+counter's address (`ds_append`/`ds_consume`) and a captured position (`capture_position`). Both are
+refused by name in console mode rather than approximated.
+
+`bbx_bake_cache --self-test`'s fourth container (`cs_mem`) is a real one: a V# in `s[0:3]`, an `offen`
+dword load at `0x1000`, a `s_waitcnt`, and a store of what it loaded at `0x1004`, so both bindings,
+the two-dword address and the prelude's load and store are exercised by every run. Every baked blob is
+checked for `DXBC`, a non-zero digest at `bytes[4..20]`, and - from the container's own `SFI0` part -
+feature flags without `Int64ShaderOps` (bit 1) or the 16-bit types (bit 7).
 
 ## 4. Tessellation: zero domain points
 
