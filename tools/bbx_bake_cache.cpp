@@ -40,6 +40,20 @@
 // then loads what it wrote through ShaderCache::Load and looks every entry up
 // again, so a cache that is not kOk is never reported as baked.
 //
+// Known, and measured from this tool rather than guessed: as the console
+// dialect stands, the block printer refuses every program. Every stage's
+// StageParams block begins "u64 l1_table; u64 reserved" (gcn/translate.cpp's
+// uniform block, gcn/lift.cpp's, unconditionally), and dxil_layout
+// (gcn/hlsl.cpp:2773) lays out only float/int/uint/bool members, so the second
+// member's offset 8 is unreachable and the printer stops the shader by name
+// ("a block member that is not a scalar, a vector, an array or a matrix",
+// gcn/hlsl.cpp:3032) - which is the behaviour tests/shaders_test.cpp pins, and
+// the right one: placed anywhere else, that member would be bound to the wrong
+// register and read garbage. So a first run over a dump reports one refusal
+// per program until the console's block layout learns 64-bit members (or the
+// console's own page-table story replaces that head), and this tool is what
+// makes that visible in one run instead of one crash per draw.
+//
 // --self-test runs the cache write, stamp, load and look-up over synthetic
 // blobs in a temporary directory: it proves the file's plumbing without a dump,
 // a compiler or any game data, and it is the only mode whose blobs are not
@@ -492,7 +506,8 @@ gcn::Stage TranslateStage(Stage stage) {
 // The console's translation options, field for field from the POD: nothing a
 // field decides is left to the translator's default, because a default that
 // changes between two builds of the port would move every key.
-gcn::TranslateOptions MakeOptions(const ConsoleStageOptions& o) {
+gcn::TranslateOptions MakeOptions(const Program& program) {
+    const ConsoleStageOptions& o = program.options;
     gcn::TranslateOptions t;
     t.stage = TranslateStage(o.stage);
     t.rsrc1 = o.rsrc1;
@@ -510,6 +525,15 @@ gcn::TranslateOptions MakeOptions(const ConsoleStageOptions& o) {
     t.cb_no_fallback = ConsoleStageOptions::kNoFallback;
     for (const std::uint32_t d : o.image_dims) t.image_dims.emplace_back(d >> 1, (d & 1) != 0);
     for (const std::uint8_t m : o.sampler_unnormalized) t.sampler_force_unnormalized.push_back(m != 0);
+    if (o.stage == Stage::kVertex) {
+        // The container's own input table, and its formats read from the
+        // module's params: one vertex module serves every draw, which is what
+        // the key's formats_from_params bit says. The position is left without
+        // Invariant: that is a Vulkan multipass decoration, and the console's
+        // dialect has no [[vk::...]] attribute to spell it with.
+        t.vertex_input = program.vertex_input;
+        t.vertex_formats_from_params = !program.vertex_input.empty();
+    }
     return t;
 }
 
@@ -621,7 +645,7 @@ Compiled Build(const Program& program, const Compiler& compiler) {
         out.reason = "decode: " + prog.errors.front().what;
         return out;
     }
-    const gcn::TranslateOptions options = MakeOptions(program.options);
+    const gcn::TranslateOptions options = MakeOptions(program);
     const gcn::TranslateResult translated = gcn::translate(prog, options);
     if (!translated.errors.empty()) {
         out.reason = "translation: " + translated.errors.front();
