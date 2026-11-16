@@ -2,6 +2,7 @@
 #include "harness.h"
 
 #include "host/d3d12/bbx_cache.h"
+#include "host/d3d12/bbx_shader_cache.h"
 
 #include <algorithm>
 #include <cstring>
@@ -162,4 +163,84 @@ TEST(Crc32MatchesKnownValue) {
     const char text[] = "123456789";
     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(text), 9);
     CHECK_EQ(Crc32(bytes), 0xcbf43926u);
+}
+
+// --- the console's own cache --------------------------------------------------
+//
+// <dump>/bbx_shaders.cache is built on a PC by tools/bbx_bake_cache.cpp and
+// loaded on the console, so the two sides must agree about what the file is for
+// without sharing a build. ExpectedConsoleStamp is that agreement: the bake
+// stamps with it, the launcher validates with it, and the compiler versions come
+// from the sidecar the bake writes beside the file.
+
+namespace {
+// What the bake records: the translator's fingerprint (a property of the
+// sources, so both builds compute it) and the compiler and signer it ran.
+CacheStamp RecordedByBake() {
+    CacheStamp s;
+    s.translator = "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8";
+    s.dxc_version = "1.9.2609.23";
+    s.dxil_version = "1.9.2609.23";
+    return s;
+}
+}  // namespace
+
+TEST(ConsoleStampIsTheBuildsTargetAndTheBakesCompiler) {
+    const CacheStamp expected = ExpectedConsoleStamp(RecordedByBake());
+    CHECK_EQ(expected.dxil_target, std::string(kConsoleDxilTarget));
+    CHECK_EQ(expected.dxil_target, std::string("dxil-6.4"));
+    CHECK_EQ(expected.bindless, std::string("tables"));
+    CHECK_EQ(expected.feature_level, std::string("11_0"));
+    CHECK_EQ(expected.pso_library, std::string("none"));
+    // From the bake's sidecar, so a cache compiled by another dxc is still
+    // this build's - it is a different compiler's output, not another target's.
+    CHECK_EQ(expected.dxc_version, std::string("1.9.2609.23"));
+    CHECK_EQ(expected.translator, RecordedByBake().translator);
+    // And the other way: a cache for another target is not this build's.
+    CacheStamp other_recorded = RecordedByBake();
+    CacheStamp other = ExpectedConsoleStamp(other_recorded);
+    other.dxil_target = "dxil-6.6";
+    CHECK(!(other == expected));
+}
+
+TEST(ShaderCacheLooksUpWhatTheBakeWroteAndRefusesTheRest) {
+    const CacheStamp recorded = RecordedByBake();
+    const CacheStamp stamp = ExpectedConsoleStamp(recorded);
+    const std::vector<std::uint8_t> blobs = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    const std::vector<CacheEntry> entries = {MakeEntry(0x11, 0, 4), MakeEntry(0x22, 4, 2)};
+    const std::vector<std::uint8_t> file = SerializeCache(stamp, entries, blobs);
+
+    ShaderCache cache;
+    CHECK(cache.Load(file, recorded.Serialize()) == CacheStatus::kOk);
+    CHECK_EQ(cache.entries(), static_cast<std::size_t>(2));
+    CHECK_EQ(cache.bytes(), file.size());
+    BakedBlob blob;
+    CHECK(cache.Lookup(0x22, &blob));
+    CHECK_EQ(blob.size, 2u);
+    CHECK_EQ(blob.raw_size, 4u);  // MakeEntry: raw_size = size * 2
+    CHECK(blob.data != nullptr && *blob.data == 0x05);
+    CHECK(!cache.Lookup(0x33, &blob));
+    CHECK(blob.data == nullptr);
+    // The line the loader logs and the HUD shows is one line, and says the size.
+    CHECK(cache.Report().find("ok") == 0);
+    CHECK(cache.Report().find("2 entries") != std::string::npos);
+
+    // No sidecar: the file has no compiler, so nothing vouches for it.
+    ShaderCache unstamped;
+    CHECK(unstamped.Load(file, std::string_view()) == CacheStatus::kStampMismatch);
+    CHECK_EQ(unstamped.entries(), static_cast<std::size_t>(0));
+    CHECK(!unstamped.Lookup(0x11, &blob));
+    CHECK(unstamped.Report().find("stamp mismatch") != std::string::npos);
+
+    // A sidecar from another compiler is that compiler's cache, not this one's.
+    CacheStamp foreign = recorded;
+    foreign.dxc_version = "1.8.0000.0";
+    ShaderCache mismatched;
+    CHECK(mismatched.Load(file, foreign.Serialize()) == CacheStatus::kStampMismatch);
+
+    // Truncated: the directory's bounds are checked before any entry is trusted.
+    std::vector<std::uint8_t> cut(file.begin(), file.end() - 3);
+    ShaderCache corrupt;
+    CHECK(corrupt.Load(cut, recorded.Serialize()) != CacheStatus::kOk);
+    CHECK_EQ(corrupt.entries(), static_cast<std::size_t>(0));
 }

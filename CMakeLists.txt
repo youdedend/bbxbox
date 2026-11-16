@@ -58,6 +58,7 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_barriers.cpp
     src/host/d3d12/bbx_budget.cpp
     src/host/d3d12/bbx_cache.cpp
+    src/host/d3d12/bbx_shader_cache.cpp
     src/host/d3d12/bbx_quarantine.cpp
     src/host/d3d12/bbx_precompile.cpp
     src/host/d3d12/bbx_descriptors.cpp
@@ -165,7 +166,11 @@ if(BBX_BUILD_TESTS)
     target_sources(bbx_tests PRIVATE
         upstream/bbhost/src/core/host_fs_common.cpp
         upstream/bbhost/src/core/host_fs_desktop.cpp
-        upstream/bbhost/src/hle/save_commit.cpp)
+        upstream/bbhost/src/hle/save_commit.cpp
+        # The printer, whose console dialect tests/shaders_test.cpp checks: no
+        # [[vk::...]], no 16-bit types, no Shader Model 6.6 - a property of the
+        # text, and so checkable without a copy of dxc in the build.
+        upstream/bbhost/src/gcn/hlsl.cpp)
     target_include_directories(bbx_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/bbhost/src")
     if(NOT WIN32)
         set(BBX_GUEST_CORE_TEST_SOURCES

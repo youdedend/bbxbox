@@ -154,9 +154,13 @@ struct Handle {
     std::vector<std::uint32_t> uses;  // values the expression reads (for scopes)
 };
 
+// Rewrites what Printer::run() produced into the console's dialect when
+// HlslOptions::dxil_sm64 asks for it (defined after the printer, below).
+void lower_to_dxil(HlslResult& r);
+
 class Printer {
 public:
-    explicit Printer(const std::vector<std::uint32_t>& w, const HlslOptions& o) : words(w), opt(o) {}
+    explicit Printer(const std::vector<std::uint32_t>& w, const HlslOptions& o) : words(w), opt(o), dxil(o.dxil_sm64) {}
 
     HlslResult run() {
         HlslResult r;
@@ -185,7 +189,8 @@ public:
                 r.arguments.push_back("-Vd");
                 r.validate_offsets = true;
             }
-            if (hv202x) r.language = "202x";
+            if (hv202x) r.language = dxil ? "2021" : "202x";
+            if (dxil) lower_to_dxil(r);
         } catch (const Unsupported& e) {
             r.errors.push_back(e.what());
             r.source.clear();
@@ -200,6 +205,8 @@ public:
 private:
     const std::vector<std::uint32_t>& words;
     const HlslOptions& opt;
+    // HlslOptions::dxil_sm64: print for dxc -T *_6_4 instead of for Vulkan.
+    const bool dxil;
 
     // ---- the module ----------------------------------------------------------------
     std::vector<Ins> module_ins;
@@ -730,13 +737,16 @@ private:
     }
 
     void prepare() {
+        // 6.4 for the console (its driver's ceiling), 6.6 for Vulkan, where
+        // DXC's SPIR-V path writes ResourceDescriptorHeap and IsHelperLane.
+        const char* const minor = dxil ? "_6_4" : "_6_6";
         switch (exec_model) {
-        case spv::EmFragment: profile = "ps_6_6"; break;
-        case spv::EmVertex: profile = "vs_6_6"; break;
-        case spv::EmTessellationEvaluation: profile = "ds_6_6"; break;
-        case spv::EmTessellationControl: profile = "hs_6_6"; break;
-        case spv::EmGLCompute: profile = "cs_6_6"; break;
-        case spv::EmGeometry: profile = "gs_6_6"; break;
+        case spv::EmFragment: profile = std::string("ps") + minor; break;
+        case spv::EmVertex: profile = std::string("vs") + minor; break;
+        case spv::EmTessellationEvaluation: profile = std::string("ds") + minor; break;
+        case spv::EmTessellationControl: profile = std::string("hs") + minor; break;
+        case spv::EmGLCompute: profile = std::string("cs") + minor; break;
+        case spv::EmGeometry: profile = std::string("gs") + minor; break;
         default: fail("execution model " + std::to_string(exec_model));
         }
         for (const std::uint32_t c : capabilities) {
@@ -960,12 +970,20 @@ private:
                 // As a built-in input of its own: IsHelperLane() would make DXC
                 // write every discard as a demote.
                 s.name = helper_invocation_name = unique("gl_HelperInvocation_");
-                helper_decls.push_back("[[vk::ext_builtin_input(23 /* HelperInvocation */)]] static const bool " + s.name + ";");
+                if (dxil) {
+                    // IsHelperLane() is SM 6.6 and the console has 6.4; there
+                    // is nothing to ask: discard ends the lane, so every read
+                    // that survives a discard is a non-helper one.
+                    helper_decls.push_back("static const bool " + s.name + " = false;  // SM 6.4: a discarded lane is not executed");
+                } else {
+                    helper_decls.push_back("[[vk::ext_builtin_input(23 /* HelperInvocation */)]] static const bool " + s.name + ";");
+                }
             } else if (s.builtin == spv::BiTessCoord) {
                 // The tessellation coordinate as the module reads it (SV_DomainLocation is two components of a quad's).
                 if (type(pointee).k != TK::Vector || type(pointee).count != 3) fail("a tessellation coordinate that is not a float3");
                 s.name = unique("gl_TessCoord_");
-                helper_decls.push_back("[[vk::ext_builtin_input(13 /* TessCoord */)]] static const float3 " + s.name + ";");
+                if (dxil) helper_decls.push_back("static float3 " + s.name + ";  // SV_DomainLocation, assigned on entry");
+                else helper_decls.push_back("[[vk::ext_builtin_input(13 /* TessCoord */)]] static const float3 " + s.name + ";");
             } else {
                 s.name = unique(base);
             }
@@ -2552,7 +2570,17 @@ private:
         std::string in_struct, out_struct, copy_in, copy_out, cp_struct, pc_struct, params;
         std::uint32_t patch_size = 0;
         for (const StageVar& v : stage_vars) {
-            if (v.builtin == spv::BiHelperInvocation || v.builtin == spv::BiTessCoord) continue;  // built-in inputs of their own (helper_decls)
+            if (v.builtin == spv::BiHelperInvocation) continue;  // a built-in input of its own (helper_decls)
+            if (v.builtin == spv::BiTessCoord) {
+                // SV_DomainLocation is three components of a triangle's and two
+                // of a quad's; the module reads three either way (the lift
+                // writes the third as zero for quads).
+                if (dxil) {
+                    params += ", " + declare(v.pointee, "si_" + v.name) + " : SV_DomainLocation";
+                    copy_in += "    " + v.name + " = si_" + v.name + ";\n";
+                }
+                continue;
+            }
             s += "static " + declare(v.pointee, v.name) + ";\n";
             if (tes && v.input && v.location >= 0 && !v.patch) {
                 // An input of each control point: the patch's array of it, one member of a control point.
@@ -2670,6 +2698,368 @@ private:
         return s;
     }
 };
+
+namespace {
+
+std::string dxil_trim(const std::string& s) {
+    const std::size_t b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) return {};
+    const std::size_t e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
+}
+
+bool dxil_starts(const std::string& s, const std::string& p) { return s.size() >= p.size() && s.compare(0, p.size(), p) == 0; }
+bool dxil_has(const std::string& s, const std::string& p) { return s.find(p) != std::string::npos; }
+
+// The operands of an attribute: the text between its first '(' and its last ')'.
+std::string dxil_args_of(const std::string& attr) {
+    const std::size_t open = attr.find('('), close = attr.rfind(')');
+    if (open == std::string::npos || close == std::string::npos || close < open) return {};
+    return attr.substr(open + 1, close - open - 1);
+}
+
+// "float2 a1" -> {"float2", "a1"}.
+std::pair<std::string, std::string> dxil_typed_name(const std::string& a) {
+    const std::size_t sp = a.rfind(' ');
+    if (sp == std::string::npos) return {a, {}};
+    return {dxil_trim(a.substr(0, sp)), dxil_trim(a.substr(sp + 1))};
+}
+
+// A parameter list, split at the commas outside a template argument list.
+std::vector<std::string> dxil_split_args(const std::string& in) {
+    std::vector<std::string> out;
+    std::string cur;
+    int depth = 0;
+    for (const char c : in) {
+        if (c == '<' || c == '(' || c == '[') ++depth;
+        if (c == '>' || c == ')' || c == ']') --depth;
+        if (c == ',' && depth == 0) {
+            out.push_back(dxil_trim(cur));
+            cur.clear();
+            continue;
+        }
+        cur += c;
+    }
+    if (!dxil_trim(cur).empty()) out.push_back(dxil_trim(cur));
+    return out;
+}
+
+// The register file a resource declaration binds to: t and s read, u written,
+// b for the lift's constant buffers. Space comes from the descriptor set.
+char dxil_register_class(const std::string& decl) {
+    if (dxil_starts(decl, "ConstantBuffer<")) return 'b';
+    if (dxil_starts(decl, "RWByteAddressBuffer") || dxil_starts(decl, "RWTexture")) return 'u';
+    if (dxil_starts(decl, "ByteAddressBuffer")) return 't';
+    if (dxil_starts(decl, "SamplerState") || dxil_starts(decl, "SamplerComparisonState")) return 's';
+    if (dxil_starts(decl, "Texture") || dxil_starts(decl, "Buffer<")) return 't';
+    return 0;
+}
+
+bool dxil_vector_name(const std::string& t) {
+    if (t.size() < 2) return false;
+    const char last = t.back();
+    return (last >= '2' && last <= '4') && (dxil_starts(t, "float") || dxil_starts(t, "uint") || dxil_starts(t, "int") || dxil_starts(t, "bool"));
+}
+
+// How DXC lays a constant buffer's member out: the size and alignment the
+// printer's declaration takes, in bytes, and whether it is one of the shapes a
+// block member can have (a scalar, a vector, an array of them or a matrix -
+// each row of a matrix is its own register, each element of an array too).
+struct DxilLayout {
+    unsigned align = 4, size = 4;
+    bool ok = false;
+};
+
+DxilLayout dxil_layout(const std::string& decl) {
+    DxilLayout l;
+    std::string t = dxil_trim(decl);
+    if (t.empty() || t.back() != ';') return l;
+    t.pop_back();
+    // An array: the last identifier before the type is the name.
+    const std::size_t sp = t.rfind(' ');
+    if (sp == std::string::npos) return l;
+    std::string type = dxil_trim(t.substr(0, sp));
+    std::string dims = dxil_trim(t.substr(sp + 1));  // name, or name[N]
+    unsigned count = 1;
+    if (!dims.empty() && dims.back() == ']') {
+        const std::size_t open = dims.rfind('[');
+        if (open == std::string::npos) return l;
+        const std::string n = dims.substr(open + 1, dims.size() - open - 2);
+        if (n.empty() || n.find_first_not_of("0123456789") != std::string::npos) return l;
+        count = static_cast<unsigned>(std::atoi(n.c_str()));
+        if (count == 0 || count > 4096) return l;
+    }
+    unsigned elems = 1, rows = 1;
+    std::string base;
+    for (const char* b : {"float", "int", "uint", "bool"}) {
+        if (!dxil_starts(type, b)) continue;
+        base = b;
+        const std::string rest = type.substr(std::string(b).size());
+        if (!rest.empty()) {
+            const std::size_t x = rest.find('x');
+            const std::string a = rest.substr(0, x), c = x == std::string::npos ? std::string() : rest.substr(x + 1);
+            if (a.empty() || a.size() > 1 || a[0] < '1' || a[0] > '4') return l;
+            elems = static_cast<unsigned>(a[0] - '0');
+            if (x != std::string::npos) {
+                if (c.size() != 1 || c[0] < '1' || c[0] > '4') return l;
+                rows = static_cast<unsigned>(c[0] - '0');
+            }
+        }
+        break;
+    }
+    if (base.empty()) return l;
+    // A row is a register of its own once it has more than one component; the
+    // elements of an array are registers too (std140's stride, which the
+    // printer checks for 16 at the lift).
+    const unsigned row = elems * 4;
+    if (rows > 1 || count > 1) {
+        l.align = 16;
+        l.size = count * rows * 16;
+    } else {
+        l.align = row;
+        l.size = row;
+    }
+    l.ok = true;
+    return l;
+}
+
+// What one of the printers' inline SPIR-V operations computes, written in the
+// HLSL Shader Model 6.4 itself has. Empty, with `why` set, for the ones it has
+// no equivalent of (those stop the shader, by name, rather than guessing).
+std::string dxil_helper_body(const std::string& name, const std::string& ret, const std::vector<std::string>& t,
+                             const std::vector<std::string>& a, std::string& why) {
+    const std::size_t n = a.size();
+    const std::string r = ret;
+    if (name == "spv_fmin" && n == 2) return "    return min(a0, a1);";
+    if (name == "spv_fmax" && n == 2) return "    return max(a0, a1);";
+    if (name == "spv_fma" && n == 3) return "    return mad(a0, a1, a2);";
+    if (name == "spv_pow" && n == 2) return "    return pow(a0, a1);";
+    if (name == "spv_exp" && n == 1) return "    return exp(a0);";
+    if (name == "spv_log" && n == 1) return "    return log(a0);";
+    if (name == "spv_round" && n == 1) return "    return round(a0);";
+    if (name == "spv_ldexp" && n == 2) return "    return ldexp(a0, a1);";
+    if ((name == "spv_nclamp" || name == "spv_uclamp" || name == "spv_sclamp") && n == 3) return "    return clamp(a0, a1, a2);";
+    if (name == "spv_fmix" && n == 3) return "    return a0 + a2 * (a1 - a0);";  // x*(1-a) + y*a, as D3D's lerp
+    if (name == "spv_fsign" && n == 1) {
+        if (dxil_vector_name(r)) {
+            why = "a vector FSign";
+            return {};
+        }
+        return "    if (a0 > 0) return " + r + "(1);\n    if (a0 < 0) return " + r + "(-1);\n    return a0;  // +-0 and NaN keep their operand";
+    }
+    if (name == "spv_ssign" && n == 1) {
+        if (dxil_vector_name(r)) {
+            why = "a vector SSign";
+            return {};
+        }
+        return "    if (a0 > 0) return 1;\n    if (a0 < 0) return -1;\n    return 0;";
+    }
+    // Half pairs: 6.4 has the conversions but not the half arithmetic
+    // (Native16BitShaderOpsSupported is FALSE on the console).
+    if (name == "spv_pack_half_2x16" && n == 1) return "    return uint(f32tof16(a0.x)) | (uint(f32tof16(a0.y)) << 16u);";
+    if (name == "spv_unpack_half_2x16" && n == 1) return "    return float2(f16tof32(a0 & 0xffffu), f16tof32(a0 >> 16u));";
+    if (name == "spv_bitfield_uextract" && n == 3) {
+        return "    const uint bits = a2 >= 32u ? 0xffffffffu : (1u << a2) - 1u;\n    return " + r +
+               "((uint(a0) >> a1) & bits);";
+    }
+    if (name == "spv_bitfield_sextract" && n == 3) {
+        return "    if (a2 >= 32u) return " + r + "(int(a0) >> a1);\n    if (a2 == 0u) return " + r +
+               "(uint(a0) << a1);\n    return " + r + "(int(uint(a0) << (32u - a1 - a2)) >> (32u - a2));";
+    }
+    if (name == "spv_bitfield_insert" && n == 4) {
+        return "    if (a3 == 0u) return a0;\n    const uint bits = a3 >= 32u ? 0xffffffffu : (1u << a3) - 1u;\n    const uint mask = bits << a2;\n"
+               "    return " +
+               r + "((uint(a0) & ~mask) | ((uint(a1) << a2) & mask));";
+    }
+    if (name == "spv_bitcast" && n == 1) {
+        if (dxil_starts(r, "float")) return "    return asfloat(a0);";
+        if (dxil_starts(r, "uint")) return "    return asuint(a0);";
+        if (dxil_starts(r, "int")) return "    return asint(a0);";
+        if (dxil_starts(r, "bool")) return "    return a0 != 0;";
+    }
+    if (name == "spv_control_barrier" && n == 3) return "    GroupMemoryBarrierWithGroupSync();";
+    // The clip prologue's demote: 6.4 has no IsHelperLane, and none is needed -
+    // discard ends the lane, which is the demote's effect on the instructions
+    // that follow it.
+    if (name == "spv_demote_to_helper" && n == 0) return "    discard;";
+    if (dxil_starts(name, "spv_iadd_carry") || dxil_starts(name, "spv_isub_borrow") || dxil_starts(name, "spv_umul_extended") ||
+        dxil_starts(name, "spv_smul_extended")) {
+        why = "a 64-bit extended arithmetic (" + name + ")";
+        return {};
+    }
+    (void)t;
+    why = "an inline SPIR-V instruction with no Shader Model 6.4 equivalent (" + name + ")";
+    return {};
+}
+
+}  // namespace
+
+void lower_to_dxil(HlslResult& r) {
+    const auto stop = [&r](const std::string& why, const std::string& line) {
+        r.errors.push_back("dxil 6.4: " + why + ": " + dxil_trim(line));
+        r.source.clear();
+    };
+    // The console's compiler takes no 16-bit types: the flag would be
+    // E_INVALIDARG on that driver, and the source would spell float16_t.
+    for (std::size_t i = 0; i < r.arguments.size();) {
+        if (r.arguments[i] == "-enable-16bit-types") r.arguments.erase(r.arguments.begin() + static_cast<std::ptrdiff_t>(i));
+        else ++i;
+    }
+    std::string out;
+    out.reserve(r.source.size() + 2048);
+    unsigned block_pos = 0;  // where DXC's layout has got to in the block being printed
+    unsigned pad_count = 0;
+    std::size_t at = 0;
+    while (at <= r.source.size()) {
+        const std::size_t nl = r.source.find('\n', at);
+        const std::string line = r.source.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        const bool last = nl == std::string::npos;
+        at = last ? r.source.size() + 1 : nl + 1;
+
+        const std::size_t first = line.find_first_not_of(" \t");
+        const std::string indent = first == std::string::npos ? line : line.substr(0, first);
+        std::string rest = first == std::string::npos ? std::string() : line.substr(first);
+
+        if (dxil_has(rest, "struct ") && rest.back() == '{') {
+            block_pos = 0;
+        } else if (rest == "};") {
+            block_pos = 0;
+        }
+        std::vector<std::string> attrs;
+        while (rest.compare(0, 2, "[[") == 0) {
+            const std::size_t end = rest.find("]]");
+            if (end == std::string::npos) {
+                stop("an attribute that does not close", line);
+                return;
+            }
+            attrs.push_back(dxil_trim(rest.substr(2, end - 2)));
+            rest = dxil_trim(rest.substr(end + 2));
+        }
+
+        std::string binding, offset, spec, inst, invariant;
+        for (const std::string& a : attrs) {
+            if (dxil_starts(a, "vk::binding(")) binding = dxil_args_of(a);
+            else if (dxil_starts(a, "vk::offset(")) offset = dxil_args_of(a);
+            else if (dxil_starts(a, "vk::constant_id(")) spec = dxil_args_of(a);
+            else if (dxil_starts(a, "vk::ext_instruction(")) inst = a;
+            else if (dxil_starts(a, "vk::ext_decorate(")) invariant = dxil_args_of(a);
+            else if (dxil_starts(a, "vk::ext_capability(") || dxil_starts(a, "vk::ext_extension(") || dxil_starts(a, "vk::location(") ||
+                     dxil_starts(a, "vk::image_format(") || dxil_starts(a, "vk::builtin(")) {
+                // Vulkan's alone: D3D says the same with a register, a semantic
+                // or a register-space, which the declaration already carries.
+            } else {
+                stop("an attribute the console's dialect does not have (" + a + ")", line);
+                return;
+            }
+        }
+
+        std::string text, pad_text;
+        if (!inst.empty()) {
+            // An inline SPIR-V helper, as a function of the same name and
+            // signature that computes it: "RET NAME(ARGS);".
+            const std::size_t open = rest.find('('), close = rest.rfind(')');
+            if (open == std::string::npos || close == std::string::npos || close < open) {
+                stop("an inline instruction that is not a declaration", line);
+                return;
+            }
+            const std::string head = dxil_trim(rest.substr(0, open));  // RET NAME
+            const std::size_t sp = head.rfind(' ');
+            if (sp == std::string::npos) {
+                stop("an inline instruction without a result type", line);
+                return;
+            }
+            const std::string ret = dxil_trim(head.substr(0, sp)), name = dxil_trim(head.substr(sp + 1));
+            const std::string args = rest.substr(open + 1, close - open - 1);
+            std::vector<std::string> types, names;
+            for (const std::string& a : dxil_split_args(args)) {
+                const auto tn = dxil_typed_name(a);
+                types.push_back(tn.first);
+                names.push_back(tn.second);
+            }
+            std::string why;
+            const std::string body = dxil_helper_body(name, ret, types, names, why);
+            if (body.empty()) {
+                stop(why, line);
+                return;
+            }
+            text = indent + ret + " " + name + "(" + args + ") {\n" + body + "\n" + indent + "}";
+        } else if (!binding.empty()) {
+            const char file = dxil_register_class(rest);
+            const std::vector<std::string> bs = dxil_split_args(binding);
+            if (!file || bs.size() != 2 || rest.empty() || rest.back() != ';') {
+                stop("a binding of something that is not one of the console's resource types", line);
+                return;
+            }
+            text = indent + rest.substr(0, rest.size() - 1) + " : register(" + std::string(1, file) + dxil_trim(bs[0]) + ", space" +
+                   dxil_trim(bs[1]) + ");";
+        } else if (!offset.empty()) {
+            // The lift's block member. packoffset is a cbuffer's, not a
+            // struct's, so the block is left to DXC's own layout - and this is
+            // where that layout is checked against the lift's, member by
+            // member: a gap DXC would fill differently is padded with a
+            // register, and a member whose offset DXC cannot produce stops the
+            // shader rather than being bound to the wrong register.
+            const long long off = std::atoll(dxil_trim(offset).c_str());
+            const DxilLayout lay = dxil_layout(rest);
+            if (!lay.ok) {
+                stop("a block member that is not a scalar, a vector, an array or a matrix", line);
+                return;
+            }
+            if (off < 0) {
+                stop("a block member at a negative offset", line);
+                return;
+            }
+            const long long want = off;
+            if (want < static_cast<long long>(block_pos)) {
+                stop("a block member inside the one before it", line);
+                return;
+            }
+            if ((want - static_cast<long long>(block_pos)) % 16 != 0) {
+                stop("a block member whose offset DXC's layout cannot reach", line);
+                return;
+            }
+            // Pad with whole registers, which DXC always packs.
+            if (want > static_cast<long long>(block_pos)) {
+                const long long n = (want - static_cast<long long>(block_pos)) / 16;
+                pad_text += indent + "float4 _dxil_pad" + std::to_string(++pad_count) + "[" + std::to_string(n) + "];\n";
+                block_pos = static_cast<unsigned>(want);
+            }
+            block_pos += lay.size;
+            text = indent + rest;
+        } else if (!spec.empty()) {
+            // A specialization constant is a compile-time constant here: the
+            // bake compiles it at its default, and the console's root
+            // signature carries the value the game reads.
+            if (!dxil_starts(rest, "const ")) {
+                stop("a specialization constant that is not a constant", line);
+                return;
+            }
+            text = indent + "static const " + rest.substr(6) + "  // specialization constant " + dxil_trim(spec);
+        } else if (!invariant.empty()) {
+            if (dxil_trim(invariant) != "18 /* Invariant */") {
+                stop("a decoration that is not Invariant", line);
+                return;
+            }
+            text = indent + "precise " + rest;
+        } else {
+            if (dxil_starts(rest, "vk::ext_execution_mode(")) continue;  // Vulkan's alone
+            text = indent + rest;
+        }
+
+        if (dxil_has(text, "float16_t")) {
+            stop("a 16-bit float (the console's driver has no Native16BitShaderOps)", line);
+            return;
+        }
+        if (dxil_has(text, "vk::")) {
+            stop("the Vulkan dialect that survived the rewrite", line);
+            return;
+        }
+        out += pad_text;
+        out += text;
+        if (!last) out += "\n";
+    }
+    r.source = out;
+}
 
 // ---- interfaces ---------------------------------------------------------------------------
 

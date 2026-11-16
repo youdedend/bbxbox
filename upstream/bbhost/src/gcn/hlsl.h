@@ -79,6 +79,14 @@ struct HlslOptions {
     bool tess_quads = false;
     int tess_spacing = 0;  // 0 integer, 1 fractional-odd, 2 fractional-even
     bool tess_cw = true;
+    // Print for the console's own compiler instead of for Vulkan: Shader Model
+    // 6.4 tables, as the Xbox Series X UWP driver's ceiling allows
+    // (D3D12_FEATURE_DATA_D3D12_OPTIONS4::Native16BitShaderOpsSupported is
+    // FALSE there, and SM 6.6's ResourceDescriptorHeap is rejected), with no
+    // [[vk::...]] attribute, no inline SPIR-V and no specialization constant
+    // anywhere in the result. The Vulkan dialect is unchanged when this is
+    // false, which is what the Linux tests and the desktop path compile.
+    bool dxil_sm64 = false;
 };
 
 struct HlslResult {

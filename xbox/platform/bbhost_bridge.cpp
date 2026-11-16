@@ -48,6 +48,9 @@
 
 #include "xbox/platform/log.h"
 #include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
+#include "xbox/platform/storage.h"
+#include "src/host/d3d12/bbx_shader_cache.h"
 #include "xbox/platform/bbhost_bridge.h"
 
 // The guest runtime. `main.cpp` is not compiled on this target - it opens a
@@ -666,6 +669,12 @@ namespace {
 // closes the window, so none of it may live in a stack frame.
 ElfImage g_image;
 std::string g_eboot_path;
+
+// The baked console shaders, loaded once at boot: the dump's copy, else the one
+// a developer put in LocalState. Every blob in it was compiled for this build's
+// DXIL target (dxil-6.4, tables, 11_0) by the bake, and ParseCache validated
+// every entry before one was trusted.
+bbx::d3d12::ShaderCache g_shader_cache;
 alignas(16) std::uint64_t g_argv[4] = {0, 0, 0, 0};
 std::atomic<bool> g_running{false};
 
@@ -687,6 +696,42 @@ DWORD WINAPI GuestMain(void* p) {
     g_running.store(false);
     bbx::platform::LogF("guest: _start returned");
     return 0;
+}
+
+}  // namespace
+
+namespace {
+
+// <dump>/bbx_shaders.cache and its sidecar, else the LocalState copy of both.
+// Both are read through the host-fs seam: a dump arrives through a
+// FutureAccessList token, which fopen cannot open on the console.
+void LoadShaderCache(const std::string& eboot) {
+    std::string dir;
+    const std::size_t slash = eboot.find_last_of("\\/");
+    if (slash != std::string::npos) dir = eboot.substr(0, slash + 1);
+    std::vector<std::string> candidates;
+    if (!dir.empty()) candidates.push_back(dir + "bbx_shaders.cache");
+    candidates.push_back(bbx::platform::Local("bbx_shaders.cache"));
+    for (const std::string& path : candidates) {
+        std::vector<std::uint8_t> bytes;
+        if (!bbx::hostfs::ReadFileAll(path, &bytes)) continue;
+        std::vector<std::uint8_t> stamp;
+        // The sidecar is `<cache>.stamp.txt`: the bake's record of who compiled
+        // it, which is what ExpectedConsoleStamp pairs with this build's target.
+        if (!bbx::hostfs::ReadFileAll(path + ".stamp.txt", &stamp)) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                      "shader_cache: %s has no .stamp.txt beside it; not used", path.c_str());
+            continue;
+        }
+        const std::string stamp_text(reinterpret_cast<const char*>(stamp.data()), stamp.size());
+        const bbx::d3d12::CacheStatus status = g_shader_cache.Load(bytes, stamp_text);
+        bbx::platform::LogF("shader_cache: status=%s entries=%zu bytes=%zu path=%s detail=%s",
+                            bbx::d3d12::CacheStatusName(status), g_shader_cache.entries(), g_shader_cache.bytes(),
+                            path.c_str(), g_shader_cache.detail().c_str());
+        return;
+    }
+    bbx::platform::LogMessage(bbx::platform::Level::kInfo,
+                              "shader_cache: none in the dump or LocalState; every program is lifted on this machine");
 }
 
 }  // namespace
@@ -742,6 +787,12 @@ bool StartGuest(const GuestRequest& req) {
                                   "into the wrong places");
     }
 
+    // The baked shaders, if the dump carries the cache: compiled for this
+    // target on a PC, so the guest's own programs do not have to be lifted and
+    // compiled at the frame they are first drawn.
+    bbx::platform::LogCrumb("boot:shader_cache");
+    LoadShaderCache(g_eboot_path);
+
     bbx::platform::LogCrumb("boot:patch_guest");
     // The instructions this processor cannot run (BMI1, LZCNT, MOVBE), rewritten
     // before anything else touches the code.
@@ -782,6 +833,18 @@ bool StartGuest(const GuestRequest& req) {
     return true;
 }
 
+std::string ShaderCacheLine() { return g_shader_cache.Report(); }
+
+bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
+                       std::uint32_t* raw_size) {
+    bbx::d3d12::BakedBlob blob;
+    if (!g_shader_cache.Lookup(key, &blob)) return false;
+    if (bytes != nullptr) *bytes = blob.data;
+    if (size != nullptr) *size = blob.size;
+    if (raw_size != nullptr) *raw_size = blob.raw_size;
+    return true;
+}
+
 bool Running() { return g_running.load(); }
 
 }  // namespace bbx::bridge
@@ -797,5 +860,14 @@ bool StartGuest(const GuestRequest& req) {
     return false;
 }
 bool Running() { return false; }
+std::string ShaderCacheLine() { return "no cache: the guest runtime is not linked into this build"; }
+bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
+                       std::uint32_t* raw_size) {
+    (void)key;
+    if (bytes != nullptr) *bytes = nullptr;
+    if (size != nullptr) *size = 0;
+    if (raw_size != nullptr) *raw_size = 0;
+    return false;
+}
 }  // namespace bbx::bridge
 #endif

@@ -73,6 +73,20 @@ enum class CacheStatus : std::uint8_t {
 
 [[nodiscard]] const char* CacheStatusName(CacheStatus status);
 
+// The identity this build gives a console shader cache. The bake
+// (tools/bbx_bake_cache.cpp) stamps what it writes with ExpectedConsoleStamp,
+// and the launcher validates it with the same function, so the two cannot drift:
+// the DXIL target, the root signature, the bind mode and the feature level are
+// the build's; the compiler and signer versions are whoever ran the bake, which
+// the stamp beside the cache supplies.
+inline constexpr char kConsoleDxilTarget[] = "dxil-6.4";      // SM 6.4 is the console's ceiling
+inline constexpr char kConsoleRootSignature[] = "rs-1.0";     // root signature 1.0, 64 DWORDs
+inline constexpr char kConsoleBindless[] = "tables";          // descriptor tables (tier 3)
+inline constexpr char kConsoleFeatureLevel[] = "11_0";
+inline constexpr char kConsoleHlslEmitter[] = "bbhost-hlsl-dxil64-1";
+inline constexpr char kConsolePsoLibrary[] = "none";          // no pipeline library: it removes the device on a console
+[[nodiscard]] CacheStamp ExpectedConsoleStamp(const CacheStamp& recorded = {});
+
 struct ParseResult {
     CacheStatus status = CacheStatus::kMissing;
     std::string detail;

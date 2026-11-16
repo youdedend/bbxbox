@@ -134,6 +134,7 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/replay.cpp
     ../src/host/d3d12/bbx_psocache.cpp
     ../src/host/d3d12/bbx_cache.cpp
+    ../src/host/d3d12/bbx_shader_cache.cpp
     ../src/host/d3d12/bbx_stream.cpp
     ../src/host/d3d12/bbx_untile.cpp
     ../src/host/d3d12/bbx_barriers.cpp
@@ -190,6 +191,7 @@ target_sources(bbxbox PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_barriers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_budget.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_cache.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_shader_cache.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_quarantine.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_precompile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_descriptors.cpp"

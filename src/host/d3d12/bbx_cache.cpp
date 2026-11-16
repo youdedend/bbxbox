@@ -293,4 +293,24 @@ std::uint32_t Crc32(std::span<const std::uint8_t> bytes) {
     return ~crc;
 }
 
+CacheStamp ExpectedConsoleStamp(const CacheStamp& recorded) {
+    CacheStamp s;
+    // Whoever ran the bake: the translator fingerprint is a property of the
+    // sources, and the two compiler versions are the bake's own.
+    s.translator = recorded.translator;
+    s.dxc_version = recorded.dxc_version;
+    s.dxil_version = recorded.dxil_version;
+    // This build's: a cache for another target, another bind mode or another
+    // emitter is not invalid, it is simply not this build's, and binding its
+    // DXIL into a pipeline built for this root signature would be a crash at
+    // the first draw rather than a slow frame.
+    s.dxil_target = kConsoleDxilTarget;
+    s.hlsl_emitter = kConsoleHlslEmitter;
+    s.root_signature = kConsoleRootSignature;
+    s.bindless = kConsoleBindless;
+    s.feature_level = kConsoleFeatureLevel;
+    s.pso_library = kConsolePsoLibrary;
+    return s;
+}
+
 }  // namespace bbx::d3d12

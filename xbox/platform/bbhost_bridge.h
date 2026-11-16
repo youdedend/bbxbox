@@ -44,4 +44,20 @@ bool Running();
 // Frames the guest has asked to present (host_present), for the launcher's HUD.
 std::uint64_t Flips();
 
+// The baked console shaders (<dump>/bbx_shaders.cache), once StartGuest has
+// loaded them: one line for the HUD, and a look-up by interface hash for the
+// pipeline that needs the program. False when the cache did not validate, with
+// the reason in the line.
+std::string ShaderCacheLine();
+bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
+                       std::uint32_t* raw_size);
+
+// The baked console shaders (<dump>/bbx_shaders.cache), once StartGuest has
+// loaded them: one line for the HUD, and a look-up by interface hash for the
+// pipeline that needs the program. False when the cache did not validate, with
+// the reason in the line.
+std::string ShaderCacheLine();
+bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
+                       std::uint32_t* raw_size);
+
 }  // namespace bbx::bridge
