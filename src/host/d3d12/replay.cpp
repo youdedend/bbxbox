@@ -15,8 +15,8 @@ namespace bbx::d3d12 {
 namespace {
 
 constexpr std::uint64_t kUploadRingBytes = 4ull << 20;  // 4 MiB a frame
-// D3D12_TEXTURE_DATA_PITCH_ALIGNMENT: a texture upload's source rows land on it.
-constexpr std::uint64_t kTexturePitchAlign = 256;
+// D3D12_TEXTURE_DATA_PITCH_ALIGNMENT: a texture upload's source rows land on it,
+// which is now the plan's own dst_row_pitch (bbx_untile aligns it when it plans).
 constexpr std::uint64_t kOverlayBytes = 64ull << 10;    // 2,048 quads
 constexpr std::uint32_t kFrameImageSize = 256;  // the placeholder final image
 
