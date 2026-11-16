@@ -294,6 +294,16 @@ VCLibs - it is `/MD` + `/ZW` - so the dependency stays; but a console without
 the framework now produces a *running* app that logs "SDL unavailable" instead
 of an image the loader refuses.
 
+The audit tests itself before it reads a binary: `check-imports.ps1` classifies
+each module and symbol through `Resolve-Module` / `Resolve-Symbol` /
+`Resolve-Provided`, and fifteen self-test cases assert what those rules must
+answer — the app CRT refused for `bbxbox.exe`, allowed for a payload; `ole32`,
+`user32` and `xaudio2_9` refused for the port's own image; `VirtualAlloc` and
+`CreateFileMapping` still failures; the six whitelisted CRT symbols answered as
+known and anything else in that list answered as a failure. A rule that quietly
+stopped matching fails the run with the rule's name instead of looking like a
+clean package.
+
 The audit got stricter in the same commit, because it can now be believed:
 `user32`, `gdi32`, `ole32`, `advapi32`, `xaudio2_9`, `vcruntime140(_app)` and
 `msvcp140(_app)` are no longer allowed modules for `bbxbox.exe`, and a DLL-CRT

@@ -119,6 +119,86 @@ $KnownUncalledSymbols = @{
         "VirtualProtect" = "the static CRT's own guard/heap init; guest pages are flipped with VirtualProtectFromApp"
     }
 }
+# --- the rules, as functions, so they can be tested ---------------------------
+# The audit is only worth the guarantee that it can fail. Both questions below
+# are asked by the loops underneath and by the self-test above them, from the same
+# code: a rule that quietly stopped matching would otherwise look exactly like a
+# clean package.
+function Resolve-Module($module, $own) {
+    # port's own image: only its own list, no payload leniency
+    if ($own) {
+        foreach ($pattern in $AllowedModules) {
+            if ($module -match $pattern) { return "allow" }
+        }
+        return "fail"
+    }
+    foreach ($pattern in $AllowedModules) {
+        if ($module -match $pattern) { return "allow" }
+    }
+    foreach ($pattern in $AppCrtModules) {
+        if ($module -match $pattern) { return "allow" }
+    }
+    return "fail"
+}
+
+function Resolve-Symbol($symbol, $own, $binaryName) {
+    $pattern = $null
+    foreach ($candidate in $ForbiddenSymbols) {
+        if ($symbol -match $candidate) { $pattern = $candidate; break }
+    }
+    if (-not $pattern) { return "allow" }
+    if (-not $own) { return "notice" }
+    if ($KnownUncalledSymbols.ContainsKey($binaryName)) {
+        foreach ($candidate in $KnownUncalledSymbols[$binaryName].Keys) {
+            if ($pattern -eq "$candidate$") { return "known" }
+        }
+    }
+    return "fail"
+}
+
+function Resolve-Provided($module) {
+    foreach ($pattern in $PlatformProvided) {
+        if ($module -match $pattern) { return $true }
+    }
+    return ($module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|vcruntime140_1|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$")
+}
+
+# Cases the audit must get right, run before it looks at a single binary. Each is
+# a real decision this port made; if one of them stops holding, the run fails with
+# the rule rather than with a package that shipped.
+$selfTestCases = @(
+    @{ What = "the port importing the app CRT";        Got = (Resolve-Module "VCRUNTIME140_APP.dll" $true);  Want = "fail" }
+    # A payload import the port would refuse is answered "fail" here and turned
+    # into a notice by the loop below; the point of the case is that the module
+    # rule says fail for the port's own image.
+    @{ What = "the payload importing the app CRT";     Got = (Resolve-Module "MSVCP140_APP.dll" $false);     Want = "fail" }
+    @{ What = "the payload importing vccorlib (C++/CX)"; Got = (Resolve-Module "vccorlib140_app.DLL" $false); Want = "allow" }
+    @{ What = "the port importing a system api set";   Got = (Resolve-Module "api-ms-win-core-file-l1-1-0.dll" $true); Want = "allow" }
+    @{ What = "the port importing ole32";              Got = (Resolve-Module "OLE32.dll" $true);             Want = "fail" }
+    @{ What = "the port importing user32";             Got = (Resolve-Module "USER32.dll" $true);            Want = "fail" }
+    @{ What = "the port importing xaudio2_9";          Got = (Resolve-Module "XAudio2_9.dll" $true);         Want = "fail" }
+    @{ What = "a CRT import the port never calls";     Got = (Resolve-Symbol "CreateFileW" $true "bbxbox.exe"); Want = "known" }
+    @{ What = "a port call to VirtualProtect";         Got = (Resolve-Symbol "VirtualProtect" $true "bbxbox.exe"); Want = "known" }
+    @{ What = "a port call to VirtualAlloc";           Got = (Resolve-Symbol "VirtualAlloc" $true "bbxbox.exe"); Want = "fail" }
+    @{ What = "a port call to CreateFileMapping";      Got = (Resolve-Symbol "CreateFileMapping" $true "bbxbox.exe"); Want = "fail" }
+    @{ What = "the payload calling a desktop API";     Got = (Resolve-Symbol "CreateDirectoryW" $false "SDL3.dll"); Want = "notice" }
+    @{ What = "the port calling the FromApp form";     Got = (Resolve-Symbol "CreateFile2FromApp" $true "bbxbox.exe"); Want = "allow" }
+    @{ What = "a VCLibs module is provided";           Got = (Resolve-Provided "VCRUNTIME140_1_APP.dll");    Want = $true }
+    @{ What = "a packaged-only DLL is not provided";   Got = (Resolve-Provided "SDL3.dll");                  Want = $false }
+)
+$selfTestBad = @($selfTestCases | Where-Object { $_.Got -ne $_.Want })
+if ($selfTestBad.Count -gt 0) {
+    $lines = @($selfTestBad | ForEach-Object { "$($_.What): got '$($_.Got)', wanted '$($_.Want)'" })
+    Write-Host "check-imports: the audit's own rules are broken"
+    $lines | ForEach-Object { Write-Host "  $_" }
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $body = ($lines -join "`n") -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+        Write-Output "::error title=import audit self-test::$body"
+    }
+    exit 1
+}
+Write-Host "check-imports: self-test PASS ($($selfTestCases.Count) rules)"
+
 $notices = New-Object System.Collections.Generic.List[string]
 
 foreach ($binary in $binaries) {
@@ -128,14 +208,10 @@ foreach ($binary in $binaries) {
     foreach ($line in $imports) {
         if ($line -notmatch "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { continue }
         $module = $Matches[1]
-        $ok = $false
-        foreach ($pattern in $AllowedModules) {
-            if ($module -match $pattern) { $ok = $true; break }
-        }
         # The *_app CRT family is allowed for payload binaries only: the port's own
         # image links the static CRT and importing any of it is the loader failure
-        # this iteration removed.
-        if (-not $ok -and -not $own -and $module -match ("(" + ($AppCrtModules -join "|") + ")")) { $ok = $true }
+        # this iteration removed. Resolve-Module is the rule (and is self-tested).
+        $ok = (Resolve-Module $module $own) -eq "allow"
         if (-not $ok) {
             if ($own) { $failures.Add("$($binary.Name): imports $module") }
             else { $notices.Add("$($binary.Name) (payload): imports $module") }
