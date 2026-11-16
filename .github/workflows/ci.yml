@@ -47,10 +47,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.tool_cache }}/dxc110
-          key: dxc110-1.10.2605.37-h60be90b_0
+          key: dxc110-1.10.2605.37-release
       - name: DXC 1.10 + spirv-tools -- fetched when the cache misses
-        # The build is pinned in the script, with the tests that prove it: the
-        # 1.10 version string, and a signer beside the compiler.
+        # Pinned in the script by tag and SHA-256: Microsoft's release tarball
+        # (it carries the signer; conda-forge's linux build does not) and
+        # conda-forge's spirv-tools. The script also proves the two libraries
+        # are there before the bake is asked to use them.
         run: python3 tools/ci_fetch_dxc110.py --dir "${{ runner.tool_cache }}/dxc110"
       - name: prebake self-test on a signed compiler
         run: |
