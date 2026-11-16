@@ -251,10 +251,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         /STACK:8388608,65536
         /APPCONTAINER
         /HIGHENTROPYVA:NO
-        /OPT:REF /OPT:ICF)
+        /OPT:REF /OPT:ICF
+        # The map is the evidence of what the binary contains: which archive
+        # member every symbol came from. package.ps1 copies it beside the .appx,
+        # `.github/workflows/ci.yml` greps the guest's symbols out of it, and
+        # `xbox/scripts/symbolicate.py` turns a console stack into names with it.
+        # It has always been *expected* - the artifact upload and the packaging
+        # both name it - but the link never made one until now. Named
+        # explicitly so the file cannot land in whatever directory the generator
+        # happens to run the linker in.
+        "/MAP:${CMAKE_CURRENT_BINARY_DIR}/bbxbox.map")
 else()
     message(WARNING "Building the console app with ${CMAKE_CXX_COMPILER_ID}: guest thunks need clang-cl")
-    target_link_options(bbxbox PRIVATE /STACK:8388608,65536)
+    target_link_options(bbxbox PRIVATE /STACK:8388608,65536
+        "/MAP:${CMAKE_CURRENT_BINARY_DIR}/bbxbox.map")
 endif()
 
 if(BBX_BBHOST)
@@ -275,7 +285,24 @@ if(BBX_BBHOST)
     # other's symbols freely - and it dead-strips an archive member no one
     # references, so `platform/bbhost_bridge.cpp` and `main.cpp`'s boot are what
     # pull the runtime in at all.
+    #
+    # The link is ON and CI builds it: a console build that *compiled* the guest
+    # and did not link it packages an app whose StartGuest is the "not linked"
+    # arm (`platform/bbhost_bridge.cpp`) - a launcher that boots nothing - and
+    # nothing about that app looks broken until a player presses start. Turning
+    # the link off is for renderer iteration, so it takes a second, explicit
+    # switch rather than one forgotten `-D`:
+    option(BBX_GUESTLESS "build the console app WITHOUT the guest runtime (renderer iteration only)" OFF)
     option(BBX_GUEST_LINK "link the guest runtime into the app and boot it" ON)
+    if(NOT BBX_GUEST_LINK AND NOT BBX_GUESTLESS)
+        message(FATAL_ERROR
+            "BBX_GUEST_LINK=OFF packages a bbxbox.exe with no guest runtime in it.\n"
+            "That is a renderer-iteration build, not something to install on a console: add\n"
+            "  -DBBX_GUESTLESS=ON\n"
+            "to say so, or drop -DBBX_GUEST_LINK=OFF to get the supported configuration.\n"
+            "CI passes neither and checks the binary afterwards (.github/workflows/ci.yml,\n"
+            "\"guest link evidence\").")
+    endif()
     if(BBX_GUEST_LINK)
         target_link_libraries(bbxbox PRIVATE bbhost_gcn bbhost_guest bbhost_host bbhost_engine
             bbx_atrac9 bbx_monocypher)

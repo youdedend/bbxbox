@@ -108,11 +108,16 @@ target_link_libraries(bbhost_gcn PUBLIC bbx_zlib)
 # this library is the list that is already clean against the Store SDK and the
 # AppContainer, compiled on every CI run so the list only grows on evidence.
 #
-# It is a *static library*, deliberately not linked into `bbxbox` yet: the HLE
-# still names host symbols the port has not provided (measure them with
-# `nm -u` over the objects and subtract what the tree defines), and a link that
-# fails says nothing about the TUs above it. Each entry here is compile-verified
-# by the Windows job; the link arrives when the last of them is in.
+# It is a *static library*, and `xbox/CMakeLists.txt` links it into `bbxbox`
+# under `BBX_GUEST_LINK` (ON, and what CI builds) together with
+# `bbhost_gcn`/`bbhost_host`/`bbhost_engine`, which is what pulls the runtime in:
+# lld-link dead-strips an archive member nothing references, so the bridge and
+# `main.cpp`'s boot are the roots. An entry that names a host symbol the port has
+# not provided is a *link* error with the object that wanted it
+# (`build.ps1` reports it as one deduplicated annotation), not a silent skip -
+# so this list is link-verified, not merely compile-verified, on every CI run.
+# The workflow's "guest link evidence" step then checks the packaged binary
+# actually carries it.
 add_library(bbhost_guest STATIC
     # src/core: the pieces the boot path stands on, all of them portable except
     # the virtual-memory layer (whose AppContainer branch is the point).

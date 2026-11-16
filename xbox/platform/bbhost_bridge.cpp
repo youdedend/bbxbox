@@ -946,7 +946,10 @@ bool Running() { return g_running.load(); }
 #else
 // The link is off (xbox/CMakeLists.txt, BBX_GUEST_LINK): the archives are
 // compiled but not part of this binary, so there is no loader to call and no
-// guest to start. The launcher says so and stays up.
+// guest to start. The launcher says so and stays up. This arm is for renderer
+// iteration only: CMake refuses `BBX_GUEST_LINK=OFF` without `BBX_GUESTLESS=ON`,
+// and the workflow's "guest link evidence" step fails any package that reached
+// this branch, so an app that boots nothing cannot be shipped by accident.
 namespace bbx::bridge {
 bool StartGuest(const GuestRequest& req) {
     (void)req;

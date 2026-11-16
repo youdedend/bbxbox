@@ -11,7 +11,7 @@ Last updated with the Xbox hardware rules folded in (`docs/ARCHITECTURE_XBOX_D3D
 | Phase | Work | State |
 |---|---|---|
 | P0 | UWP shell, launcher, memory contract, packaging, CI, import audit | **Implemented; not yet run on console.** `.appx` layout, manifest (`codeGeneration` + `removableStorage` only), SDL3-uwp/libuwp cached dependency build, memory self-test, `check-imports.ps1`, `local_precheck.sh`, CI. |
-| P1 | Guest boot + HLE + audio/input, no rendering | **Started.** The portable core (`elf`, `imports`, `thunk`, `tls_rewrite`, `sha256`, `paced_file`, `memory`, `bbx_self`) is compiled by the host test build and unit-tested (191 cases). The UWP arena adapter (`guest_memory_bbhost.h`) is what bbhost's `core/memory.h` resolves to under `BBX_UWP`. **The boot input is solved:** `src/host/core/bbx_self.{h,cpp}` decodes the fSELF wrapper (`4f 15 3d 1d`) into a flat ELF and is shared by `load_orbis_elf` and `gpu::eboot_shaders`, so a real `eboot.bin` from a retail disc dump is read instead of the encrypted bytes. Run against the user's own 93,825,704-byte `eboot.bin` it produces a 93,667,640-byte ELF whose `e_entry` lands on the x86-64 prologue in `ph0`, whose `PT_DYNAMIC` carries the Orbis tags, and that still holds all 5,493 `OrbShdr` containers the bake step needs; plain ELF input passes through untouched, and a retail-encrypted SELF is refused with a diagnostic instead of a garbage image. Segments are placed from the wrapper's own entry table (the file's offsets are not the image's), and `PT_LOAD`/`PT_DYNAMIC`/`PT_SCE_DYNLIB_DATA` that cannot be placed is a hard error, not a hole. **The guest's file system is routed off the CRT.** `hle/fs.cpp`, `hle/fios.cpp` and `hle/save_commit.cpp` no longer call `_open`/`_read`/`_stat64`/`FindFirstFileA`/`std::filesystem`/`CreateFileW`: they call `xbox/platform/host_fs.h`, one table of operations with two implementations — the CRT and POSIX for a desktop build (`upstream/bbhost/src/core/host_fs_desktop.cpp`, which the host tests exercise) and `CreateFile2FromApp`/`GetFileAttributesExFromApp`/`FindFirstFileExFromApp`/`MoveFileFromApp`/`RemoveDirectoryFromApp`/`ReplaceFileFromApp` in the AppContainer (`xbox/platform/host_fs_uwp.cpp`). The path policy — `/app0`, the update folder ahead of the base dump, the mods and plugin overlays, `/data`, mount points, the case-insensitive fallback — is unchanged and now runs unchanged on both; the save commit's moves, flushes and recoveries go through the same seam, and its protocol has a test of its own. The app runs the seam's self test once at boot and logs one line, so an AppContainer that refuses a call says so at launch instead of at the game's first save. **The console's memory layer is the AppContainer's.** Direct memory is a
+| P1 | Guest boot + HLE + audio/input, no rendering | **Linked; not booted.** The portable core (`elf`, `imports`, `thunk`, `tls_rewrite`, `sha256`, `paced_file`, `memory`, `bbx_self`) is compiled by the host test build and unit-tested (191 cases). The UWP arena adapter (`guest_memory_bbhost.h`) is what bbhost's `core/memory.h` resolves to under `BBX_UWP`. **The boot input is solved:** `src/host/core/bbx_self.{h,cpp}` decodes the fSELF wrapper (`4f 15 3d 1d`) into a flat ELF and is shared by `load_orbis_elf` and `gpu::eboot_shaders`, so a real `eboot.bin` from a retail disc dump is read instead of the encrypted bytes. Run against the user's own 93,825,704-byte `eboot.bin` it produces a 93,667,640-byte ELF whose `e_entry` lands on the x86-64 prologue in `ph0`, whose `PT_DYNAMIC` carries the Orbis tags, and that still holds all 5,493 `OrbShdr` containers the bake step needs; plain ELF input passes through untouched, and a retail-encrypted SELF is refused with a diagnostic instead of a garbage image. Segments are placed from the wrapper's own entry table (the file's offsets are not the image's), and `PT_LOAD`/`PT_DYNAMIC`/`PT_SCE_DYNLIB_DATA` that cannot be placed is a hard error, not a hole. **The guest's file system is routed off the CRT.** `hle/fs.cpp`, `hle/fios.cpp` and `hle/save_commit.cpp` no longer call `_open`/`_read`/`_stat64`/`FindFirstFileA`/`std::filesystem`/`CreateFileW`: they call `xbox/platform/host_fs.h`, one table of operations with two implementations — the CRT and POSIX for a desktop build (`upstream/bbhost/src/core/host_fs_desktop.cpp`, which the host tests exercise) and `CreateFile2FromApp`/`GetFileAttributesExFromApp`/`FindFirstFileExFromApp`/`MoveFileFromApp`/`RemoveDirectoryFromApp`/`ReplaceFileFromApp` in the AppContainer (`xbox/platform/host_fs_uwp.cpp`). The path policy — `/app0`, the update folder ahead of the base dump, the mods and plugin overlays, `/data`, mount points, the case-insensitive fallback — is unchanged and now runs unchanged on both; the save commit's moves, flushes and recoveries go through the same seam, and its protocol has a test of its own. The app runs the seam's self test once at boot and logs one line, so an AppContainer that refuses a call says so at launch instead of at the game's first save. **The console's memory layer is the AppContainer's.** Direct memory is a
 `CreateFileMappingFromApp(..., PAGE_READWRITE | SEC_RESERVE, ...)` section, not a
 6 GiB RWX one: RWX is refused outright by the container, and without
 `SEC_RESERVE` the whole size is charged at creation and Game Mode's 5,120 MiB
@@ -25,16 +25,20 @@ the SDK's app-partition import library otherwise pulls in `MapViewOfFile2`,
 which the audit refuses. The page protections in `write_watch.cpp`,
 `win_watch.cpp` and `kernel.cpp` are `VirtualProtectFromApp`, and
 `core/host_clock_shim.h` supplies `clock_gettime` over the Win32 clocks (the
-Store SDK has no `<pthread_time.h>`). **The guest runtime compiles for the console, all but four files of it.** The
-`bbhost_guest` library is forty translation units: all twenty of `src/core` that
+Store SDK has no `<pthread_time.h>`). **The guest runtime compiles for the console — all 23 files of `src/hle` — and is linked into the app.** The
+`bbhost_guest` library is forty-four translation units: all twenty of `src/core` that
 a console build uses (every one except the Linux VM layer and the desktop host-fs
-backend), the winpthreads shim, and nineteen of the twenty-three in `src/hle` —
+backend), the winpthreads shim, and all twenty-three in `src/hle` —
 the file system, `fios`, save commits, the kernel, pthreads, the
 synchronisation primitives, the variadic shims (asm and all), libc, gnm's
 resource tracking, the audio stack (`audio`, `ajm`, `avplayer`), `dialog`, the
-network modules (`net`, `http`, `np_matching2`, `np_signaling`), `runtime` and
-the guest console — compiled against the Store SDK and the AppContainer on every
-Windows run. Getting there needed three things upstream's MinGW build had for
+network modules (`net`, `http`, `np_matching2`, `np_signaling`), `runtime`, the
+guest console, and the last four (`video`, `system`, `gnm_exec`, `gx_trace`) —
+compiled against the Store SDK and the AppContainer on every Windows run, and
+linked into `bbxbox` with `bbhost_gcn`/`bbhost_host`/`bbhost_engine`
+(§"What the packaged app contains"). **Compiled and linked is not booted:** no
+guest ELF has been loaded at run time and no HLE entry point has executed, so
+this row is "the runtime is in the app", not "the game starts". Getting there needed three things upstream's MinGW build had for
 free:
 
   * `xbox/winpthreads_shim/` — `<pthread.h>`, `<sched.h>` and `<sys/time.h>`
@@ -89,15 +93,29 @@ translation units compiled for the console**, and the last two libraries also
 needed the `.att_syntax prefix` fix (the engine's `frame_ret` and friends are
 module-level asm too).
 
-The three libraries are still **not on `bbxbox`'s link line**, and that is now
-the only thing between the tree and a booting guest. The census machinery is in
-place so the gap closes in one run rather than twenty: the app links with
-`/ERRORLIMIT:0`, and `xbox/scripts/build.ps1` turns a link failure into one
-deduplicated `undefined symbols` annotation (each symbol with the object that
-wanted it, up to 50 KB) instead of the first eighty lines. The sandbox cannot
-read job logs — `results-receiver.actions.githubusercontent.com` is not
-reachable and the API's log endpoint is 404 — so the annotation *is* the
-channel, and it now holds the whole list.
+The three libraries are **on `bbxbox`'s link line**. `xbox/CMakeLists.txt`
+links `bbhost_gcn bbhost_guest bbhost_host bbhost_engine` (plus `bbx_atrac9` and
+`bbx_monocypher`) whenever `BBX_GUEST_LINK` is on — which is the default, and the
+configuration CI builds, because neither `xbox/scripts/build.ps1` nor the
+workflow passes `-DBBX_GUEST_LINK` — and defines `BBX_GUEST_BOOT`, so
+`platform/bbhost_bridge.cpp` compiles its real `StartGuest` instead of the arm
+that logs `BBX_GUEST_LINK=OFF` and returns. "What the packaged app contains"
+below is the three facts that say the packaged binary carries the guest, and the
+check that keeps them true. Linked is not booted: no guest ELF has been loaded
+at run time and nothing has run on a console.
+
+The census machinery that got the link there is still worth keeping, because the
+same channel serves whatever gap comes next: the app links with `/ERRORLIMIT:0`,
+and `xbox/scripts/build.ps1` turns a link failure into one deduplicated
+`undefined symbols` annotation (each symbol with the object that wanted it, up
+to 50 KB) instead of the first eighty lines. The sandbox cannot read job logs —
+`results-receiver.actions.githubusercontent.com` is not reachable and the API's
+log endpoint is 404 — so the annotation *is* the channel. It is also, in
+hindsight, the same evidence from the other side: a symbol that is not on the
+link line can neither collide nor go missing, so the two diagnostic runs before
+the fix (`duplicate symbol host_gpu_*`, `undefined symbols
+PipelineSet::CreateGuestRootSignature / host_render_worker_jobs`) could only
+speak about objects that were linked.
 
 `src/hle` is **not** linked into `bbxbox` yet: `runtime.cpp` pulls `thunk_wrap`, the guest-thread entry points, the fs HLE and the audio stack, so the HLE/VM hook routing (`win_vm.cpp`, `hle/fs.cpp`, `hle/fios.cpp`, `hle/audio.cpp`) is the next milestone step. Nothing has booted a game. |
 | P2 | D3D12 device, swapchain, replay of clears/copies/barriers/markers | **Written and compile-verified; not yet run on a console.** `bbx_d3d12.cpp`, `device.cpp` (11_0 device, WARP refused, caps validated, one queue + fence + three frame allocators, bounded heaps, device-loss capture), `swapchain.cpp` (CoreWindow flip-discard ×3, plan-sized, inverse-scaled, RTVs, resize, present), `pipeline.cpp` (one root signature per pass: 32-bit constants in `b0`, Tier-3 typed tables in space 0, `t0`/`u0` for the compute passes; PSOs created on first use from the build-time DXIL and accounted through `bbx_psocache`; **no `CreatePipelineLibrary`**) and `replay.cpp` (WalkStream before emitting, clears, copies, barriers, markers as PIX events, the untile dispatch from `bbx_untile`'s plan, present + overlay passes, and the boot GPU self-test through a READBACK heap) are compiled by the Windows job against the real SDK and type-checked locally by `tools/syntax_check.sh`. `xbox/platform/hud.cpp` lays the boot report out as solid quads (a 3x5 font, so no atlas is needed for P2) and `xbox/platform/d3d12_session.cpp` owns device + swapchain + pipelines + replay behind an `IUnknown*`, which is what `main.cpp` calls — the app therefore **links and packages** with the
@@ -226,6 +244,53 @@ the port) and the desktop API imports inside the shipped third-party DLLs
 (SDL3-uwp, libuwp, Microsoft's DXC), which the port does not own. `bbxbox.exe`
 imports no desktop-only file, memory or loader API.
 
+### What the packaged app contains (and what keeps it so)
+
+"Compiled" and "linked" and "booted" are three different claims, and only the
+first two are evidenced. As of run `43856060763` (`7e2d757`), the app that CI
+packages contains the guest runtime:
+
+* **The cache said so.** That run's `build/xbox/CMakeCache.txt` had
+  `BBX_GUEST_LINK:BOOL=ON` and `BBX_BBHOST:BOOL=ON` — the defaults of
+  `xbox/CMakeLists.txt`, since nothing overrides them — so `bbxbox` was linked
+  against the four archives and `BBX_GUEST_BOOT` was defined for the bridge.
+* **The link said so, twice over.** A successful link is silent, but its
+  failures are not: the two runs that failed while the bridge's first real
+  dispatch landed reported `duplicate symbol` collisions among `host_gpu_*` and
+  `undefined symbol` for `PipelineSet::CreateGuestRootSignature` and
+  `host_render_worker_jobs`. Those are link-time statements about archive
+  members, and they exist only if the archives are on the line.
+* **The binary said so, in size.** `bbxbox.exe` is 5,218,304 B in that run
+  (pdb 36,286,464 B, `.appx` 2,468,130 B), against 4,451,328–4,467,200 B in the
+  four green runs from before the guest link landed: ~750 KB of guest, host
+  layer and `hle`. The `.map`/`.pdb` from that run could not be downloaded here
+  (the artifact blob URL answers `EOF`), which is why the claim rests on the
+  configure defaults, the build succeeding and the size — and why the map is now
+  produced and checked in the run itself instead of being inspected afterwards.
+
+Two changes hold that in place, so the claim cannot quietly stop being true:
+
+* `xbox/CMakeLists.txt` now passes `/MAP`, so the `bbxbox.map` that
+  `xbox/scripts/package.ps1` already copied beside the `.appx` and the workflow
+  already uploaded is actually generated. Before this, every green run warned
+  `no bbxbox.map under build: a crash report from the console cannot be
+  symbolised` — a real gap in first-console debugging, not a cosmetic one.
+* The workflow's `guest link evidence` step fails the run unless the cache has
+  `BBX_GUEST_LINK:BOOL=ON`, the Ninja link line names all four archives, the map
+  carries `StartGuest@`, `load_orbis_elf`, `register_hle` and `hle_gnm_exec`, and
+  `bbxbox.exe` contains the guest loader's own `eboot sha256` literal. It emits
+  the sizes as a notice so the evidence survives in the annotation even though a
+  later artifact download may not. This matters because a guestless build passes
+  every other check in this workflow — it compiles, it packages, it imports
+  cleanly, its self-test runs — and boots nothing.
+* At configure time, `-DBBX_GUEST_LINK=OFF` is now a `FATAL_ERROR` unless it is
+  accompanied by `-DBBX_GUESTLESS=ON`: dropping the link is a deliberate act for
+  renderer iteration, not a thing to reach by forgetting a flag.
+
+None of this is a boot. It is the statement that the shipped binary has the
+guest's code in it; §"First physical-console run" lists what the first console
+run has to show before "boots" may be written down.
+
 ## Verified here (build machine)
 
 * **229 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
@@ -276,9 +341,45 @@ imports no desktop-only file, memory or loader API.
   self-test has never actually dispatched — so "the replay is correct" is a compile-time claim and
   nothing more. In particular, the untile dispatch and the read-only-DSV rule (G12) are not
   exercised by anything that runs here.
-* bbhost's `src/hle` is not linked into the app, so no guest code has run: `load_orbis_elf` is
-  compiled and unit-testable but is not called by any boot path yet, and `CUSA03173` has never been
-  opened by this port.
+* **Guest execution.** `load_orbis_elf` and the HLE are *in* the packaged app (see "What the
+  packaged app contains"), and `main.cpp` calls `bbx::bridge::StartGuest`, but no guest ELF has been
+  loaded at run time and no HLE entry point has executed: `CUSA03173` has never been opened by this
+  port, and the ELF fixtures the tests use are synthetic. "Linked" is the claim; "boots" is the one
+  the first console run has to make.
+
+## First physical-console run
+
+The order is not negotiable, because each step's failure mode is different and
+only the previous step's log tells you which one you are looking at.
+
+1. **Install.** Sideload `bbxbox.cer` into *Trusted People*, then
+   `Microsoft.VCLibs.x64.14.00.appx`, then `bbxbox.appx` (Device Portal →
+   Apps, or Dev Mode). Pass: the tile appears and the app activates — that is
+   `bbxbox.App` through `bbxbox.def`, the manifest, and the framework
+   dependency, nothing of the port yet.
+2. **Launch with no dump.** Pass: the view and the HUD draw, the launcher says
+   there is no dump, and `bbxbox_logs\loader.log` exists on a granted path
+   without a `crash.log`. This is where a D3D12 device, the swapchain and the
+   overlay are first exercised for real — `syntax_check.sh` type-checked them,
+   no driver has created them.
+3. **Point it at the dump and press start.** This is the first time guest code
+   can run. Pass, in this order in `loader.log`:
+   `ImageBase`/segment mapping for the unwrapped image, `relocs: N relative, …`,
+   the `eboot sha256 …` line **matching the pinned digest** (`BBHOST_ANY_EBOOT`
+   off, so a modded eboot is refused, not silently accepted), the thread
+   creation, and the HLE's first output for the descriptor tables. The
+   guest's own `main` running *and* the first frame presenting is the point at
+   which "boot verified" may be written down — not before, and not for a
+   partial sequence.
+4. **Capture on failure, before retrying.** `bbxbox_logs\crash.log` from that
+   boot, the `bbxbox.map`/`bbxbox.pdb` **from the same build**
+   (`xbox/scripts/symbolicate.py` turns `module+0xRVA` into names), and the
+   run's artifact, so the report is reproducible; a retry with a different
+   build throws the addresses away.
+5. **Deferred, and known to be deferred:** audio (LibAtrac9 is linked but no
+   ATRAC9 stream has been decoded on a console), 4K/HDR output, rumble, the
+   virtual keyboard, the memory self-test's numbers under the Game-mode limit,
+   and every D3D12 claim past device creation.
 
 ## Rules that must not regress
 
