@@ -15,6 +15,7 @@
 
 #include "src/host/d3d12/bbx_d3d12.h"
 #include "xbox/platform/display.h"
+#include "xbox/platform/guest_frames.h"
 #include "xbox/platform/hud.h"
 
 namespace bbx::platform {
@@ -65,7 +66,7 @@ public:
     // only the newest. A memcpy and a short lock are all the guest thread pays,
     // so a flip never waits on the GPU, and a frame the presenter has not taken
     // yet is counted and dropped rather than queued behind it.
-    void SubmitGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height);
+    void SubmitGuestFrame(const bbx::platform::GuestFrame& frame);
 
     // Frames the guest offered and the presenter took (and how many it dropped
     // because the guest outran it), for the HUD.

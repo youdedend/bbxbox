@@ -18,11 +18,15 @@
 // The exceptions are the three that a running game cannot do without, and they
 // are implemented for real further down:
 //   * host_pad_state / host_pad_present - the player's controller;
-//   * host_present - the flip, counted and logged, not yet drawn:
-//     `d3d12_session` presents the launcher's HUD, and putting the guest's
-//     display buffer on the television is the D3D12 backend's slice.
+//   * host_present - the flip: the guest's display buffer, described by the
+//     attribute its registration stated (format, tiling, pitch), handed to
+//     `d3d12_session`, which untiles and uploads it before the present pass.
+//     The description is read here, on the guest's thread, and it is arithmetic:
+//     nothing in it waits for the GPU.
 
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -50,6 +54,7 @@
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/hostfs_extra.h"
 #include "xbox/platform/storage.h"
+#include "src/host/d3d12/bbx_scanout.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
 #include "xbox/platform/guest_frames.h"
 #include "xbox/platform/bbhost_bridge.h"
@@ -202,15 +207,66 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
         bbx::platform::LogCrumb("gpu:flip");
     }
     if (display_va == 0 || display_w == 0 || display_h == 0) { return; }
+    // The attribute the buffer was registered with. A flip of an address no port
+    // registered is not a display buffer, and presenting it "as RGBA8" would be
+    // three guesses about bytes the console described exactly - so it is dropped
+    // and said once, not per frame.
+    std::uint32_t format = 0, tiling = 0, pitch_pixels = 0;
+    if (!hle_video_display_attribute(display_va, &format, &tiling, &pitch_pixels)) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                      "video: a flip of %p, which no sceVideoOutRegisterBuffers registered; "
+                                      "the frame is dropped (the attribute is what describes the pixels)",
+                                      reinterpret_cast<void*>(static_cast<std::uintptr_t>(display_va)));
+        }
+        return;
+    }
+    bbx::d3d12::ScanoutFormat scanout_format = bbx::d3d12::ScanoutFormat::kA8R8G8B8Srgb;
+    bbx::d3d12::ScanoutTiling scanout_tiling = bbx::d3d12::ScanoutTiling::kTile;
+    if (!bbx::d3d12::ScanoutFormatFromWord(format, scanout_format) ||
+        !bbx::d3d12::ScanoutTilingFromWord(tiling, scanout_tiling)) {
+        static std::atomic<std::uint32_t> said_bits{0xffffffffu};
+        if (said_bits.exchange(format << 1 | (tiling & 1u)) != (format << 1 | (tiling & 1u))) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                      "video: a display buffer with pixel format 0x%08x and tiling mode %u, which "
+                                      "this port has no name for; the frame is dropped",
+                                      format, tiling);
+        }
+        return;
+    }
+    bbx::d3d12::ScanoutDesc desc;
+    desc.format = scanout_format;
+    desc.tiling = scanout_tiling;
+    desc.width = display_w;
+    desc.height = display_h;
+    desc.pitch_pixels = pitch_pixels;
+    // What the copy will read, in the guest's own layout: a tiled buffer is the
+    // same number of bytes, in micro tiles rather than rows.
+    const bbx::d3d12::ScanoutState state = bbx::d3d12::DescribeScanout(desc);
+    if (!state.ok) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn, "video: no frame presented: %s", state.reason.c_str());
+        }
+        return;
+    }
     // The scanout buffer, as this process can read it: the guest arena is mapped
     // in-process, so a guest virtual address is a pointer here - once the range is
     // known to be inside the image. sceVideoOutRegisterBuffers can be handed an
     // address the image no longer covers (a mode change, a title that reuses a
     // buffer after freeing it), and a flip must not fault the guest.
-    const std::uint64_t bytes = static_cast<std::uint64_t>(display_w) * static_cast<std::uint64_t>(display_h) * 4u;
     const std::uint8_t* pixels = nullptr;
-    if (!GuestScanoutPixels(display_va, bytes, &pixels)) { return; }
-    bbx::platform::SubmitGuestFrame(pixels, display_w, display_h);
+    if (!GuestScanoutPixels(display_va, state.bytes, &pixels)) { return; }
+    bbx::platform::GuestFrame frame;
+    frame.pixels = pixels;
+    frame.width = display_w;
+    frame.height = display_h;
+    frame.format = format;
+    frame.tiling = tiling;
+    frame.pitch = pitch_pixels;
+    frame.bytes = state.bytes;
+    bbx::platform::SubmitGuestFrame(frame);
 }
 
 // The launcher owns the window: there is nothing here to pump, nothing to

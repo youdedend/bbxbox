@@ -161,6 +161,12 @@ std::uint64_t hle_video_note_flip_call(std::int64_t arg);
 std::uint64_t hle_video_flip_count();
 // Whether the game registered `va` as a display buffer (any port; lock-free).
 bool hle_video_is_display_buffer(std::uint64_t va);
+// The attribute of the display buffer at `va` (sceVideoOutSetBufferAttribute):
+// the pixel format word, the tiling mode (0 is TILED) and the row pitch in
+// pixels. False when `va` is not a registered display buffer. The presenter
+// reads the buffer with these; guessing any of the three draws a wrong picture.
+bool hle_video_display_attribute(std::uint64_t va, std::uint32_t* format, std::uint32_t* tiling,
+                                 std::uint32_t* pitch);
 std::uint64_t hle_video_last_tick_ns();  // steady-clock ns of the last vblank tick (diagnostics)
 // A test harness asked the run to end as BBHOST_EXIT_SECONDS ends one (the
 // `exit` request of BBHOST_TEST_REQUESTS): the exit reports and the cache

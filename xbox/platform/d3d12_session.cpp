@@ -51,6 +51,9 @@ struct D3d12Session::Impl {
     std::vector<std::uint8_t> frame_pixels;
     std::vector<std::uint8_t> frame_upload;
     std::uint32_t frame_width = 0, frame_height = 0;
+    // The buffer's attribute, carried from the flip: the pixels are in the
+    // guest's own layout (format, tiling, pitch), and this says which.
+    d3d12::ScanoutDesc frame_desc;
     bool frame_pending = false;
     std::uint64_t guest_frames = 0, guest_frames_dropped = 0;
 
@@ -98,8 +101,8 @@ namespace {
 // treats as "drop the frame".
 D3d12Session* g_frame_target = nullptr;
 
-void TakeGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
-    if (g_frame_target != nullptr) { g_frame_target->SubmitGuestFrame(rgba, width, height); }
+void TakeGuestFrame(const bbx::platform::GuestFrame& frame) {
+    if (g_frame_target != nullptr) { g_frame_target->SubmitGuestFrame(frame); }
 }
 
 }  // namespace
@@ -258,19 +261,21 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     // The guest's frame first, beneath everything: the swap is under the lock and
     // the copy is not, so the guest thread's flip costs it a memcpy.
     std::vector<std::uint8_t> frame;
-    std::uint32_t frame_width = 0, frame_height = 0;
+    d3d12::ScanoutDesc frame_desc;
     {
         std::lock_guard<std::mutex> lk(impl.frame_mutex);
         if (impl.frame_pending) {
             impl.frame_upload.swap(impl.frame_pixels);
             frame.swap(impl.frame_upload);
-            frame_width = impl.frame_width;
-            frame_height = impl.frame_height;
+            frame_desc = impl.frame_desc;
             impl.frame_pending = false;
         }
     }
-    if (!frame.empty() && frame_width != 0 && frame_height != 0) {
-        const d3d12::Status uploaded = impl.replay.UploadFrame(frame.data(), frame_width, frame_height);
+    if (!frame.empty() && frame_desc.width != 0 && frame_desc.height != 0) {
+        // The upload is the description's: the image is made in the guest's
+        // format, and a tiled buffer is detiled on the GPU before the present
+        // pass samples it.
+        const d3d12::Status uploaded = impl.replay.UploadFrame(frame.data(), frame_desc);
         if (uploaded != d3d12::Status::kOk) {
             LogCrumb("replay: guest frame dropped");
             ++impl.guest_frames_dropped;
@@ -298,17 +303,37 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     return impl.replay.EndFrame(vsync);
 }
 
-void D3d12Session::SubmitGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
-    if (impl_ == nullptr || rgba == nullptr || width == 0 || height == 0) { return; }
-    const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
+void D3d12Session::SubmitGuestFrame(const bbx::platform::GuestFrame& frame) {
+    if (impl_ == nullptr || frame.pixels == nullptr || frame.width == 0 || frame.height == 0 || frame.bytes == 0) {
+        return;
+    }
+    // The console's words, decoded once here: a word this port has no name for
+    // is a frame it cannot read, and a frame kept anyway would be presented as
+    // the wrong picture on its first flip.
+    d3d12::ScanoutFormat format = d3d12::ScanoutFormat::kA8R8G8B8;
+    d3d12::ScanoutTiling tiling = d3d12::ScanoutTiling::kTile;
+    if (!d3d12::ScanoutFormatFromWord(frame.format, format) ||
+        !d3d12::ScanoutTilingFromWord(frame.tiling, tiling)) {
+        std::lock_guard<std::mutex> lk(impl_->frame_mutex);
+        ++impl_->guest_frames_dropped;
+        return;
+    }
     std::lock_guard<std::mutex> lk(impl_->frame_mutex);
     // Only the newest survives: a frame the presenter has not taken yet is the
     // one this replaces, which is what a television shows anyway.
     if (impl_->frame_pending) { ++impl_->guest_frames_dropped; }
-    if (impl_->frame_pixels.size() != bytes) { impl_->frame_pixels.resize(bytes); }
-    std::memcpy(impl_->frame_pixels.data(), rgba, bytes);
-    impl_->frame_width = width;
-    impl_->frame_height = height;
+    // The copy is of the guest's own bytes - a tiled buffer is the same size, in
+    // micro tiles - and the detile and the format are the GPU's work, not this
+    // thread's: the guest is between two waits here.
+    if (impl_->frame_pixels.size() != frame.bytes) { impl_->frame_pixels.resize(static_cast<std::size_t>(frame.bytes)); }
+    std::memcpy(impl_->frame_pixels.data(), frame.pixels, static_cast<std::size_t>(frame.bytes));
+    impl_->frame_width = frame.width;
+    impl_->frame_height = frame.height;
+    impl_->frame_desc.format = format;
+    impl_->frame_desc.tiling = tiling;
+    impl_->frame_desc.width = frame.width;
+    impl_->frame_desc.height = frame.height;
+    impl_->frame_desc.pitch_pixels = frame.pitch;
     impl_->frame_pending = true;
 }
 

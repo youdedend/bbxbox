@@ -182,14 +182,16 @@ Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height, DxgiF
 
 Status Replay::UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
     // RGBA8, linearly: what the stream's transfers and the HLE's own frames are.
-    // A display buffer says more than that (bbx_scanout), and its describing
-    // overload is the one that has to be exactly right about the format.
+    // In the console's own names that is A8B8G8R8 (the COMP_SWAP_ALT of the CB's
+    // 8-bit pair: bytes R,G,B,A) with tiling mode 1. A display buffer says more
+    // than that - bbx_scanout - and its describing overload is the one that has
+    // to be exactly right about the format.
     ScanoutDesc desc;
-    desc.format = ScanoutFormat::kR8G8B8A8;
+    desc.format = ScanoutFormat::kA8B8G8R8;
     desc.tiling = ScanoutTiling::kLinear;
     desc.width = width;
     desc.height = height;
-    desc.pitch = width * 4u;
+    desc.pitch_pixels = width;
     return UploadFrame(rgba, desc);
 }
 

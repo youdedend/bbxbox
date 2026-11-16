@@ -1015,17 +1015,68 @@ GUEST_ABI int hle_video_set_attr(void* attr, unsigned fmt, unsigned tile, unsign
     return 0;
 }
 
-// Every address the game has registered as a display buffer, read without g_vo_mu
-// (hle_video_is_display_buffer: the renderer asks under its own lock).
-std::atomic<std::uint64_t> g_display_bufs[32] = {};
-void note_display_buffer(std::uint64_t va) {
+// Every address the game registered as a display buffer, with the attribute it
+// was registered with, read without g_vo_mu (hle_video_is_display_buffer and
+// hle_video_display_attribute: the renderer asks under its own lock, and the
+// presenter asks from host_present, which some flip paths call with g_vo_mu
+// already held - a mutex there would be a deadlock, not a wait).
+struct DisplayBuffer {
+    std::atomic<std::uint64_t> va{0};
+    std::atomic<std::uint64_t> attr{0};  // PackDisplayAttr: which pixels these are
+};
+DisplayBuffer g_display_bufs[32];
+// The attribute of the last registration, for an address the table could not
+// keep (more display buffers than its 32 entries): is_display_buffer's own
+// fallback already counts such an address as a display buffer, and the newest
+// attribute is the only answer there is.
+std::atomic<std::uint64_t> g_last_display_attr{0};
+
+// format << 32 | tiling << 24 | pitch. The pitch is in pixels and a display is
+// never 16 million of them across; the tiling mode is 0 or 1.
+std::uint64_t PackDisplayAttr(std::uint32_t format, std::uint32_t tiling, std::uint32_t pitch) {
+    return (static_cast<std::uint64_t>(format) << 32) | (static_cast<std::uint64_t>(tiling & 0xffu) << 24) |
+           (pitch & 0xffffffu);
+}
+
+void note_display_buffer(std::uint64_t va, std::uint64_t attr) {
     if (!va) return;
-    for (std::atomic<std::uint64_t>& b : g_display_bufs) {
-        std::uint64_t v = b.load(std::memory_order_acquire);
-        if (v == va) return;
-        if (!v && b.compare_exchange_strong(v, va, std::memory_order_acq_rel)) return;
-        if (v == va) return;
+    g_last_display_attr.store(attr, std::memory_order_release);
+    for (DisplayBuffer& b : g_display_bufs) {
+        std::uint64_t v = b.va.load(std::memory_order_acquire);
+        if (v == va) {
+            b.attr.store(attr, std::memory_order_release);  // re-registered: a new attribute
+            return;
+        }
+        if (!v && b.va.compare_exchange_strong(v, va, std::memory_order_acq_rel)) {
+            b.attr.store(attr, std::memory_order_release);
+            return;
+        }
+        if (v == va) {
+            b.attr.store(attr, std::memory_order_release);
+            return;
+        }
     }
+}
+
+bool hle_video_display_attribute(std::uint64_t va, std::uint32_t* format, std::uint32_t* tiling,
+                                 std::uint32_t* pitch) {
+    if (va == 0) return false;
+    std::uint64_t packed = 0;
+    bool found = false;
+    for (const DisplayBuffer& b : g_display_bufs) {
+        const std::uint64_t v = b.va.load(std::memory_order_acquire);
+        if (!v) break;
+        if (v == va) {
+            packed = b.attr.load(std::memory_order_acquire);
+            found = true;
+            break;
+        }
+    }
+    if (!found) { packed = g_last_display_attr.load(std::memory_order_acquire); }
+    if (format) *format = static_cast<std::uint32_t>(packed >> 32);
+    if (tiling) *tiling = static_cast<std::uint32_t>((packed >> 24) & 0xffu);
+    if (pitch) *pitch = static_cast<std::uint32_t>(packed & 0xffffffu);
+    return true;
 }
 
 GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, const void* attr) {
@@ -1038,10 +1089,15 @@ GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, con
              addrs && n > 0 ? addrs[0] : nullptr, at ? at[3] : 0, at ? at[4] : 0, at ? at[5] : 0, at ? at[0] : 0,
              at ? at[1] : 0);
     VideoPort* p = vo_get(handle);
+    // The attribute every buffer of this port shares: the format word, the
+    // tiling mode (0 is TILED) and the pitch in pixels. It is published with
+    // each address, because the presenter reads a flip by address alone.
+    const std::uint64_t packed = attr ? PackDisplayAttr(at[0], at[1], at[5])
+                                     : g_last_display_attr.load(std::memory_order_acquire);
     for (int i = 0; addrs && i < n; ++i) {
         const int idx = start + i;
         if (idx >= 0 && idx < 16) p->buffers[idx] = reinterpret_cast<std::uint64_t>(addrs[i]);
-        note_display_buffer(reinterpret_cast<std::uint64_t>(addrs[i]));
+        note_display_buffer(reinterpret_cast<std::uint64_t>(addrs[i]), packed);
     }
     if (attr) {
         const auto* a = static_cast<const unsigned*>(attr);
@@ -1137,8 +1193,8 @@ void hle_video_set_picture(unsigned w, unsigned h) {
 
 std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
 bool hle_video_is_display_buffer(std::uint64_t va) {
-    for (const std::atomic<std::uint64_t>& b : g_display_bufs) {
-        const std::uint64_t v = b.load(std::memory_order_acquire);
+    for (const DisplayBuffer& b : g_display_bufs) {
+        const std::uint64_t v = b.va.load(std::memory_order_acquire);
         if (!v) return false;
         if (v == va) return true;
     }
