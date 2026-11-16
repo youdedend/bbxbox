@@ -66,6 +66,10 @@ jobs:
   console:
     name: UWP build + import audit
     runs-on: windows-2025
+    # The rolling release step creates a tag and a prerelease; nothing else in
+    # this workflow writes to the repository.
+    permissions:
+      contents: write
     env:
       # ccache would otherwise keep its cache under %LOCALAPPDATA%, outside the
       # path the cache steps above save and restore.
@@ -271,3 +275,40 @@ jobs:
             build/xbox/**/bbxbox.map
             build/xbox/**/bbxbox.pdb
           if-no-files-found: error
+
+      - name: rolling Xbox release
+        # One direct download link for the box: the appx, its certificate and the
+        # Dependencies folder the title's CRT needs, in one zip, on a tag that says
+        # which build it is. Prerelease, because nothing here is a boot.
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $tag = "Xbox-Pre-release-$(Get-Date -Format yyyyMMdd)-$sha"
+          $zip = "build/bbxbox-XboxSeriesXS-UWP.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path build/appx/* -DestinationPath $zip -CompressionLevel Optimal
+          $body = @"
+          Unsigned-trust UWP build of bbxbox for Xbox Series X|S, made from ${{ github.sha }}.
+
+          **Install the Microsoft.VCLibs.140.00.UWPDesktop framework package first**
+          (it is in `Dependencies/` inside the zip, and the app will not launch without
+          it). Then install `bbxbox.appx` after trusting `bbxbox.cer` in the console's
+          Device Portal, as the README's sideloading section describes.
+
+          This is a prerelease: it packages the port, and it does not claim the game
+          boots. The build's own gates are in the run that produced it.
+          "@
+          gh release create $tag $zip --prerelease --title $tag --notes $body
+          # Rolling: the previous builds go, so the tag list is one link and not a
+          # museum. Only this repository's own pre-release tags are pruned.
+          $old = gh release list --limit 100 --json tagName,isPrerelease |
+            ConvertFrom-Json |
+            Where-Object { $_.isPrerelease -and $_.tagName -like 'Xbox-Pre-release-*' -and $_.tagName -ne $tag }
+          foreach ($r in $old) {
+            Write-Output "pruning $($r.tagName)"
+            gh release delete $r.tagName --yes --cleanup-tag
+          }
+          Write-Output "::notice title=xbox release::$tag"

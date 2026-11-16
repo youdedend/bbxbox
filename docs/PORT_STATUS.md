@@ -279,6 +279,16 @@ turn into real bindings.
 Every dispatch that cannot run says so once by key, with the reason in the log
 (`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
+## Downloads
+
+Every push to the active branch publishes one rolling prerelease:
+`Xbox-Pre-release-<yyyyMMdd>-<shorthash>`, with a single asset
+`bbxbox-XboxSeriesXS-UWP.zip` (the appx, its certificate, and the `Dependencies/`
+folder). The Microsoft.VCLibs UWPDesktop framework package in that folder must be
+installed first or the app will not launch; the previous build's tag is deleted
+when a new one is made, so there is one link and not a museum. It is a prerelease:
+it packages the port and claims no boot.
+
 ## Verified on hardware (inherited, and what it changes here)
 
 | Hardware fact | Source | Enforced in this tree |
