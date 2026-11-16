@@ -261,12 +261,18 @@ packages contains the guest runtime:
   `host_render_worker_jobs`. Those are link-time statements about archive
   members, and they exist only if the archives are on the line.
 * **The binary said so, in size.** `bbxbox.exe` is 5,218,304 B in that run
-  (pdb 36,286,464 B, `.appx` 2,468,130 B), against 4,451,328–4,467,200 B in the
+  (pdb 36,286,464 B, `.appx` 2,468,134 B), against 4,451,328–4,467,200 B in the
   four green runs from before the guest link landed: ~750 KB of guest, host
-  layer and `hle`. The `.map`/`.pdb` from that run could not be downloaded here
-  (the artifact blob URL answers `EOF`), which is why the claim rests on the
-  configure defaults, the build succeeding and the size — and why the map is now
-  produced and checked in the run itself instead of being inspected afterwards.
+  layer and `hle`. The `.map`/`.pdb` from *that* run could not be downloaded here
+  (the artifact blob URL answers `EOF`), so at that point the claim rested on the
+  configure defaults, the build succeeding and the size.
+* **The map says so now, per archive.** Run `43861803683` (`6797e7b`) produced
+  `bbxbox.map` (4,510,484 B) and reported its own account of the link as an
+  annotation: **11,948 symbols came out of `bbhost_guest`**, 2,225 out of
+  `bbhost_host`, 4,951 out of `bbhost_engine`, with `load_orbis_elf` and
+  `register_hle` among them and the loader's `eboot sha256` text in the exe. That
+  is direct evidence, in the run, instead of an inference from a size delta — and
+  it is the evidence a later artifact download cannot take away.
 
 Two changes hold that in place, so the claim cannot quietly stop being true:
 
@@ -274,7 +280,8 @@ Two changes hold that in place, so the claim cannot quietly stop being true:
   `xbox/scripts/package.ps1` already copied beside the `.appx` and the workflow
   already uploaded is actually generated. Before this, every green run warned
   `no bbxbox.map under build: a crash report from the console cannot be
-  symbolised` — a real gap in first-console debugging, not a cosmetic one.
+  symbolised` — a real gap in first-console debugging, not a cosmetic one, and
+  the warning is gone from the run now.
 * The workflow's `guest link evidence` step fails the run unless the cache has
   `BBX_GUEST_LINK:BOOL=ON`, the Ninja link line names all four archives,
   `bbxbox.exe` contains the guest loader's own `eboot sha256` literal, the map
