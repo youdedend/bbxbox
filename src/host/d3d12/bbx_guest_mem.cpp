@@ -225,7 +225,6 @@ namespace bbx::d3d12 {
 
 namespace {
 
-constexpr std::uint32_t kDescriptorCount = GuestMemory::kDescriptorCount;  // the page table's SRV, then a UAV per slab
 constexpr std::uint64_t kGuardBytes = kPageBytes;
 // host_gpu_mem_write's documented ceiling (host/gpu.h): one upload at a time.
 constexpr std::uint64_t kStagingBytes = 64ull << 10;
@@ -328,13 +327,13 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     // the one copy that publishes them are two heaps, not one.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = kDescriptorCount;
+    heap_desc.NumDescriptors = GuestMemory::kDescriptorCount;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(heap_.GetAddressOf())))) return Status::kOutOfMemory;
     // Where those descriptors are published: the device's one shader-visible
     // CBV/SRV/UAV heap, at the offset the arena reserved for space 3.
     if (device.CbvSrvUavHeap() == nullptr) return Status::kInvalidArgument;
-    if (visible_base + kDescriptorCount > Device::kCbvSrvUavDescriptors) return Status::kInvalidArgument;
+    if (visible_base + GuestMemory::kDescriptorCount > Device::kCbvSrvUavDescriptors) return Status::kInvalidArgument;
     visible_base_ = visible_base;
     visible_stride_ = device.CbvSrvUavStride();
     slab_uav_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -359,7 +358,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     // slab starts as. A slab that turns resident later copies its own slot
     // again (EnsureSlab), so the shader-visible table always names the buffer
     // the table's entry implies.
-    device_->CopyDescriptorsSimple(kDescriptorCount, VisibleCpu(0), page_table_srv_,
+    device_->CopyDescriptorsSimple(GuestMemory::kDescriptorCount, VisibleCpu(0), page_table_srv_,
                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // The copy that fills the page table, and the fence value that says it is

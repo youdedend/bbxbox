@@ -1051,4 +1051,5 @@ struct ID3DBlob : IUnknown {
 
 struct DECLSPEC_UUID("c079a9e4-0e4a-4d8b-9f0f-1fd2f6b8a3a1") ID3D12RootSignature : ID3D12DeviceChild {};
 struct DECLSPEC_UUID("765a30f3-f624-4c6f-a828-ace948622445") ID3D12PipelineState : ID3D12Pageable {};
-struct ID3D12CommandSignature : ID3D12Pageable {};
+struct DECLSPEC_UUID("c36a797c-ec80-4f0a-8985-a7b2475082d1") ID3D12CommandSignature
+    : ID3D12Pageable {};
