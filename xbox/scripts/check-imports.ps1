@@ -192,7 +192,7 @@ $importLogDir = Split-Path $PackageDir -Parent
 foreach ($name in $watched) {
     $path = Join-Path $PackageDir $name
     if (-not (Test-Path $path)) {
-        Write-Host "imports $name: not in the package"
+        Write-Host "imports ${name}: not in the package"
         continue
     }
     $table = @(& $Dumpbin /nologo /imports $path 2>&1)
@@ -203,9 +203,9 @@ foreach ($name in $watched) {
         Sort-Object -Unique)
     $text = ($modules -join ", ")
     if ($text.Length -gt 3500) { $text = $text.Substring(0, 3500) + " ..." }
-    Write-Host "imports $name ($($modules.Count) modules): $text"
+    Write-Host "imports ${name} ($($modules.Count) modules): $text"
     if ($env:GITHUB_ACTIONS -eq 'true') {
-        Write-Output "::notice title=imports $name::$($text -replace '%', '%25')"
+        Write-Output "::notice title=imports ${name}::$($text -replace '%', '%25')"
     }
 }
 
