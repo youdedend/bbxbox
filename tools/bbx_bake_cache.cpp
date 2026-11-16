@@ -629,13 +629,16 @@ struct Compiled {
     std::uint64_t program_hash = 0;
     std::vector<std::uint8_t> object;  // the signed DXBC container
     std::string reason;                // why not, when object is empty
+    std::string source;                // the console's HLSL
     bool lifted = false;
+    bool hlsl_ok = false;
+    bool lifted_only = false;          // stopped before DXC: no compiler in hand
 };
 
 // One key: the full translation, the lift, the console's HLSL, and DXC. The
 // module is the lift's when the lift takes the program and the translator's
 // SPIR-V otherwise - the same choice host/render.cpp makes.
-Compiled Build(const Program& program, const Compiler& compiler) {
+Compiled Build(const Program& program, const Compiler* compiler) {
     Compiled out;
     out.key = program.key;
     out.stage = program.stage;
@@ -674,9 +677,17 @@ Compiled Build(const Program& program, const Compiler& compiler) {
         out.reason = "hlsl: needs " + hlsl.arguments.front();
         return out;
     }
+    // The half the launcher repeats: stage facts, translation, lift and the
+    // console's HLSL, with no compiler in hand. What is left is DXC.
+    out.source = hlsl.source;
+    out.hlsl_ok = true;
+    if (compiler == nullptr) {
+        out.lifted_only = true;
+        return out;
+    }
     std::vector<std::uint8_t> object;
     std::string why;
-    if (!compiler.Compile(program.stage, hlsl.source, object, why)) {
+    if (!compiler->Compile(program.stage, hlsl.source, object, why)) {
         out.reason = "dxc: " + why.substr(0, why.find('\n'));
         return out;
     }
@@ -879,31 +890,170 @@ void SyntheticObject(const std::string& source, std::vector<std::uint8_t>& out) 
     std::memcpy(out.data() + 24, "DXIL", 4);
 }
 
-int SelfTest() {
-    // The file's plumbing without a dump, a compiler or game data: keys, the
-    // entries, the zlib blobs, the stamp beside them, and the read-back.
-    std::vector<Compiled> compiled;
-    for (int k = 0; k < 12; ++k) {
-        ConsoleStageKey key;
-        key.stage = (k % 3) == 0 ? Stage::kVertex : (k % 3) == 1 ? Stage::kPixel : Stage::kCompute;
-        key.rsrc1 = static_cast<std::uint32_t>(k);
-        const std::vector<std::uint32_t> words = {0xbf810000u, static_cast<std::uint32_t>(k)};
-        Compiled c;
-        c.key = ConsoleStageKeyOf(words, key);
-        c.stage = key.stage;
-        c.program_hash = bbx::Fnv1a64(static_cast<std::uint32_t>(k));
-        SyntheticObject("synthetic " + std::to_string(k), c.object);
-        compiled.push_back(std::move(c));
+// A container around `words`, laid out as the game's are: the 'Shdr' file
+// header, the console stage header (RSRC1, RSRC2, the mask or the thread
+// counts), the code, and the 'OrbShdr' footer whose 24-bit length is the code's.
+// It reads through gcn::shader_code and ReadConsoleContainerStage the way a
+// container from a .shaderbnd.dcx does, which is the point: the self-test's
+// input has the same shape as the bake's, and its key is the draw's key.
+struct ContainerRegs {
+    std::uint32_t rsrc1 = 0;
+    std::uint32_t rsrc2 = 0;
+    std::uint32_t mask = 0;  // PS: SPI_PS_INPUT_ENA, VS: PA_CL_VS_OUT_CNTL
+    std::uint32_t threads[3] = {8, 8, 1};
+    std::uint32_t footer = 0;  // the ShaderBinaryInfo hash, unique per container
+};
+
+std::vector<std::uint8_t> ConsoleContainer(std::uint8_t type, const std::vector<std::uint32_t>& words,
+                                           const ContainerRegs& regs) {
+    const std::size_t header_dw = 0x20;  // the stage header: registers, then the tables
+    const std::size_t code_at = 16 + header_dw * 4;
+    const std::size_t footer_at = code_at + words.size() * 4;
+    std::vector<std::uint8_t> c(footer_at + 32, 0);
+    const auto put = [&c](std::size_t at, std::uint32_t v) { std::memcpy(c.data() + at, &v, 4); };
+    std::memcpy(c.data(), "Shdr", 4);
+    c[4] = 1;  // major
+    c[6] = 1;  // minor
+    c[8] = type;
+    c[9] = static_cast<std::uint8_t>(header_dw);
+    const std::size_t base = 16;  // the sixteen register words start here
+    put(base + 16, regs.rsrc1);  // regs[4]
+    put(base + 20, regs.rsrc2);  // regs[5]
+    if (type == 4) {
+        put(base + 24, regs.threads[0]);  // regs[6..8]: COMPUTE_NUM_THREAD_X/Y/Z
+        put(base + 28, regs.threads[1]);
+        put(base + 32, regs.threads[2]);
+    } else {
+        put(base + 32, regs.mask);  // regs[8]
+        // No declared inputs: the trivial program reads none, and the tables
+        // past the registers stay empty (usage count 0).
+        c[base + (type == 2 ? 0x38 : 0x24)] = 0;
     }
-    // One duplicate key on purpose: the file must hold it once.
-    compiled.push_back(compiled.front());
-    Options options;
-    options.out = (fs::temp_directory_path() / "bbx_bake_cache_selftest").string();
+    for (std::size_t k = 0; k < words.size(); ++k) put(code_at + 4 * k, words[k]);
+    std::memcpy(c.data() + footer_at, "OrbShdr", 7);
+    c[footer_at + 7] = 0;  // version
+    put(footer_at + 8, static_cast<std::uint32_t>(words.size() * 4) << 8);  // flags:8 | length:24
+    put(footer_at + 16, regs.footer);
+    return c;
+}
+
+// The pipeline the bake runs, on containers it reads the way it reads a bundle's:
+// stage facts, the key, translation, lift, the console's HLSL, and - when a
+// compiler is in hand - DXC, the signature gate, and the file. `--dxc` makes the
+// last part real; without one the run stops at the HLSL and the file's plumbing
+// is exercised with blobs that only look like DXIL, in a temporary directory.
+int SelfTest(const Options& options) {
+    struct Case {
+        const char* name;
+        std::uint8_t type;  // ShaderFileHeader type: 1 VS, 2 PS, 4 CS
+        std::vector<std::uint32_t> words;
+        ContainerRegs regs;
+        Stage stage;
+    };
+    std::vector<Case> cases = {
+        // A vertex shader: four moves into v0..v3 (the position) and the end.
+        {"vs_pos", 1, {0x7e000280u, 0x7e020281u, 0x7e040282u, 0x7e060283u, 0xbf810000u}, {0x2c008u, 0x10u, 0x104u, {}, 0x56313031u}, Stage::kVertex},
+        // A pixel shader: a colour in v0, exp mrt0 and the end.
+        {"ps_mrt0", 2, {0x7e000280u, 0xf800080fu, 0x00000000u, 0xbf810000u}, {0u, 0xc0u, 3u, {}, 0x50533031u}, Stage::kPixel},
+        // A compute shader: the end is the whole program, which is also the
+        // program that says the least about its stage's params.
+        {"cs_end", 4, {0xbf810000u}, {0xa1u, 0xc0u, 0u, {8, 8, 1}, 0x43533031u}, Stage::kCompute},
+    };
+    std::printf("bbx_bake_cache: self-test, %zu console container(s)\n", cases.size());
+    Compiler compiler;
+    bool have_compiler = false;
+    if (!options.dxc.empty()) {
+        std::string error;
+        if (!compiler.Load(options.dxc, options.dxil, error)) {
+            std::fprintf(stderr, "bbx_bake_cache: %s\n", error.c_str());
+            return 1;
+        }
+        have_compiler = true;
+    }
+    std::vector<Compiled> compiled;
+    int failures = 0;
+    for (const Case& c : cases) {
+        Item item;
+        item.name = c.name;
+        item.type = c.type;
+        item.container = ConsoleContainer(c.type, c.words, c.regs);
+        item.source = "self-test";
+        const Analysed analysed = Analyse(item);
+        if (!analysed.ok) {
+            std::fprintf(stderr, "  FAIL %-8s analyse: %s\n", c.name, analysed.reason.c_str());
+            ++failures;
+            continue;
+        }
+        if (analysed.program.stage != c.stage) {
+            std::fprintf(stderr, "  FAIL %-8s stage %d, not %d\n", c.name, static_cast<int>(analysed.program.stage),
+                         static_cast<int>(c.stage));
+            ++failures;
+            continue;
+        }
+        // The same container twice is the same key: that is what the .cache's
+        // directory promises a launcher.
+        const Analysed again = Analyse(item);
+        if (!again.ok || again.program.key != analysed.program.key) {
+            std::fprintf(stderr, "  FAIL %-8s key is not stable\n", c.name);
+            ++failures;
+            continue;
+        }
+        Compiled built = Build(analysed.program, have_compiler ? &compiler : nullptr);
+        if (!built.hlsl_ok) {
+            std::fprintf(stderr, "  FAIL %-8s %s\n", c.name, built.reason.c_str());
+            ++failures;
+            continue;
+        }
+        // Every stage's params_t starts with the page table's u64, which the
+        // console's dialect writes as the two dwords it is: no 64-bit integer
+        // capability, and no address the shader reads.
+        if (built.source.find("uint64_t") != std::string::npos) {
+            std::fprintf(stderr, "  FAIL %-8s the HLSL still names a uint64_t\n", c.name);
+            ++failures;
+            continue;
+        }
+        if (built.source.find("[[vk::") != std::string::npos) {
+            std::fprintf(stderr, "  FAIL %-8s the HLSL carries a [[vk::...]] attribute\n", c.name);
+            ++failures;
+            continue;
+        }
+        std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s\n", c.name,
+                    static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
+                    built.source.size(), built.object.size(), built.object.empty() ? "unsigned (no compiler)" : "signed");
+        if (have_compiler) {
+            if (built.object.empty()) {
+                ++failures;  // Build already said why
+                continue;
+            }
+            compiled.push_back(std::move(built));
+        }
+    }
+    if (failures != 0) {
+        std::fprintf(stderr, "bbx_bake_cache: self-test FAIL (%d of %zu containers)\n", failures, cases.size());
+        return 1;
+    }
+    if (compiled.empty()) {
+        // No compiler: the file's plumbing on blobs shaped like DXC's, so the
+        // serialisation, the stamp, the zlib and the look-up are still walked.
+        for (int k = 0; k < 3; ++k) {
+            Compiled c;
+            c.key = ConsoleStageKeyOf(cases[k].words, ConsoleStageKey{});
+            c.stage = cases[k].stage;
+            c.program_hash = bbx::Fnv1a64(static_cast<std::uint32_t>(k));
+            SyntheticObject(cases[k].name, c.object);
+            compiled.push_back(std::move(c));
+        }
+        std::printf("  (no --dxc: the cache leg runs on blobs shaped like DXC's)\n");
+    }
+    Options finish = options;
+    finish.out = (fs::temp_directory_path() / "bbx_bake_cache_selftest").string();
     std::error_code ec;
-    fs::create_directories(options.out, ec);
-    const int result = Finish(compiled, options, "self-test", {});
-    fs::remove_all(options.out, ec);
-    std::printf("bbx_bake_cache: self-test %s (synthetic blobs, temporary directory, removed)\n", result == 0 ? "PASS" : "FAIL");
+    fs::create_directories(finish.out, ec);
+    const std::string version = have_compiler ? compiler.version() : "none";
+    const int result = Finish(compiled, finish, version, {});
+    fs::remove_all(finish.out, ec);
+    std::printf("bbx_bake_cache: self-test %s (%s, temporary directory, removed)\n", result == 0 ? "PASS" : "FAIL",
+                have_compiler ? version.c_str() : "no compiler: HLSL only");
     return result;
 }
 
@@ -946,7 +1096,9 @@ void Usage() {
         "  --jobs <n>       threads (default: the machine's)\n"
         "  --limit <n>      stop after n containers (to try one bundle first)\n"
         "  --check-compiler compile one trivial ps_6_4 and report whether it signed\n"
-        "  --self-test      the cache write/read-back over synthetic blobs; no dump\n"
+        "  --self-test      three console containers (VS, PS, CS) through the\n"
+        "                   pipeline and the file; no dump. With --dxc the blobs\n"
+        "                   must be signed, so the run exercises the whole thing\n"
         "  --help           this text\n");
 }
 
@@ -993,7 +1145,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (options.self_test) return SelfTest();
+    if (options.self_test) return SelfTest(options);
     if (options.check_compiler) {
         if (options.dxc.empty()) {
             std::fprintf(stderr, "bbx_bake_cache: --check-compiler needs --dxc\n");
@@ -1093,7 +1245,7 @@ int main(int argc, char** argv) {
     std::vector<Compiled> compiled(unique.size());
     done = 0;
     Parallel(options.jobs, unique.size(), [&](std::size_t i) {
-        compiled[i] = Build(unique[i], compiler);
+        compiled[i] = Build(unique[i], &compiler);
         const std::size_t n = done.fetch_add(1) + 1;
         if (n % 100 == 0) std::fprintf(stderr, "  compiled %zu/%zu\r", n, unique.size());
     });

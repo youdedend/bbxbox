@@ -92,6 +92,10 @@ UntilePlan PlanUntile(FormatInfo format, Tiling tiling, std::uint32_t width, std
         plan.reason = "empty extent";
         return plan;
     }
+    // The destination's rows are the texture copy's rows: D3D12's pitch, which
+    // is also the stride UntileCs stores a row at.
+    plan.dst_row_pitch =
+        static_cast<std::uint32_t>(AlignUp(static_cast<std::uint64_t>(width) * format.bytes_per_block, 256));
     if (tiling == Tiling::kLinear) {
         // Nothing to detile: the copy queue does it, and a plan with no
         // dispatch means exactly that.

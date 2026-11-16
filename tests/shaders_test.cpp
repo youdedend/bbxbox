@@ -192,7 +192,103 @@ std::vector<std::uint32_t> FragmentFixture(const std::vector<std::uint32_t>& blo
     return m;
 }
 
+// A pixel shader whose block starts with a 64-bit member - every stage's
+// StageParams does, as u64 l1_table - and which either reads that member or does
+// not. `read_wide`: the program loads it and uses it, which is what the console's
+// page-table walk does (Slice 5); otherwise nothing touches it.
+std::vector<std::uint32_t> WideBlockFixture(bool read_wide) {
+    std::vector<std::uint32_t> m = {0x07230203u, 0x00010600u, 0u, 400u, 0u};
+    const auto op = [&m](std::uint32_t code, const std::vector<std::uint32_t>& ops) {
+        m.push_back((static_cast<std::uint32_t>(ops.size() + 1) << 16) | code);
+        for (const std::uint32_t o : ops) m.push_back(o);
+    };
+    const std::uint32_t kVoid = 1, kFunc = 2, kFloat = 3, kVec4 = 4, kBlock = 11, kPtrBlock = 12, kUint = 16, kZero = 17,
+                       kU64 = 20, kPtrU64 = 21, kOut = 30, kPtrOut = 31, kPtrVec = 32;
+    const std::uint32_t vBlock = 22, vOut = 23, fMain = 24, lbl = 25, kOne = 26;
+    const std::uint32_t tBlock = 34, tPtr = 35, tWide = 36, tU32 = 37, tF32 = 38;
+
+    op(17, {1});                                        // OpCapability Shader
+    op(17, {11});                                       // OpCapability Int64
+    op(14, {0, 1});                                     // OpMemoryModel Logical GLSL450
+    op(15, {4, fMain, 0x6e69616du, 0u, vBlock, vOut});   // OpEntryPoint Fragment "main"
+    op(16, {fMain, 7});                                 // OpExecutionMode OriginUpperLeft
+    op(71, {vBlock, 34, 0});                            // DescriptorSet 0
+    op(71, {vBlock, 33, 2});                            // Binding 2
+    op(71, {vOut, kOut, 0});                            // Location 0 out
+    op(71, {kBlock, 2});                                // Block
+    op(72, {kBlock, 0, 35, 0});                         // member 0 at offset 0
+    op(72, {kBlock, 1, 35, 16});                        // member 1 at offset 16
+    op(19, {kVoid});
+    op(33, {kFunc, kVoid});
+    op(22, {kFloat, 32});
+    op(23, {kVec4, kFloat, 4});
+    op(21, {kUint, 32, 0});
+    op(21, {kU64, 64, 0});
+    op(43, {kUint, kZero, 0u});
+    op(43, {kUint, kOne, 1u});
+    op(30, {kBlock, kU64, kVec4});                      // the block: a u64, then a float4
+    op(32, {kPtrBlock, 2, kBlock});
+    op(32, {kPtrU64, 2, kU64});
+    op(32, {kPtrVec, 2, kVec4});
+    op(32, {kPtrOut, 3, kVec4});
+    op(59, {kPtrBlock, vBlock, 2});
+    op(59, {kPtrOut, vOut, 3});
+    op(54, {kVoid, fMain, 0, kFunc});
+    op(248, {lbl});
+    if (read_wide) {
+        op(65, {kPtrU64, tPtr, vBlock, kZero});          // OpAccessChain member 0
+        op(61, {kU64, tWide, tPtr});                     // OpLoad
+        op(110, {kUint, tU32, tWide});                   // OpUConvert
+        op(109, {kFloat, tF32, tU32});                   // OpConvertUToF
+        op(81, {kVec4, tBlock, tF32});                   // OpCompositeConstruct
+    } else {
+        op(65, {kPtrVec, tPtr, vBlock, kOne});           // OpAccessChain member 1
+        op(61, {kVec4, tBlock, tPtr});                   // OpLoad
+    }
+    op(62, {vOut, tBlock});
+    op(253, {});
+    op(56, {});
+    return m;
+}
+
 }  // namespace
+
+TEST(ConsoleDialectWritesA64BitBlockMemberTheShaderDoesNotReadAsTwoDwords) {
+    // Every stage's StageParams starts with u64 l1_table; u64 reserved, and a
+    // console VS or PS reads neither. DXC's "64-Bit integer" requirement is a
+    // capability the console's driver does not have, so an unread member is
+    // declared as the two dwords it is: the same eight bytes, at the same
+    // offset, inside one register.
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult unread = gcn::emit_hlsl(WideBlockFixture(false), options);
+    CHECK(unread.ok());
+    CHECK(unread.source.find("uint64_t") == std::string::npos);
+    CHECK(unread.source.find("uint2 l1_table;") != std::string::npos);
+    // The Vulkan dialect keeps the 64-bit member: there the device has Int64.
+    const gcn::HlslResult vulkan = gcn::emit_hlsl(WideBlockFixture(false), {});
+    CHECK(vulkan.ok());
+    CHECK(vulkan.source.find("uint64_t") != std::string::npos);
+    // A member the shader does read is stopped by name: as two dwords it would
+    // compute something else, and the console has no 64-bit path for it yet.
+    const gcn::HlslResult read = gcn::emit_hlsl(WideBlockFixture(true), options);
+    CHECK(!read.ok());
+    CHECK(!read.errors.empty());
+    CHECK(read.errors.front().find("64-bit block member") != std::string::npos);
+}
+
+TEST(ConsoleDialectDropsThePageTableWalkerAComputeShaderNeverCalls) {
+    // A compute lift declares xlate() whatever the program does (gcn/lift.cpp),
+    // written with the block's 64-bit head and PhysicalStorageBuffer loads:
+    // neither of which the console's dialect has. One the shader never calls is
+    // dead code and the printer drops it; the real lift's own output is what
+    // the drop is really tested on, in tools/bbx_bake_cache --self-test.
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult s = gcn::emit_hlsl(FragmentFixture({0}), options);
+    CHECK(s.ok());
+    CHECK(s.source.find("xlate") == std::string::npos);
+}
 
 TEST(ConsoleDialectHasNoVulkanAttributeAndNoShaderModel66) {
     const std::vector<std::uint32_t> module = FragmentFixture({0});

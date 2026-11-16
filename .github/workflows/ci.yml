@@ -17,7 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
-        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build ccache
+        # zstd reads conda-forge's .conda archives (tools/ci_fetch_dxc110.py).
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build ccache zstd
       - name: compiler cache -- restore
         id: ccache-restore
         uses: actions/cache/restore@v4
@@ -34,6 +35,31 @@ jobs:
         with:
           path: ~/.cache/ccache
           key: ccache-host-${{ runner.os }}-${{ github.sha }}
+
+      # The prebaked cache is worth an hour of a machine's time only if the blobs
+      # in it are signed, and signing is a property of one build of the compiler:
+      # libdxil.so must sit beside libdxcompiler.so, or DXC returns DXBC
+      # containers whose digest is zeros. So this job compiles a real vertex, a
+      # real pixel and a real compute container - the same door the bake uses -
+      # on every push, and fails if any of the three comes back unsigned.
+      - name: DXC 1.10 + spirv-tools -- cached between runs
+        id: dxc
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/dxc110
+          key: dxc110-1.10.2605.37-h60be90b_0
+      - name: DXC 1.10 + spirv-tools -- fetched when the cache misses
+        # The build is pinned in the script, with the tests that prove it: the
+        # 1.10 version string, and a signer beside the compiler.
+        run: python3 tools/ci_fetch_dxc110.py --dir "${{ runner.tool_cache }}/dxc110"
+      - name: prebake self-test on a signed compiler
+        run: |
+          set -euo pipefail
+          ./tools/build_bake_cache.sh
+          dxc="${{ runner.tool_cache }}/dxc110/lib/libdxcompiler.so"
+          dxil="${{ runner.tool_cache }}/dxc110/lib/libdxil.so"
+          ./build/bbx_bake_cache --check-compiler --dxc "$dxc" --dxil "$dxil"
+          ./build/bbx_bake_cache --self-test --dxc "$dxc" --dxil "$dxil"
 
   console:
     name: UWP build + import audit

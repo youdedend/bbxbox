@@ -2,6 +2,7 @@
 // The replay, as described in replay.h.
 #include "src/host/d3d12/replay.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -88,7 +89,7 @@ Status Replay::Create(Device& device, Swapchain& swapchain, PipelineSet& pipelin
     if (status != Status::kOk) { return status; }
     status = CreateOverlayBuffer();
     if (status != Status::kOk) { return status; }
-    status = CreateFrameImage(kFrameImageSize, kFrameImageSize);
+    status = CreateFrameImage(kFrameImageSize, kFrameImageSize, DxgiFormat::kR8G8B8A8Unorm);
     if (status != Status::kOk) { return status; }
     // A 1x1 white texture: the source for solid overlay panels, so the overlay
     // pass has one pipeline and one descriptor shape whether or not a glyph atlas
@@ -142,14 +143,17 @@ Status Replay::CreateOverlayBuffer() {
     return Status::kOk;
 }
 
-Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height) {
+Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height, DxgiFormat format) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
     desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // The guest's scanout format, as DXGI states it - B8G8R8A8 for the console's
+    // A8R8G8B8. Making the image in the memory order keeps the copy a copy: a
+    // swizzle here is where red and blue get swapped.
+    desc.Format = static_cast<DXGI_FORMAT>(format);
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -165,36 +169,65 @@ Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height) {
     }
     frame_srv_ = AllocateCbvSrvUav();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.Format = static_cast<DXGI_FORMAT>(format);
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     device_->Get()->CreateShaderResourceView(frame_image_.Get(), &srv, frame_srv_.cpu);
     frame_image_width_ = width;
     frame_image_height_ = height;
+    frame_image_format_ = format;
     return Status::kOk;
 }
 
 Status Replay::UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
+    // RGBA8, linearly: what the stream's transfers and the HLE's own frames are.
+    // A display buffer says more than that (bbx_scanout), and its describing
+    // overload is the one that has to be exactly right about the format.
+    ScanoutDesc desc;
+    desc.format = ScanoutFormat::kR8G8B8A8;
+    desc.tiling = ScanoutTiling::kLinear;
+    desc.width = width;
+    desc.height = height;
+    desc.pitch = width * 4u;
+    return UploadFrame(rgba, desc);
+}
+
+Status Replay::UploadFrame(const std::uint8_t* pixels, const ScanoutDesc& desc) {
     if (!in_frame_) { return Status::kInvalidArgument; }
-    if (rgba == nullptr || width == 0 || height == 0) { return Status::kInvalidArgument; }
-    if (!frame_image_ || frame_image_width_ != width || frame_image_height_ != height) {
-        // The guest's display changed size (or this is the first flip): the
-        // placeholder goes rather than being stretched over the frame.
+    const ScanoutState scanout = DescribeScanout(desc);
+    const std::uint32_t width = desc.width;
+    const std::uint32_t height = desc.height;
+    if (pixels == nullptr || !scanout.ok) {
+        if (!scanout.ok) { Log("replay: frame not presented: %s", scanout.reason.c_str()); }
+        return Status::kInvalidArgument;
+    }
+    if (!frame_image_ || frame_image_width_ != width || frame_image_height_ != height ||
+        frame_image_format_ != scanout.format) {
+        // The guest's display changed size or format (or this is the first
+        // flip): the old image goes rather than being stretched over the frame,
+        // or sampled in a format its bytes are not in.
         frame_image_.Reset();
-        const Status recreated = CreateFrameImage(width, height);
+        frame_srv_ = {};
+        const Status recreated = CreateFrameImage(width, height, scanout.format);
         if (recreated != Status::kOk) { return recreated; }
     }
-    // D3D12 wants the source rows on a 256-byte pitch.
-    const std::uint64_t row_bytes = static_cast<std::uint64_t>(width) * 4u;
-    const std::uint64_t pitch = (row_bytes + kTexturePitchAlign - 1) / kTexturePitchAlign * kTexturePitchAlign;
+    // D3D12 wants the source rows on a 256-byte pitch, and the guest's own rows
+    // sit at the pitch it stated (the same pitch when it stated none).
+    // A row is the guest's own pitch of pixels; the copy never reads more of a
+    // row than the image can hold.
+    const std::uint64_t row_bytes = std::min<std::uint64_t>(scanout.row_pitch, scanout.dst_row_pitch);
+    const std::uint64_t pitch = scanout.dst_row_pitch;
     const std::uint64_t bytes = pitch * height;
-    if (frame_staging_ == nullptr || frame_staging_bytes_ < bytes) {
+    // The staging buffer holds the guest's bytes whole (a tiled buffer is copied
+    // up in one run) and then the detiled rows, so it is the larger of the two.
+    const std::uint64_t staging_bytes = std::max(bytes, scanout.bytes);
+    if (frame_staging_ == nullptr || frame_staging_bytes_ < staging_bytes) {
         frame_staging_.Reset();
         frame_staging_mapped_ = nullptr;
         frame_staging_bytes_ = 0;
         const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_RESOURCE_DESC desc = BufferDesc(bytes, D3D12_RESOURCE_FLAG_NONE);
+        const D3D12_RESOURCE_DESC desc = BufferDesc(staging_bytes, D3D12_RESOURCE_FLAG_NONE);
         const HRESULT hr = device_->Get()->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             __uuidof(ID3D12Resource), reinterpret_cast<void**>(frame_staging_.GetAddressOf()));
@@ -210,12 +243,63 @@ Status Replay::UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::u
             frame_staging_mapped_ = nullptr;
             return Status::kUnavailable;
         }
-        frame_staging_bytes_ = bytes;
+        frame_staging_bytes_ = staging_bytes;
     }
     auto* rows = static_cast<std::uint8_t*>(frame_staging_mapped_);
+    if (scanout.tiled) {
+        // The guest's bytes are micro tiles, so a row copy would shear the
+        // frame. They go up whole and UntileCs linearises them into a buffer
+        // whose rows are the texture's - the copy after it is then the linear
+        // one below, from bytes instead of from the guest's memory.
+        std::memcpy(rows, pixels, static_cast<std::size_t>(std::min<std::uint64_t>(scanout.bytes, staging_bytes)));
+        if (frame_linear_ == nullptr || frame_linear_bytes_ < bytes) {
+            frame_linear_.Reset();
+            const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+            const D3D12_RESOURCE_DESC linear = BufferDesc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            const HRESULT hr = device_->Get()->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &linear, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                __uuidof(ID3D12Resource), reinterpret_cast<void**>(frame_linear_.GetAddressOf()));
+            if (FAILED(hr)) {
+                Log("replay: linear frame buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+                frame_linear_.Reset();
+                return FromHresult(hr);
+            }
+            frame_linear_bytes_ = bytes;
+        }
+        const Status untiled = DispatchUntile(scanout.plan, frame_staging_.Get(), frame_linear_.Get(), 4);
+        if (untiled != Status::kOk) {
+            Log("replay: the tiled scanout was not detiled (%s); the frame is dropped",
+                StatusName(untiled));
+            return untiled;
+        }
+        (void)TransitionBarrier(frame_linear_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION linear_source{};
+        linear_source.pResource = frame_linear_.Get();
+        linear_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        linear_source.PlacedFootprint.Offset = 0;
+        linear_source.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(scanout.format);
+        linear_source.PlacedFootprint.Footprint.Width = width;
+        linear_source.PlacedFootprint.Footprint.Height = height;
+        linear_source.PlacedFootprint.Footprint.Depth = 1;
+        linear_source.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(pitch);
+        D3D12_TEXTURE_COPY_LOCATION frame_target{};
+        frame_target.pResource = frame_image_.Get();
+        frame_target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        frame_target.SubresourceIndex = 0;
+        (void)TransitionBarrier(frame_image_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+        command_list_->CopyTextureRegion(&frame_target, 0, 0, 0, &linear_source, nullptr);
+        (void)TransitionBarrier(frame_image_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        (void)TransitionBarrier(frame_linear_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+        ++stats_.copies;
+        return Status::kOk;
+    }
     for (std::uint32_t row = 0; row < height; ++row) {
         std::memcpy(rows + static_cast<std::uint64_t>(row) * pitch,
-                    rgba + static_cast<std::uint64_t>(row) * row_bytes,
+                    pixels + static_cast<std::uint64_t>(row) * scanout.row_pitch,
                     static_cast<std::size_t>(row_bytes));
     }
 
@@ -223,7 +307,7 @@ Status Replay::UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::u
     source.pResource = frame_staging_.Get();
     source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     source.PlacedFootprint.Offset = 0;
-    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    source.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(scanout.format);
     source.PlacedFootprint.Footprint.Width = width;
     source.PlacedFootprint.Footprint.Height = height;
     source.PlacedFootprint.Footprint.Depth = 1;
@@ -636,11 +720,18 @@ Status Replay::DispatchUntile(const UntilePlan& plan, ID3D12Resource* tiled_sour
     command_list_->SetComputeRootSignature(pipelines_->RootSignature(PassKind::kUntile));
     command_list_->SetPipelineState(pso);
     for (const UntileDispatch& dispatch : plan.dispatches) {
-        // b0: tile_counts (x,y,z,0), pixels (w,h,0,0) -- the shader's own packing.
-        const std::uint32_t constants[8] = {dispatch.tiles_x, dispatch.tiles_y,
-                                            dispatch.tiles_z, bytes_per_tile,
-                                            plan.width,      plan.height,
-                                            plan.src_row_pitch, 0};
+        // b0, in untile.hlsl's own declaration order: uint2 tile_counts,
+        // uint2 pixels, uint swizzle, uint bytes_per_tile, uint src_origin,
+        // uint dst_row_pitch. The dispatch's src_offset is the only origin the
+        // shader is given - the plan already folded the tile row into it.
+        const std::uint32_t constants[8] = {dispatch.tiles_x,
+                                            dispatch.tiles_y,
+                                            plan.width,
+                                            plan.height,
+                                            static_cast<std::uint32_t>(plan.tiling),
+                                            bytes_per_tile,
+                                            static_cast<std::uint32_t>(dispatch.src_offset),
+                                            plan.dst_row_pitch};
         command_list_->SetComputeRoot32BitConstants(0, 8, constants, 0);
         // Root parameters 1 and 2 are the source and destination tables (b0 is 0).
         command_list_->SetComputeRootDescriptorTable(1, source.gpu);

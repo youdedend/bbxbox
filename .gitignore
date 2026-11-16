@@ -39,3 +39,4 @@ bbxbox.ini
 eboot.bin
 dvdroot_ps4/
 shadercache/
+__pycache__/

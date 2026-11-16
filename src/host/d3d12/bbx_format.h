@@ -80,6 +80,7 @@ enum class DxgiFormat : std::uint32_t {
     kB5G6R5Unorm = 85,
     kB5G5R5A1Unorm = 86,
     kB8G8R8A8Unorm = 87,
+    kB8G8R8A8UnormSrgb = 91,
     kB8G8R8X8Unorm = 88,
     kBc6hUf16 = 95,
     kBc6hSf16 = 96,

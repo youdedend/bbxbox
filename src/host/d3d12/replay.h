@@ -32,6 +32,7 @@
 
 #include "src/host/d3d12/bbx_d3d12.h"
 #include "src/host/d3d12/bbx_stream.h"
+#include "src/host/d3d12/bbx_scanout.h"
 #include "src/host/d3d12/bbx_untile.h"
 
 namespace bbx::d3d12 {
@@ -85,9 +86,13 @@ public:
     // that frame's command list, so the guest thread never waits on the GPU, and
     // a frame that does not fit is dropped rather than stalled. A size change
     // recreates the image (the placeholder is 256x256 until the first flip).
-    // The pixels are RGBA8; the display's own format arrives with the display
-    // HLE, which is where the guest's tiling is stated too.
+    // The pixels are RGBA8, linearly: the stream's own transfers and the HLE's
+    // own frames. A display buffer's format and tiling arrive with the display
+    // HLE (bbx_scanout), and that overload makes the image in the guest's own
+    // format - never a swizzle of it - and untiles a tiled buffer before the
+    // present pass samples it.
     Status UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height);
+    Status UploadFrame(const std::uint8_t* pixels, const ScanoutDesc& desc);
     Status DrawOverlay();
 
     // The glyph atlas is uploaded once (an R8_UNORM coverage texture).
@@ -122,7 +127,7 @@ private:
     Status CreateUploadRing();
     Status CreateOverlayBuffer();
     Status CreateWhiteTexture();
-    Status CreateFrameImage(std::uint32_t width, std::uint32_t height);
+    Status CreateFrameImage(std::uint32_t width, std::uint32_t height, DxgiFormat format);
     Status CreateSelftestResources(std::uint32_t elements);
     Status CloseAndSubmit();
     Status TransitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
@@ -143,6 +148,12 @@ private:
     // UPLOAD heap buffer, remade when the frame grows, kept out of the 4 MiB
     // per-frame ring a 1080p frame does not fit in.
     std::uint32_t frame_image_width_ = 0, frame_image_height_ = 0;
+    DxgiFormat frame_image_format_ = DxgiFormat::kUnknown;
+    // A tiled display buffer is untiled on the GPU into this buffer, and the
+    // texture copy reads it: UntileCs writes raw bytes, so the frame image's
+    // rows have to exist as bytes before they can be a texture.
+    ComPtr<ID3D12Resource> frame_linear_;
+    std::uint64_t frame_linear_bytes_ = 0;
     ComPtr<ID3D12Resource> frame_staging_;
     void* frame_staging_mapped_ = nullptr;
     std::uint64_t frame_staging_bytes_ = 0;

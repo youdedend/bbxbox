@@ -74,6 +74,9 @@ struct UntilePlan {
     DxgiFormat format = DxgiFormat::kUnknown;
     std::uint32_t width = 0, height = 0, depth = 1;
     std::uint32_t src_row_pitch = 0;  // bytes, for the tiled source's outer stride
+    // Bytes per row of the linear destination: D3D12's 256-byte pitch for a
+    // texture copy, and the stride UntileCs writes a row at.
+    std::uint32_t dst_row_pitch = 0;
     std::vector<UntileDispatch> dispatches;
 
     [[nodiscard]] std::uint32_t total_groups() const;

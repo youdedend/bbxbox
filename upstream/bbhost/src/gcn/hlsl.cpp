@@ -2932,6 +2932,58 @@ void lower_to_dxil(HlslResult& r) {
         if (r.arguments[i] == "-enable-16bit-types") r.arguments.erase(r.arguments.begin() + static_cast<std::ptrdiff_t>(i));
         else ++i;
     }
+    // A compute lift declares its page-table walker (xlate) whether or not the
+    // program walks: a dispatch's loads and stores go through it, and the lift
+    // writes it beside them (gcn/lift.cpp: declare_guest_memory). A program that
+    // never calls it needs neither the function nor what it reads - the stage
+    // block's 64-bit head, and the PhysicalStorageBuffer loads it is written
+    // with, neither of which the console's dialect has. An xlate the module
+    // never calls is therefore dropped here: it is dead code, no value the
+    // shader computes comes from it. One the module does call is left in place,
+    // and the block member it reads stops the shader by name below, because the
+    // console's own page table is a piece of work of its own (Slice 5).
+    {
+        std::size_t mentioned = 0, declared = 0;
+        std::size_t at = 0;
+        while (at < r.source.size()) {
+            const std::size_t nl = r.source.find('\n', at);
+            const std::string line = r.source.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+            if (line.find("xlate(") != std::string::npos) {
+                ++mentioned;
+                if (dxil_starts(dxil_trim(line), "uint64_t xlate(")) ++declared;
+            }
+            at = nl == std::string::npos ? r.source.size() : nl + 1;
+        }
+        // The declaration, the definition, and nothing that calls it: the two of
+        // them are dropped whole - the definition's body goes with its head, up
+        // to the closing brace in the first column.
+        if (declared == 2 && mentioned == 2) {
+            std::string kept;
+            bool inside = false;
+            for (std::size_t from = 0; from <= r.source.size();) {
+                const std::size_t nl = r.source.find('\n', from);
+                const std::size_t end = nl == std::string::npos ? r.source.size() : nl;
+                const std::string line = r.source.substr(from, end - from);
+                const std::string body = dxil_trim(line);
+                bool drop = inside;
+                if (!inside) {
+                    if (dxil_starts(body, "uint64_t xlate(")) {
+                        drop = true;
+                        inside = body.back() != ';';  // the declaration ends there; the definition does not
+                    }
+                } else if (body == "}") {
+                    inside = false;
+                }
+                if (!drop) {
+                    kept += line;
+                    if (nl != std::string::npos) kept += '\n';
+                }
+                if (nl == std::string::npos) break;
+                from = nl + 1;
+            }
+            r.source = kept;
+        }
+    }
     std::string out;
     out.reserve(r.source.size() + 2048);
     unsigned block_pos = 0;  // where DXC's layout has got to in the block being printed
@@ -3027,10 +3079,50 @@ void lower_to_dxil(HlslResult& r) {
             // register, and a member whose offset DXC cannot produce stops the
             // shader rather than being bound to the wrong register.
             const long long off = std::atoll(dxil_trim(offset).c_str());
-            const DxilLayout lay = dxil_layout(rest);
-            if (!lay.ok) {
-                stop("a block member that is not a scalar, a vector, an array or a matrix", line);
-                return;
+            // A 64-bit member makes DXC emit "shader requires additional
+            // functionality: 64-Bit integer" (the Int64ShaderOps capability) for
+            // the whole shader, and the console's driver does not have it. Every
+            // stage's StageParams block starts with two of them - u64 l1_table,
+            // u64 reserved - and a console VS or PS reads neither: the page-table
+            // walk is a compute path's (Slice 5) and the second is a debug mode's.
+            // An unread one is therefore declared as the two dwords it is: the
+            // same 8 bytes at the same offset (a uint2 packs at 4 and DXC keeps it
+            // inside one register), with nothing of 64-bit in the shader. One the
+            // shader does read stops here by name, because its arithmetic is
+            // 64-bit in the lift's module and the console has no path for it yet -
+            // bound as two dwords it would compute something else.
+            DxilLayout lay;
+            std::string member;
+            const auto tn = dxil_typed_name(rest.back() == ';' ? rest.substr(0, rest.size() - 1) : rest);
+            const bool wide = tn.first == "uint64_t" || tn.first == "int64_t";
+            if (wide) {
+                const std::string ref = "." + tn.second;
+                bool read = false;
+                for (std::size_t p = r.source.find(ref); p != std::string::npos && !read; p = r.source.find(ref, p + 1)) {
+                    const std::size_t after = p + ref.size();
+                    if (after >= r.source.size()) {
+                        read = true;
+                        break;
+                    }
+                    const char c = r.source[after];
+                    const bool ident = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+                    read = !ident;  // `.l1_table` but not `.l1_table_hi`
+                }
+                if (read) {
+                    stop("a 64-bit block member that the shader reads (the console's page-table walk is Slice 5)", line);
+                    return;
+                }
+                lay.ok = true;
+                lay.align = 4;
+                lay.size = 8;
+                member = indent + "uint2 " + tn.second + ";";
+            } else {
+                lay = dxil_layout(rest);
+                if (!lay.ok) {
+                    stop("a block member that is not a scalar, a vector, an array or a matrix", line);
+                    return;
+                }
+                member = indent + rest;
             }
             if (off < 0) {
                 stop("a block member at a negative offset", line);
@@ -3060,8 +3152,18 @@ void lower_to_dxil(HlslResult& r) {
                     block_pos += 4;
                 }
             }
+            // DXC keeps a member of more than one dword inside a single
+            // register, and moves it to the next 16-byte boundary rather than
+            // let it straddle one; a register-sized member is 16-aligned
+            // outright. An offset that would straddle is therefore one DXC's
+            // layout cannot produce, and the pad above cannot fix it.
+            if (lay.size >= 16 ? want % 16 != 0
+                               : lay.size > 4 && (want % 16) + static_cast<long long>(lay.size) > 16) {
+                stop("a block member DXC's layout would move to the next register", line);
+                return;
+            }
             block_pos += lay.size;
-            text = indent + rest;
+            text = member;
         } else if (!spec.empty()) {
             // A specialization constant is a compile-time constant here: the
             // bake compiles it at its default, and the console's root
