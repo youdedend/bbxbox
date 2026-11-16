@@ -111,6 +111,34 @@ bool GuestPageTable::MapAlias(std::uint64_t alias_va, std::uint64_t va, std::uin
     return true;
 }
 
+bool GuestPageTable::ContiguousSlab(std::uint64_t va, std::uint64_t bytes, std::uint32_t* slab,
+                                    std::uint64_t* offset) const {
+    if (slab == nullptr || offset == nullptr || bytes == 0) return false;
+    // 4-byte aligned: every view this port makes is dword addressed.
+    if ((va & 3u) != 0) return false;
+    if (va + bytes < va) return false;  // wrapped
+    const GuestSlot first = SlotAt(va);
+    if (first.guard()) return false;
+    // Walk the pages the range touches. The first page may start before `va`
+    // (a range at a page's middle), so its own offset is the page's.
+    const std::uint64_t first_page = va & ~(kPageBytes - 1);
+    std::uint64_t page = first_page;
+    std::uint64_t expected = first.offset;  // where this page starts in the slab
+    while (page < va + bytes) {
+        const GuestSlot slot = SlotAt(page);
+        if (slot.guard() || slot.slab != first.slab) return false;
+        if (slot.offset != expected) return false;  // not adjacent in the slab
+        expected += kPageBytes;
+        if (page + kPageBytes < page) return false;
+        page += kPageBytes;
+    }
+    *slab = first.slab;
+    *offset = static_cast<std::uint64_t>(first.offset) + (va - first_page);
+    // The last page's data must fit the slab too.
+    if (*offset + bytes > kGuestSlabBytes) return false;
+    return true;
+}
+
 GuestSlot GuestPageTable::SlotAt(std::uint64_t va) const {
     const auto it = tables_.find(RegionOf(va));
     if (it == tables_.end()) return GuestSlot{};

@@ -69,6 +69,8 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_guest_mem.cpp
     src/host/d3d12/bbx_guest_vsharp.cpp
     src/host/d3d12/bbx_guest_path.cpp
+    src/host/d3d12/bbx_path_table.cpp
+    src/host/d3d12/bbx_guest_binding.cpp
     src/host/d3d12/bbx_guest_root.cpp
     src/host/d3d12/bbx_psocache.cpp
     src/host/d3d12/bbx_tess.cpp
@@ -144,6 +146,8 @@ if(BBX_BUILD_TESTS)
         tests/guest_mem_test.cpp
         tests/guest_vsharp_test.cpp
         tests/guest_path_test.cpp
+        tests/path_table_test.cpp
+        tests/guest_binding_test.cpp
         tests/precompile_test.cpp
         tests/barriers_test.cpp
         tests/sfo_test.cpp

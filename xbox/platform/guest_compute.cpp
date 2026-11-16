@@ -30,13 +30,22 @@
 // own user data and leaving those zero is therefore the shader's actual contract,
 // not a placeholder.
 //
-// What is still missing on purpose (Slice 5B-2b), and counted and logged rather
-// than guessed: resolving a space-1 descriptor from the dispatch's user data
-// (which V#/T# a baked binding names is the translator's `ResourcePath`, and
-// binding a wrong buffer is worse than binding none), so the space-1 slots are
-// null descriptors today; the graphics half (`host_gpu_draw`); and the sampled
-// resources. Every dispatch this file cannot run says so once by key with the
-// reason, in host_gpu_d3d12.cpp's log and report.
+// The space-1 slots (Slice 5B-2b): a baked module's `t#`/`u#` are whatever the
+// translator made them, which this side cannot work out for itself, so the bake
+// writes the assignment beside the cache (`bbx_shaders.paths`) and step 4 binds
+// from it: for each plan, the path resolved against this dispatch's own user
+// data, the V# decided (`bbx_guest_binding.h`), and one view written into the
+// compute stage's slice of the guest arena. A binding with no plan stays a null
+// descriptor, which D3D12 defines as "nothing bound" - never a default view. Each
+// refusal (a path that does not resolve, a range the page table cannot address,
+// a range that spans two slabs) is one plain-English line naming the step, and
+// the slot it refused is left null.
+//
+// What is still missing on purpose, and counted and logged rather than guessed:
+// a read-only (`t#`) view over guest memory, which would need the slabs in a read
+// state and a transition this pass does not record yet; the graphics half
+// (`host_gpu_draw`); and the sampled resources. Every dispatch this file cannot
+// run says so once by key with the reason, in host_gpu_d3d12.cpp's log and report.
 #include "xbox/platform/guest_compute.h"
 
 #include <algorithm>
@@ -57,7 +66,9 @@
 #include "src/host/d3d12/bbx_psocache.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
 #include "src/host/d3d12/device.h"
+#include "src/host/d3d12/bbx_guest_binding.h"
 #include "src/host/d3d12/bbx_guest_path.h"
+#include "src/host/d3d12/bbx_path_table.h"
 #include "src/host/d3d12/pipeline.h"
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/log.h"
@@ -207,6 +218,15 @@ std::string Join(const std::string& dir, const char* name) {
     return bbx::hostfs::JoinPath(dir, name);
 }
 
+// The resolver's guest-memory seam (bbx_guest_path.h's ReadGuest): the port's
+// guest VAs are its own pointers (hle/kernel.cpp maps direct memory there), and a
+// range the guest has not mapped is a refusal, not a zero fill.
+bool ReadGuestMemory(void*, std::uint64_t va, void* out, std::size_t bytes) {
+    if (!hle_kernel_va_mapped(va, bytes)) return false;
+    std::memcpy(out, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
+    return true;
+}
+
 }  // namespace
 
 struct GuestCompute::Impl {
@@ -221,6 +241,17 @@ struct GuestCompute::Impl {
     ShaderCache cache;
     bool cache_tried = false;
     std::string cache_line = "shader cache: not loaded";
+
+    // The bake's binding assignment (bbx_shaders.paths), paired with the cache's
+    // stamp: it says which guest memory each of a module's t#/u# is.
+    d3d12::PathTable paths;
+    bool paths_tried = false;
+    std::string paths_line = "binding table: not loaded";
+    // Which key's plans are in the compute stage's slots right now. The region is
+    // one per stage, not one per program, so a key change has to put the previous
+    // key's writes back to null - and only once nothing is reading them.
+    std::uint64_t bound_key = 0;
+    bool bound_valid = false;
 
     std::unordered_map<std::uint64_t, Program> programs;              // code VA -> program
     std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>,
@@ -246,6 +277,147 @@ struct GuestCompute::Impl {
     ComPtr<ID3D12CommandSignature> indirect;
 
     Counts counts;
+
+    // --- the space-1 slots (5B-2b) ------------------------------------------------
+    // The compute stage's 191 descriptors in the device's one shader-visible
+    // CBV/SRV/UAV heap: b1..b63 at kCbvOffset, t0..t63 at kSrvOffset, u0..u63 at
+    // kUavOffset (bbx_guest_root.h's GuestHeapLayout). Slot indices here are
+    // relative to the stage's region, which is what GuestHeapSlotFor answers.
+    D3D12_CPU_DESCRIPTOR_HANDLE SlotHandleAt(std::uint32_t absolute) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = device->CbvSrvUavHeap()->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(absolute) * cbv_stride;
+        return handle;
+    }
+    // The compute stage's slice of the arena, as a slot index inside it.
+    D3D12_CPU_DESCRIPTOR_HANDLE SlotHandle(std::uint32_t slot) const {
+        return SlotHandleAt(arena_base + GuestHeapLayout::StageRegion(2) + slot);
+    }
+
+    // A null CBV/SRV/UAV: D3D12 reads such a descriptor as "nothing bound", which
+    // is a defined zero for every load a shader makes through it. `slot` is the
+    // stage-relative index the layout's ranges are counted in.
+    void WriteNullSlotAt(std::uint32_t absolute, std::uint32_t slot) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE handle = SlotHandleAt(absolute);
+        if (slot >= GuestHeapLayout::kUavOffset) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = DXGI_FORMAT_R32_UINT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer.NumElements = 0;
+            device->Get()->CreateUnorderedAccessView(nullptr, nullptr, &uav, handle);
+        } else if (slot >= GuestHeapLayout::kCbvOffset && slot < GuestHeapLayout::kSrvOffset) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+            cbv.BufferLocation = 0;
+            cbv.SizeInBytes = 0;
+            device->Get()->CreateConstantBufferView(&cbv, handle);
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R32_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.NumElements = 0;
+            device->Get()->CreateShaderResourceView(nullptr, &srv, handle);
+        }
+    }
+
+    void WriteNullSlot(std::uint32_t slot) {
+        WriteNullSlotAt(arena_base + GuestHeapLayout::StageRegion(2) + slot, slot);
+    }
+
+    void WriteNullRegion() {
+        for (std::uint32_t slot = 0; slot < GuestHeapLayout::kSpace1Count; ++slot) WriteNullSlot(slot);
+    }
+
+    // One buffer view over the slab a plan resolved to: the resource is the slab
+    // itself (never a copy, so a store lands in the guest's own memory), and the
+    // view names the range inside it - offset in dwords, length in dwords.
+    bool WriteBufferUav(std::uint32_t slot, const d3d12::BindingWrite& write) {
+        if (memory->EnsureSlab(write.slab) != d3d12::Status::kOk) return false;
+        ID3D12Resource* slab = memory->SlabBuffer(write.slab);
+        if (slab == nullptr) return false;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R32_UINT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav.Buffer.FirstElement = write.offset / 4;
+        uav.Buffer.NumElements = write.dwords;
+        uav.Buffer.StructureByteStride = 0;
+        uav.Buffer.CounterOffsetInBytes = 0;
+        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        device->Get()->CreateUnorderedAccessView(slab, nullptr, &uav, SlotHandle(slot));
+        return true;
+    }
+
+    // The plans for `key`, written into this stage's slots. Called before the
+    // command list that reads them, and - when another key's plans are in place -
+    // after the device is idle, because a submission still reading the previous
+    // key's descriptors is a race the API would not report.
+    void BindResources(std::uint64_t key, const GpuDispatch& d) {
+        if (paths.status() != d3d12::PathTableStatus::kOk) return;
+        if (bound_valid && bound_key == key) return;
+        if (bound_valid) {
+            (void)device->WaitIdle();
+            WriteNullRegion();
+            bound_valid = false;
+        }
+        std::uint32_t written = 0, refused = 0, nulls = 0, planned = 0;
+        std::string line;
+        for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
+            const d3d12::BindingPlan* plan = paths.Find(key, binding);
+            if (plan == nullptr) continue;
+            ++planned;
+            d3d12::GuestHeapSlot slot{};
+            const d3d12::GuestRangeKind kind =
+                plan->kind == d3d12::BindingKind::kUav ? d3d12::GuestRangeKind::kUav : d3d12::GuestRangeKind::kSrv;
+            if (!d3d12::GuestHeapSlotFor(GuestStage::kCompute, kind, binding, d3d12::kGuestParamsSpace, &slot)) {
+                ++refused;
+                line += " " + std::to_string(binding) + ": the root signature has no space-1 slot for it";
+                continue;
+            }
+            const d3d12::BindingWrite write =
+                d3d12::DecideBindingWrite(*plan, d.user_data, memory->Table(), ReadGuestMemory, nullptr);
+            switch (write.verdict) {
+            case d3d12::BindingVerdict::kNull:
+                ++nulls;  // the null descriptor is the right answer, and it is already there
+                break;
+            case d3d12::BindingVerdict::kWrite:
+                if (write.kind != d3d12::BindingKind::kUav) {
+                    // A t# over guest memory is a read of a resource the same
+                    // program writes through the space-3 slabs; the state and the
+                    // transition for that are not recorded yet, so the slot stays
+                    // null rather than being read in a state nobody proved.
+                    ++refused;
+                    line += " " + d3d12::BindingWriteLine(write) +
+                            " refused (a read-only view over guest memory needs a state this pass does not record)";
+                    break;
+                }
+                if (!WriteBufferUav(slot.index, write)) {
+                    ++refused;
+                    line += " " + d3d12::BindingWriteLine(write) + " refused (the slab is not resident)";
+                    break;
+                }
+                ++written;
+                line += " " + d3d12::BindingWriteLine(write);
+                break;
+            default:
+                ++refused;
+                line += " " + d3d12::BindingWriteLine(write);
+                break;
+            }
+        }
+        counts.bindings_written += written;
+        counts.bindings_refused += refused;
+        counts.bindings_null += nulls;
+        bound_key = key;
+        bound_valid = planned != 0;
+        if (planned != 0) {
+            std::string text = "guest compute: key ";
+            char head[48];
+            std::snprintf(head, sizeof(head), "%016llx: %u plan(s), %u slot(s) written, %u null, %u refused",
+                          static_cast<unsigned long long>(key), planned, written, nulls, refused);
+            text += head;
+            text += line;
+            LogMessage(refused != 0 ? Level::kWarn : Level::kInfo, "%s", text.c_str());
+        }
+    }
 
     // --- cache -------------------------------------------------------------------
     void LoadCache() {
@@ -319,6 +491,56 @@ struct GuestCompute::Impl {
                        d3d12::CacheStatusName(status));
         }
     }
+
+    // The bake's binding assignment, from the file beside the cache and paired
+    // with it: a table whose stamp is not this cache's is refused whole. Said
+    // once, at load, because it is a property of the dump and not of a dispatch.
+    void LoadPaths() {
+        if (paths_tried) return;
+        paths_tried = true;
+        if (cache.status() != d3d12::CacheStatus::kOk) {
+            paths_line = "binding table: not read (the shader cache did not validate)";
+            return;
+        }
+        const char* root = hle_fs_data_root();
+        const std::string dir = root != nullptr ? root : "";
+        if (dir.empty()) {
+            paths_line = "binding table: no data root yet; no space-1 descriptor is bound until the dump is mounted";
+            return;
+        }
+        const std::string path = Join(dir, "bbx_shaders.paths");
+        bbx::hostfs::FileStat stat{};
+        if (!bbx::hostfs::Exists(path) || !bbx::hostfs::Stat(path, &stat) || stat.size == 0 ||
+            stat.size > (1u << 20)) {
+            paths_line = "binding table: " + path +
+                         " is missing or implausible; every space-1 slot stays a null descriptor (rerun the bake)";
+            LogMessage(Level::kWarn, "guest compute: %s", paths_line.c_str());
+            return;
+        }
+        std::string text(static_cast<std::size_t>(stat.size), '\0');
+        const int handle = bbx::hostfs::Open(path, bbx::hostfs::kRead);
+        if (handle < 0) {
+            paths_line = "binding table: " + path + " would not open";
+            LogMessage(Level::kError, "guest compute: %s", paths_line.c_str());
+            return;
+        }
+        std::size_t read = 0;
+        while (read < text.size()) {
+            const std::int64_t got = bbx::hostfs::Read(handle, text.data() + read, text.size() - read);
+            if (got <= 0) break;
+            read += static_cast<std::size_t>(got);
+        }
+        (void)bbx::hostfs::Close(handle);
+        text.resize(read);
+        const d3d12::PathTableStatus status = paths.Load(text, cache.stamp_digest());
+        paths_line = "binding table: " + path + ", " + paths.Report();
+        if (status == d3d12::PathTableStatus::kOk) {
+            LogMessage(Level::kInfo, "guest compute: %s", paths_line.c_str());
+        } else {
+            LogMessage(Level::kError, "guest compute: %s (%s): no space-1 descriptor is bound from it",
+                       paths_line.c_str(), d3d12::PathTableStatusName(status));
+        }
+    }
 };
 
 GuestCompute::GuestCompute() : impl_(std::make_unique<Impl>()) {}
@@ -347,33 +569,9 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
     // bbx_guest_root.h's rule 4: these are written straight into the device's one
     // shader-visible heap, because a view created there is legal and a copy from
     // a shader-visible heap is not.
-    D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
-    null_srv.Format = DXGI_FORMAT_R32_UINT;
-    null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    null_srv.Buffer.NumElements = 0;  // D3D12 reads a null resource as null when the format is given
-    D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
-    null_uav.Format = DXGI_FORMAT_R32_UINT;
-    null_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    null_uav.Buffer.NumElements = 0;
     for (std::uint32_t stage = 0; stage < GuestHeapLayout::kStageRegions; ++stage) {
         const std::uint32_t base = impl.arena_base + GuestHeapLayout::StageRegion(stage);
-        for (std::uint32_t i = 0; i < GuestHeapLayout::kSpace1Count; ++i) {
-            D3D12_CPU_DESCRIPTOR_HANDLE handle = device.CbvSrvUavHeap()->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += static_cast<SIZE_T>(base + i) * impl.cbv_stride;
-            if (i >= GuestHeapLayout::kUavOffset) {
-                device.Get()->CreateUnorderedAccessView(nullptr, nullptr, &null_uav, handle);
-            } else if (i >= GuestHeapLayout::kCbvOffset && i < GuestHeapLayout::kSrvOffset) {
-                // b1..b63 are constant buffers: a null CBV is a view with no
-                // address, which the shader reads as zeroes.
-                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
-                cbv.BufferLocation = 0;
-                cbv.SizeInBytes = 0;
-                device.Get()->CreateConstantBufferView(&cbv, handle);
-            } else {
-                device.Get()->CreateShaderResourceView(nullptr, &null_srv, handle);
-            }
-        }
+        for (std::uint32_t i = 0; i < GuestHeapLayout::kSpace1Count; ++i) impl.WriteNullSlotAt(base + i, i);
     }
     // s0..s63 in the sampler heap: one linear-clamp sampler repeated. A shader
     // that samples before 5B-2b binds its S# gets a defined filter rather than a
@@ -445,6 +643,10 @@ void GuestCompute::Destroy() {
     impl.indirect.Reset();
     impl.programs.clear();
     impl.keys.clear();
+    impl.paths = d3d12::PathTable{};
+    impl.paths_tried = false;
+    impl.bound_key = 0;
+    impl.bound_valid = false;
     impl.device = nullptr;
     impl.pipelines = nullptr;
     impl.memory = nullptr;
@@ -457,6 +659,7 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     if (impl_ == nullptr || !Ready()) return 0;
     Impl& impl = *impl_;
     impl.LoadCache();
+    impl.LoadPaths();
     const auto id = std::make_tuple(d.code_va, d.rsrc1, d.rsrc2, d.threads[0], d.threads[1], d.threads[2]);
     if (const auto it = impl.keys.find(id); it != impl.keys.end()) return it->second;
 
@@ -509,6 +712,27 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     }
     const std::uint64_t built = d3d12::ConsoleStageKeyOf(program->second.words, key);
     impl.keys.emplace(id, built);
+    // What the bake assigned this key, said once and next to the table line it
+    // belongs with: a program that reads a resource table and a key the bake gave
+    // no binding to is the one case where a dispatch runs with every t#/u# null,
+    // and it has to be a line in the log rather than a silent zero.
+    std::uint32_t plans = 0;
+    for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
+        if (impl.paths.Find(built, binding) != nullptr) ++plans;
+    }
+    const Program& decoded = program->second;
+    if (impl.paths.status() == d3d12::PathTableStatus::kOk) {
+        if (plans == 0 && !decoded.table_reads_dw.empty()) {
+            ++impl.counts.keys_without_plans;
+            LogMessage(Level::kWarn,
+                       "guest compute: key %016llx (%s): the program reads %zu dword(s) through its resource table "
+                       "and the bake recorded no space-1 binding for it, so every t#/u# stays a null descriptor",
+                       static_cast<unsigned long long>(built), decoded.name.c_str(), decoded.table_reads_dw.size());
+        } else {
+            LogMessage(Level::kInfo, "guest compute: key %016llx (%s): %u space-1 binding plan(s) from the bake",
+                       static_cast<unsigned long long>(built), decoded.name.c_str(), plans);
+        }
+    }
     return built;
 }
 
@@ -516,6 +740,7 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     if (impl_ == nullptr || !Ready() || impl_->device == nullptr) return false;
     Impl& impl = *impl_;
     impl.LoadCache();
+    impl.LoadPaths();
     ++impl.clock;
     if (impl.cache.status() != d3d12::CacheStatus::kOk) {
         ++impl.counts.no_cache;
@@ -586,6 +811,11 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     if (d.gds_base != 0) {
         std::memcpy(params + 88, &d.gds_base, sizeof(d.gds_base));
     }
+
+    // The space-1 slots, from the bake's plans for this key (5B-2b): before the
+    // list that reads them, and never mid-flight - BindResources waits when
+    // another key's descriptors are still in the region.
+    impl.BindResources(key, d);
 
     // Record it.
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -676,7 +906,8 @@ std::string GuestCompute::Report() const {
     char line[512];
     std::snprintf(line, sizeof(line),
                   "guest compute: %llu dispatch(es) run, %llu indirect, %llu cache miss, %llu no cache, "
-                  "%llu bad program, %llu bad blob, %llu bad PSO, %llu evicted, %llu record failure(s)",
+                  "%llu bad program, %llu bad blob, %llu bad PSO, %llu evicted, %llu record failure(s), "
+                  "%llu space-1 slot(s) written, %llu refused, %llu null, %llu key(s) without plans",
                   static_cast<unsigned long long>(impl.counts.ran),
                   static_cast<unsigned long long>(impl.counts.indirect),
                   static_cast<unsigned long long>(impl.counts.miss),
@@ -685,8 +916,12 @@ std::string GuestCompute::Report() const {
                   static_cast<unsigned long long>(impl.counts.bad_blob),
                   static_cast<unsigned long long>(impl.counts.bad_pso),
                   static_cast<unsigned long long>(impl.counts.evicted),
-                  static_cast<unsigned long long>(impl.counts.record_failed));
-    return impl.cache_line + "\n" + line;
+                  static_cast<unsigned long long>(impl.counts.record_failed),
+                  static_cast<unsigned long long>(impl.counts.bindings_written),
+                  static_cast<unsigned long long>(impl.counts.bindings_refused),
+                  static_cast<unsigned long long>(impl.counts.bindings_null),
+                  static_cast<unsigned long long>(impl.counts.keys_without_plans));
+    return impl.cache_line + "\n" + impl.paths_line + "\n" + line;
 }
 
 void GuestCompute::OnFrame(std::uint64_t completed) {

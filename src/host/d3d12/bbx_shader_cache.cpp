@@ -15,8 +15,10 @@ CacheStatus ShaderCache::Load(std::span<const std::uint8_t> cache, std::string_v
     // A file without its sidecar has no second half, so it is refused rather
     // than trusted on its own word.
     const CacheStamp recorded = CacheStamp::Parse(stamp_text);
+    stamp_digest_ = StampDigest{};
     parsed_ = ParseCache(file_, ExpectedConsoleStamp(recorded));
     if (parsed_.status != CacheStatus::kOk) return parsed_.status;
+    stamp_digest_ = ExpectedConsoleStamp(recorded).Digest();
     index_.reserve(parsed_.entries.size());
     for (std::uint32_t i = 0; i < parsed_.entries.size(); ++i) index_.emplace(parsed_.entries[i].key, i);
     return parsed_.status;

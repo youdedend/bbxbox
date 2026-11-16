@@ -41,6 +41,10 @@ public:
         std::uint64_t no_indirect = 0;    // an indirect dispatch with args that cannot be reached
         std::uint64_t record_failed = 0;  // a command list that would not record
         std::uint64_t uav_barriers = 0;   // one after every dispatch
+        std::uint64_t bindings_written = 0;   // space-1 slots written from the bake's plans
+        std::uint64_t bindings_refused = 0;   // plans this pass would not bind (the slot stays null)
+        std::uint64_t bindings_null = 0;      // plans that named a null V#: the null descriptor is right
+        std::uint64_t keys_without_plans = 0; // keys that read a table the bake assigned nothing to
     };
 
     GuestCompute();

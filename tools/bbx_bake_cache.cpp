@@ -87,6 +87,7 @@
 #include "host/shader_patch.h"
 #include "host/d3d12/bbx_cache.h"
 #include "host/d3d12/bbx_common.h"
+#include "host/d3d12/bbx_path_table.h"
 #include "host/d3d12/bbx_shader_cache.h"
 #include "src/host/core/bbx_self.h"
 
@@ -680,6 +681,16 @@ Analysed Analyse(const Item& item) {
 
 struct Compiled {
     std::uint64_t key = 0;
+    // The bindings the baked module declares in space 1, as the console has to
+    // bind them (`bbx_shaders.paths`). A plan is recorded only when the port can
+    // make a descriptor of it: a buffer the translator tracked by its address
+    // rather than by a V# has no length, so it is counted here and left out,
+    // which is the conservative answer - the console then reads "no plan" for
+    // that slot instead of a view of whatever the address pointed at.
+    std::vector<bbx::d3d12::BindingPlan> bindings;
+    std::uint32_t pointer_bindings = 0;
+    std::uint32_t image_bindings = 0;
+    std::uint32_t sampler_bindings = 0;
     Stage stage = Stage::kPixel;
     std::uint64_t program_hash = 0;
     std::vector<std::uint8_t> object;  // the signed DXBC container
@@ -708,6 +719,30 @@ Compiled Build(const Program& program, const Compiler* compiler) {
     if (!translated.errors.empty()) {
         out.reason = "translation: " + translated.errors.front();
         return out;
+    }
+    // What the module binds in space 1. `buffers` is the translator's list of
+    // storage-buffer bindings; the console's fixed choices keep constant buffers
+    // constant (ConsoleStageOptions::kCbSsbo = false), so for a compute-ish
+    // program it is empty today - the file says so per key rather than leaving
+    // the reader to wonder, and the writer is the same either way.
+    out.image_bindings = static_cast<std::uint32_t>(translated.images.size());
+    out.sampler_bindings = static_cast<std::uint32_t>(translated.samplers.size());
+    for (const gcn::BufferBinding& buffer : translated.buffers) {
+        if (buffer.pointer) {
+            ++out.pointer_bindings;
+            continue;
+        }
+        bbx::d3d12::BindingPlan plan;
+        plan.binding = buffer.binding;
+        plan.kind = buffer.written ? bbx::d3d12::BindingKind::kUav : bbx::d3d12::BindingKind::kSrv;
+        plan.path.user_sgpr = buffer.path.user_sgpr;
+        plan.path.final_offset_dw = buffer.path.final_offset_dw;
+        plan.path.final_vsharp = buffer.path.final_vsharp;
+        plan.path.immediate = buffer.path.immediate;
+        for (const gcn::ResourceStep& step : buffer.path.loads) {
+            plan.path.loads.push_back(bbx::d3d12::PathStep{step.offset_dw, step.vsharp});
+        }
+        out.bindings.push_back(std::move(plan));
     }
     gcn::LiftResult lifted;
     switch (program.stage) {
@@ -853,6 +888,11 @@ int Finish(const std::vector<Compiled>& compiled, const Options& options, const 
     }
     std::vector<CacheEntry> entries;
     std::vector<std::uint8_t> blobs;
+    // The second artefact: the binding plans, as the console reads them
+    // (`bbx_shaders.paths`). Filled in the same pass, so a key that reaches the
+    // cache has its plans and a key that does not has neither.
+    std::string bindings_text;
+    std::size_t planned = 0;
     entries.reserve(compiled.size());
     std::size_t raw_bytes = 0, repeated_keys = 0;
     std::unordered_map<std::uint64_t, bool> once;
@@ -883,6 +923,18 @@ int Finish(const std::vector<Compiled>& compiled, const Options& options, const 
         entries.push_back(entry);
         blobs.insert(blobs.end(), packed.begin(), packed.end());
         raw_bytes += c.object.size();
+        char note[224] = {};
+        std::snprintf(note, sizeof(note),
+                      "# key %016llx stage %u: %zu buffer binding(s) recorded, %u not (an address, not a V#), "
+                      "%u image(s), %u sampler(s)\n",
+                      static_cast<unsigned long long>(c.key), static_cast<unsigned>(c.stage), c.bindings.size(),
+                      c.pointer_bindings, c.image_bindings, c.sampler_bindings);
+        bindings_text += note;
+        for (const bbx::d3d12::BindingPlan& plan : c.bindings) {
+            bindings_text += bbx::d3d12::PathTable::FormatBinding(c.key, static_cast<std::uint32_t>(c.stage), plan);
+            bindings_text += '\n';
+        }
+        planned += c.bindings.size();
     }
     if (entries.empty()) {
         std::fprintf(stderr, "bbx_bake_cache: nothing was signed, so there is no cache to write\n");
@@ -912,6 +964,25 @@ int Finish(const std::vector<Compiled>& compiled, const Options& options, const 
         }
         std::fclose(s);
     }
+    // The binding table beside the cache, header and stamp first: the console
+    // refuses a table whose stamp is not the cache's, so the two are one artefact.
+    const std::string paths_path = (fs::path(options.out) / "bbx_shaders.paths").string();
+    const std::string paths_text = std::string(bbx::d3d12::PathTable::HeaderLine()) + "\n" +
+                                   bbx::d3d12::PathTable::FormatStamp(stamp.Digest()) + "\n" + bindings_text;
+    {
+        std::FILE* f = std::fopen(paths_path.c_str(), "wb");
+        if (!f || std::fwrite(paths_text.data(), 1, paths_text.size(), f) != paths_text.size()) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "bbx_bake_cache: cannot write %s\n", paths_path.c_str());
+            return 1;
+        }
+        std::fclose(f);
+    }
+    // And read it back the way the console does: a table that does not load, or
+    // that lost a binding on the way, is not a bake.
+    bbx::d3d12::PathTable read_back;
+    const bbx::d3d12::PathTableStatus table_status = read_back.Load(paths_text, stamp.Digest());
+
     // Read back what was written, the way the launcher will: the file's own
     // bytes and its sidecar through ShaderCache::Load, then every key looked up
     // and inflated to the size and digest the directory claims.
@@ -941,6 +1012,13 @@ int Finish(const std::vector<Compiled>& compiled, const Options& options, const 
     std::printf("  %s: load %s (%s); look-up %zu/%zu\n", cache_path.c_str(), bbx::d3d12::CacheStatusName(status),
                 cache.Report().c_str(), round_trip, entries.size());
     std::printf("  %s: %s\n", stamp_path.c_str(), FirstLine(stamp.Serialize()).c_str());
+    std::printf("  %s: %s; %zu plan(s) read back of %zu written\n", paths_path.c_str(), read_back.Report().c_str(),
+                read_back.bindings(), planned);
+    if (table_status != bbx::d3d12::PathTableStatus::kOk || read_back.bindings() != planned) {
+        std::fprintf(stderr, "bbx_bake_cache: the binding table did not read back: %s (%zu of %zu plans)\n",
+                     read_back.Report().c_str(), read_back.bindings(), planned);
+        return 1;
+    }
     if (status != bbx::d3d12::CacheStatus::kOk || bad_round_trip != 0 || round_trip != entries.size()) {
         std::fprintf(stderr, "bbx_bake_cache: the cache did not read back: %zu of %zu entries, %zu bad (%s)\n", round_trip,
                      entries.size(), bad_round_trip, bbx::d3d12::CacheStatusName(status));

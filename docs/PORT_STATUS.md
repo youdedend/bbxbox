@@ -226,11 +226,37 @@ because the bake has the translator's assignment and the console does not. The
 round trip is tested by resolving the parsed plan and comparing the address and the
 words with the original's.
 
-What is left of 5B-2b: the bake's binding assignment. The port now knows where the
-table is and which entries the program reads; which `tN`/`uN` the baked HLSL
-declared for each entry is the translator's assignment and has to come out of the
-bake (it has it), not out of an offset-to-slot guess — so the space-1 slots are
-still null descriptors, and still counted.
+**The bake's binding assignment is now an artefact, and the console binds from it
+(5B-2b step 2).** `tools/bbx_bake_cache.cpp` writes `bbx_shaders.paths` beside the
+cache: `# bbx_shaders.paths v1`, then the cache's own stamp, then one line per
+binding (`bind <key> <stage> <t#/u#> <srv|uav> user=…;imm=…;fin=…;finv=…;loads=…` —
+the committed `SerializePath` spelling) and a comment per key carrying the counts
+the console cannot see (buffer bindings recorded, addresses left out because a
+pointer has no length, images, samplers). `src/host/d3d12/bbx_path_table.{h,cpp}`
+is the reader, and it is the trust boundary: a table whose stamp is not the
+cache's is refused whole, and so is a line this format did not write, an unknown
+record kind, a binding outside `t0..t63`, a bad path, or the same binding twice —
+eight `tests/path_table_test.cpp` cases, because one accepted wrong plan binds
+another buffer's bytes and no frame explains it. `bbx_guest_binding.{h,cpp}` turns
+a plan into a descriptor in three steps that each refuse by name — the path
+resolved against *this dispatch's* user data, the V# decided (`DecideSlot`), the
+range inside one slab (`ContiguousSlab`, because one D3D12 buffer view names one
+resource) — and `tests/guest_binding_test.cpp` pins all nine verdicts including
+the two-slab range and the unaligned V#. `platform/guest_compute.cpp` loads the
+table with the cache, and per key change (waiting for the device first: the region
+is one per stage, so the previous key's writes go back to null) writes a UAV view
+per planned binding into the compute stage's slots, logging one line per key with
+what was written and what was refused; a slot with no plan stays a null
+descriptor, never a default view.
+
+Two honest limits of that step, both logged rather than hidden: the console's
+fixed choices keep constant buffers constant (`ConsoleStageOptions::kCbSsbo`), so
+the translator declares no storage-buffer binding today and the file records zero
+buffer bindings per key — the counts in its comments say so — and a read-only
+(`t#`) view over guest memory is refused by name, because the slabs would need a
+read state and a transition this pass does not record yet. Both are what the
+graphics half (vertex fetch, tbuffer loads) and the sampled-resource half will
+turn into real bindings.
 Every dispatch that cannot run says so once by key, with the reason in the log
 (`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
@@ -384,7 +410,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **272 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **296 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

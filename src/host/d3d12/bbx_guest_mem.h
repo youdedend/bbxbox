@@ -122,6 +122,15 @@ public:
     // The entry the shader reads for `va` (the guard page when unmapped). The
     // region index is clamped exactly as the shader clamps it.
     [[nodiscard]] GuestSlot SlotAt(std::uint64_t va) const;
+
+    // One guest range that a single D3D12 buffer view can describe: the slab it
+    // lives in and its byte offset there. False when the range is not mapped, is
+    // empty, or spans two slabs or two pages that are not adjacent in one slab -
+    // a view can only name one resource, and binding the wrong one is the failure
+    // this whole path exists to avoid. `offset` is the byte offset of `va`
+    // inside `slab`.
+    [[nodiscard]] bool ContiguousSlab(std::uint64_t va, std::uint64_t bytes, std::uint32_t* slab,
+                                      std::uint64_t* offset) const;
     [[nodiscard]] bool IsMapped(std::uint64_t va) const;
     [[nodiscard]] bool RegionMapped(std::uint32_t region) const;
 

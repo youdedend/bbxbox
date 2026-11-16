@@ -46,6 +46,10 @@ public:
     [[nodiscard]] std::size_t entries() const { return parsed_.entries.size(); }
     [[nodiscard]] std::size_t bytes() const { return file_.size(); }
     [[nodiscard]] CacheStatus status() const { return parsed_.status; }
+    // The stamp the last Load validated against (zeroed when it did not): the
+    // binding table beside the cache has to carry the same one, because a table
+    // from another bake names another build's bindings.
+    [[nodiscard]] StampDigest stamp_digest() const { return stamp_digest_; }
     [[nodiscard]] const std::string& detail() const { return parsed_.detail; }
 
     // "ok: 25711 entries, 41.2 MiB" or "stamp mismatch: ...": the one line the
@@ -54,6 +58,7 @@ public:
 
 private:
     std::vector<std::uint8_t> file_;
+    StampDigest stamp_digest_{};
     ParseResult parsed_;
     std::unordered_map<std::uint64_t, std::uint32_t> index_;  // interface hash -> entry
 };

@@ -361,3 +361,82 @@ TEST(GuestRoot_RefusesABindingItDoesNotCarry) {
     CHECK(!GuestBinding(layout, GuestRangeKind::kUav, kGuestSlabRegister, kGuestSpace + 1, &slot));
     CHECK(layout.Describe().find("space 3") != std::string::npos);
 }
+
+// ---- one range, one view ----------------------------------------------------
+//
+// A D3D12 buffer view names one resource, so a guest range a shader reads through
+// one descriptor has to live in one slab, contiguous. These cases decide when a
+// binding may be written at all; the wrong answer binds another buffer's bytes.
+
+namespace {
+constexpr std::uint64_t kWindowBase = 0;
+}  // namespace
+
+TEST(GuestMem_OnePageIsOneSlabRange) {
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, kPageBytes, 0));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(table.ContiguousSlab(kWindowBase, 16, &slab, &offset));
+    CHECK_EQ(slab, kGuestFirstDataSlab);
+    CHECK_EQ(offset, 0ull);
+}
+
+TEST(GuestMem_APageMidRangeStartsAtItsOwnOffset) {
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, kPageBytes, 0));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(table.ContiguousSlab(kWindowBase + 0x100, 0x200, &slab, &offset));
+    CHECK_EQ(offset, 0x100ull);
+}
+
+TEST(GuestMem_AdjacentPagesInOneSlabAreOneRange) {
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, 4 * kPageBytes, 0));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(table.ContiguousSlab(kWindowBase + kPageBytes, 2 * kPageBytes, &slab, &offset));
+    CHECK_EQ(slab, kGuestFirstDataSlab);
+    CHECK_EQ(offset, kPageBytes);
+}
+
+TEST(GuestMem_ARangeThatSpansTwoSlabsIsRefused) {
+    // Two separate mappings: the second range starts a new slab.
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, kPageBytes, 0));
+    CHECK(table.MapLinear(kWindowBase + kPageBytes, kPageBytes, kSlabPages));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(!table.ContiguousSlab(kWindowBase, 2 * kPageBytes, &slab, &offset));
+}
+
+TEST(GuestMem_ARangeThatStraddlesPagesOutOfOrderIsRefused) {
+    // The second VA maps the *first* slab's page 0 again: adjacent in the guest's
+    // address space, not adjacent in the slab.
+    GuestPageTable table;
+    CHECK(table.MapRange(kWindowBase, kPageBytes, kGuestFirstDataSlab, 0));
+    CHECK(table.MapRange(kWindowBase + kPageBytes, kPageBytes, kGuestFirstDataSlab, 0));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(!table.ContiguousSlab(kWindowBase, 2 * kPageBytes, &slab, &offset));
+}
+
+TEST(GuestMem_UnmappedAndEmptyRangesAreRefused) {
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, kPageBytes, 0));
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(!table.ContiguousSlab(kWindowBase, 0, &slab, &offset));            // empty
+    CHECK(!table.ContiguousSlab(kWindowBase + kPageBytes, 16, &slab, &offset));  // unmapped: the guard
+    CHECK(!table.ContiguousSlab(kWindowBase + 2, 16, &slab, &offset));       // unaligned
+}
+
+TEST(GuestMem_ARangeThatRunsPastTheSlabIsRefused) {
+    GuestPageTable table;
+    CHECK(table.MapLinear(kWindowBase, kPageBytes, kSlabPages - 1));  // the last page of a slab
+    std::uint32_t slab = 0;
+    std::uint64_t offset = 0;
+    CHECK(table.ContiguousSlab(kWindowBase, 16, &slab, &offset));  // fits
+    CHECK(!table.ContiguousSlab(kWindowBase, kPageBytes + 16, &slab, &offset));
+}

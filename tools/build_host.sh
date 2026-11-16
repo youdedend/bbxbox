@@ -30,6 +30,8 @@ sources=(
   "$root"/src/host/d3d12/bbx_guest_mem.cpp
   "$root"/src/host/d3d12/bbx_guest_vsharp.cpp
   "$root"/src/host/d3d12/bbx_guest_path.cpp
+  "$root"/src/host/d3d12/bbx_path_table.cpp
+  "$root"/src/host/d3d12/bbx_guest_binding.cpp
   "$root"/src/host/d3d12/bbx_guest_root.cpp
   "$root"/xbox/platform/dump.cpp
   "$root"/xbox/platform/ini_file.cpp
@@ -53,6 +55,8 @@ sources=(
   "$root"/tests/guest_mem_test.cpp
   "$root"/tests/guest_vsharp_test.cpp
   "$root"/tests/guest_path_test.cpp
+  "$root"/tests/path_table_test.cpp
+  "$root"/tests/guest_binding_test.cpp
   "$root"/tests/precompile_test.cpp
   "$root"/tests/barriers_test.cpp
   "$root"/tests/sfo_test.cpp
