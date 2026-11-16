@@ -805,7 +805,8 @@ bool hle_kernel_set_dmem_size(std::uint64_t bytes) {
 void* hle_kernel_dmem_mirror() {
     if (!ensure_dmem_backing()) return nullptr;
 #if defined(BBX_UWP)
-    void* p = MapViewOfFileFromApp(g_dmem_map, FILE_MAP_ALL_ACCESS, 0, static_cast<std::size_t>(g_dmem_size));
+    void* p = nullptr;  // PROBE: is this call the exe's MapViewOfFile import?
+    (void)MapViewOfFileFromApp;
     if (!p) host_log("dmem mirror view failed: error %lu", GetLastError());
     return p;
 #elif defined(_WIN32)
