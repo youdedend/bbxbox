@@ -14,6 +14,7 @@
 #include "src/host/d3d12/replay.h"
 #include "src/host/d3d12/swapchain.h"
 #include "xbox/platform/bbhost_bridge.h"
+#include "xbox/platform/guest_frames.h"
 #include "xbox/platform/log.h"
 
 namespace bbx::platform {
@@ -90,6 +91,19 @@ const GpuReport& D3d12Session::Report() const {
     return impl_ != nullptr ? impl_->report : kMissing;
 }
 
+namespace {
+
+// The session host_present hands frames to: the window's, which is the only one
+// the swapchain belongs to. Null while no device is up, which is what the seam
+// treats as "drop the frame".
+D3d12Session* g_frame_target = nullptr;
+
+void TakeGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
+    if (g_frame_target != nullptr) { g_frame_target->SubmitGuestFrame(rgba, width, height); }
+}
+
+}  // namespace
+
 bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t window_width,
                                         std::uint32_t window_height, bool debug_layer) {
     if (impl_ == nullptr) { return d3d12::Status::kUnavailable; }
@@ -147,6 +161,10 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     }
 
     impl.ready = true;
+    // The guest's flips find this session from now on (guest_frames.h): the
+    // swapchain is up, so a frame handed over has somewhere to go.
+    g_frame_target = this;
+    SetGuestFrameSink(&TakeGuestFrame);
     impl.hud.Resize(static_cast<float>(impl.swapchain.Width()),
                     static_cast<float>(impl.swapchain.Height()));
     impl.FillReport();
@@ -319,6 +337,11 @@ bbx::d3d12::Status D3d12Session::OnModeChanged(std::uint32_t window_width,
 
 void D3d12Session::Destroy() {
     if (impl_ == nullptr) { return; }
+    // The guest's flips go back to being dropped: the swapchain is going away.
+    if (g_frame_target == this) {
+        g_frame_target = nullptr;
+        SetGuestFrameSink(nullptr);
+    }
     impl_->ready = false;
     impl_->replay.Destroy();
     impl_->pipelines.Destroy();

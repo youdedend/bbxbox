@@ -369,9 +369,6 @@ bool InitSdl() {
         const bbx::d3d12::Status status = g_session.gpu->Create(window_abi, window_width,
                                                                window_height, false);
         if (status == bbx::d3d12::Status::kOk) {
-            // The guest's flips reach this session: host_present hands it the
-            // scanout buffer, and Present uploads it beneath the HUD.
-            bbx::bridge::AttachFrameSink(g_session.gpu.get());
             const bbx::platform::GpuReport& report = g_session.gpu->Report();
             bbx::platform::LogF("d3d12: %s, %s, self-test %s", report.adapter.c_str(),
                                 report.swapchain.c_str(), report.selftest.c_str());

@@ -51,7 +51,7 @@
 #include "xbox/platform/hostfs_extra.h"
 #include "xbox/platform/storage.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
-#include "xbox/platform/d3d12_session.h"
+#include "xbox/platform/guest_frames.h"
 #include "xbox/platform/bbhost_bridge.h"
 
 // The guest runtime. `main.cpp` is not compiled on this target - it opens a
@@ -81,10 +81,6 @@ namespace {
 // pad the launcher draws with can never be two different controllers.
 SDL_Gamepad* g_pad = nullptr;
 std::uint64_t g_flips = 0;
-// The window's session, set once by the launcher: null until the device is up,
-// and read from the guest's thread on every flip. It has to be declared here,
-// above host_present, which is the only reader.
-std::atomic<bbx::platform::D3d12Session*> g_frame_sink{nullptr};
 
 }  // namespace
 
@@ -191,8 +187,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     if ((g_flips % 60) == 1) {
         bbx::platform::LogCrumb("gpu:flip");
     }
-    bbx::platform::D3d12Session* const session = g_frame_sink.load(std::memory_order_acquire);
-    if (session == nullptr || display_va == 0 || display_w == 0 || display_h == 0) { return; }
+    if (display_va == 0 || display_w == 0 || display_h == 0) { return; }
     // The scanout buffer, as this process can read it: the guest arena is mapped
     // in-process, so a guest virtual address is a pointer here - once the range is
     // known to be inside the image. sceVideoOutRegisterBuffers can be handed an
@@ -201,7 +196,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     const std::uint64_t bytes = static_cast<std::uint64_t>(display_w) * static_cast<std::uint64_t>(display_h) * 4u;
     const std::uint8_t* pixels = nullptr;
     if (!GuestScanoutPixels(display_va, bytes, &pixels)) { return; }
-    session->SubmitGuestFrame(pixels, display_w, display_h);
+    bbx::platform::SubmitGuestFrame(pixels, display_w, display_h);
 }
 
 // The launcher owns the window: there is nothing here to pump, nothing to
@@ -863,8 +858,6 @@ bool StartGuest(const GuestRequest& req) {
     return true;
 }
 
-void AttachFrameSink(bbx::platform::D3d12Session* session) { g_frame_sink.store(session, std::memory_order_release); }
-
 std::string ShaderCacheLine() { return g_shader_cache.Report(); }
 
 bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
@@ -892,7 +885,6 @@ bool StartGuest(const GuestRequest& req) {
     return false;
 }
 bool Running() { return false; }
-void AttachFrameSink(bbx::platform::D3d12Session* session) { (void)session; }
 std::string ShaderCacheLine() { return "no cache: the guest runtime is not linked into this build"; }
 bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
                        std::uint32_t* raw_size) {
