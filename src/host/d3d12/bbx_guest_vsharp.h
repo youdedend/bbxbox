@@ -91,6 +91,9 @@ struct SlotReport {
     std::uint32_t outside_guest = 0;
     std::uint32_t empty_range = 0;
     std::uint32_t unaligned = 0;
+    // A slot the table did not have the words for. Its own counter, because it
+    // is a fact about the *read*, not about the descriptor.
+    std::uint32_t unread = 0;
 
     void Count(const SlotDecision& decision);
     [[nodiscard]] std::uint32_t slots() const;
@@ -98,5 +101,16 @@ struct SlotReport {
     // reviewer can check against the dump without a device.
     [[nodiscard]] std::string Line() const;
 };
+
+// A whole table, decided. `words` is the resource table as the guest's memory
+// holds it: `slots` V#s of four dwords each, in slot order. `word_count` is what
+// the read actually produced, and it is a parameter rather than an assumption:
+// a table the dispatch names but the guest has not written (or a length that
+// disagrees with the shader's declared count) leaves slots *unread*, and an
+// unread slot is refused, never bound from whatever followed in memory. That is
+// the one place where being short has to be loud.
+[[nodiscard]] SlotReport DecideTable(const std::uint32_t* words, std::uint32_t word_count,
+                                     std::uint32_t slots,
+                                     std::uint64_t base_limit = kGuestWindowBytes);
 
 }  // namespace bbx::d3d12

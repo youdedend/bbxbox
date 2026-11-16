@@ -77,6 +77,22 @@ SlotDecision DecideSlot(const std::uint32_t words[4], std::uint64_t base_limit) 
     return decision;
 }
 
+SlotReport DecideTable(const std::uint32_t* words, std::uint32_t word_count, std::uint32_t slots,
+                       std::uint64_t base_limit) {
+    SlotReport report;
+    const std::uint32_t readable = words == nullptr ? 0 : word_count / 4;
+    for (std::uint32_t slot = 0; slot < slots; ++slot) {
+        if (slot >= readable) {
+            // Not a null V#: nothing was read, so nothing may be bound, and the
+            // difference has to survive into the log.
+            ++report.unread;
+            continue;
+        }
+        report.Count(DecideSlot(words + static_cast<std::size_t>(slot) * 4, base_limit));
+    }
+    return report;
+}
+
 void SlotReport::Count(const SlotDecision& decision) {
     switch (decision.verdict) {
         case SlotVerdict::kBindable: ++bindable; break;
@@ -89,12 +105,17 @@ void SlotReport::Count(const SlotDecision& decision) {
 }
 
 std::uint32_t SlotReport::slots() const {
-    return bindable + empty + crosses_region + outside_guest + empty_range + unaligned;
+    return bindable + empty + crosses_region + outside_guest + empty_range + unaligned + unread;
 }
 
 std::string SlotReport::Line() const {
     const std::uint32_t refused = crosses_region + outside_guest + empty_range + unaligned;
     char line[192] = {};
+    if (unread != 0) {
+        std::snprintf(line, sizeof(line), "%u bindable, %u null, %u refused, %u unread (the table is shorter than the shader's count)",
+                      bindable, empty, refused, unread);
+        return line;
+    }
     if (refused == 0) {
         std::snprintf(line, sizeof(line), "%u bindable, %u null, none refused", bindable, empty);
     } else {

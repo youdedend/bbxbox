@@ -183,3 +183,45 @@ TEST(GuestVSharp_ACleanReportSaysNothingWasRefused) {
     const std::string line = report.Line();
     CHECK(line.find("none refused") != std::string::npos);
 }
+
+TEST(GuestVSharp_TableShorterThanTheDeclaredCountRefusesTheRest) {
+    // A table the guest wrote 3 slots into, a shader that declares 5: the two
+    // missing slots must be "unread", never whatever the bytes after the table
+    // happen to hold.
+    std::uint32_t words[3 * 4] = {};
+    for (int slot = 0; slot < 3; ++slot) {
+        MakeVSharp(words + slot * 4, 0x4000'0000ull + static_cast<std::uint64_t>(slot) * 0x1000, 4, 64);
+    }
+    const SlotReport report = DecideTable(words, 3 * 4, 5);
+    CHECK_EQ(report.bindable, 3u);
+    CHECK_EQ(report.unread, 2u);
+    CHECK_EQ(report.slots(), 5u);
+    CHECK(report.Line().find("2 unread") != std::string::npos);
+}
+
+TEST(GuestVSharp_NoTableAtAllIsEverySlotUnread) {
+    const SlotReport report = DecideTable(nullptr, 0, 4);
+    CHECK_EQ(report.unread, 4u);
+    CHECK_EQ(report.bindable, 0u);
+    CHECK_EQ(report.empty, 0u);  // unread is not the same as null
+}
+
+TEST(GuestVSharp_ATableOfTheRightLengthBindsEverySlot) {
+    std::uint32_t words[4 * 4] = {};
+    for (int slot = 0; slot < 4; ++slot) {
+        MakeVSharp(words + slot * 4, 0x5000'0000ull + static_cast<std::uint64_t>(slot) * 0x400, 0, 0x400);
+    }
+    const SlotReport report = DecideTable(words, 4 * 4, 4);
+    CHECK_EQ(report.bindable, 4u);
+    CHECK_EQ(report.unread, 0u);
+    CHECK_EQ(report.slots(), 4u);
+}
+
+TEST(GuestVSharp_APartialSlotIsUnreadNotHalfDecoded) {
+    // Six dwords: one whole V# and half of the next. The half is not a V#.
+    std::uint32_t words[6] = {};
+    MakeVSharp(words, 0x6000'0000ull, 0, 0x100);
+    const SlotReport report = DecideTable(words, 6, 2);
+    CHECK_EQ(report.bindable, 1u);
+    CHECK_EQ(report.unread, 1u);
+}

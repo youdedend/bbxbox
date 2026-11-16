@@ -196,7 +196,7 @@ this a null slot (GCN reads zeroes — the null descriptor already says so), is 
 range inside one 4 GiB region of the guest's window (the page table's `va_hi` has
 no carry, so a range that crosses one cannot be walked and is refused rather than
 mapped halfway), and is it aligned and non-empty. `tests/guest_vsharp_test.cpp`
-pins sixteen cases — the boundary ones included: a range ending exactly on the 4
+pins twenty cases — the boundary ones included: a range ending exactly on the 4
 GiB line binds, one byte past it does not, and `base + bytes` saturates rather
 than wrapping into something that would look bindable. It is portable-core only
 until the dispatch path calls it: what the wiring needs is the one fact this step
@@ -346,7 +346,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **245 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **249 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot
