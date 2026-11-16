@@ -67,6 +67,7 @@ sources=(
   "$root"/tests/dump_test.cpp
   "$root"/tests/ini_test.cpp
   "$root"/tests/launcher_test.cpp
+  "$root"/tests/storage_test.cpp
   "$root"/tests/overlay_test.cpp
   "$root"/tests/swap_test.cpp
   "$root"/tests/guest_memory_test.cpp
@@ -123,7 +124,7 @@ for unit in adler32 crc32 inflate inffast inftrees uncompr zutil compress trees 
 done
 ar rcs "$objdir/libbbx_zlib.a" "${zlib_objs[@]}"
 
-"${cxx_cmd[@]}" -std=c++20 -O2 -Wall -Wextra -Werror \
+"${cxx_cmd[@]}" -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
   -I "$root/src" -I "$root/tests" -I "$root" -I "$root/upstream/bbhost/src" \
   -I "$zlib" -DBBX_HAVE_ZLIB=1 \
   -o "$out" "${sources[@]}" "$objdir/libbbx_zlib.a"

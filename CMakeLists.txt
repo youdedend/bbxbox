@@ -158,6 +158,7 @@ if(BBX_BUILD_TESTS)
         tests/dump_test.cpp
         tests/ini_test.cpp
         tests/launcher_test.cpp
+        tests/storage_test.cpp
         tests/overlay_test.cpp
         tests/swap_test.cpp
         tests/guest_memory_test.cpp
@@ -191,6 +192,7 @@ if(BBX_BUILD_TESTS)
         upstream/bbhost/src/gcn/hlsl.cpp)
     target_include_directories(bbx_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/bbhost/src")
     if(NOT WIN32)
+        find_package(Threads REQUIRED)
         set(BBX_GUEST_CORE_TEST_SOURCES
             upstream/bbhost/src/core/sha256.cpp
             upstream/bbhost/src/core/imports.cpp
@@ -201,6 +203,7 @@ if(BBX_BUILD_TESTS)
         )
         target_sources(bbx_tests PRIVATE ${BBX_GUEST_CORE_TEST_SOURCES})
         target_include_directories(bbx_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/bbhost/src")
+        target_link_libraries(bbx_tests PRIVATE Threads::Threads)
     endif()
     target_link_libraries(bbx_tests PRIVATE bbx_d3d12_core bbx_platform_core)
     target_include_directories(bbx_tests PRIVATE tests "${CMAKE_CURRENT_SOURCE_DIR}")

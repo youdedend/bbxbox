@@ -470,12 +470,14 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         // because a UWP title cannot relaunch itself the way a desktop build
         // does when the reservation loses.
         (void)bbx::platform::ReserveGuestWindows();
-        if (!bbx::platform::StorageInit()) {
-            bbx::platform::LogMessage(bbx::platform::Level::kError, "storage init failed");
-        }
+        const bbx::platform::StorageInitResult& storage = bbx::platform::StorageInit();
         if (!bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
             // Without a log the run is still worth doing; the crash handler's
             // OutputDebugStringA path remains.
+        }
+        if (!storage.ok) {
+            bbx::platform::LogMessage(bbx::platform::Level::kError, "%s",
+                                      bbx::platform::FormatStorageFailureLine(storage).c_str());
         }
         bbx::platform::LogMessage(bbx::platform::Level::kInfo, "bbxbox launcher starting");
         // The guest's file system, exercised once at boot: the HLE's reads and
@@ -635,22 +637,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     //
     // The apartment comes first out of necessity, not preference: StorageInit
     // asks ApplicationData for LocalState, and a WinRT call without an apartment
-    // fails with CO_E_NOTINITIALIZED - caught and lost, because the log does not
-    // exist yet. StorageInit has a kernel32-only fallback for exactly that case
-    // (xbox/platform/storage.cpp), and LogOpen is idempotent so the framework
-    // view opening it again cannot rotate these lines away.
+    // fails with CO_E_NOTINITIALIZED. StorageInit records each probe into its
+    // static list (with a kernel32-only fallback when LocalState is missing),
+    // LogOpen opens loader.log on that path, and ReplayStorageResults writes the
+    // recorded lines into it before anything else runs.
     try {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
     } catch (const winrt::hresult_error&) {
         // An apartment already on this thread is not a launch failure.
     }
-    const bool storage_early = bbx::platform::StorageInit();
+    const bbx::platform::StorageInitResult& storage_early = bbx::platform::StorageInit();
     const bool log_early = bbx::platform::LogOpen(bbx::platform::Paths().local_state);
     if (log_early) {
-        bbx::platform::LogMessage(bbx::platform::Level::kInfo,
-                                  "wWinMain: localstate %s, storage %s",
-                                  bbx::platform::Paths().local_state.c_str(),
-                                  storage_early ? "ok" : "FAILED (log open on a derived path)");
+        bbx::platform::ReplayStorageResults();
+        if (storage_early.ok) {
+            bbx::platform::LogMessage(bbx::platform::Level::kInfo,
+                                      "wWinMain: localstate %s, storage ok",
+                                      bbx::platform::Paths().local_state.c_str());
+        } else {
+            bbx::platform::LogMessage(
+                bbx::platform::Level::kError,
+                "wWinMain: localstate %s, %s (log open on a derived path)",
+                bbx::platform::Paths().local_state.c_str(),
+                bbx::platform::FormatStorageFailureLine(storage_early).c_str());
+        }
     }
     bbx::platform::InstallLastChanceLogger();
     try {

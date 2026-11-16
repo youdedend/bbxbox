@@ -11,11 +11,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "xbox/platform/dump.h"
+#include "xbox/platform/log.h"
 
 namespace bbx::platform {
 
@@ -26,8 +30,186 @@ struct StoragePaths {
     std::string roaming;
 };
 
-// Resolves the paths, creates `LocalState\shadercache` and the crash directory.
-bool StorageInit();
+struct StorageProbeOutcome {
+    std::string path;
+    std::int32_t hr = 0;
+    bool ok = false;
+};
+
+// One probe recorded during StorageInit, before loader.log exists:
+// ApplicationData::Current() itself, each folder asked of it, Package::Current(),
+// and (when LocalFolder failed) the kernel32-derived LocalState path.
+struct StorageEntry {
+    const char* name;
+    std::string path;
+    std::int32_t hr;
+    bool ok;
+
+    StorageEntry() : name(""), path(), hr(0), ok(false) {}
+    StorageEntry(const char* entry_name, std::string entry_path, std::int32_t entry_hr,
+                 bool entry_ok)
+        : name(entry_name), path(std::move(entry_path)), hr(entry_hr), ok(entry_ok) {}
+};
+
+inline constexpr std::size_t kMaxStorageEntries = 8;
+
+// Held once by StorageInit's call_once and returned by reference to every
+// caller, so wWinMain (before LogOpen) and LauncherView::Initialize (after)
+// read the same struct rather than a stack-local flag.
+struct StorageInitResult {
+    StoragePaths paths;
+    StorageEntry entries[kMaxStorageEntries];
+    std::size_t count = 0;
+    bool ok = false;
+    bool roaming_missing = false;
+    std::int32_t roaming_hr = 0;
+    const char* failed_folder = "";
+
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return ok; }
+
+    void Reset() {
+        paths = StoragePaths{};
+        for (std::size_t i = 0; i < kMaxStorageEntries; ++i) {
+            entries[i] = StorageEntry{};
+        }
+        count = 0;
+        ok = false;
+        roaming_missing = false;
+        roaming_hr = 0;
+        failed_folder = "";
+    }
+
+    void Record(const char* name, std::string path, std::int32_t hr, bool entry_ok) {
+        if (count >= kMaxStorageEntries) return;
+        entries[count++] = StorageEntry(name, std::move(path), hr, entry_ok);
+    }
+};
+
+[[nodiscard]] inline std::string FormatStorageHresult(std::int32_t hr) {
+    char hex[16] = {};
+    std::snprintf(hex, sizeof(hex), "0x%08x",
+                  static_cast<unsigned>(static_cast<std::uint32_t>(hr)));
+    return hex;
+}
+
+[[nodiscard]] inline std::string FormatStorageEntry(const StorageEntry& entry) {
+    std::string line = "storage: ";
+    line += entry.name != nullptr ? entry.name : "";
+    if (entry.ok) {
+        line += ' ';
+        line += entry.path.empty() ? "ok" : entry.path;
+        line += " (";
+        line += FormatStorageHresult(entry.hr);
+        line += ')';
+    } else {
+        line += " unavailable (";
+        line += FormatStorageHresult(entry.hr);
+        line += ')';
+    }
+    return line;
+}
+
+[[nodiscard]] inline std::string FormatStorageFailureLine(const StorageInitResult& state) {
+    const char* which = (state.failed_folder != nullptr && state.failed_folder[0] != '\0')
+                            ? state.failed_folder
+                            : "unknown";
+    return std::string("storage init failed: ") + which;
+}
+
+// Populates `state` once through `once` without emitting log lines (the log
+// file is opened from `state.paths.local_state` afterwards), and returns the
+// address of `state` on every call (a pointer rather than a const reference so
+// GCC 13's -Wdangling-reference does not mistake the temporary `make_prober`
+// lambda for the referent). Local + Temporary is enough; a missing Roaming
+// leaves `ok` true and sets `roaming_missing` for one warning on replay.
+template <class MakeProber>
+const StorageInitResult* RunStorageInitOnce(std::once_flag& once, StorageInitResult& state,
+                                            MakeProber&& make_prober) {
+    std::call_once(once, [&state, &make_prober]() {
+        state.Reset();
+        auto prober = make_prober();
+
+        const StorageProbeOutcome app = prober.AppData();
+        state.Record("ApplicationData::Current", app.path, app.hr, app.ok);
+
+        bool have_local = false;
+        bool have_temp = false;
+        if (app.ok) {
+            const StorageProbeOutcome local = prober.Local();
+            if (local.ok) state.paths.local_state = local.path;
+            state.Record("local", local.path, local.hr, local.ok);
+            have_local = local.ok;
+
+            const StorageProbeOutcome temp = prober.Temporary();
+            if (temp.ok) state.paths.temp = temp.path;
+            state.Record("temporary", temp.path, temp.hr, temp.ok);
+            have_temp = temp.ok;
+
+            const StorageProbeOutcome roaming = prober.Roaming();
+            if (roaming.ok) {
+                state.paths.roaming = roaming.path;
+            } else {
+                state.roaming_missing = true;
+                state.roaming_hr = roaming.hr;
+            }
+            state.Record("roaming", roaming.path, roaming.hr, roaming.ok);
+        }
+
+        const StorageProbeOutcome pkg = prober.Package();
+        if (pkg.ok) state.paths.package = pkg.path;
+        state.Record("package", pkg.path, pkg.hr, pkg.ok);
+
+        if (!app.ok) {
+            state.ok = false;
+            state.failed_folder = "ApplicationData::Current";
+        } else if (!have_local && !have_temp) {
+            state.ok = false;
+            state.failed_folder = "local, temporary";
+        } else if (!have_local) {
+            state.ok = false;
+            state.failed_folder = "local";
+        } else if (!have_temp) {
+            state.ok = false;
+            state.failed_folder = "temporary";
+        } else {
+            state.ok = true;
+            state.failed_folder = "";
+        }
+
+        if (!have_local) {
+            const StorageProbeOutcome derived = prober.DeriveLocal();
+            if (derived.ok && !derived.path.empty()) {
+                state.paths.local_state = derived.path;
+                state.Record("local (derived)", derived.path, derived.hr, true);
+            }
+        }
+
+        if (!state.paths.local_state.empty()) {
+            prober.PrepareDirs(state.paths);
+        }
+    });
+    return &state;
+}
+
+template <class EmitFn, class FlushFn>
+void ReplayStorageInit(const StorageInitResult& state, EmitFn&& emit, FlushFn&& flush) {
+    for (std::size_t i = 0; i < state.count; ++i) {
+        emit(Level::kInfo, FormatStorageEntry(state.entries[i]));
+        flush();
+    }
+    if (state.roaming_missing) {
+        std::string warn = "storage: roaming unavailable (";
+        warn += FormatStorageHresult(state.roaming_hr);
+        warn += ") - Xbox has no roaming folder; not needed";
+        emit(Level::kWarn, warn);
+        flush();
+    }
+}
+
+// Resolves the paths, creates `LocalState\shadercache` and the crash directory,
+// and records each probe result for ReplayStorageResults() once loader.log opens.
+const StorageInitResult& StorageInit();
+void ReplayStorageResults();
 [[nodiscard]] const StoragePaths& Paths();
 
 // LocalState-relative helpers ("loader.log", "shadercache\\stages.bin").

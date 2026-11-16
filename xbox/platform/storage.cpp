@@ -29,7 +29,7 @@
 namespace bbx::platform {
 namespace {
 
-StoragePaths g_paths;
+StorageInitResult g_storage;
 std::once_flag g_once;
 
 // GetFileAttributesExFromApp is the APP-partition way to ask about a path;
@@ -68,76 +68,107 @@ std::string Join(const std::string& a, const std::string& b) {
     return a + "\\" + b;
 }
 
-}  // namespace
+struct WinrtStorageProber {
+    winrt::Windows::Storage::ApplicationData current{nullptr};
 
-bool StorageInit() {
-    bool ok = false;
-    std::call_once(g_once, [&ok]() {
-        // Each folder on its own, with its own HRESULT. Xbox does not support
-        // ApplicationData roaming, so one throw from RoamingFolder used to take
-        // LocalFolder and TemporaryFolder down with it - and the console's log
-        // said "storage init failed" one line after LocalState had worked.
-        const auto folder = [](const char* name, auto&& get, std::string& out) {
-            try {
-                out = winrt::to_string(get().Path());
-                LogMessage(Level::kInfo, "storage: %s %s", name, out.c_str());
-                return true;
-            } catch (const winrt::hresult_error& error) {
-                LogMessage(Level::kWarn, "storage: %s unavailable (0x%08x)%s", name,
-                           static_cast<unsigned>(error.code().value),
-                           std::string_view(name) == "roaming" ? " - Xbox has no roaming folder; not needed" : "");
-                return false;
-            }
-        };
-        const auto appdata = []() { return winrt::Windows::Storage::ApplicationData::Current(); };
-        const bool have_local = folder("local", [&] { return appdata().LocalFolder(); }, g_paths.local_state);
-        const bool have_temp = folder("temporary", [&] { return appdata().TemporaryFolder(); }, g_paths.temp);
-        (void)folder("roaming", [&] { return appdata().RoamingFolder(); }, g_paths.roaming);
+    StorageProbeOutcome AppData() {
         try {
-            g_paths.package =
-                winrt::to_string(winrt::Windows::ApplicationModel::Package::Current().InstalledPath());
+            current = winrt::Windows::Storage::ApplicationData::Current();
+            return {"", 0, true};
         } catch (const winrt::hresult_error& error) {
-            LogMessage(Level::kWarn, "storage: package path unavailable (0x%08x)",
-                       static_cast<unsigned>(error.code().value));
+            return {"", static_cast<std::int32_t>(error.code().value), false};
         }
-        ok = have_local && have_temp;
-        if (!ok) {
-            LogMessage(Level::kError, "storage: LocalState or TemporaryFolder is missing; deriving the path");
-            // A launch that dies with an empty LocalState has no log to read, so
-            // the log cannot depend on WinRT activation. The folder is where the
-            // platform puts it - %LOCALAPPDATA%\Packages\<family>\LocalState -
-            // and both halves are reachable from an AppContainer with kernel32
-            // alone. If this path is wrong, LogOpen's fopen fails and the run is
-            // exactly as logless as it was before: nothing is lost by trying.
-            wchar_t local_app_data[MAX_PATH * 2] = {};
-            wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH] = {};
-            UINT32 family_len = PACKAGE_FAMILY_NAME_MAX_LENGTH;
-            if (::GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH * 2) > 0 &&
-                ::GetCurrentPackageFamilyName(&family_len, family) == ERROR_SUCCESS) {
+    }
+
+    StorageProbeOutcome Local() {
+        try {
+            return {winrt::to_string(current.LocalFolder().Path()), 0, true};
+        } catch (const winrt::hresult_error& error) {
+            return {"", static_cast<std::int32_t>(error.code().value), false};
+        }
+    }
+
+    StorageProbeOutcome Temporary() {
+        try {
+            return {winrt::to_string(current.TemporaryFolder().Path()), 0, true};
+        } catch (const winrt::hresult_error& error) {
+            return {"", static_cast<std::int32_t>(error.code().value), false};
+        }
+    }
+
+    StorageProbeOutcome Roaming() {
+        try {
+            return {winrt::to_string(current.RoamingFolder().Path()), 0, true};
+        } catch (const winrt::hresult_error& error) {
+            return {"", static_cast<std::int32_t>(error.code().value), false};
+        }
+    }
+
+    StorageProbeOutcome Package() {
+        try {
+            return {
+                winrt::to_string(winrt::Windows::ApplicationModel::Package::Current().InstalledPath()),
+                0, true};
+        } catch (const winrt::hresult_error& error) {
+            return {"", static_cast<std::int32_t>(error.code().value), false};
+        }
+    }
+
+    StorageProbeOutcome DeriveLocal() {
+        // A launch that dies with an empty LocalState has no log to read, so
+        // the log cannot depend on WinRT activation. The folder is where the
+        // platform puts it - %LOCALAPPDATA%\Packages\<family>\LocalState -
+        // and both halves are reachable from an AppContainer with kernel32
+        // alone. If this path is wrong, LogOpen's open fails and the run is
+        // exactly as logless as it was before: nothing is lost by trying.
+        wchar_t local_app_data[MAX_PATH * 2] = {};
+        wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH] = {};
+        UINT32 family_len = PACKAGE_FAMILY_NAME_MAX_LENGTH;
+        if (::GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH * 2) > 0) {
+            const LONG rc = ::GetCurrentPackageFamilyName(&family_len, family);
+            if (rc == ERROR_SUCCESS) {
                 std::wstring derived(local_app_data);
                 derived += L"\\Packages\\";
                 derived += family;
                 derived += L"\\LocalState";
-                g_paths.local_state = Narrow(derived);
-                ok = !g_paths.local_state.empty();
-                LogMessage(Level::kWarn, "storage: local state derived without WinRT: %s",
-                           g_paths.local_state.c_str());
+                const std::string narrow = Narrow(derived);
+                if (!narrow.empty()) return {narrow, 0, true};
             }
+            return {"", static_cast<std::int32_t>(HRESULT_FROM_WIN32(static_cast<DWORD>(rc))),
+                    false};
         }
-        if (ok) {
-            ::CreateDirectoryFromAppW(Widen(Local("shadercache")).c_str(), nullptr);
-            ::CreateDirectoryFromAppW(Widen(Local("crashes")).c_str(), nullptr);
-            ::CreateDirectoryFromAppW(Widen(Local("guestswap")).c_str(), nullptr);
-        }
-    });
-    return ok;
+        return {"", static_cast<std::int32_t>(HRESULT_FROM_WIN32(::GetLastError())), false};
+    }
+
+    void PrepareDirs(const StoragePaths& paths) {
+        ::CreateDirectoryFromAppW(Widen(Join(paths.local_state, "shadercache")).c_str(), nullptr);
+        ::CreateDirectoryFromAppW(Widen(Join(paths.local_state, "crashes")).c_str(), nullptr);
+        ::CreateDirectoryFromAppW(Widen(Join(paths.local_state, "guestswap")).c_str(), nullptr);
+    }
+};
+
+}  // namespace
+
+const StorageInitResult& StorageInit() {
+    // Runs before LogOpen in wWinMain and is asked again by LauncherView::Initialize:
+    // the probes record into `g_storage` once and every caller reads that struct,
+    // while ReplayStorageResults() writes the recorded lines once loader.log exists.
+    return *RunStorageInitOnce(g_once, g_storage, []() { return WinrtStorageProber{}; });
 }
 
-const StoragePaths& Paths() { return g_paths; }
+void ReplayStorageResults() {
+    const StorageInitResult& state = StorageInit();
+    ReplayStorageInit(
+        state,
+        [](Level level, const std::string& line) { LogMessage(level, "%s", line.c_str()); },
+        []() { LogFlush(); });
+}
+
+const StoragePaths& Paths() { return g_storage.paths; }
 
 std::string Local(const std::string& relative) {
-    if (g_paths.local_state.empty()) return relative;
-    return Join(g_paths.local_state, relative);
+    if (g_storage.paths.local_state.empty()) return relative;
+    return Join(g_storage.paths.local_state, relative);
 }
 
 bool ReadBinary(const std::string& path, std::vector<std::uint8_t>& out, std::size_t cap) {
@@ -343,7 +374,7 @@ std::vector<std::string> CandidateDumpRoots() {
         ::FindClose(find);
         roots.push_back(Narrow(root));
     }
-    if (!g_paths.local_state.empty()) roots.push_back(g_paths.local_state);
+    if (!g_storage.paths.local_state.empty()) roots.push_back(g_storage.paths.local_state);
     return roots;
 }
 
