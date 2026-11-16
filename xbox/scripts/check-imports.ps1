@@ -65,6 +65,13 @@ $AllowedModules = @(
     "^windowscodecs\.dll$"
 )
 
+# The modules the platform (or the VCLibs framework package the manifest
+# requires) provides, for the "does it ship with us" question only.
+$PlatformProvided = @(
+    "^api-ms-win-", "^ext-ms-win-", "^vcruntime140(_1)?_app", "^msvcp140(_\d+)?_app",
+    "^vccorlib140_app", "^concrt140_app"
+)
+
 # Symbols that exist but are refused at run time inside an AppContainer. Each has
 # a FromApp replacement, and the port must use it.
 $ForbiddenSymbols = @(
@@ -89,9 +96,27 @@ if ($binaries.Count -eq 0) { throw "no binaries under $PackageDir" }
 $OwnBinaries = @("bbxbox.exe")
 # Exact symbols that are imported but never called on the console's paths. Each
 # one is here for a stated reason; the list is not a place to hide a mistake.
+# The value is the reason, and it has to name the owner of the call.
 $KnownUncalledSymbols = @{
     "bbxbox.exe" = @{
         "LoadLibraryExW" = "C++/WinRT base.h activation fallback; the port itself calls LoadPackagedLibrary only"
+        # The static CRT (xbox/CMakeLists.txt) brings its own file and memory
+        # layer into the image, and that layer is written against the desktop
+        # names. Nothing in `xbox/platform` calls it any more: the log goes
+        # through hostfs, guest pages through VirtualProtectFromApp, the dump
+        # through CreateFile2FromApp. The caller left is bbhost's own
+        # `core/paced_file.cpp` (`std::fopen` for a save's staged write) - a
+        # finding, not an allowance, recorded in docs/PORT_STATUS.md under
+        # "known gaps"; removing it is what lets these five leave this list.
+        "CreateFileW" = "static CRT stdio; the port's paths use hostfs. Caller: bbhost core/paced_file.cpp"
+        "CreateDirectoryW" = "static CRT stdio; the port's paths use hostfs (CreateDirectoryFromApp)"
+        "DeleteFileW" = "static CRT stdio; the port's paths use hostfs (DeleteFileFromApp)"
+        "FindFirstFileExW" = "static CRT stdio; the port's paths use hostfs (FindFirstFileExFromApp)"
+        "MoveFileExW" = "static CRT stdio; the port's paths use hostfs (MoveFileFromApp)"
+        # libvcruntime's __GSHandlerCheck and heap init. VirtualProtect is the one
+        # that matters on a console (W^X), which is why it stays forbidden
+        # everywhere else: a port TU that calls it is still a failure.
+        "VirtualProtect" = "the static CRT's own guard/heap init; guest pages are flipped with VirtualProtectFromApp"
     }
 }
 $notices = New-Object System.Collections.Generic.List[string]
@@ -107,7 +132,10 @@ foreach ($binary in $binaries) {
         foreach ($pattern in $AllowedModules) {
             if ($module -match $pattern) { $ok = $true; break }
         }
-        if (-not $ok -and $module -match ("(" + ($AppCrtModules -join "|") + ")")) { $ok = $true }
+        # The *_app CRT family is allowed for payload binaries only: the port's own
+        # image links the static CRT and importing any of it is the loader failure
+        # this iteration removed.
+        if (-not $ok -and -not $own -and $module -match ("(" + ($AppCrtModules -join "|") + ")")) { $ok = $true }
         if (-not $ok) {
             if ($own) { $failures.Add("$($binary.Name): imports $module") }
             else { $notices.Add("$($binary.Name) (payload): imports $module") }
@@ -157,14 +185,20 @@ foreach ($binary in $binaries) {
     foreach ($line in $imports) {
         if ($line -notmatch "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { continue }
         $module = $Matches[1]
-        # Modules the platform provides: an import of one is a packaging question
-        # only for the *port's* binaries (they may not use them, above), while a
-        # payload DLL importing one is Microsoft's business and reaches here as a
-        # notice. That is why this list is longer than $AllowedModules.
-        if ($module -match "^api-ms-win-" -or $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|vcruntime140_1|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$" -or
-            $module -match ("(" + ($AppCrtModules -join "|") + ")")) {
-            continue
+        # Modules the platform provides. Two different questions are asked of an
+        # import and they have different answers: may the *port's* own code use
+        # it ($AllowedModules, short and strict), and may any binary here import
+        # it without carrying it ($PlatformProvided, longer). The *_APP CRT names
+        # come from Microsoft.VCLibs, which the manifest depends on - SDL3.dll is
+        # /ZW + /MD and needs them, bbxbox.exe links the static CRT and must not.
+        $provided = $false
+        foreach ($pattern in $PlatformProvided) {
+            if ($module -match $pattern) { $provided = $true; break }
         }
+        if (-not $provided) {
+            $provided = $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|vcruntime140_1|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$"
+        }
+        if ($provided) { continue }
         if ($packaged -notcontains $module) { $failures.Add("$($binary.Name): imports $module but it is not in the package") }
     }
 }

@@ -17,7 +17,12 @@ namespace bbx::platform {
 namespace {
 
 std::mutex g_mutex;
-FILE* g_file = nullptr;
+// The log is a hostfs handle, not a FILE*: the static CRT's stdio reaches
+// CreateFileW, which an AppContainer refuses on the dump's granted folders -
+// and the same layer is what writes loader.log into LocalState. hostfs is the
+// seam that is FromApp on the console (xbox/platform/host_fs.h), and it is what
+// the USB mirror already used.
+int g_file = -1;
 Level g_level = Level::kInfo;
 std::uint64_t g_start = 0;
 char g_last_line[512] = {};
@@ -59,9 +64,15 @@ void MirrorWrite(int handle, const char* text) {
 
 // The handler must not allocate or lock: take the mutex only if it is free.
 void WriteRaw(const char* text) {
-    if (g_file != nullptr) {
-        std::fputs(text, g_file);
-        std::fflush(g_file);
+    if (g_file >= 0) {
+        const std::size_t size = std::strlen(text);
+        std::size_t put = 0;
+        while (put < size) {
+            const std::int64_t written = hostfs::Write(g_file, text + put, size - put);
+            if (written <= 0) break;
+            put += static_cast<std::size_t>(written);
+        }
+        (void)hostfs::Flush(g_file);
     }
     if (g_mirror >= 0) {
         std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
@@ -269,22 +280,20 @@ bool LogOpen(const std::string& local_state) {
     // can fail, and the framework view opens it again when the platform enters
     // it. Rotating twice would move the lines written between the two into
     // `loader.prev.log` - exactly the lines a launch that died needs to keep.
-    if (g_file != nullptr) return true;
+    if (g_file >= 0) return true;
     g_start = ::GetTickCount64();
     const std::string current = local_state + "\\loader.log";
     const std::string previous = local_state + "\\loader.prev.log";
-    std::remove(previous.c_str());
-    std::rename(current.c_str(), previous.c_str());
-    g_file = std::fopen(current.c_str(), "w");
-    if (g_file == nullptr) return false;
-    std::setvbuf(g_file, nullptr, _IONBF, 0);
-    return true;
+    (void)hostfs::Unlink(previous);
+    (void)hostfs::Rename(current, previous, true);
+    g_file = hostfs::Open(current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+    return g_file >= 0;
 }
 
 void LogClose() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_file != nullptr) std::fclose(g_file);
-    g_file = nullptr;
+    if (g_file >= 0) (void)hostfs::Close(g_file);
+    g_file = -1;
 }
 
 void LogSetLevel(Level level) { g_level = level; }
@@ -403,7 +412,7 @@ const char* LastLine() { return g_last_line; }
 
 void LogFlush() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_file != nullptr) std::fflush(g_file);
+    if (g_file >= 0) (void)hostfs::Flush(g_file);
     if (g_mirror >= 0) {
         std::unique_lock<std::mutex> mirror(g_mirror_mu, std::try_to_lock_t());
         if (mirror.owns_lock()) (void)hostfs::Flush(g_mirror);

@@ -238,11 +238,33 @@ subject matches the manifest's publisher (`CN=bbxbox`), and `bbxbox.cer` plus th
 `Microsoft.VCLibs.x64.14.00.appx` framework package are produced next to it, so the
 artifact is the three files a console wants.
 
-The import audit's own findings are recorded in the run's annotations: the only
+The import audit's own findings are recorded in the run's annotations: the
 notices are `LoadLibraryExW` (C++/WinRT's activation fallback, never called by
-the port) and the desktop API imports inside the shipped third-party DLLs
-(SDL3-uwp, libuwp, Microsoft's DXC), which the port does not own. `bbxbox.exe`
-imports no desktop-only file, memory or loader API.
+the port), the desktop API imports and the `*_APP` CRT imports inside the shipped
+third-party DLLs (SDL3-uwp, libuwp), which the port does not own and does not
+allow in its own image, and the seven symbols listed in
+`check-imports.ps1`'s `$KnownUncalledSymbols` with the owner named in each.
+
+**The CRT is static (`/MT`), and that is a console lesson rather than a size
+decision.** The first packaged build that reached a Series X was installed,
+launched and left LocalState empty: the process died in the loader with
+`0xC0000135` because `bbxbox.exe` imported `VCRUNTIME140_APP.dll` and
+`MSVCP140_APP.dll` from the `Microsoft.VCLibs` framework package, and nothing of
+the port's had run, so nothing of the port's could say so. With `/MT` the CRT is
+in the image and the import table is the system's libraries plus `SDL3.dll` (and
+`libuwp.dll`), both of which the package carries. `SDL3.dll` itself still needs
+VCLibs - it is `/MD` + `/ZW` - so the dependency stays; but a console without
+the framework now produces a *running* app that logs "SDL unavailable" instead
+of an image the loader refuses.
+
+The audit got stricter in the same commit, because it can now be believed:
+`user32`, `gdi32`, `ole32`, `advapi32`, `xaudio2_9`, `vcruntime140(_app)` and
+`msvcp140(_app)` are no longer allowed modules for `bbxbox.exe`, and a DLL-CRT
+configure is refused outright. What the static CRT brings with it is its own
+file layer, written against `CreateFileW` and friends; the port's own paths were
+moved off it (`log.cpp` now writes `loader.log` through `hostfs`, i.e.
+`CreateFile2FromApp`), and the one caller left is bbhost's `core/paced_file.cpp`
+- see "known gaps" below.
 
 ### What the packaged app contains (and what keeps it so)
 
@@ -349,7 +371,9 @@ run has to show before "boots" may be written down.
 * Anything requiring a real console: package install (the `.appx` is signed with an ephemeral
   `CN=bbxbox` certificate and the VCLibs framework package is staged beside it, but neither has been
   installed on a console), Game-mode memory limit, the memory self-test's numbers, 4K/HDR output,
-  rumble, the virtual keyboard, and D3D12 device creation.
+  rumble, the virtual keyboard, and D3D12 device creation. One package *was* installed and launched
+  and died in the loader (`0xC0000135`); that is what the static CRT answers. Whether it answers it
+  is a fact for the next console run, not for this file.
 * `src/host/d3d12`'s replay half: `replay.cpp` and `pipeline.cpp` now exist and compile against the
   real SDK, but no `ID3D12Device` has been created on a console, no root signature has been
   serialised by a real driver, no PSO has been created by one, nothing has presented, and the GPU
@@ -361,6 +385,23 @@ run has to show before "boots" may be written down.
   loaded at run time and no HLE entry point has executed: `CUSA03173` has never been opened by this
   port, and the ELF fixtures the tests use are synthetic. "Linked" is the claim; "boots" is the one
   the first console run has to make.
+
+## Known gaps
+
+Recorded, not hoped away. Each one is a call that compiles, packages and is
+refused (or wrong) only on the console, and each one has an owner in the tree.
+
+* **bbhost's `core/paced_file.cpp` still writes through `std::fopen`.** The static
+  CRT turns that into an import of `CreateFileW`, which an AppContainer accepts
+  for LocalState and refuses on a granted folder — and a paced write is the
+  guest's save path. Everything else in the port is on the `hostfs` seam
+  (`CreateFile2FromApp` and friends), including `log.cpp`'s `loader.log`. This is
+  the reason five symbols are listed in `check-imports.ps1`'s
+  `$KnownUncalledSymbols` instead of failing the audit, and removing it is what
+  lets them leave that list.
+* **`src/host/d3d12`'s sampled-resource and graphics paths** are still the counted
+  refusals described under "Not verified"; the compute dispatch is the only
+  D3D12 path that runs.
 
 ## First physical-console run
 
