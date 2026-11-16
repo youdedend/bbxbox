@@ -276,3 +276,85 @@ TEST(GuestPath_APlanSaysWhatItWalks) {
     immediate.immediate = true;
     CHECK(immediate.str() == "immediate s6");
 }
+
+// ---- the plan on one line ---------------------------------------------------
+//
+// The bake has the translator's assignment and the console does not, so the plan
+// crosses between them as text. A format either side misunderstands binds the
+// wrong buffer, so both directions and every refusal are tested.
+
+TEST(GuestPath_APlanRoundTripsThroughItsText) {
+    PathPlan plan;
+    plan.user_sgpr = 3;
+    plan.loads.push_back(PathStep{2, false});
+    plan.loads.push_back(PathStep{0x11, true});
+    plan.final_offset_dw = 7;
+    plan.final_vsharp = true;
+    const std::string text = SerializePath(plan);
+    CHECK(text == "user=3;imm=0;fin=7;finv=1;loads=2:0,17:1");
+    PathPlan back;
+    CHECK(ParsePath(text, &back));
+    CHECK_EQ(back.user_sgpr, 3);
+    CHECK(!back.immediate);
+    CHECK_EQ(back.final_offset_dw, 7);
+    CHECK(back.final_vsharp);
+    CHECK_EQ(back.loads.size(), 2u);
+    CHECK(back.loads[0] == (PathStep{2, false}));
+    CHECK(back.loads[1] == (PathStep{0x11, true}));
+    CHECK(SerializePath(back) == text);
+}
+
+TEST(GuestPath_AnImmediatePlanRoundTripsWithNoLoads) {
+    PathPlan plan;
+    plan.user_sgpr = 6;
+    plan.immediate = true;
+    const std::string text = SerializePath(plan);
+    CHECK(text == "user=6;imm=1;fin=0;finv=0;loads=");
+    PathPlan back;
+    CHECK(ParsePath(text, &back));
+    CHECK(back.immediate);
+    CHECK(back.loads.empty());
+}
+
+TEST(GuestPath_TextThisFormatDidNotWriteIsRefused) {
+    PathPlan plan;
+    // A missing key.
+    CHECK(!ParsePath("user=0;imm=0;fin=0;loads=", &plan));
+    // A key it does not define: a future bake's field must not be ignored.
+    CHECK(!ParsePath("user=0;imm=0;fin=0;finv=0;loads=;stride=16", &plan));
+    // A slot outside the sixteen user SGPRs.
+    CHECK(!ParsePath("user=16;imm=0;fin=0;finv=0;loads=", &plan));
+    CHECK(!ParsePath("user=-2;imm=0;fin=0;finv=0;loads=", &plan));
+    // A load step without its vsharp flag, and a bad flag.
+    CHECK(!ParsePath("user=0;imm=0;fin=0;finv=0;loads=4", &plan));
+    CHECK(!ParsePath("user=0;imm=0;fin=0;finv=0;loads=4:2", &plan));
+    // A flag that is not 0 or 1.
+    CHECK(!ParsePath("user=0;imm=2;fin=0;finv=0;loads=", &plan));
+    // Text that is not this format at all.
+    CHECK(!ParsePath("", &plan));
+    CHECK(!ParsePath("s0 -> [ptr+0x10]", &plan));
+}
+
+TEST(GuestPath_AParsedPlanResolvesExactlyLikeTheOneThatWasWritten) {
+    // The round trip is only worth anything if it resolves: same words, same
+    // address, same refusal.
+    FlatMemory memory;
+    memory.base = 0x5000'0000ull;
+    const std::uint32_t payload[4] = {0xdead'0001u, 0xdead'0002u, 0xdead'0003u, 0xdead'0004u};
+    WriteDwords(&memory, 0, payload, 4);
+    const std::uint32_t user[16] = {static_cast<std::uint32_t>(memory.base),
+                                    static_cast<std::uint32_t>(memory.base >> 32), 0, 0, 0, 0, 0, 0,
+                                    0, 0, 0, 0, 0, 0, 0, 0};
+    PathPlan plan;
+    plan.user_sgpr = 0;  // the words are at the pointer itself
+    PathPlan back;
+    CHECK(ParsePath(SerializePath(plan), &back));
+    std::uint32_t first[4] = {};
+    std::uint32_t second[4] = {};
+    const PathResult a = ResolvePath(plan, user, 4, ReadFlat, &memory, first);
+    const PathResult b = ResolvePath(back, user, 4, ReadFlat, &memory, second);
+    CHECK(a.verdict == PathVerdict::kResolved);
+    CHECK(b.verdict == PathVerdict::kResolved);
+    CHECK_EQ(a.at, b.at);
+    CHECK_EQ(first[0], second[0]);
+}

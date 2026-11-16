@@ -219,6 +219,13 @@ The base a V# names is 40 bits (eight bits of word 1), which is the rule bbhost'
 `interp_base` and gpu.cpp's V# print both use; the first version of `DecodeVSharp`
 read sixteen, which would have lifted a buffer's stride into its address.
 
+The plan crosses to the console as one line of text (`SerializePath` /
+`ParsePath`, strict on the way in: an unknown key, a slot outside the sixteen user
+SGPRs, or a load step without its flag is refused rather than half-understood),
+because the bake has the translator's assignment and the console does not. The
+round trip is tested by resolving the parsed plan and comparing the address and the
+words with the original's.
+
 What is left of 5B-2b: the bake's binding assignment. The port now knows where the
 table is and which entries the program reads; which `tN`/`uN` the baked HLSL
 declared for each entry is the translator's assignment and has to come out of the
@@ -377,7 +384,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **268 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **272 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

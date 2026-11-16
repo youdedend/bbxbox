@@ -2,6 +2,7 @@
 #include "src/host/d3d12/bbx_guest_path.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace bbx::d3d12 {
@@ -108,6 +109,82 @@ PathResult ResolvePath(const PathPlan& plan, const std::uint32_t* user, int ndw,
     }
     result.at = addr;
     return result;
+}
+
+std::string SerializePath(const PathPlan& plan) {
+    std::string out = "user=" + std::to_string(plan.user_sgpr);
+    out += plan.immediate ? ";imm=1" : ";imm=0";
+    out += ";fin=" + std::to_string(plan.final_offset_dw);
+    out += plan.final_vsharp ? ";finv=1" : ";finv=0";
+    out += ";loads=";
+    for (std::size_t i = 0; i < plan.loads.size(); ++i) {
+        if (i != 0) out += ",";
+        out += std::to_string(plan.loads[i].offset_dw);
+        out += plan.loads[i].vsharp ? ":1" : ":0";
+    }
+    return out;
+}
+
+bool ParsePath(const std::string& text, PathPlan* out) {
+    if (out == nullptr) return false;
+    PathPlan plan;
+    bool have_user = false, have_imm = false, have_fin = false, have_finv = false, have_loads = false;
+    std::size_t at = 0;
+    while (at <= text.size()) {
+        const std::size_t end = text.find(';', at);
+        const std::string field = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (!field.empty()) {
+            const std::size_t eq = field.find('=');
+            if (eq == std::string::npos) return false;
+            const std::string key = field.substr(0, eq);
+            const std::string value = field.substr(eq + 1);
+            auto number = [](const std::string& s, long* v) {
+                if (s.empty()) return false;
+                char* stop = nullptr;
+                const long parsed = std::strtol(s.c_str(), &stop, 10);
+                if (stop == nullptr || *stop != '\0') return false;
+                *v = parsed;
+                return true;
+            };
+            long n = 0;
+            if (key == "user") {
+                if (!number(value, &n) || n < -1 || n > 15) return false;
+                plan.user_sgpr = static_cast<int>(n);
+                have_user = true;
+            } else if (key == "imm" || key == "finv") {
+                if (!number(value, &n) || (n != 0 && n != 1)) return false;
+                if (key == "imm") { plan.immediate = n != 0; have_imm = true; }
+                else { plan.final_vsharp = n != 0; have_finv = true; }
+            } else if (key == "fin") {
+                if (!number(value, &n) || n < 0) return false;
+                plan.final_offset_dw = static_cast<int>(n);
+                have_fin = true;
+            } else if (key == "loads") {
+                have_loads = true;
+                std::size_t cursor = 0;
+                while (cursor < value.size()) {
+                    const std::size_t step_end = value.find(',', cursor);
+                    const std::string step = value.substr(cursor, step_end == std::string::npos ? std::string::npos : step_end - cursor);
+                    const std::size_t colon = step.find(':');
+                    if (colon == std::string::npos) return false;
+                    long offset = 0, vsharp = 0;
+                    if (!number(step.substr(0, colon), &offset) || offset < 0) return false;
+                    if (!number(step.substr(colon + 1), &vsharp) || (vsharp != 0 && vsharp != 1)) return false;
+                    if (plan.loads.size() >= 8) return false;  // a chain longer than this is not a path
+                    plan.loads.push_back(PathStep{static_cast<std::uint32_t>(offset), vsharp != 0});
+                    if (step_end == std::string::npos) break;
+                    cursor = step_end + 1;
+                }
+            } else {
+                return false;  // a key this format does not define
+            }
+        }
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    if (!have_user || !have_imm || !have_fin || !have_finv || !have_loads) return false;
+    *out = std::move(plan);
+    return true;
 }
 
 std::vector<UserDataLoad> DecodeUserDataLoads(const std::uint32_t* words, std::size_t count) {

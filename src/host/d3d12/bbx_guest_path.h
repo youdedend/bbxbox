@@ -81,6 +81,15 @@ struct PathResult {
 [[nodiscard]] PathResult ResolvePath(const PathPlan& plan, const std::uint32_t* user, int ndw,
                                      ReadGuest read, void* context, std::uint32_t* out);
 
+// A plan as one line of text, and back. The bake has the translator's assignment
+// (`gcn::TranslateResult`'s buffers, each with a `ResourcePath`) and the console
+// does not - so the plan has to be written beside the cache and read back there,
+// and a format both sides agree on is the whole contract between them. Strict on
+// the way in: a line with a token this function did not write is refused, because
+// a path half-understood binds the wrong buffer.
+[[nodiscard]] std::string SerializePath(const PathPlan& plan);
+[[nodiscard]] bool ParsePath(const std::string& text, PathPlan* out);
+
 // ---- the program's own account of where the table is ----------------------
 
 // One SMRD load the program makes out of its user data.
