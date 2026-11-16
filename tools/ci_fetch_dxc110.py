@@ -205,17 +205,18 @@ def main() -> int:
     signer = os.path.join(target, "lib", DXC_LIBS[1])
     for path in (compiler, signer):
         if not os.path.exists(path):
-            log(f"missing {path}")
-            return 1
+            raise RuntimeError(f"missing {path} after the fetch")
     if os.path.getsize(compiler) < (4 << 20):
-        log(f"{compiler} is {os.path.getsize(compiler)} bytes: not a DXC build")
-        return 1
+        raise RuntimeError(f"{compiler} is {os.path.getsize(compiler)} bytes: not a DXC build")
     with open(compiler, "rb") as f:
         blob = f.read()
-    # `--version`'s string is baked into the library; the console's stamp reads it.
-    if b"1.10." not in blob:
-        log(f"{compiler} carries no 1.10 version string")
-        return 1
+    # Not a gate: the arbiter of "does this compiler sign" is the tool itself
+    # (`bbx_bake_cache --check-compiler`), which compiles a shader through the
+    # same door the bake uses. The string is worth a line either way.
+    if b"1.10." in blob:
+        log(f"{compiler}: the 1.10 version string is in the library")
+    else:
+        log(f"{compiler}: WARNING no '1.10.' string in the library; --check-compiler decides")
     validator = os.path.join(target, "bin", SPIRV_BINS[0])
     if arguments.with_spirv_tools and os.path.exists(validator):
         try:
@@ -233,5 +234,17 @@ def main() -> int:
     return 0
 
 
+def annotate(message: str) -> None:
+    """A failure a runner's log may not be reachable for: say it in the annotation."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        encoded = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=ci_fetch_dxc110::{encoded}", file=sys.stderr)
+    log(message)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:  # noqa: BLE001 - a fetch failure is one failure
+        annotate(f"{type(error).__name__}: {error}")
+        sys.exit(1)

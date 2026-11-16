@@ -137,6 +137,7 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_shader_cache.cpp
     ../src/host/d3d12/bbx_stream.cpp
     ../src/host/d3d12/bbx_untile.cpp
+    ../src/host/d3d12/bbx_scanout.cpp
     ../src/host/d3d12/bbx_barriers.cpp
 )
 
@@ -198,6 +199,7 @@ target_sources(bbxbox PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_present.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_stream.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_untile.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/bbx_scanout.cpp"
     # A dumped eboot is a fake SELF, and the guest's loader (core/elf.cpp) asks
     # this file to unwrap it: the previous reader rejected it with "decrypt SELF
     # first", which sent the player looking for a step that does not exist.
