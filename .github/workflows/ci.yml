@@ -162,14 +162,11 @@ jobs:
       - name: guest link evidence
         shell: bash
         # The build that packages the .appx is the one that has to carry the
-        # guest. Three facts, from the build tree rather than from a log: the
-        # cache says the link was on, the link line names the four archives, and
-        # the binary has the guest's own code in it - a map symbol from the
-        # loader and the HLE's registration, plus a literal only the loader
-        # writes. A build that compiled the guest and did not link it passes
-        # every other check in this workflow (it packages, it imports cleanly,
-        # its self-test runs) and boots nothing, which is why this is an error
-        # and not a notice.
+        # guest, and a guestless build passes every other check here: it
+        # compiles, it packages, it imports cleanly, its self-test runs, and it
+        # boots nothing. So this asserts the facts in the order they can go
+        # wrong - the switch, the link line, the binary, and the map's account
+        # of which archive every symbol came from - and it fails the run.
         run: |
           set -uo pipefail
           fail() { echo "::error title=guest link evidence::$1"; exit 1; }
@@ -177,26 +174,41 @@ jobs:
           ninja=build/xbox/build.ninja
           [ -f "$cache" ] || fail "no $cache: nothing to check"
           [ -f "$ninja" ] || fail "no $ninja: nothing to check"
+
           grep -q 'BBX_GUEST_LINK:BOOL=ON' "$cache" ||
-            fail "BBX_GUEST_LINK is not ON in the build that produced this package (see xbox/CMakeLists.txt; a guestless build is for renderer iteration and needs -DBBX_GUESTLESS=ON)"
+            fail "BBX_GUEST_LINK is not ON in the build that produced this package (xbox/CMakeLists.txt; a guestless build is for renderer iteration and needs -DBBX_GUESTLESS=ON)"
           for lib in bbhost_guest bbhost_host bbhost_engine bbhost_gcn; do
             grep -q "$lib" "$ninja" || fail "$lib is not on bbxbox's link line"
           done
+
           exe=$(find build/xbox -name bbxbox.exe | head -1)
           [ -n "$exe" ] || fail "bbxbox.exe was not produced"
-          map=$(find build/xbox -name bbxbox.map | head -1)
-          [ -n "$map" ] || fail "no bbxbox.map: the link did not record what it took (is /MAP still in xbox/CMakeLists.txt?)"
-          # Definitions only the guest archives provide, and free functions, so
-          # the name survives whatever decoration the linker prints: the ELF
-          # loader, the HLE's registration, the GCN command processor.
-          for sym in 'load_orbis_elf' 'register_hle' 'hle_gnm_execute'; do
-            grep -qaF "$sym" "$map" || fail "the map has no '$sym': the guest runtime is not in this binary"
-          done
           # A literal from the guest's ELF loader (core/elf.cpp): code, not a
           # flag, and it survives /OPT:REF because the loader logs it.
           grep -qaF 'eboot sha256' "$exe" ||
             fail "bbxbox.exe does not contain the guest loader's text: the guest was compiled but not linked"
-          echo "::notice title=guest link evidence::bbxbox.exe $(stat -c%s "$exe") B, bbxbox.map $(stat -c%s "$map") B, link line 4/4 archives, load_orbis_elf+register_hle+hle_gnm_execute in the map, guest loader text in the exe"
+
+          map=$(find build/xbox -name bbxbox.map | head -1)
+          [ -n "$map" ] || fail "no bbxbox.map: the link did not record what it took (is /MAP still in xbox/CMakeLists.txt?)"
+          # Free functions, so the name survives whatever decoration the linker
+          # prints: the ELF loader and the HLE's registration, both reached from
+          # the bridge's StartGuest and therefore never dead-stripped.
+          for sym in 'load_orbis_elf' 'register_hle'; do
+            grep -qaF "$sym" "$map" || fail "the map has no '$sym': the guest runtime is not in this binary"
+          done
+          # And the map's own account: a symbol attributed to an archive was
+          # taken *out* of it, which the switch and the link line alone cannot
+          # say (an archive nothing references is on the line and contributes
+          # nothing). The floor is deliberately far below the truth.
+          guest=$(grep -ac 'bbhost_guest' "$map" || true)
+          host=$(grep -ac 'bbhost_host' "$map" || true)
+          engine=$(grep -ac 'bbhost_engine' "$map" || true)
+          [ "${guest:-0}" -ge 20 ] ||
+            fail "only ${guest:-0} map symbols came out of bbhost_guest: the archive is on the link line but the app does not use it"
+          [ "${host:-0}" -ge 1 ] || fail "bbhost_host contributed nothing to the binary"
+          [ "${engine:-0}" -ge 1 ] || fail "bbhost_engine contributed nothing to the binary"
+
+          echo "::notice title=guest link evidence::bbxbox.exe $(stat -c%s "$exe") B, bbxbox.map $(stat -c%s "$map") B; link line 4/4 archives; map symbols: bbhost_guest $guest, bbhost_host $host, bbhost_engine $engine; load_orbis_elf + register_hle in the map; guest loader text in the exe"
       - name: which object still calls a refused import
         if: always()
         shell: bash

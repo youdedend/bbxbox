@@ -276,10 +276,18 @@ Two changes hold that in place, so the claim cannot quietly stop being true:
   `no bbxbox.map under build: a crash report from the console cannot be
   symbolised` — a real gap in first-console debugging, not a cosmetic one.
 * The workflow's `guest link evidence` step fails the run unless the cache has
-  `BBX_GUEST_LINK:BOOL=ON`, the Ninja link line names all four archives, the map
-  carries `StartGuest@`, `load_orbis_elf`, `register_hle` and `hle_gnm_exec`, and
-  `bbxbox.exe` contains the guest loader's own `eboot sha256` literal. It emits
-  the sizes as a notice so the evidence survives in the annotation even though a
+  `BBX_GUEST_LINK:BOOL=ON`, the Ninja link line names all four archives,
+  `bbxbox.exe` contains the guest loader's own `eboot sha256` literal, the map
+  carries `load_orbis_elf` and `register_hle` (free functions, reached from the
+  bridge's `StartGuest`, so decoration cannot hide them and `/OPT:REF` cannot
+  drop them), and the map attributes at least twenty symbols to `bbhost_guest`
+  and one each to `bbhost_host`/`bbhost_engine` — which is the part a flag and a
+  link line cannot say, since an archive nothing references sits on the line and
+  contributes nothing. That last distinction is not academic: the first version
+  of this check also named `hle_gnm_execute`, and the linker had legitimately
+  dead-stripped it, because nothing on the boot path reaches the GCN command
+  processor until the draw path exists. It emits the sizes and the per-archive
+  counts as a notice so the evidence survives in the annotation even though a
   later artifact download may not. This matters because a guestless build passes
   every other check in this workflow — it compiles, it packages, it imports
   cleanly, its self-test runs — and boots nothing.
