@@ -38,6 +38,12 @@ class Device;
 // parameter(s), 4/64 DWORDs, ..." (bbx_guest_root.cpp's Describe).
 [[nodiscard]] std::string GuestRootDescription();
 
+// Builds a D3D12 signature out of a GuestRootLayout: the tables, the root CBV
+// and the space-3 page table plus slabs. A free function so a test (or the
+// report) can ask a device for it without a PipelineSet; PipelineSet::Create
+// calls it and keeps the result.
+Status CreateGuestRootSignature(Device& device, ID3D12RootSignature** out);
+
 // The port's own passes. `kCount` last; the guest's draws (P3) go through the
 // cache with keys of their own, not through this enum.
 enum class PassKind : std::uint8_t {
@@ -90,11 +96,6 @@ public:
 
 private:
     Status CreateRootSignature(PassKind kind);
-    // Builds a D3D12 signature out of a GuestRootLayout: the tables, the root
-    // CBV and - for a graphics stage - the static samplers the guest's samplers
-    // resolve against. Exposed as a free function so a test can ask a device for
-    // it without a PipelineSet.
-    Status CreateGuestRootSignature(Device& device, ID3D12RootSignature** out);
     Status CreateGraphicsPso(PassKind kind, const shaders::Blob& vs, const shaders::Blob& ps);
     Status CreateComputePso(PassKind kind, const shaders::Blob& cs);
 
