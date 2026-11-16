@@ -352,6 +352,13 @@ std::vector<patch_file::Site> render_scale_sites(const RenderScale& rs) { return
 void render_scale_size(int quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t* render_w, std::uint32_t* render_h) {  }
 
 // host/gpu.h
+//
+// Only what the host layer does not itself define: `src/host/d3d12/host_gpu_d3d12.cpp`
+// answers the rest of this header on the console (the timeline fence, the guest's
+// slabs, the dispatch), and a second definition of anything it answers is a
+// duplicate symbol at link, not a fallback. Four were removed here when the
+// bridge landed: host_gpu_read_guest, host_gpu_mem_write_serial/_ordered and
+// host_gpu_dispatch_user_reads.
 void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {  }
 std::uint64_t host_gpu_completed_submits() { return {}; }
 std::uint64_t host_gpu_completed_submits_seen() { return {}; }
@@ -359,7 +366,6 @@ std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::ui
 bool host_gpu_copy_image_region(const GpuImageCopy& c) { return {}; }
 void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {  }
 bool host_gpu_device_lost() { return {}; }
-std::uint32_t host_gpu_dispatch_user_reads() { return {}; }
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value) {  }
 bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) { return {}; }
 std::string host_gpu_fill_stats() { return {}; }
@@ -368,7 +374,6 @@ void host_gpu_lists_arrival(std::uint64_t id) {  }
 std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks) { return {}; }
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) {  }
 void host_gpu_pipeline_work(std::uint64_t out[14]) {  }
-void host_gpu_read_guest(std::uint64_t va, std::size_t bytes, void* out) {  }
 void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {  }
 void host_gpu_refill_selftest() {  }
 std::uint64_t host_gpu_ring_place(const void* data, std::size_t bytes, std::size_t align) { return {}; }
@@ -629,7 +634,6 @@ bool menu_pointer_in_menu() { return {}; }
 void hle_watch_arm(std::uint64_t lo, std::uint64_t hi) {  }
 void hle_bp_arm(std::uint64_t va) {  }
 bool host_gpu_list_committed(std::uint64_t id) { return {}; }
-bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) { return {}; }
 bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes) { return {}; }
 bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen, std::uint32_t cap_at, std::uint32_t cap_piece) { return {}; }
 bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) { return {}; }
@@ -669,7 +673,6 @@ std::uint32_t menu_back_button() { return {}; }
 void hle_watch_arm_reads(std::uint64_t lo, std::uint64_t hi) {  }
 void hle_watch_report() {  }
 bool host_gpu_splice(std::uint64_t id) { return {}; }
-bool host_gpu_mem_write_ordered(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) { return {}; }
 bool ingame_menu_open() { return {}; }
 bool host_options_open() { return {}; }
 bool plugin_panel_native_corner_wanted() { return {}; }
