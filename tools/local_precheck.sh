@@ -134,6 +134,25 @@ for tu in xbox/platform/*.cpp; do
     done < <(grep -oE '"(src/)?host/d3d12/[a-z0-9_]+\.h"' "$tu" | tr -d '"' | sed -e 's|^src/||' | sort -u)
 done
 rm -f "$console_list"
+# The bake tool has its own list too (`tools/build_bake_cache.sh`), and it is the
+# one CI builds before the self-test: a core file the bake calls but the script
+# does not compile is an undefined symbol on a runner and nowhere here.
+missing_bake=()
+while IFS= read -r header; do
+    case "$header" in
+        src/*) impl="${header%.h}.cpp" ;;
+        *) impl="src/${header%.h}.cpp" ;;
+    esac
+    [ -f "$impl" ] || continue
+    if ! grep -q "$(basename "$impl")" tools/build_bake_cache.sh; then
+        missing_bake+=("tools/bbx_bake_cache.cpp includes $header, and $(basename "$impl") is not in tools/build_bake_cache.sh")
+    fi
+done < <(grep -oE '"(src/)?host/d3d12/[a-z0-9_]+\.h"' tools/bbx_bake_cache.cpp | tr -d '"' | sort -u)
+
+if [ ${#missing_bake[@]} -gt 0 ]; then
+    printf '%s\n' "${missing_bake[@]}"
+    fail "the bake includes a core header whose .cpp tools/build_bake_cache.sh does not compile"
+fi
 if [ ${#missing[@]} -gt 0 ]; then
     printf '%s\n' "${missing[@]}"
     fail "a console translation unit includes a core header whose .cpp the console build does not compile"

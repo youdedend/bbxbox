@@ -59,12 +59,19 @@ for unit in "${quiet[@]}"; do
   "$cxx" -std=c++20 -O2 -w -pthread "${includes[@]}" -c "$unit" -o "$obj"
   objects+=("$obj")
 done
+# The bake writes the binding assignment beside the cache, so it links the same
+# writer/reader the console uses (5B-2b): `bbx_path_table` and the path text it
+# shares with `guest_compute.cpp` are one contract, not two spellings.
 "$cxx" -std=c++20 -O2 -Wall -Wextra -Werror -pthread "${includes[@]}" \
   -o "$out" \
   "$root/tools/bbx_bake_cache.cpp" \
   "$root/src/host/core/bbx_self.cpp" \
   "$root/src/host/d3d12/bbx_cache.cpp" \
   "$root/src/host/d3d12/bbx_shader_cache.cpp" \
+  "$root/src/host/d3d12/bbx_path_table.cpp" \
+  "$root/src/host/d3d12/bbx_guest_path.cpp" \
+  "$root/src/host/d3d12/bbx_guest_vsharp.cpp" \
+  "$root/src/host/d3d12/bbx_guest_mem.cpp" \
   "${objects[@]}" "$objdir/libbbx_zlib.a" -ldl
 
 if [ "$run" = 1 ]; then
