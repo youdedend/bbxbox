@@ -117,18 +117,25 @@ foreach ($binary in $binaries) {
             elseif ($allowed) { $notices.Add("$($binary.Name): imports $symbol, documented as never called") }
             else {
                 # The symbol alone does not say where it came from: the module it
-                # is imported from, and the names around it, are what a reviewer
-                # needs to find the translation unit. Forty lines back is the
-                # module header dumpbin printed before the name.
+                # is imported from does, and so do the names beside it in that
+                # module (they are all one translation unit's worth of calls).
                 $lines = @($imports)
                 $at = -1
                 for ($i = 0; $i -lt $lines.Count; ++$i) { if ($lines[$i] -match $pattern) { $at = $i; break } }
-                $detail = ""
+                $where = ""
                 if ($at -ge 0) {
-                    $lo = [Math]::Max(0, $at - 40)
-                    $detail = "`n" + (($lines[$lo..$at]) -join "`n")
+                    $module = "?"
+                    $from = $at
+                    for ($i = $at; $i -ge 0; --$i) {
+                        if ($lines[$i] -match "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { $module = $Matches[1]; $from = $i; break }
+                    }
+                    $names = @($lines[$from..$at] | ForEach-Object {
+                        if ($_ -match '^\s+[0-9A-F]+\s+([A-Za-z_][A-Za-z0-9_]*)$') { $Matches[1] } })
+                    # Only the names, not dumpbin's addresses: the annotation has
+                    # a length limit and the neighbours are the useful half.
+                    $where = " (from $module, with " + ($names -join ', ') + ")"
                 }
-                $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/$detail")
+                $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/$where")
             }
         }
     }
