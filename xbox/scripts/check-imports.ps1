@@ -40,21 +40,29 @@ if (-not (Test-Path $Dumpbin)) { throw "dumpbin.exe not found" }
 # OS provides the *_app family (it is part of the platform, not the package), so
 # they are allowed as modules and skipped by the packaged check; the desktop
 # names are *not* allowed, because a console does not have them.
-$AppCrtModules = @(
-    "_app\.dll$", "^msvcp140_\d", "^concrt140_app", "^vccorlib140_app"
-)
+# bbxbox.exe links the static CRT (/MT, xbox/CMakeLists.txt), so it must import
+# *no* CRT module at all. The *_app DLLs stay allowed only for the payload
+# binaries: SDL3.dll is C++/CX and imports vccorlib140_app, and the siblings come
+# from the Microsoft.VCLibs framework package that the manifest depends on. The
+# desktop names (vcruntime140.dll, msvcp140.dll) are never allowed for anyone.
+$AppCrtModules = @("^vccorlib140_app", "^msvcp140_\d")
+# Nothing here is a desktop-only library. The list used to carry user32, gdi32,
+# ole32, advapi32 and xaudio2_9 "because the console has them"; that is true and
+# beside the point - an AppContainer title that imports them is a title holding
+# a pointer it cannot use, and each allowance hid a call site nobody had moved to
+# the WinRT/FromApp shape. They are gone, and so are the CRT DLLs.
 $AllowedModules = @(
-    "^api-ms-win-", "^ext-ms-win-", "^ucrtbase\.dll$", "^vcruntime140_app", "^msvcp140_app",
+    "^api-ms-win-", "^ext-ms-win-", "^ucrtbase\.dll$",
     "^oleaut32\.dll$", "^combase\.dll$",
     "^kernel32\.dll$", "^kernelbase\.dll$", "^d3d12\.dll$", "^dxgi\.dll$", "^d3d11\.dll$",
     # No dxcompiler.dll / dxil.dll: the package does not carry a shader compiler
     # (DXIL is compiled at build time), so importing one is a packaging bug, not
     # an allowance. An import that is not in this list is a failure.
-    "^xaudio2_9\.dll$", "^SDL3\.dll$", "^libuwp\.dll$",
-    "^ole32\.dll$", "^windows\.storage\.dll$", "^combase\.dll$", "^sechost\.dll$",
-    "^powrprof\.dll$", "^user32\.dll$", "^gdi32\.dll$", "^advapi32\.dll$", "^shcore\.dll$",
+    "^SDL3\.dll$", "^libuwp\.dll$",
+    "^windows\.storage\.dll$", "^sechost\.dll$",
+    "^powrprof\.dll$", "^shcore\.dll$",
     "^bcrypt\.dll$", "^ntdll\.dll$", "^rpcrt4\.dll$", "^mmdevapi\.dll$", "^avrt\.dll$",
-    "^dwrite\.dll$", "^d2d1\.dll$", "^windowscodecs\.dll$", "^setupapi\.dll$", "^cfgmgr32\.dll$"
+    "^windowscodecs\.dll$"
 )
 
 # Symbols that exist but are refused at run time inside an AppContainer. Each has
@@ -149,7 +157,11 @@ foreach ($binary in $binaries) {
     foreach ($line in $imports) {
         if ($line -notmatch "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { continue }
         $module = $Matches[1]
-        if ($module -match "^api-ms-win-" -or $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$" -or
+        # Modules the platform provides: an import of one is a packaging question
+        # only for the *port's* binaries (they may not use them, above), while a
+        # payload DLL importing one is Microsoft's business and reaches here as a
+        # notice. That is why this list is longer than $AllowedModules.
+        if ($module -match "^api-ms-win-" -or $module -match "^(kernel32|kernelbase|ucrtbase|vcruntime140|vcruntime140_1|msvcp140|d3d12|dxgi|d3d11|dxcompiler|dxil|xaudio2_9|ole32|oleaut32|combase|user32|gdi32|advapi32|bcrypt|ntdll|mmdevapi|avrt)\.dll$" -or
             $module -match ("(" + ($AppCrtModules -join "|") + ")")) {
             continue
         }
@@ -165,6 +177,35 @@ if ($notices.Count -gt 0) {
         $body = ($uniqueNotices -join "`n") -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
         if ($body.Length -gt 55000) { $body = $body.Substring($body.Length - 55000) }
         Write-Output "::warning title=import audit notices::$body"
+    }
+}
+
+# --- what the three binaries actually import --------------------------------
+# The audit above answers a yes/no question; when the answer is no, the next
+# question is always "imports *what*?". dumpbin's table goes to
+# `build/imports-<name>.log` (the build-logs artifact picks `build/*.log` up)
+# and the module list goes to an annotation, because a run's log is not always
+# reachable afterwards. The three are the ones a load failure can come from: the
+# port's own image, and the two DLLs the package ships.
+$watched = @("bbxbox.exe", "SDL3.dll", "libuwp.dll")
+$importLogDir = Split-Path $PackageDir -Parent
+foreach ($name in $watched) {
+    $path = Join-Path $PackageDir $name
+    if (-not (Test-Path $path)) {
+        Write-Host "imports $name: not in the package"
+        continue
+    }
+    $table = @(& $Dumpbin /nologo /imports $path 2>&1)
+    if (Test-Path $importLogDir) {
+        Set-Content -Path (Join-Path $importLogDir "imports-$name.log") -Value $table -Encoding utf8
+    }
+    $modules = @($table | ForEach-Object { if ($_ -match "^\s+([A-Za-z0-9_.\-]+\.dll)\s*$") { $Matches[1] } } |
+        Sort-Object -Unique)
+    $text = ($modules -join ", ")
+    if ($text.Length -gt 3500) { $text = $text.Substring(0, 3500) + " ..." }
+    Write-Host "imports $name ($($modules.Count) modules): $text"
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        Write-Output "::notice title=imports $name::$($text -replace '%', '%25')"
     }
 }
 

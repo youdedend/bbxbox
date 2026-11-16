@@ -15,6 +15,36 @@
 cmake_minimum_required(VERSION 3.28)
 project(bbxbox LANGUAGES C CXX)
 
+# --- the CRT is static, because the console's loader runs first ---------------
+#
+# The packaged app was installed on a Series X, launched, and left LocalState
+# empty: it died before wWinMain with 0xC0000135 (STATUS_DLL_NOT_FOUND). A DLL
+# CRT is exactly that failure - bbxbox.exe imports VCRUNTIME140_APP.dll and
+# MSVCP140_APP.dll from the Microsoft.VCLibs framework package, and a sideload
+# that does not get that framework deployed cannot start the image at all. There
+# is no code of ours to log it, because none of ours has run.
+#
+# /MT removes the question. Nothing of ours is a DLL import any more: the CRT is
+# in the image, and what is left in the import table is the system's libraries
+# and the two DLLs the package carries. VCLibs stays a dependency regardless -
+# SDL3.dll is built /MD + /ZW and needs vccorlib140_app/msvcp140_app from it -
+# but SDL3.dll is *in* the package, so its absence cannot be a loader failure.
+#
+# CMP0091 is what makes CMAKE_MSVC_RUNTIME_LIBRARY mean anything in the first
+# place; it is NEW by default at 3.28 and is set here so a future
+# `cmake_minimum_required` cannot quietly move it back.
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING
+    "the console build links the static CRT; see the comment above")
+if(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+    message(FATAL_ERROR
+        "CMAKE_MSVC_RUNTIME_LIBRARY is '${CMAKE_MSVC_RUNTIME_LIBRARY}'.\n"
+        "The console build links the static CRT (/MT): with the DLL CRT the loader fails\n"
+        "on VCRUNTIME140_APP.dll before wWinMain, which is what a Series X did. Drop the\n"
+        "override, and see xbox/scripts/check-imports.ps1 for the audit that enforces it.")
+endif()
+message(STATUS "runtime library: ${CMAKE_MSVC_RUNTIME_LIBRARY} (the CRT is in the image)")
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
     message(FATAL_ERROR "xbox/ must be configured with -DCMAKE_SYSTEM_NAME=WindowsStore")
 endif()
@@ -329,8 +359,16 @@ endif()
 # be named explicitly, and the desktop vcruntime140_1.lib (which supplies
 # __CxxFrameHandler4) has to be refused, or the link picks it and the package
 # fails import validation on the console.
+#
+# It is only reachable for a DLL-CRT build, and the guard at the top of this file
+# refuses that configuration: with /MT (what ships) there is nothing to import,
+# and linking vcruntime140_app.lib anyway would put VCRUNTIME140_APP.dll back
+# into the import table - the failure this iteration exists to remove. So the
+# block below is gated on the runtime library, and today it is documentation as
+# much as code: what it knows about vcruntime140_1.lib and __CxxFrameHandler4 is
+# the reason it is kept rather than deleted.
 set(BBX_STORE_CRT_DIR "" CACHE PATH "the MSVC lib/x64/store directory (the Store CRT)")
-if(BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
+if(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL" AND BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
     # The directory goes first on the search path, so the store CRT wins over the
     # desktop one for every library name the CRT itself requests.
     target_link_directories(bbxbox BEFORE PRIVATE "${BBX_STORE_CRT_DIR}")
@@ -349,8 +387,10 @@ if(BBX_STORE_CRT_DIR AND EXISTS "${BBX_STORE_CRT_DIR}")
     else()
         message(STATUS "store CRT: only the plain import-library names exist")
     endif()
-else()
+elseif(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
     message(WARNING "BBX_STORE_CRT_DIR is not set; the link will import the desktop CRT")
+else()
+    message(STATUS "store CRT: not used, the CRT is linked statically (/MT)")
 endif()
 
 target_link_libraries(bbxbox PRIVATE

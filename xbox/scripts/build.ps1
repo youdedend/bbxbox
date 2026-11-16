@@ -80,7 +80,10 @@ $cfgArgs = @(
     "-DCMAKE_C_COMPILER=clang-cl",
     "-DCMAKE_CXX_COMPILER=clang-cl",
     "-DCMAKE_BUILD_TYPE=$Configuration",
-    "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL",
+    # No -DCMAKE_MSVC_RUNTIME_LIBRARY here: xbox/CMakeLists.txt sets it to the
+    # static CRT and refuses the DLL one. Passing MultiThreadedDLL from this
+    # script is what produced the 0xC0000135 launch on a Series X (the loader
+    # wanted VCRUNTIME140_APP.dll from a framework package that was not deployed).
     "-DBBX_SDL3_PREFIX=$prefix\sdl3",
     "-DBBX_LIBUWP_PREFIX=$prefix\libuwp",
     "-DBBX_DXC_PREFIX=$prefix\dxc",
