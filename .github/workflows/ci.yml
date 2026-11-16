@@ -152,7 +152,7 @@ jobs:
           # counted: one line that says what the link could possibly take.
           census=$(grep -roh --binary-files=text -E '__imp_(MapView|CreateFileMapping)[A-Za-z0-9_]*' \
                      build/xbox --include='*.obj' 2>/dev/null | sort | uniq -c | head -20 | tr '\n' ' ')
-          [ -z "$census" ] || echo "::warning title=mapping stubs in objects::${census//%/%25}"
+          [ -z "$census" ] || echo "::notice title=mapping stubs in objects::${census//%/%25}"
           exit 0
       - name: package + check imports
         shell: pwsh
