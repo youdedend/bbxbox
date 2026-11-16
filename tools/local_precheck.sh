@@ -105,6 +105,40 @@ if ! grep -q "allocatable" src/host/d3d12/bbx_budget.h; then
   fail "bbx_budget.h lost allocatable()"
 fi
 
+# --- 5a. the console build's own source list --------------------------------
+# The portable core is one list and the console's build is another, so a new
+# core file can compile here, pass every host test, and still be missing from
+# `xbox/CMakeLists.txt` - which is a link error three minutes into CI (PathTable,
+# 5B-2b). A translation unit under `xbox/platform/` that includes a core header
+# whose `.cpp` exists and is built here must have that `.cpp` in the console's
+# list too.
+# What the console's build actually compiles: its own list, plus the SDK-only
+# files the root CMakeLists gathers in BBX_CONSOLE_SOURCES for it.
+console_list="$(mktemp)"
+cat xbox/CMakeLists.txt > "$console_list"
+sed -n '/set(BBX_CONSOLE_SOURCES/,/^)/p' CMakeLists.txt >> "$console_list"
+missing=()
+for tu in xbox/platform/*.cpp; do
+    [ -f "$tu" ] || continue
+    while IFS= read -r header; do
+        case "$header" in
+            src/*) impl="${header%.h}.cpp" ;;
+            *) impl="src/${header%.h}.cpp" ;;
+        esac
+        [ -f "$impl" ] || continue
+        # The console's list spells these `../src/host/d3d12/<name>.cpp`, so the
+        # basename is the part that has to be there.
+        if ! grep -q "$(basename "$impl")" "$console_list"; then
+            missing+=("$tu includes $header, and $(basename "$impl") is not in xbox/CMakeLists.txt")
+        fi
+    done < <(grep -oE '"(src/)?host/d3d12/[a-z0-9_]+\.h"' "$tu" | tr -d '"' | sed -e 's|^src/||' | sort -u)
+done
+rm -f "$console_list"
+if [ ${#missing[@]} -gt 0 ]; then
+    printf '%s\n' "${missing[@]}"
+    fail "a console translation unit includes a core header whose .cpp the console build does not compile"
+fi
+
 # --- 5b. the vendored guest core ---------------------------------------------
 if [ ! -f upstream/bbhost/UPSTREAM-PIN ]; then
   fail "upstream/bbhost/UPSTREAM-PIN is missing"

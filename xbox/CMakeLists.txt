@@ -174,6 +174,11 @@ set(BBX_D3D12_SOURCES
     # the pointer (platform/guest_compute.cpp logs it per program).
     ../src/host/d3d12/bbx_guest_vsharp.cpp
     ../src/host/d3d12/bbx_guest_path.cpp
+    # The bake's binding assignment beside the cache, and the decision that turns
+    # one plan into a descriptor (5B-2b): both are portable core files, and the
+    # dispatch reads the first and writes from the second.
+    ../src/host/d3d12/bbx_path_table.cpp
+    ../src/host/d3d12/bbx_guest_binding.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
     platform/guest_compute.cpp
 )
