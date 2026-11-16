@@ -51,6 +51,7 @@
 #include "xbox/platform/hostfs_extra.h"
 #include "xbox/platform/storage.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
+#include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/bbhost_bridge.h"
 
 // The guest runtime. `main.cpp` is not compiled on this target - it opens a
@@ -80,6 +81,10 @@ namespace {
 // pad the launcher draws with can never be two different controllers.
 SDL_Gamepad* g_pad = nullptr;
 std::uint64_t g_flips = 0;
+// The window's session, set once by the launcher: null until the device is up,
+// and read from the guest's thread on every flip. It has to be declared here,
+// above host_present, which is the only reader.
+std::atomic<bbx::platform::D3d12Session*> g_frame_sink{nullptr};
 
 }  // namespace
 
@@ -170,17 +175,33 @@ PadState host_pad_state() {
 
 bool host_pad_present() { return g_pad != nullptr; }
 
+// The guest's scanout range, as this process can read it (defined beside the
+// image it reads): false when the address is not inside the mapped arena.
+bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels);
+
 // --- the flip --------------------------------------------------------------
-// Called by the guest's video HLE once per frame. The launcher's own loop is
-// what runs now, so this only counts and reports: blocking here would stall the
-// guest thread behind a presenter that is not listening to it yet.
+// Called by the guest's video HLE once per frame, on the guest's thread. What it
+// does is bounded: a bounds check, a memcpy into the session's pending frame and
+// a counter - nothing that waits for the GPU or for the presenter, because the
+// guest is between two EOP/label waits here and stalling it stalls the game.
 void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h,
                   const PresentFlip& flip) {
-    (void)buffer_index; (void)display_va; (void)display_w; (void)display_h; (void)flip;
+    (void)buffer_index; (void)flip;
     ++g_flips;
     if ((g_flips % 60) == 1) {
         bbx::platform::LogCrumb("gpu:flip");
     }
+    bbx::platform::D3d12Session* const session = g_frame_sink.load(std::memory_order_acquire);
+    if (session == nullptr || display_va == 0 || display_w == 0 || display_h == 0) { return; }
+    // The scanout buffer, as this process can read it: the guest arena is mapped
+    // in-process, so a guest virtual address is a pointer here - once the range is
+    // known to be inside the image. sceVideoOutRegisterBuffers can be handed an
+    // address the image no longer covers (a mode change, a title that reuses a
+    // buffer after freeing it), and a flip must not fault the guest.
+    const std::uint64_t bytes = static_cast<std::uint64_t>(display_w) * static_cast<std::uint64_t>(display_h) * 4u;
+    const std::uint8_t* pixels = nullptr;
+    if (!GuestScanoutPixels(display_va, bytes, &pixels)) { return; }
+    session->SubmitGuestFrame(pixels, display_w, display_h);
 }
 
 // The launcher owns the window: there is nothing here to pump, nothing to
@@ -668,6 +689,15 @@ namespace {
 // `_start` runs on its own thread until the game either finishes or the player
 // closes the window, so none of it may live in a stack frame.
 ElfImage g_image;
+
+bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels) {
+    if (pixels != nullptr) *pixels = nullptr;
+    const std::uint64_t slide = g_image.mem.slide;
+    const std::uint64_t size = g_image.mem.size;
+    if (g_image.mem.base == nullptr || va < slide || va - slide >= size || bytes > size - (va - slide)) { return false; }
+    if (pixels != nullptr) *pixels = static_cast<const std::uint8_t*>(g_image.mem.base) + (va - slide);
+    return true;
+}
 std::string g_eboot_path;
 
 // The baked console shaders, loaded once at boot: the dump's copy, else the one
@@ -833,6 +863,8 @@ bool StartGuest(const GuestRequest& req) {
     return true;
 }
 
+void AttachFrameSink(bbx::platform::D3d12Session* session) { g_frame_sink.store(session, std::memory_order_release); }
+
 std::string ShaderCacheLine() { return g_shader_cache.Report(); }
 
 bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
@@ -860,6 +892,7 @@ bool StartGuest(const GuestRequest& req) {
     return false;
 }
 bool Running() { return false; }
+void AttachFrameSink(bbx::platform::D3d12Session* session) { (void)session; }
 std::string ShaderCacheLine() { return "no cache: the guest runtime is not linked into this build"; }
 bool ShaderCacheLookup(std::uint64_t key, const std::uint8_t** bytes, std::uint32_t* size,
                        std::uint32_t* raw_size) {

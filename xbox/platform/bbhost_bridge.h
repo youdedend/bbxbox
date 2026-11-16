@@ -13,7 +13,16 @@
 
 struct SDL_Gamepad;
 
+namespace bbx::platform {
+class D3d12Session;
+}
+
 namespace bbx::bridge {
+
+// The window's GPU session, so a flip can reach the swapchain: the launcher
+// sets it once the device is up, and host_present hands it the guest's scanout
+// buffer without ever waiting for it.
+void AttachFrameSink(bbx::platform::D3d12Session* session);
 
 // The pad the launcher's event loop is reading. Called once when a controller
 // arrives; the game's reads translate it (host/window.h's PadState).

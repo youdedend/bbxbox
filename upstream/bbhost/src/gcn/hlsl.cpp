@@ -2882,10 +2882,37 @@ std::string dxil_helper_body(const std::string& name, const std::string& ret, co
     // discard ends the lane, which is the demote's effect on the instructions
     // that follow it.
     if (name == "spv_demote_to_helper" && n == 0) return "    discard;";
-    if (dxil_starts(name, "spv_iadd_carry") || dxil_starts(name, "spv_isub_borrow") || dxil_starts(name, "spv_umul_extended") ||
-        dxil_starts(name, "spv_smul_extended")) {
-        why = "a 64-bit extended arithmetic (" + name + ")";
-        return {};
+    // The wide arithmetic the lift uses to build 64-bit addresses, as the two
+    // 32-bit words it is: s_addc/s_subb/mul_hi are carried and borrowed in
+    // arithmetic the console's compiler already has, so no shader needs 64-bit
+    // integer operations (which SM 6.4 has, but which a driver is free to
+    // implement with a helper call).
+    if ((name == "spv_iadd_carry" || name == "spv_isub_borrow" || name == "spv_umul_extended" || name == "spv_smul_extended") &&
+        n == 2) {
+        const std::string pair = r + " r;";
+        if (name == "spv_iadd_carry") {
+            return "    const uint lo = a0 + a1;\n    " + pair +
+                   "\n    r.lo = lo;\n    r.hi = lo < a0 ? 1u : 0u;\n    return r;";
+        }
+        if (name == "spv_isub_borrow") {
+            return "    const uint lo = a0 - a1;\n    " + pair +
+                   "\n    r.lo = lo;\n    r.hi = a0 < a1 ? 1u : 0u;\n    return r;";
+        }
+            // The high word of a 32x32 product, from four 16-bit products: the
+            // middle two carry into the top one, which no instruction needed.
+        const std::string mul =
+            "    const uint a = uint(a0), b = uint(a1);\n"
+            "    const uint al = a & 0xffffu, ah = a >> 16u, bl = b & 0xffffu, bh = b >> 16u;\n"
+            "    const uint p0 = al * bl, p1 = al * bh, p2 = ah * bl, p3 = ah * bh;\n"
+            "    const uint cy = ((p0 >> 16u) + (p1 & 0xffffu) + (p2 & 0xffffu)) >> 16u;\n"
+            "    const uint hi = p3 + (p1 >> 16u) + (p2 >> 16u) + cy;\n";
+        if (name == "spv_umul_extended") {
+            return mul + "    " + pair + "\n    r.lo = a * b;\n    r.hi = hi;\n    return r;";
+        }
+        // Signed: the unsigned high word less a times the sign-extension of b
+        // and b times that of a, which is what two's complement's correction is.
+        return mul + "    " + pair + "\n    r.lo = a * b;\n    r.hi = asint(hi - (a0 < 0 ? b : 0u) - (a1 < 0 ? a : 0u));\n"
+                     "    return r;";
     }
     (void)t;
     why = "an inline SPIR-V instruction with no Shader Model 6.4 equivalent (" + name + ")";
@@ -3014,15 +3041,24 @@ void lower_to_dxil(HlslResult& r) {
                 stop("a block member inside the one before it", line);
                 return;
             }
-            if ((want - static_cast<long long>(block_pos)) % 16 != 0) {
+            // DXC packs a scalar into any free component, so a gap of dwords is
+            // reachable with dwords and one of registers with registers; a gap
+            // of anything else is an offset its layout cannot produce, and the
+            // shader stops here rather than reading the member before it.
+            if ((want - static_cast<long long>(block_pos)) % 4 != 0) {
                 stop("a block member whose offset DXC's layout cannot reach", line);
                 return;
             }
-            // Pad with whole registers, which DXC always packs.
-            if (want > static_cast<long long>(block_pos)) {
-                const long long n = (want - static_cast<long long>(block_pos)) / 16;
-                pad_text += indent + "float4 _dxil_pad" + std::to_string(++pad_count) + "[" + std::to_string(n) + "];\n";
-                block_pos = static_cast<unsigned>(want);
+            while (want > static_cast<long long>(block_pos)) {
+                const long long gap = want - static_cast<long long>(block_pos);
+                if (gap >= 16 && block_pos % 16 == 0) {
+                    pad_text += indent + "float4 _dxil_pad" + std::to_string(++pad_count) + "[" +
+                                std::to_string(gap / 16) + "];\n";
+                    block_pos += static_cast<unsigned>(gap / 16 * 16);
+                } else {
+                    pad_text += indent + "uint _dxil_pad" + std::to_string(++pad_count) + ";\n";
+                    block_pos += 4;
+                }
             }
             block_pos += lay.size;
             text = indent + rest;

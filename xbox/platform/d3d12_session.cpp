@@ -6,11 +6,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "src/host/d3d12/device.h"
 #include "src/host/d3d12/pipeline.h"
 #include "src/host/d3d12/replay.h"
 #include "src/host/d3d12/swapchain.h"
+#include "xbox/platform/bbhost_bridge.h"
 #include "xbox/platform/log.h"
 
 namespace bbx::platform {
@@ -38,6 +41,17 @@ struct D3d12Session::Impl {
     Hud hud{1920.0f, 1080.0f};
     GpuReport report;
     bool ready = false;
+
+    // The guest's frame, triple buffered: the guest thread writes `frame_pixels`,
+    // Present swaps it with `frame_upload` and copies that into the scanout image
+    // outside the lock. Two buffers are enough to never wait for the third: the
+    // third frame that arrives before Present takes one is dropped and counted.
+    std::mutex frame_mutex;
+    std::vector<std::uint8_t> frame_pixels;
+    std::vector<std::uint8_t> frame_upload;
+    std::uint32_t frame_width = 0, frame_height = 0;
+    bool frame_pending = false;
+    std::uint64_t guest_frames = 0, guest_frames_dropped = 0;
 
     [[nodiscard]] d3d12::DeviceDesc Desc(bool debug) const {
         d3d12::DeviceDesc desc{};
@@ -172,7 +186,7 @@ Hud D3d12Session::BuildReportHud() const {
     const float line = Hud::TextHeight(static_cast<std::uint32_t>(scale)) +
                        static_cast<float>(scale) * 3.0f;
 
-    const std::uint32_t lines = 7;
+    const std::uint32_t lines = 9;
     const float panel_height = line * static_cast<float>(lines) + margin;
     const float panel_y = height - panel_height - margin;
     hud.Panel(margin, panel_y, width - margin * 2.0f, panel_height, HudColor::Panel());
@@ -195,6 +209,14 @@ Hud D3d12Session::BuildReportHud() const {
     y += line;
     hud.Status(x, y, s, impl.report.selftest_ok, impl.report.selftest);
     y += line;
+    // The baked console shaders, and how many frames the guest has offered: the
+    // two facts a live test reads off the television (StartGuest loads the cache
+    // and logs the same line; host_present counts the flips).
+    hud.Row(x, y, row_width, s, "SHADER CACHE", bridge::ShaderCacheLine(), HudColor::White());
+    y += line;
+    hud.Row(x, y, row_width, s, "GUEST FLIPS",
+            std::to_string(static_cast<unsigned long long>(bridge::Flips())), HudColor::White());
+    y += line;
     hud.Text(x, y, s, "LAUNCHER UI AND GUEST BOOT ARE P1B: THIS IS THE 4K GPU PATH",
              HudColor::Grey());
     return hud;
@@ -215,6 +237,32 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     LogCrumb("replay: begin frame");
     d3d12::Status status = impl.replay.BeginFrame();
     if (status != d3d12::Status::kOk) { return status; }
+    // The guest's frame first, beneath everything: the swap is under the lock and
+    // the copy is not, so the guest thread's flip costs it a memcpy.
+    std::vector<std::uint8_t> frame;
+    std::uint32_t frame_width = 0, frame_height = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl.frame_mutex);
+        if (impl.frame_pending) {
+            impl.frame_upload.swap(impl.frame_pixels);
+            frame.swap(impl.frame_upload);
+            frame_width = impl.frame_width;
+            frame_height = impl.frame_height;
+            impl.frame_pending = false;
+        }
+    }
+    if (!frame.empty() && frame_width != 0 && frame_height != 0) {
+        const d3d12::Status uploaded = impl.replay.UploadFrame(frame.data(), frame_width, frame_height);
+        if (uploaded != d3d12::Status::kOk) {
+            LogCrumb("replay: guest frame dropped");
+            ++impl.guest_frames_dropped;
+        } else {
+            ++impl.guest_frames;
+        }
+        // It goes back to the pool for the next flip, with its capacity intact.
+        std::lock_guard<std::mutex> lk(impl.frame_mutex);
+        impl.frame_upload.swap(frame);
+    }
     // The boot colour: near-black, so a missed quad is visible rather than hidden.
     status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f);
     if (status != d3d12::Status::kOk) { return status; }
@@ -230,6 +278,26 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     status = impl.replay.DrawOverlay();
     if (status != d3d12::Status::kOk) { return status; }
     return impl.replay.EndFrame(vsync);
+}
+
+void D3d12Session::SubmitGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
+    if (impl_ == nullptr || rgba == nullptr || width == 0 || height == 0) { return; }
+    const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
+    std::lock_guard<std::mutex> lk(impl_->frame_mutex);
+    // Only the newest survives: a frame the presenter has not taken yet is the
+    // one this replaces, which is what a television shows anyway.
+    if (impl_->frame_pending) { ++impl_->guest_frames_dropped; }
+    if (impl_->frame_pixels.size() != bytes) { impl_->frame_pixels.resize(bytes); }
+    std::memcpy(impl_->frame_pixels.data(), rgba, bytes);
+    impl_->frame_width = width;
+    impl_->frame_height = height;
+    impl_->frame_pending = true;
+}
+
+std::uint64_t D3d12Session::GuestFrames() const {
+    if (impl_ == nullptr) { return 0; }
+    std::lock_guard<std::mutex> lk(impl_->frame_mutex);
+    return impl_->guest_frames;
 }
 
 bbx::d3d12::Status D3d12Session::OnModeChanged(std::uint32_t window_width,

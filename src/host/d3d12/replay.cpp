@@ -14,6 +14,8 @@ namespace bbx::d3d12 {
 namespace {
 
 constexpr std::uint64_t kUploadRingBytes = 4ull << 20;  // 4 MiB a frame
+// D3D12_TEXTURE_DATA_PITCH_ALIGNMENT: a texture upload's source rows land on it.
+constexpr std::uint64_t kTexturePitchAlign = 256;
 constexpr std::uint64_t kOverlayBytes = 64ull << 10;    // 2,048 quads
 constexpr std::uint32_t kFrameImageSize = 256;  // the placeholder final image
 
@@ -168,6 +170,77 @@ Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height) {
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     device_->Get()->CreateShaderResourceView(frame_image_.Get(), &srv, frame_srv_.cpu);
+    frame_image_width_ = width;
+    frame_image_height_ = height;
+    return Status::kOk;
+}
+
+Status Replay::UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) {
+    if (!in_frame_) { return Status::kInvalidArgument; }
+    if (rgba == nullptr || width == 0 || height == 0) { return Status::kInvalidArgument; }
+    if (!frame_image_ || frame_image_width_ != width || frame_image_height_ != height) {
+        // The guest's display changed size (or this is the first flip): the
+        // placeholder goes rather than being stretched over the frame.
+        frame_image_.Reset();
+        const Status recreated = CreateFrameImage(width, height);
+        if (recreated != Status::kOk) { return recreated; }
+    }
+    // D3D12 wants the source rows on a 256-byte pitch.
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(width) * 4u;
+    const std::uint64_t pitch = (row_bytes + kTexturePitchAlign - 1) / kTexturePitchAlign * kTexturePitchAlign;
+    const std::uint64_t bytes = pitch * height;
+    if (frame_staging_ == nullptr || frame_staging_bytes_ < bytes) {
+        frame_staging_.Reset();
+        frame_staging_mapped_ = nullptr;
+        frame_staging_bytes_ = 0;
+        const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_RESOURCE_DESC desc = BufferDesc(bytes, D3D12_RESOURCE_FLAG_NONE);
+        const HRESULT hr = device_->Get()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            __uuidof(ID3D12Resource), reinterpret_cast<void**>(frame_staging_.GetAddressOf()));
+        if (FAILED(hr)) {
+            Log("replay: frame staging buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+            frame_staging_.Reset();
+            return FromHresult(hr);
+        }
+        if (FAILED(frame_staging_->Map(0, &kNoRead, &frame_staging_mapped_)) ||
+            frame_staging_mapped_ == nullptr) {
+            Log("replay: frame staging buffer could not be mapped");
+            frame_staging_.Reset();
+            frame_staging_mapped_ = nullptr;
+            return Status::kUnavailable;
+        }
+        frame_staging_bytes_ = bytes;
+    }
+    auto* rows = static_cast<std::uint8_t*>(frame_staging_mapped_);
+    for (std::uint32_t row = 0; row < height; ++row) {
+        std::memcpy(rows + static_cast<std::uint64_t>(row) * pitch,
+                    rgba + static_cast<std::uint64_t>(row) * row_bytes,
+                    static_cast<std::size_t>(row_bytes));
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = frame_staging_.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = 0;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    source.PlacedFootprint.Footprint.Width = width;
+    source.PlacedFootprint.Footprint.Height = height;
+    source.PlacedFootprint.Footprint.Depth = 1;
+    source.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(pitch);
+    D3D12_TEXTURE_COPY_LOCATION target{};
+    target.pResource = frame_image_.Get();
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    target.SubresourceIndex = 0;
+    // The image is created readable (PIXEL_SHADER_RESOURCE); each upload takes it
+    // out of that state and puts it back, so DrawPresent always samples a
+    // resource in the state it declares.
+    (void)TransitionBarrier(frame_image_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+    command_list_->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    (void)TransitionBarrier(frame_image_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ++stats_.copies;
     return Status::kOk;
 }
 
@@ -796,6 +869,12 @@ void Replay::Destroy() {
     atlas_.Reset();
     white_.Reset();
     frame_image_.Reset();
+    if (frame_staging_ != nullptr && frame_staging_mapped_ != nullptr) {
+        frame_staging_->Unmap(0, nullptr);
+    }
+    frame_staging_mapped_ = nullptr;
+    frame_staging_bytes_ = 0;
+    frame_staging_.Reset();
     upload_.Reset();
     command_list_.Reset();
     overlay_count_ = 0;

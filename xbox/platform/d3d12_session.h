@@ -59,6 +59,17 @@ public:
 
     // Draws one HUD frame and presents it. `hud` is consumed as it is.
     bbx::d3d12::Status Present(const Hud& hud, bool vsync = true);
+
+    // The guest's scanout frame, handed over from the guest thread on its flip
+    // (host_present): copied here and uploaded on the next Present, which keeps
+    // only the newest. A memcpy and a short lock are all the guest thread pays,
+    // so a flip never waits on the GPU, and a frame the presenter has not taken
+    // yet is counted and dropped rather than queued behind it.
+    void SubmitGuestFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height);
+
+    // Frames the guest offered and the presenter took (and how many it dropped
+    // because the guest outran it), for the HUD.
+    [[nodiscard]] std::uint64_t GuestFrames() const;
     // A television mode change: re-plan, resize the swapchain, resize the HUD.
     bbx::d3d12::Status OnModeChanged(std::uint32_t window_width, std::uint32_t window_height);
 

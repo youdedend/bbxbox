@@ -79,6 +79,15 @@ public:
     // is structurally valid and reports the error instead of reading past it.
     Status ExecuteStreamBlock(std::span<const std::uint8_t> block);
     Status DrawPresent(float red, float green, float blue);
+
+    // The guest's scanout buffer, uploaded into the image DrawPresent samples.
+    // Called inside a frame, between BeginFrame and DrawPresent: the copy goes on
+    // that frame's command list, so the guest thread never waits on the GPU, and
+    // a frame that does not fit is dropped rather than stalled. A size change
+    // recreates the image (the placeholder is 256x256 until the first flip).
+    // The pixels are RGBA8; the display's own format arrives with the display
+    // HLE, which is where the guest's tiling is stated too.
+    Status UploadFrame(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height);
     Status DrawOverlay();
 
     // The glyph atlas is uploaded once (an R8_UNORM coverage texture).
@@ -129,7 +138,14 @@ private:
     std::uint64_t upload_capacity_ = 0;
     std::uint64_t upload_used_ = 0;
 
-    ComPtr<ID3D12Resource> frame_image_;    // the "guest's final image" until P3
+    ComPtr<ID3D12Resource> frame_image_;    // the guest's scanout image (256x256 until the first flip)
+    // Its size, and the staging buffer the guest's frame is copied through: one
+    // UPLOAD heap buffer, remade when the frame grows, kept out of the 4 MiB
+    // per-frame ring a 1080p frame does not fit in.
+    std::uint32_t frame_image_width_ = 0, frame_image_height_ = 0;
+    ComPtr<ID3D12Resource> frame_staging_;
+    void* frame_staging_mapped_ = nullptr;
+    std::uint64_t frame_staging_bytes_ = 0;
     ComPtr<ID3D12Resource> atlas_;          // R8_UNORM glyph coverage
     ComPtr<ID3D12Resource> white_;          // 1x1 white: solid overlay panels
     Slice frame_srv_{};
