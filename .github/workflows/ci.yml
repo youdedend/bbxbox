@@ -135,22 +135,24 @@ jobs:
         if: always()
         shell: bash
         # The import audit names the symbol, the link names nothing: this step
-        # names where the reference is - an object in the build tree, a static
-        # library member, or the line of the link map that took it - so a
-        # refusal is fenced at its source instead of guessed at. `grep` rather
-        # than `findstr`: objects are binary. Annotations, not stdout, because a
-        # run's log is not always reachable afterwards.
+        # names the object that still refers to it, with the exact stub token
+        # (`__imp_<name>` and not `__imp_<name>FromApp`, which is the right call),
+        # so a refusal is fenced at its source instead of guessed at. `grep`
+        # rather than `findstr`: objects are binary. Annotations, not stdout,
+        # because a run's log is not always reachable afterwards.
         run: |
           set +e
           for sym in MapViewOfFile CreateFile2 FindFirstFileExW FindFirstFileW \
                      CreateDirectoryW MoveFileExW DeleteFileW CreateFileA CreateFileW; do
-            stub="__imp_${sym}"
-            hits=$(grep -rl --binary-files=text -F "$stub" build/xbox build-deps/prefix \
-                     --include='*.obj' --include='*.lib' 2>/dev/null | head -12 | tr '\n' ' ')
-            [ -n "$hits" ] && echo "::warning title=stub $sym::${hits//%/%25}"
-            map=$(grep -n -F "$sym" build/xbox/bbxbox.map 2>/dev/null | head -6 | tr '\n' ' ')
-            [ -n "$map" ] && echo "::warning title=map $sym::${map//%/%25}"
+            files=$(grep -rl --binary-files=text -E "__imp_${sym}([^A-Za-z0-9_]|$)" \
+                      build/xbox --include='*.obj' --include='*.lib' 2>/dev/null | head -10 | tr '\n' ' ')
+            [ -z "$files" ] || echo "::warning title=stub ${sym}::${files//%/%25}"
           done
+          # Every MapView* and CreateFileMapping* stub in the whole build tree,
+          # counted: one line that says what the link could possibly take.
+          census=$(grep -roh --binary-files=text -E '__imp_(MapView|CreateFileMapping)[A-Za-z0-9_]*' \
+                     build/xbox --include='*.obj' 2>/dev/null | sort | uniq -c | head -20 | tr '\n' ' ')
+          [ -z "$census" ] || echo "::warning title=mapping stubs in objects::${census//%/%25}"
           exit 0
       - name: package + check imports
         shell: pwsh
