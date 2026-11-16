@@ -1017,9 +1017,24 @@ int SelfTest(const Options& options) {
             ++failures;
             continue;
         }
-        std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s\n", c.name,
+        // The digest is what makes "signed" a measurement: DXBC and a non-zero
+        // one. A runner's log is not always reachable afterwards, so the same
+        // line goes out as an annotation in CI.
+        char digest[48] = "none";
+        if (!built.object.empty()) {
+            std::snprintf(digest, sizeof(digest), "%08x%08x%08x%08x",
+                          static_cast<unsigned>(built.object[4]), static_cast<unsigned>(built.object[5]),
+                          static_cast<unsigned>(built.object[6]), static_cast<unsigned>(built.object[7]));
+        }
+        std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s, digest %s\n", c.name,
                     static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
-                    built.source.size(), built.object.size(), built.object.empty() ? "unsigned (no compiler)" : "signed");
+                    built.source.size(), built.object.size(),
+                    built.object.empty() ? "unsigned (no compiler)" : "signed", digest);
+        if (std::getenv("GITHUB_ACTIONS") != nullptr) {
+            std::printf("::notice title=prebake %s::key %016llx %s, %zu bytes, digest %s\n", c.name,
+                        static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
+                        built.object.size(), digest);
+        }
         if (have_compiler) {
             if (built.object.empty()) {
                 ++failures;  // Build already said why
