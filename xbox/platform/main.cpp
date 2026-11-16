@@ -372,6 +372,9 @@ bool InitSdl() {
             const bbx::platform::GpuReport& report = g_session.gpu->Report();
             bbx::platform::LogF("d3d12: %s, %s, self-test %s", report.adapter.c_str(),
                                 report.swapchain.c_str(), report.selftest.c_str());
+            if (!report.guest.empty()) {
+                bbx::platform::LogF("d3d12: %s", report.guest.c_str());
+            }
         } else {
             bbx::platform::LogF("d3d12: unavailable (%s); the SDL renderer stays in use",
                                 bbx::d3d12::StatusName(status));

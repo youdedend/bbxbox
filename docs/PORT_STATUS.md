@@ -133,13 +133,44 @@ before it destroys the device. What that makes real now:
   table for the page table and the 32 slabs), with no static samplers and no
   `ID3D12PipelineLibrary`.
 
-Not yet: the pipeline itself. A dispatch resolves its shader identity, and a key
-the baked cache does not carry is counted and *refused once per key*, with the
-reason in the log (`host_gpu_d3d12.cpp`, `GuestDispatchReport()`) — never dispatched
-as something the console cannot run. Building the compute PSO from the cached
-DXIL and issuing the dispatch, and the whole graphics half
-(`host_gpu_draw`, render-target views, the blits) stay counted stubs until
-Slice 5B-2, which is the next slice.
+**And the compute pipeline on top of it (Slice 5B-2a).** `platform/guest_compute.cpp` now
+runs a dispatch rather than refusing it:
+
+* the program at `COMPUTE_PGM_LO/HI` is read out of the guest's own memory (the
+  `OrbShdr` footer gives its length, a program without one is decoded to its
+  `s_endpgm`) and patched exactly as the bake patches it;
+* its key is built the way the bake builds it — the same words, the same
+  `gcn::translate`, the same `predict_image_dims`, the same `ConsoleStageKeyOf`
+  — so a look-up hits the blob the bake wrote instead of a shader this build
+  invented;
+* the blob is inflated from `<dump>/bbx_shaders.cache` (validated once against
+  its stamp: `dxil-6.4`, `rs-1.0`, `tables`, `11_0`), and the compute PSO is
+  created on first use against the guest compute root signature, with `PsoCache`
+  owning the budget and the eviction;
+* the dispatch is recorded with one shader-visible CBV/SRV/UAV heap and one
+  sampler heap, the 512-byte `StageParams` block as the root CBV at `b0, space1`
+  (its `user_sgpr` from the dispatch's own user data — with `kCbSsbo = false`,
+  `kBindless = false` and the space-3 lowering, that is the whole contract a
+  console compute shader has, not a placeholder), the space-1 tables, the space-3
+  page table and slabs, then `Dispatch` or `ExecuteIndirect` (the arguments are
+  the guest's own three dwords, in the slab the page table puts them in — no
+  copy) and a UAV barrier.
+
+The four D3D12 rules that decide the signatures are stated in
+`docs/ARCHITECTURE_XBOX_D3D12.md` §3.4 and enforced by `bbx_guest_root.h`: a
+sampler never shares a table with a CBV/SRV/UAV range, `b1..b63`/`t0..t63`/
+`u0..u63`/`s0..s63` are covered, vertex and pixel get their own tables (compute is
+5 DWORDs, graphics 9, ceiling 64), and the guest arena is an index space over the
+device's *one* shader-visible heap with a `FLAG_NONE` source heap, because
+`CopyDescriptorsSimple` refuses a shader-visible source.
+
+What is still counted and refused, rather than guessed (Slice 5B-2b): resolving a
+space-1 descriptor from the dispatch's user data (which V#/T# a baked binding
+names is the translator's `ResourcePath`, and binding the wrong buffer is worse
+than binding none — the slots are null descriptors today), the whole graphics
+half (`host_gpu_draw`, render-target views, the blits), and sampled resources.
+Every dispatch that cannot run says so once by key, with the reason in the log
+(`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
 ## Verified on hardware (inherited, and what it changes here)
 
@@ -197,7 +228,7 @@ imports no desktop-only file, memory or loader API.
 
 ## Verified here (build machine)
 
-* **226 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **229 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

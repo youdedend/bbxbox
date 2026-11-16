@@ -2,14 +2,18 @@
 // The console session (see d3d12_session.h): device, swapchain, pipelines, replay.
 #include "xbox/platform/d3d12_session.h"
 
+#include "src/host/d3d12/bbx_descriptors.h"
 #include "src/host/d3d12/bbx_guest_mem.h"
+#include "src/host/d3d12/bbx_guest_root.h"
 #include "src/host/d3d12/host_gpu_d3d12.h"
 
 #include <windows.h>
 
 #include <cstdio>
+#include <memory>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "src/host/d3d12/device.h"
@@ -17,6 +21,7 @@
 #include "src/host/d3d12/replay.h"
 #include "src/host/d3d12/swapchain.h"
 #include "xbox/platform/bbhost_bridge.h"
+#include "xbox/platform/guest_compute.h"
 #include "xbox/platform/guest_frames.h"
 #include "xbox/platform/log.h"
 
@@ -68,6 +73,14 @@ struct D3d12Session::Impl {
     d3d12::GuestMemory guest_memory;
     d3d12::GuestGpuBinding guest_binding;
     std::string guest_memory_line;
+    // The guest arena's descriptors, reserved once at Create: space 3's 33 and
+    // three stage regions of 191 (bbx_guest_root.h's GuestHeapLayout). One slice
+    // for the CBV/SRV/UAV heap, one for the samplers, both permanent: the guest
+    // heap is fixed, and a dispatch rewrites slots in place.
+    std::unique_ptr<d3d12::DescriptorRing> guest_arena;
+    std::unique_ptr<d3d12::DescriptorRing> guest_sampler_arena;
+    std::uint32_t guest_arena_base = 0, guest_sampler_base = 0;
+    GuestCompute guest_compute;
 
     [[nodiscard]] d3d12::DeviceDesc Desc(bool debug) const {
         d3d12::DeviceDesc desc{};
@@ -107,6 +120,14 @@ struct D3d12Session::Impl {
         Impl& impl = *static_cast<Impl*>(user);
         return impl.guest_memory.ReadGuest(impl.guest_plan.table, va, out, bytes) == d3d12::Status::kOk;
     }
+    // The pipeline half (guest_compute.cpp): the shader's bake-identical key, and
+    // the dispatch itself.
+    static std::uint64_t DispatchKey(void* user, const GpuDispatch& d) {
+        return static_cast<Impl*>(user)->guest_compute.KeyFor(d);
+    }
+    static bool Dispatch(void* user, std::uint64_t key, const GpuDispatch& d) {
+        return static_cast<Impl*>(user)->guest_compute.Run(key, d);
+    }
 
     // Installs the binding the guest's HLE calls through (host_gpu_d3d12.h).
     void InstallGuestBinding() {
@@ -120,8 +141,12 @@ struct D3d12Session::Impl {
         guest_binding.mem_fill = &Impl::MemFill;
         guest_binding.mem_copy = &Impl::MemCopy;
         guest_binding.read_guest = &Impl::ReadGuest;
-        // dispatch_key and dispatch are Slice 5B-2's: the shader's identity and
-        // the compute pipeline. Until then a dispatch is counted and refused.
+        // The compute pipeline: Slice 5B-2a's half. A graphics draw is still
+        // host_gpu_draw's counted stub (5B-2b), and it does not go through here.
+        if (guest_compute.Ready()) {
+            guest_binding.dispatch_key = &Impl::DispatchKey;
+            guest_binding.dispatch = &Impl::Dispatch;
+        }
         guest_binding.ready = ready && guest_memory.Ready();
         d3d12::SetGuestGpuBinding(&guest_binding);
     }
@@ -138,6 +163,7 @@ struct D3d12Session::Impl {
         }
         if (report.adapter.empty()) { report.adapter = "unknown adapter"; }
         report.memory = device.DescribeMemory();
+        report.guest = guest_memory_line + " | " + guest_compute.Report();
         char text[192];
         std::snprintf(text, sizeof(text), "%ux%u x%u%s%s", swapchain.Width(), swapchain.Height(),
                       swapchain.BufferCount(), plan.clamped ? ", clamped" : "",
@@ -233,8 +259,31 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     // failed device: the rest of the port still runs.
     impl.guest_plan = d3d12::PlanGuestMemory();
     impl.guest_memory_line = impl.guest_plan.Report();
+    // The guest arena's descriptors first: space 3 (the page table and 32 slabs)
+    // and one region per stage, out of the device's single shader-visible heap
+    // (bbx_guest_root.h's rule 4 - one heap per command list, and a copy may not
+    // come from a shader-visible source).
+    impl.guest_arena = std::make_unique<d3d12::DescriptorRing>(impl.device.CbvSrvUavHeap() != nullptr
+                                                                  ? d3d12::Device::kCbvSrvUavDescriptors
+                                                                  : 0);
+    impl.guest_sampler_arena = std::make_unique<d3d12::DescriptorRing>(d3d12::Device::kSamplerDescriptors);
+    const std::optional<d3d12::DescriptorSlice> arena =
+        impl.guest_arena->ReservePermanent(d3d12::GuestHeapLayout::kCbvSrvUavDescriptors);
+    const std::optional<d3d12::DescriptorSlice> samplers =
+        impl.guest_sampler_arena->ReservePermanent(d3d12::GuestHeapLayout::kStageRegions *
+                                                   d3d12::GuestHeapLayout::kSamplerCount);
+    if (!arena.has_value() || !samplers.has_value()) {
+        LogMessage(Level::kError, "d3d12: the guest descriptor arena does not fit the device's heaps");
+        impl.guest_arena_base = 0;
+        impl.guest_sampler_base = 0;
+    } else {
+        impl.guest_arena_base = arena->offset;
+        impl.guest_sampler_base = samplers->offset;
+    }
     if (impl.guest_plan.ok()) {
-        const d3d12::Status memory = impl.guest_memory.Create(impl.device, impl.device.Memory(), impl.guest_plan);
+        const d3d12::Status memory = impl.guest_memory.Create(
+            impl.device, impl.device.Memory(), impl.guest_plan,
+            impl.guest_arena_base + d3d12::GuestHeapLayout::kSpace3Base);
         if (memory != d3d12::Status::kOk) {
             LogMessage(Level::kWarn, "d3d12: guest memory not created (%s): guest dispatches will be refused",
                        d3d12::StatusName(memory));
@@ -242,6 +291,20 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
         LogMessage(Level::kInfo, "d3d12: %s", impl.guest_memory.Describe().c_str());
     } else {
         LogMessage(Level::kError, "d3d12: %s", impl.guest_plan.refused.c_str());
+    }
+    if (impl.guest_memory.Ready()) {
+        const d3d12::Status compute = impl.guest_compute.Create(impl.device, impl.pipelines, impl.guest_memory,
+                                                                impl.guest_arena_base, impl.guest_sampler_base);
+        if (compute != d3d12::Status::kOk) {
+            LogMessage(Level::kWarn, "d3d12: guest compute not created (%s): dispatches will be refused",
+                       d3d12::StatusName(compute));
+        } else {
+            std::string line = impl.guest_compute.Report();
+            for (char& c : line) {
+                if (c == '\n') c = ' ';
+            }
+            LogMessage(Level::kInfo, "d3d12: %s", line.c_str());
+        }
     }
     // The guest's HLE now sees the device's fence and the guest's slabs
     // (host_gpu_d3d12.h): a dispatch checks `available` before anything else.
@@ -382,7 +445,13 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     }
     status = impl.replay.DrawOverlay();
     if (status != d3d12::Status::kOk) { return status; }
-    return impl.replay.EndFrame(vsync);
+    const d3d12::Status presented = impl.replay.EndFrame(vsync);
+    // The frame's fence has passed (or the present failed and the driver is
+    // waiting anyway), so the guest's compute PSOs whose eviction it proves are
+    // released now: a pipeline object freed while a recorded list still names it
+    // is the one lifetime mistake D3D12 does not report.
+    impl.guest_compute.OnFrame(impl.device.CompletedValue());
+    return presented;
 }
 
 void D3d12Session::SubmitGuestFrame(const bbx::platform::GuestFrame& frame) {
@@ -452,6 +521,9 @@ void D3d12Session::Destroy() {
     impl_->ready = false;
     // The guest's HLE must stop calling into this device before it is destroyed.
     d3d12::SetGuestGpuBinding(nullptr);
+    impl_->guest_compute.Destroy();
+    impl_->guest_arena.reset();
+    impl_->guest_sampler_arena.reset();
     impl_->guest_memory.Destroy();
     impl_->guest_binding = d3d12::GuestGpuBinding{};
     impl_->replay.Destroy();

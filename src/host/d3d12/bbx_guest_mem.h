@@ -198,6 +198,14 @@ class Device;
 // an untouched slot holds the guard buffer's UAV instead, so all 32 descriptors
 // are valid from the first dispatch while the empty table costs 64 KiB rather
 // than 8 GiB of the console's 5,120 MiB budget.
+//
+// The views are made in a heap of this object's own that is *not* shader-visible
+// (D3D12_DESCRIPTOR_HEAP_FLAG_NONE), and copied into the device's single
+// shader-visible CBV/SRV/UAV heap at `visible_base`: a command list takes one
+// CBV/SRV/UAV heap, and CopyDescriptorsSimple refuses a shader-visible source
+// heap, so "many heaps" is not an option the API leaves open. The copy is why
+// the guest arena is an index space (bbx_guest_root.h's rule 4) rather than a
+// heap per subsystem.
 class GuestMemory {
 public:
     GuestMemory() = default;
@@ -209,13 +217,34 @@ public:
     // created here and never rewritten, because the plan's windows are fixed
     // for a boot (a mapping that changes is a new plan).
     // `budget` is the device's own (Device::Memory()): a slab asks it first.
-    Status Create(Device& device, Budget& budget, const GuestPlan& plan);
+    // `visible_base` is where this object's kDescriptorCount descriptors sit in
+    // the device's shader-visible CBV/SRV/UAV heap; the caller reserves them
+    // (GuestHeapLayout::kSpace3Count, the arena's first region).
+    Status Create(Device& device, Budget& budget, const GuestPlan& plan, std::uint32_t visible_base = 0);
     void Destroy();
     [[nodiscard]] bool Ready() const { return page_table_ != nullptr; }
 
-    // The two CPU descriptors the guest root signature's tables point at.
+    // The views as this object made them (a heap the CPU writes and the GPU
+    // cannot see): what a copy names as its source.
     [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE PageTableSrv() const { return page_table_srv_; }
     [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE SlabUav(std::uint32_t slab) const;
+    // The same descriptors where a command list can see them (the device's
+    // shader-visible heap at `visible_base`): the guest root signature's space-3
+    // table points here.
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE TableHandle() const;
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE VisibleHandle(std::uint32_t index) const;
+    [[nodiscard]] std::uint32_t VisibleBase() const { return visible_base_; }
+    // How many descriptors the space-3 region takes (the page table plus every
+    // slab), which is what the caller had to reserve.
+    static constexpr std::uint32_t kDescriptorCount = 1 + kGuestSlabCount;
+
+    // The plan's page table, as the guest's memory is laid out: what a run list
+    // is cut with, and what an indirect dispatch's three dwords are located by.
+    [[nodiscard]] const GuestPageTable& Table() const { return table_; }
+    // The buffer a slab is, once it is resident: a dispatch whose arguments (or
+    // whose whole access) name a slab through the page table can hand D3D12 the
+    // slab itself rather than a copy.
+    [[nodiscard]] ID3D12Resource* SlabBuffer(std::uint32_t slab) const;
 
     // Makes `slab` resident (a 256 MiB committed buffer, counted in the budget)
     // and points its UAV at it. Called the first time an upload touches it.
@@ -239,6 +268,7 @@ private:
     // wait. An upload is a boot-time or a one-off event, not a per-frame flow, so
     // the wait that a frame would not tolerate is exactly what makes the write
     // complete for the CPU when the call returns.
+    D3D12_CPU_DESCRIPTOR_HANDLE VisibleCpu(std::uint32_t index) const;
     Status Submit(ID3D12GraphicsCommandList* list, const std::function<void(ID3D12GraphicsCommandList*)>& record);
     Status Record(ID3D12GraphicsCommandList** list, ComPtr<ID3D12CommandAllocator>* allocator);
 
@@ -250,9 +280,12 @@ private:
     ComPtr<ID3D12Resource> upload_;    // kStagingBytes, HEAP_TYPE_UPLOAD
     ComPtr<ID3D12Resource> readback_;  // kStagingBytes, HEAP_TYPE_READBACK
     std::map<std::uint32_t, ComPtr<ID3D12Resource>> slabs_;
-    ComPtr<ID3D12DescriptorHeap> heap_;  // 1 SRV + 32 UAVs, shader-visible
+    GuestPageTable table_;               // the plan's table, copied: the run lists' source
+    ComPtr<ID3D12DescriptorHeap> heap_;  // 1 SRV + 32 UAVs, FLAG_NONE (a copy's source)
     D3D12_CPU_DESCRIPTOR_HANDLE page_table_srv_{};
     std::uint32_t slab_uav_stride_ = 0;
+    std::uint32_t visible_base_ = 0;   // where the copies live in the device's heap
+    std::uint32_t visible_stride_ = 0; // the device heap's descriptor size
     std::uint32_t slabs_resident_ = 0;
     std::uint64_t committed_bytes_ = 0;
     std::uint64_t uploads_ = 0, upload_bytes_ = 0;

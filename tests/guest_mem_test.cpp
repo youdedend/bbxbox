@@ -223,10 +223,12 @@ TEST(GuestMem_TableLayoutIsDeterministic) {
 // The signature fits the console's 64 DWORDs, and it names the registers the
 // baked shaders name: b0 space1 for StageParams, t0 and u0..u31 in space3.
 TEST(GuestRoot_FitsAndNamesTheShadersRegisters) {
-    const GuestRootLayout layout = GuestRoot();
+    const GuestRootLayout layout = GuestRoot(GuestStage::kCompute);
     CHECK(layout.Valid());
     CHECK(layout.Dwords() <= GuestRootLayout::kMaxDwords);
-    CHECK_EQ(layout.Dwords(), 4u);  // two root descriptors' worth: a CBV (2) and two tables (2)
+    // Two root descriptors' worth: a CBV (2) and three tables (3). The samplers
+    // have a table of their own, which is D3D12's rule, not a packing choice.
+    CHECK_EQ(layout.Dwords(), 5u);
 
     bool params_seen = false;
     for (const GuestRootParam& p : layout.params) {
@@ -246,22 +248,116 @@ TEST(GuestRoot_FitsAndNamesTheShadersRegisters) {
     // the page table is not reachable there: the two spaces must not overlap.
     CHECK(GuestBinding(layout, GuestRangeKind::kSrv, 0, kGuestParamsSpace, &slot));
     CHECK(slot.param == GuestRootParamKind::kStageResources);
-    CHECK_EQ(slot.offset, 0u);
+    CHECK_EQ(slot.offset, kGuestCbvCount);  // after b1..b63
     CHECK(GuestBinding(layout, GuestRangeKind::kUav, 0, kGuestParamsSpace, &slot));
-    CHECK_EQ(slot.offset, kGuestSrvCount);
+    CHECK_EQ(slot.offset, kGuestCbvCount + kGuestSrvCount);
+    // Rule 1: a sampler is in its own table, so its offset is the sampler
+    // table's, not the resources table's.
     CHECK(GuestBinding(layout, GuestRangeKind::kSampler, 3, kGuestParamsSpace, &slot));
-    CHECK_EQ(slot.offset, kGuestSrvCount + kGuestUavCount + 3);
+    CHECK(slot.param == GuestRootParamKind::kStageSamplers);
+    CHECK_EQ(slot.offset, 3u);
+    // And b0 is the root CBV: a table that carried it would be a second view.
+    CHECK(!GuestBinding(layout, GuestRangeKind::kCbv, 0, kGuestParamsSpace, &slot));
+    CHECK(GuestBinding(layout, GuestRangeKind::kCbv, 1, kGuestParamsSpace, &slot));
+    CHECK_EQ(slot.offset, 0u);
+}
+
+// The sampler heap is not the CBV/SRV/UAV heap (rule 1), and a table is all
+// samplers or no samplers: a layout that mixed them must not validate.
+TEST(GuestRoot_KeepsSamplersOutOfTheResourceTable) {
+    const GuestRootLayout layout = GuestRoot(GuestStage::kCompute);
+    CHECK(layout.Valid());
+    for (const GuestRootParam& p : layout.params) {
+        bool sampler = false, other = false;
+        for (const GuestRange& r : p.ranges) {
+            if (GuestRangeIsSampler(r.kind)) {
+                sampler = true;
+            } else {
+                other = true;
+            }
+        }
+        CHECK(!(sampler && other));
+    }
+    // A hand-built table that mixes them is refused by name.
+    GuestRootLayout broken = layout;
+    for (GuestRootParam& p : broken.params) {
+        if (p.kind == GuestRootParamKind::kStageSamplers) {
+            p.ranges.push_back(GuestRange{GuestRangeKind::kSrv, 0, 1, kGuestParamsSpace});
+        }
+    }
+    CHECK(!broken.Valid());
+}
+
+// The graphics signature is the same ranges twice - once per stage - plus the
+// shared guest memory: 4 + 4 + 1. Two stages' t0 are two resources, so a shared
+// table would bind one to both.
+TEST(GuestRoot_GivesEachGraphicsStageItsOwnTables) {
+    const GuestRootLayout layout = GuestRoot(GuestStage::kGraphics);
+    CHECK(layout.Valid());
+    CHECK_EQ(layout.Dwords(), 9u);
+    GuestBindingSlot vs{}, ps{};
+    CHECK(GuestBinding(layout, GuestRangeKind::kSrv, 0, kGuestParamsSpace, &vs, GuestVisibility::kVertex));
+    CHECK(GuestBinding(layout, GuestRangeKind::kSrv, 0, kGuestParamsSpace, &ps, GuestVisibility::kPixel));
+    CHECK(vs.param_index != ps.param_index);
+    // The pixel stage's lookup must not find the vertex stage's table.
+    GuestBindingSlot only_ps{};
+    CHECK(GuestBinding(layout, GuestRangeKind::kSrv, 0, kGuestParamsSpace, &only_ps, GuestVisibility::kPixel));
+    CHECK(only_ps.param_index == ps.param_index);
+    CHECK_EQ(only_ps.offset, kGuestCbvCount);
+    // The compute signature has no vertex/pixel visibility at all: a VS binding
+    // asked of it is refused rather than served by a table it does not have.
+    const GuestRootLayout compute = GuestRoot(GuestStage::kCompute);
+    GuestBindingSlot none{};
+    CHECK(!GuestBinding(compute, GuestRangeKind::kSrv, 0, kGuestParamsSpace, &none, GuestVisibility::kVertex) ||
+          none.param_index == 1u);
+    CHECK(compute.Describe().find("compute") != std::string::npos);
+}
+
+// The arena's offsets are the descriptors' identities (rule 4): a copy moves a
+// view from the CPU heap to the shader-visible one by keeping the same slot, so
+// two bindings can never share one and the regions never overlap.
+TEST(GuestRoot_HeapLayoutDoesNotOverlap) {
+    using H = GuestHeapLayout;
+    CHECK_EQ(H::kSpace3Count, 1u + kGuestSlabCount);
+    CHECK_EQ(H::kSrvOffset, H::kCbvOffset + kGuestCbvCount);
+    CHECK_EQ(H::kUavOffset, H::kSrvOffset + kGuestSrvCount);
+    CHECK_EQ(H::kSpace1Count, H::kUavOffset + kGuestUavCount);
+    CHECK_EQ(H::StageRegion(0), H::kSpace3Count);  // the first stage's region starts after space 3
+    CHECK_EQ(H::StageRegion(1), H::StageRegion(0) + H::kSpace1Count);
+    CHECK_EQ(H::StageRegion(2) + H::kSpace1Count, H::kCbvSrvUavDescriptors);
+
+    GuestHeapSlot page{}, slab{}, srv{}, uav{}, cbv{}, sampler{};
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kSrv, 0, kGuestSpace, &page));
+    CHECK(!page.sampler);
+    CHECK_EQ(page.index, H::kSpace3Base);
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kUav, 31, kGuestSpace, &slab));
+    CHECK_EQ(slab.index, H::kSpace3Base + 1u + 31u);
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kSrv, 7, kGuestParamsSpace, &srv));
+    CHECK_EQ(srv.index, H::kSrvOffset + 7u);
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kUav, 7, kGuestParamsSpace, &uav));
+    CHECK_EQ(uav.index, H::kUavOffset + 7u);
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kCbv, 7, kGuestParamsSpace, &cbv));
+    CHECK_EQ(cbv.index, H::kCbvOffset + 6u);  // b1 is the class's first slot
+    CHECK(GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kSampler, 7, kGuestParamsSpace, &sampler));
+    CHECK(sampler.sampler);
+    CHECK_EQ(sampler.index, 7u);
+    // Out of range in both directions: b0 is the root CBV, and the classes stop
+    // where the shaders' registers do.
+    CHECK(!GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kCbv, 0, kGuestParamsSpace, &cbv));
+    CHECK(!GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kSrv, kGuestSrvCount, kGuestParamsSpace, &srv));
+    CHECK(!GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kUav, kGuestSlabCount, kGuestSpace, &uav));
+    CHECK(!GuestHeapSlotFor(GuestStage::kCompute, GuestRangeKind::kSampler, kGuestSamplerCount, kGuestParamsSpace,
+                            &sampler));
 }
 
 // A binding outside every range is refused, not clamped: a stale descriptor read
 // as a texture is a picture that is wrong in a way no log explains.
 TEST(GuestRoot_RefusesABindingItDoesNotCarry) {
-    const GuestRootLayout layout = GuestRoot();
+    const GuestRootLayout layout = GuestRoot(GuestStage::kCompute);
     GuestBindingSlot slot{};
     CHECK(!GuestBinding(layout, GuestRangeKind::kSrv, kGuestSrvCount, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kUav, kGuestUavCount, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kSampler, kGuestSamplerCount, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kUav, kGuestSlabRegister, kGuestSpace + 1, &slot));
-    CHECK(layout.Describe().find("space3") != std::string::npos ||
-          layout.Describe().find("space 3") != std::string::npos);
+    CHECK(layout.Describe().find("space 3") != std::string::npos);
 }

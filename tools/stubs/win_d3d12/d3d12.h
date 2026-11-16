@@ -30,6 +30,7 @@ using D3D12_GPU_VIRTUAL_ADDRESS = unsigned long long;
 struct ID3D12DescriptorHeap;
 struct ID3D12RootSignature;
 struct ID3D12PipelineState;
+struct ID3D12CommandSignature;
 struct ID3DBlob;
 
 struct D3D12_ROOT_SIGNATURE_DESC;
@@ -65,7 +66,51 @@ struct D3D12_RENDER_TARGET_VIEW_DESC;
 struct D3D12_DEPTH_STENCIL_VIEW_DESC;
 struct D3D12_SHADER_RESOURCE_VIEW_DESC;
 struct D3D12_UNORDERED_ACCESS_VIEW_DESC;
-struct D3D12_CONSTANT_BUFFER_VIEW_DESC;
+struct D3D12_CONSTANT_BUFFER_VIEW_DESC {
+    D3D12_GPU_VIRTUAL_ADDRESS BufferLocation;
+    UINT SizeInBytes;
+};
+constexpr float D3D12_FLOAT32_MAX = 3.402823466e+38F;
+
+enum D3D12_INDIRECT_ARGUMENT_TYPE {
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW = 0,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED = 1,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH = 2,
+    D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW = 3,
+    D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW = 4,
+    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT = 5,
+    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW = 6,
+    D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW = 7,
+    D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW = 8,
+};
+struct D3D12_INDIRECT_ARGUMENT_DESC {
+    D3D12_INDIRECT_ARGUMENT_TYPE Type;
+    union {
+        struct {
+            UINT Slot;
+        } VertexBuffer;
+        struct {
+            UINT RootParameterIndex;
+            UINT DestOffsetIn32BitValues;
+            UINT Num32BitValuesToSet;
+        } Constant;
+        struct {
+            UINT RootParameterIndex;
+        } ConstantBufferView;
+        struct {
+            UINT RootParameterIndex;
+        } ShaderResourceView;
+        struct {
+            UINT RootParameterIndex;
+        } UnorderedAccessView;
+    };
+};
+struct D3D12_COMMAND_SIGNATURE_DESC {
+    UINT ByteStride;
+    UINT NumArgumentDescs;
+    const D3D12_INDIRECT_ARGUMENT_DESC* pArgumentDescs;
+    UINT NodeMask;
+};
 struct D3D12_SAMPLER_DESC;
 struct D3D12_ROOT_PARAMETER;
 struct D3D12_STATIC_SAMPLER_DESC;
@@ -580,6 +625,8 @@ struct DECLSPEC_UUID("189819f1-1db6-4b57-be54-1821339b85f7") ID3D12Device : ID3D
                                            void** allocator) = 0;
     virtual HRESULT CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                                                REFIID riid, void** state) = 0;
+    virtual HRESULT CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, void* root_signature,
+                                           REFIID riid, void** signature) = 0;
     virtual HRESULT CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                               REFIID riid, void** state) = 0;
     virtual HRESULT CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -589,6 +636,12 @@ struct DECLSPEC_UUID("189819f1-1db6-4b57-be54-1821339b85f7") ID3D12Device : ID3D
     virtual HRESULT CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                         void** heap) = 0;
     virtual UINT GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) = 0;
+    // Copies descriptor ranges. The source heap must not be SHADER_VISIBLE
+    // (bbx_guest_root.h's rule 4); idle instructions are an upper bound the
+    // driver may ignore.
+    virtual void CopyDescriptorsSimple(UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE destination,
+                                       D3D12_CPU_DESCRIPTOR_HANDLE source,
+                                       D3D12_DESCRIPTOR_HEAP_TYPE type) = 0;
     virtual HRESULT CreateRootSignature(UINT node_mask, const void* blob, SIZE_T blob_size,
                                        REFIID riid, void** signature) = 0;
     virtual HRESULT CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
@@ -696,6 +749,8 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
     virtual void DrawIndexedInstanced(UINT index_count, UINT instance_count, UINT index_offset,
                                       INT base_vertex, UINT instance_offset) = 0;
     virtual void Dispatch(UINT x, UINT y, UINT z) = 0;
+    virtual void ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_count, void* args,
+                                 D3D12_GPU_VIRTUAL_ADDRESS args_offset, void* count, UINT64 count_offset) = 0;
     virtual void IASetVertexBuffers(UINT start_slot, UINT count,
                                     const D3D12_VERTEX_BUFFER_VIEW* views) = 0;
     virtual void IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) = 0;
@@ -726,6 +781,7 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
     virtual void OMSetStencilRef(UINT ref) = 0;
     virtual void SetGraphicsRootSignature(void* signature) = 0;
     virtual void SetComputeRootSignature(void* signature) = 0;
+    virtual void SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) = 0;
     virtual void SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) = 0;
     virtual void SetGraphicsRoot32BitConstant(UINT index, UINT value, UINT offset) = 0;
     virtual void SetGraphicsRoot32BitConstants(UINT index, UINT count, const void* values,
@@ -995,3 +1051,4 @@ struct ID3DBlob : IUnknown {
 
 struct DECLSPEC_UUID("c079a9e4-0e4a-4d8b-9f0f-1fd2f6b8a3a1") ID3D12RootSignature : ID3D12DeviceChild {};
 struct DECLSPEC_UUID("765a30f3-f624-4c6f-a828-ace948622445") ID3D12PipelineState : ID3D12Pageable {};
+struct ID3D12CommandSignature : ID3D12Pageable {};

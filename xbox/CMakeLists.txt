@@ -141,6 +141,7 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_barriers.cpp
     ../src/host/d3d12/bbx_guest_mem.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
+    platform/guest_compute.cpp
 )
 
 set(BBX_APP_SOURCES

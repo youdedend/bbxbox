@@ -35,6 +35,8 @@ while IFS= read -r file; do files+=("$file"); done < <(
       # The UWP platform TUs that avoid C++/WinRT: the D3D12 session takes an
       # IUnknown* and SDK headers only, precisely so it lands in this check.
       ls "$root"/xbox/platform/d3d12_session.cpp 2>/dev/null
+      # The compute executor: SDK headers and the translator, no C++/WinRT.
+      ls "$root"/xbox/platform/guest_compute.cpp 2>/dev/null
     }
 )
 

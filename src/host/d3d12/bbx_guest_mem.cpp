@@ -225,7 +225,7 @@ namespace bbx::d3d12 {
 
 namespace {
 
-constexpr std::uint32_t kDescriptorCount = 1 + kGuestSlabCount;  // the page table's SRV, then a UAV per slab
+constexpr std::uint32_t kDescriptorCount = GuestMemory::kDescriptorCount;  // the page table's SRV, then a UAV per slab
 constexpr std::uint64_t kGuardBytes = kPageBytes;
 // host_gpu_mem_write's documented ceiling (host/gpu.h): one upload at a time.
 constexpr std::uint64_t kStagingBytes = 64ull << 10;
@@ -281,13 +281,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE GuestMemory::SlabUav(std::uint32_t slab) const {
     return handle;
 }
 
-Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan) {
+Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan, std::uint32_t visible_base) {
     Destroy();
     if (!device.Get()) return Status::kUnavailable;
     if (!plan.ok()) return Status::kInvalidArgument;
     owner_ = &device;
     device_ = device.Get();
     budget_ = &budget;
+    table_ = plan.table;
 
     D3D12_HEAP_PROPERTIES default_heap{};
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -322,11 +323,20 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
                                                 nullptr, IID_PPV_ARGS(guard_.GetAddressOf())))) {
         return Status::kOutOfMemory;
     }
+    // The views are made here, in a heap the CPU owns: CopyDescriptorsSimple
+    // refuses a shader-visible source heap, so the source and the destination of
+    // the one copy that publishes them are two heaps, not one.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = kDescriptorCount;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(heap_.GetAddressOf())))) return Status::kOutOfMemory;
+    // Where those descriptors are published: the device's one shader-visible
+    // CBV/SRV/UAV heap, at the offset the arena reserved for space 3.
+    if (device.CbvSrvUavHeap() == nullptr) return Status::kInvalidArgument;
+    if (visible_base + kDescriptorCount > Device::kCbvSrvUavDescriptors) return Status::kInvalidArgument;
+    visible_base_ = visible_base;
+    visible_stride_ = device.CbvSrvUavStride();
     slab_uav_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     page_table_srv_ = heap_->GetCPUDescriptorHandleForHeapStart();
 
@@ -345,6 +355,12 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
         uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_->CreateUnorderedAccessView(guard_.Get(), nullptr, &uav, SlabUav(slab));
     }
+    // One copy publishes all 33: the page table's SRV and the guard UAV every
+    // slab starts as. A slab that turns resident later copies its own slot
+    // again (EnsureSlab), so the shader-visible table always names the buffer
+    // the table's entry implies.
+    device_->CopyDescriptorsSimple(kDescriptorCount, VisibleCpu(0), page_table_srv_,
+                                   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // The copy that fills the page table, and the fence value that says it is
     // done: the tables are right before any dispatch can name them.
@@ -367,6 +383,26 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     committed_bytes_ = bytes.size() + kGuardBytes;
     slabs_resident_ = std::min(plan.slabs_resident, kGuestSlabCount);
     return Status::kOk;
+}
+
+ID3D12Resource* GuestMemory::SlabBuffer(std::uint32_t slab) const {
+    if (slab == kGuestGuardSlab) return guard_.Get();
+    const auto it = slabs_.find(slab);
+    return it == slabs_.end() ? nullptr : it->second.Get();
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE GuestMemory::VisibleCpu(std::uint32_t index) const {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = owner_->CbvSrvUavHeap()->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(visible_base_ + index) * visible_stride_;
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GuestMemory::TableHandle() const { return VisibleHandle(0); }
+
+D3D12_GPU_DESCRIPTOR_HANDLE GuestMemory::VisibleHandle(std::uint32_t index) const {
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = owner_->CbvSrvUavHeap()->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(visible_base_ + index) * visible_stride_;
+    return handle;
 }
 
 Status GuestMemory::EnsureSlab(std::uint32_t slab) {
@@ -392,6 +428,9 @@ Status GuestMemory::EnsureSlab(std::uint32_t slab) {
     uav.Buffer.NumElements = static_cast<UINT>(kGuestSlabBytes / 4);
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(buffer.Get(), nullptr, &uav, SlabUav(slab));
+    // Publish it: a slot the shader-visible table still pointed at the guard
+    // buffer would read zeros where the guest wrote its data.
+    device_->CopyDescriptorsSimple(1, VisibleCpu(1 + slab), SlabUav(slab), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     slabs_.emplace(slab, std::move(buffer));
     slabs_resident_ = static_cast<std::uint32_t>(slabs_.size() + 1);
     committed_bytes_ += kGuestSlabBytes;

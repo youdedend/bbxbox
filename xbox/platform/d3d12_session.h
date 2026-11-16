@@ -31,6 +31,7 @@ struct GpuReport {
     std::string memory;          // the budget's own accounting
     std::string swapchain;       // size, buffer count, the plan's reason
     std::string selftest;        // the GPU self-test's verdict
+    std::string guest;           // the guest's memory plan and compute dispatches
     bool uma = false;
     bool selftest_ok = false;
 };

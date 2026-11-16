@@ -143,9 +143,38 @@ and every load, store and atomic to a call into a prelude that `gcn/hlsl.cpp` pr
 
 A shader's address is the page's slab and offset plus `va_lo & 0xffff`, and the access is `.Load`,
 `.Store`, `InterlockedAdd`, `InterlockedAnd` or `InterlockedOr` on that slab. The constants live in
-`src/host/d3d12/pipeline.h` (`kGuestSpace`, `kGuestPageTableRegister`, `kGuestSlabRegister`,
-`kGuestSlabCount`, `kGuestSlabBytes`, `kPageL1Entries`, `kPageL2Entries`) so Slice 5B and the bake
+`src/host/d3d12/bbx_guest_mem.h` (`kGuestSpace`, `kGuestPageTableRegister`, `kGuestSlabRegister`,
+`kGuestSlabCount`, `kGuestSlabBytes`, `kPageL1Entries`, `kPageL2Entries`) so the launcher and the bake
 cannot disagree about them.
+
+### 3.4 The root signature those shaders need, and the four rules it obeys
+
+`src/host/d3d12/bbx_guest_root.*` describes it as data and `pipeline.cpp` turns that into D3D12:
+`b0, space1` is the `StageParams` root CBV, `space1` carries the stage's own Vulkan bindings flattened
+into registers (`b1..b63` constant buffers, `t0..t63` SRVs, `u0..u63` UAVs, `s0..s63` samplers), and
+`space3` carries the guest memory above. Four facts about D3D12 decide its shape:
+
+1. **A descriptor table is all samplers or no samplers.** `D3D12SerializeRootSignature` rejects a table
+   that mixes a `SAMPLER` range with `CBV`/`SRV`/`UAV` ranges, so `s0..s63` has a table of its own in
+   every signature - and a sampler lives in the sampler heap, not the CBV/SRV/UAV one.
+2. **CBV, SRV and UAV may share a table; they may not share a register file.** Three ranges, because a
+   guest's flat Vulkan binding numbers collide across classes (`b3` and `t3` are different resources and
+   both exist). `b0` is absent from the table on purpose: it is the root CBV.
+3. **One root parameter has one visibility.** A vertex/pixel draw needs *both* stages' space-1 tables, so
+   the graphics signature carries them separately (`VISIBILITY_VERTEX`, `VISIBILITY_PIXEL`); sharing one
+   table would bind the VS's `t0` and the PS's `t0` to the same descriptor. The compute signature is one
+   stage, so its tables are `VISIBILITY_ALL`. Same ranges, same baked DXIL, only the visibility differs:
+   **compute is 5 DWORDs** (root CBV + resources + samplers + space 3) and **graphics is 9** (4 per stage
+   + space 3), against the console's ceiling of 64.
+4. **One shader-visible CBV/SRV/UAV heap, and no copying from it.** `SetDescriptorHeaps` takes one such
+   heap per command list, and `CopyDescriptorsSimple` refuses a `SHADER_VISIBLE` *source*. The guest
+   arena is therefore an index space (`GuestHeapLayout`): views are made once in a `FLAG_NONE` heap
+   (`bbx_guest_mem.cpp`), copied into the device's single shader-visible heap at fixed offsets - space 3
+   first, then one region per stage - and the dispatcher's tables are GPU handles into that region.
+
+No static samplers and no `ID3D12PipelineLibrary`, for the reasons in `bbx_cache.h`
+(`kConsolePsoLibrary`): a static sampler cannot carry an aniso/border combination per binding, and the
+pipeline library removes the device on a console.
 
 Two sites still name a *host* address in the params block, and cannot be spelled on the console: a GDS
 counter's address (`ds_append`/`ds_consume`) and a captured position (`capture_position`). Both are

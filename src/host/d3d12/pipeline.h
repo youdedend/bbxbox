@@ -34,15 +34,21 @@ namespace bbx::d3d12 {
 
 class Device;
 
-// What a guest shader's signature costs, for the boot report: "guest root: 3
-// parameter(s), 4/64 DWORDs, ..." (bbx_guest_root.cpp's Describe).
-[[nodiscard]] std::string GuestRootDescription();
+// What a guest shader's signature costs, for the boot report: "guest root
+// (compute): 4 parameter(s), 5/64 DWORDs, ..." (bbx_guest_root.cpp's Describe).
+[[nodiscard]] std::string GuestRootDescription(GuestStage stage = GuestStage::kCompute);
 
-// Builds a D3D12 signature out of a GuestRootLayout: the tables, the root CBV
+// Builds a D3D12 signature out of a GuestRootLayout: the root CBV, the stage's
+// space-1 tables (one per stage for graphics: two stages' t0 are two resources)
 // and the space-3 page table plus slabs. A free function so a test (or the
-// report) can ask a device for it without a PipelineSet; PipelineSet::Create
+// report) can ask a device for one without a PipelineSet; PipelineSet::Create
 // calls it and keeps the result.
-Status CreateGuestRootSignature(Device& device, ID3D12RootSignature** out);
+//
+// The signature is console 1.0 and states its own rules by construction: no
+// table mixes a sampler with a CBV/SRV/UAV range (D3D12 refuses to serialize
+// that), no static samplers (a guest sampler carries an aniso/border combination
+// per binding), and no pipeline library.
+Status CreateGuestRootSignature(Device& device, GuestStage stage, ID3D12RootSignature** out);
 
 // The port's own passes. `kCount` last; the guest's draws (P3) go through the
 // cache with keys of their own, not through this enum.
@@ -71,11 +77,17 @@ public:
     // The PSO for `kind`, created if this is the first use. Null on failure; the
     // reason is logged once and the pass is skipped rather than crashing.
     [[nodiscard]] ID3D12PipelineState* Ensure(PassKind kind);
-    // The guest shaders' signature (bbx_guest_root.h): created with the port's
-    // own, once, and used by every guest dispatch. Null when the device refused
-    // it, which the boot report says rather than failing a dispatch later.
-    [[nodiscard]] ID3D12RootSignature* GuestRootSignature() const { return guest_root_.Get(); }
-    [[nodiscard]] bool GuestRootReady() const { return guest_root_ != nullptr; }
+    // The guest shaders' signatures (bbx_guest_root.h): created with the port's
+    // own, once each. A compute dispatch uses GuestRootSignature(kCompute), a
+    // vertex/pixel draw kGraphics (which carries both stages' tables, because a
+    // root parameter has one visibility). Null when the device refused one,
+    // which the boot report says rather than failing a dispatch later.
+    [[nodiscard]] ID3D12RootSignature* GuestRootSignature(GuestStage stage) const {
+        return guest_roots_[static_cast<std::size_t>(stage)].Get();
+    }
+    [[nodiscard]] bool GuestRootReady(GuestStage stage) const {
+        return guest_roots_[static_cast<std::size_t>(stage)] != nullptr;
+    }
 
     [[nodiscard]] ID3D12RootSignature* RootSignature(PassKind kind) const {
         return kind < PassKind::kCount ? roots_[static_cast<std::size_t>(kind)].Get() : nullptr;
@@ -101,8 +113,9 @@ private:
 
     Device* device_ = nullptr;
     std::array<ComPtr<ID3D12RootSignature>, static_cast<std::size_t>(PassKind::kCount)> roots_{};
-    // The guest's: one signature for every baked shader (bbx_guest_root.h).
-    ComPtr<ID3D12RootSignature> guest_root_;
+    // The guest's: one signature per stage kind for every baked shader
+    // (bbx_guest_root.h). kCompute and kGraphics.
+    std::array<ComPtr<ID3D12RootSignature>, 2> guest_roots_{};
     std::array<ComPtr<ID3D12PipelineState>, static_cast<std::size_t>(PassKind::kCount)> psos_{};
     std::unique_ptr<PsoCache> cache_;
     std::uint64_t clock_ = 0;
