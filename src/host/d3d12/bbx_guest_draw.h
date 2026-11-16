@@ -62,6 +62,7 @@ enum class DrawVerdict : std::uint8_t {
     kNoTarget,           // CB_TARGET_MASK or CB_SHADER_MASK selects nothing
     kUnknownTargetFormat, // a target's CB_COLORn_INFO FORMAT is not one this port maps
     kNoTargetExtent,     // a target's slice is shorter than one row: no pixels in it
+    kExtraStage,         // VGT_SHADER_STAGES_EN names a stage other than VS/PS
 };
 
 [[nodiscard]] const char* DrawVerdictName(DrawVerdict verdict);
@@ -96,8 +97,15 @@ struct DrawIdentity {
 // context file (0xA000-based, 0x1000 entries), `uconfig` the user-config file
 // (0xC000-based). Offsets are the ones `host/render.cpp`'s
 // `draw_inputs_from_registers` uses; nothing else is read.
+// `stages` is VGT_SHADER_STAGES_EN as the caller knows it (0 when it does not):
+// a draw that enables a stage other than the vertex and pixel programs this file
+// decodes - tessellation's LS/HS or a geometry shader - is refused by name rather
+// than drawn as if it were a VS/PS draw. `host/render.cpp` reads the same word's
+// low three bits for the same question ("a stage other than VS/PS"); the port does
+// not decode the stage list on its own, because which stages a draw has is the
+// session's answer and guessing it here would be a silent fallthrough.
 [[nodiscard]] DrawIdentity DecodeDraw(const std::uint32_t* sh, const std::uint32_t* ctx,
-                                     const std::uint32_t* uconfig);
+                                     const std::uint32_t* uconfig, std::uint32_t stages = 0);
 
 // A stable fingerprint of the identity, for "log this once": two draws that would
 // build the same pipeline share it, and a draw whose target moved does not.

@@ -104,16 +104,25 @@ const char* DrawVerdictName(DrawVerdict verdict) {
     case DrawVerdict::kNoTarget: return "no render target is enabled";
     case DrawVerdict::kUnknownTargetFormat: return "a render target's format is not one this port maps";
     case DrawVerdict::kNoTargetExtent: return "a render target's pitch and format give no pixels";
+    case DrawVerdict::kExtraStage: return "the draw enables a stage this port does not draw";
     }
     return "?";
 }
 
-DrawIdentity DecodeDraw(const std::uint32_t* sh, const std::uint32_t* ctx, const std::uint32_t* uconfig) {
+DrawIdentity DecodeDraw(const std::uint32_t* sh, const std::uint32_t* ctx, const std::uint32_t* uconfig,
+                        std::uint32_t stages) {
     DrawIdentity out;
     if (sh == nullptr || ctx == nullptr || uconfig == nullptr) {
         out.verdict = DrawVerdict::kNoVertexProgram;
         out.why = "the draw has no register file";
         return out;
+    }
+    // A stage other than the two this file decodes, first: drawing it as a VS/PS
+    // draw would be a frame built from the wrong program, and the alternative -
+    // skipping it quietly - is a frame with a hole nobody can attribute.
+    if ((stages & 0x7u) != 0) {
+        return Refuse(out, DrawVerdict::kExtraStage,
+                      "VGT_SHADER_STAGES_EN " + Hex(stages) + " enables the ES/GS/HS/LS bits, and this port draws VS/PS");
     }
     // The two stage programs first: a draw names both, and one without the other
     // is not a draw this port can build a pipeline for.

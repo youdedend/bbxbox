@@ -260,8 +260,9 @@ one value, sRGB 6 vs 9, which is written out rather than passed through), the
 target extent from PITCH and SLICE, the depth format from DB_Z_INFO's two bits and
 the stencil plane, and the scissor rectangle `draw_scissor` builds. It refuses
 four ways, each with the register values in the line: no vertex program, no pixel
-program, no enabled target, an unmapped target format (and a slice shorter than
-one row). `tests/guest_draw_test.cpp` pins fifteen cases and the fingerprint
+program, no enabled target, an unmapped target format, a slice shorter than one
+row, and a draw whose `VGT_SHADER_STAGES_EN` enables a stage other than VS/PS (the
+session passes that word; the decoder does not re-derive the stage list). `tests/guest_draw_test.cpp` pins fifteen cases and the fingerprint
 `host_gpu_draw` logs "once per unique draw" with. `host_gpu_draw` now decodes,
 logs, and refuses by name; it still returns false, because the pipeline that would
 make the draw real is the next step, and a draw reported as drawn while nothing
@@ -428,7 +429,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **311 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **312 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

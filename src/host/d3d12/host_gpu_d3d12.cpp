@@ -374,7 +374,10 @@ bool host_gpu_draw(const GpuDraw& d) {
     // their formats, the depth format, the scissor. No field is guessed, and an
     // identity this port cannot build a pipeline for is refused by name here
     // rather than dropped by a counter.
-    const DrawIdentity identity = DecodeDraw(d.sh, d.ctx, d.uconfig);
+    // The stage list is the session's answer (`GpuDrawInputs::stages`, i.e.
+    // VGT_SHADER_STAGES_EN); with no GX inputs there is nothing to say it, so 0.
+    const std::uint32_t stages = d.gx != nullptr ? d.gx->stages : 0;
+    const DrawIdentity identity = DecodeDraw(d.sh, d.ctx, d.uconfig, stages);
     const std::uint64_t fingerprint = DrawFingerprint(identity);
     if (identity.verdict != DrawVerdict::kOk) {
         ++c.draw_refusals;

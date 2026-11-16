@@ -274,3 +274,23 @@ TEST(GuestDraw_ARefusedDrawStillHasAFingerprint) {
     CHECK(DrawFingerprint(refused) !=
           DrawFingerprint(DecodeDraw(good.sh.data(), good.ctx.data(), good.uconfig.data())));
 }
+
+TEST(GuestDraw_ADrawWithAnotherStageIsRefusedByNameNotDrawnAsAVsPsDraw) {
+    // VGT_SHADER_STAGES_EN's low three bits are the ES/GS/HS/LS enables
+    // (host/render.cpp reads them for the same question). A tessellated or
+    // geometry-shader draw is not a VS/PS draw, and drawing it as one would build
+    // the frame from the wrong programs.
+    const Registers r = OneDraw();
+    const DrawIdentity plain = DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data(), 0);
+    CHECK(plain.verdict == DrawVerdict::kOk);
+    const DrawIdentity tess = DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data(), 0x1);
+    CHECK(tess.verdict == DrawVerdict::kExtraStage);
+    CHECK(DrawIdentityLine(tess).find("a stage this port does not draw") != std::string::npos);
+    CHECK(DrawIdentityLine(tess).find("VGT_SHADER_STAGES_EN 0x1") != std::string::npos);
+    // And a geometry shader in the ES/GS bit pair, which is the other shape the
+    // game's draws take.
+    CHECK(DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data(), 0x2).verdict == DrawVerdict::kExtraStage);
+    // The fingerprint of a refused draw is stable, so it is logged once.
+    CHECK_EQ(DrawFingerprint(tess),
+             DrawFingerprint(DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data(), 0x1)));
+}
