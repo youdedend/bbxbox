@@ -290,6 +290,10 @@ jobs:
           $zip = "build/bbxbox-XboxSeriesXS-UWP.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path build/appx/* -DestinationPath $zip -CompressionLevel Optimal
+          # The map goes in beside the appx: a fault offset from the TV log is only
+          # an address without it.
+          $map = Get-ChildItem -Path build/xbox -Recurse -Filter bbxbox.map -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($map) { Compress-Archive -Path $map.FullName -DestinationPath $zip -Update }
           $body = @"
           Unsigned-trust UWP build of bbxbox for Xbox Series X|S, made from ${{ github.sha }}.
 

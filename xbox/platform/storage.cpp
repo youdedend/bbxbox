@@ -73,19 +73,36 @@ std::string Join(const std::string& a, const std::string& b) {
 bool StorageInit() {
     bool ok = false;
     std::call_once(g_once, [&ok]() {
+        // Each folder on its own, with its own HRESULT. Xbox does not support
+        // ApplicationData roaming, so one throw from RoamingFolder used to take
+        // LocalFolder and TemporaryFolder down with it - and the console's log
+        // said "storage init failed" one line after LocalState had worked.
+        const auto folder = [](const char* name, auto&& get, std::string& out) {
+            try {
+                out = winrt::to_string(get().Path());
+                LogMessage(Level::kInfo, "storage: %s %s", name, out.c_str());
+                return true;
+            } catch (const winrt::hresult_error& error) {
+                LogMessage(Level::kWarn, "storage: %s unavailable (0x%08x)%s", name,
+                           static_cast<unsigned>(error.code().value),
+                           std::string_view(name) == "roaming" ? " - Xbox has no roaming folder; not needed" : "");
+                return false;
+            }
+        };
+        const auto appdata = []() { return winrt::Windows::Storage::ApplicationData::Current(); };
+        const bool have_local = folder("local", [&] { return appdata().LocalFolder(); }, g_paths.local_state);
+        const bool have_temp = folder("temporary", [&] { return appdata().TemporaryFolder(); }, g_paths.temp);
+        (void)folder("roaming", [&] { return appdata().RoamingFolder(); }, g_paths.roaming);
         try {
-            const auto local = winrt::Windows::Storage::ApplicationData::Current().LocalFolder();
-            const auto temp = winrt::Windows::Storage::ApplicationData::Current().TemporaryFolder();
-            const auto roaming = winrt::Windows::Storage::ApplicationData::Current().RoamingFolder();
-            g_paths.local_state = winrt::to_string(local.Path());
-            g_paths.temp = winrt::to_string(temp.Path());
-            g_paths.roaming = winrt::to_string(roaming.Path());
             g_paths.package =
                 winrt::to_string(winrt::Windows::ApplicationModel::Package::Current().InstalledPath());
-            ok = true;
         } catch (const winrt::hresult_error& error) {
-            LogMessage(Level::kError, "storage: ApplicationData unavailable (0x%08x)",
+            LogMessage(Level::kWarn, "storage: package path unavailable (0x%08x)",
                        static_cast<unsigned>(error.code().value));
+        }
+        ok = have_local && have_temp;
+        if (!ok) {
+            LogMessage(Level::kError, "storage: LocalState or TemporaryFolder is missing; deriving the path");
             // A launch that dies with an empty LocalState has no log to read, so
             // the log cannot depend on WinRT activation. The folder is where the
             // platform puts it - %LOCALAPPDATA%\Packages\<family>\LocalState -
