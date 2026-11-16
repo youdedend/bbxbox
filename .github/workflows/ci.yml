@@ -135,18 +135,21 @@ jobs:
         if: always()
         shell: bash
         # The import audit names the symbol, the link names nothing: this step
-        # names the object - or the archive member's library - that still refers
-        # to it, so a refusal is fenced at its source instead of guessed at.
-        # `grep` rather than `findstr`: the objects are binary. Only the build
-        # tree: the dependency prefix's own archives are not in the link.
-        # Annotations, not stdout - a run's log is not always reachable after.
+        # names where the reference is - an object in the build tree, a static
+        # library member, or the line of the link map that took it - so a
+        # refusal is fenced at its source instead of guessed at. `grep` rather
+        # than `findstr`: objects are binary. Annotations, not stdout, because a
+        # run's log is not always reachable afterwards.
         run: |
           set +e
           for sym in MapViewOfFile CreateFile2 FindFirstFileExW FindFirstFileW \
                      CreateDirectoryW MoveFileExW DeleteFileW CreateFileA CreateFileW; do
-            hits=$(grep -rl --binary-files=text -E "(^|[^A-Za-z0-9_])${sym}([^A-Za-z0-9_]|\$)" \
-                     build/xbox --include='*.obj' --include='*.lib' 2>/dev/null | head -20 | tr '\n' ' ')
-            [ -z "$hits" ] || echo "::warning title=refused import ${sym}::${hits//%/%25}"
+            stub="__imp_${sym}"
+            hits=$(grep -rl --binary-files=text -F "$stub" build/xbox build-deps/prefix \
+                     --include='*.obj' --include='*.lib' 2>/dev/null | head -12 | tr '\n' ' ')
+            [ -n "$hits" ] && echo "::warning title=stub $sym::${hits//%/%25}"
+            map=$(grep -n -F "$sym" build/xbox/bbxbox.map 2>/dev/null | head -6 | tr '\n' ' ')
+            [ -n "$map" ] && echo "::warning title=map $sym::${map//%/%25}"
           done
           exit 0
       - name: package + check imports
