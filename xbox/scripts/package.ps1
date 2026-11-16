@@ -175,6 +175,17 @@ if ($LASTEXITCODE -ne 0) {
     Write-Warning ("signtool verify /pa: " + (($verifyOut | Out-String).Trim()))
 }
 
+# The sizes, as a notice: the report a reviewer reads says what the package
+# costs, and the guest runtime's link is most of it. An annotation because a
+# run's log is not always reachable afterwards.
+$exeSize = (Get-Item $exe.FullName).Length
+$pdbItem = Get-Item (Join-Path $out "bbxbox.pdb") -ErrorAction SilentlyContinue
+$pdbSize = if ($pdbItem) { $pdbItem.Length } else { 0 }
+$appxSize = (Get-Item $appx).Length
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    Write-Output ("::notice title=sizes::bbxbox.exe {0:N0} B; bbxbox.pdb {1:N0} B; " +
+        "{2} {3:N0} B" -f $exeSize, $pdbSize, (Split-Path $appx -Leaf), $appxSize)
+}
 Write-Host "package: $appx"
 Write-Host "package: $dependencies\$($vclibs.Name)"
 if (Test-Path $cerPath) { Write-Host "package: $cerPath" }
