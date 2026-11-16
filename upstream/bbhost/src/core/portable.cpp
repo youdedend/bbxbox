@@ -722,14 +722,6 @@ const void* host_map_file(const char* path, std::size_t* size) {
     }
     *size = got;
     return p;
-#elif defined(BBX_UWP)
-    // `CreateFileA`, `CreateFileMappingA` and `MapViewOfFile` are the desktop's
-    // names for what the container spells `*FromApp`; this is the sampler's
-    // read-only map of the image for `BBHOST_SAMPLE`, a developer's switch, and
-    // the guest's own file reads go through the host-fs seam, so there is
-    // nothing here to lose.
-    (void)path; (void)size;
-    return nullptr;
 #elif defined(_WIN32)
     // The sharing fopen's "rb" gives, so a file another program has open still maps.
     const HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
