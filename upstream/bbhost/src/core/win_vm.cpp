@@ -450,6 +450,19 @@ void win_vm_dump_views() {
 }
 
 bool win_vm_unmap(void* at, std::uint64_t len) {
+#if defined(BBX_UWP)
+    // `api()` is never short of its three calls in a packaged title (they are
+    // `VirtualAlloc2FromApp`, `MapViewOfFile3FromApp` and `UnmapViewOfFile2`,
+    // each declared for the app partition), so the fallback below cannot run -
+    // and taking a view's address out of it is not worth an import: the SDK's
+    // app-partition import library supplies `UnmapViewOfFile` in the same member
+    // as `MapViewOfFile`, and the audit refuses the second (see check-imports.ps1
+    // and the ten `<filesystem>` sites). The view is still unmapped, through the
+    // same placeholder path the rest of the layer uses.
+    if (at == nullptr) return false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    return unmap_locked(reinterpret_cast<std::uintptr_t>(at), len);
+#else
     if (!api().ok) {
         MEMORY_BASIC_INFORMATION m{};
         VirtualQuery(at, &m, sizeof(m));
@@ -457,6 +470,7 @@ bool win_vm_unmap(void* at, std::uint64_t len) {
     }
     std::lock_guard<std::mutex> lk(g_mu);
     return unmap_locked(reinterpret_cast<std::uintptr_t>(at), len);
+#endif
 }
 
 #endif
