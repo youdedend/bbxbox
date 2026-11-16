@@ -102,17 +102,17 @@ $KnownUncalledSymbols = @{
         "LoadLibraryExW" = "C++/WinRT base.h activation fallback; the port itself calls LoadPackagedLibrary only"
         # The static CRT (xbox/CMakeLists.txt) brings its own file and memory
         # layer into the image, and that layer is written against the desktop
-        # names. Nothing in `xbox/platform` calls it any more: the log goes
-        # through hostfs, guest pages through VirtualProtectFromApp, the dump
-        # through CreateFile2FromApp. The caller left is bbhost's own
-        # `core/paced_file.cpp` (`std::fopen` for a save's staged write) - a
-        # finding, not an allowance, recorded in docs/PORT_STATUS.md under
-        # "known gaps"; removing it is what lets these five leave this list.
-        "CreateFileW" = "static CRT stdio; the port's paths use hostfs. Caller: bbhost core/paced_file.cpp"
-        "CreateDirectoryW" = "static CRT stdio; the port's paths use hostfs (CreateDirectoryFromApp)"
-        "DeleteFileW" = "static CRT stdio; the port's paths use hostfs (DeleteFileFromApp)"
-        "FindFirstFileExW" = "static CRT stdio; the port's paths use hostfs (FindFirstFileExFromApp)"
-        "MoveFileExW" = "static CRT stdio; the port's paths use hostfs (MoveFileFromApp)"
+        # names. Nothing calls it any more: the log goes through hostfs, the
+        # dump through CreateFile2FromApp, saves through hostfs's
+        # `core/paced_file.cpp` (which used std::fopen until 5B-2b step 3), guest
+        # pages through VirtualProtectFromApp. What is left is the CRT's own
+        # objects, and `/OPT:REF` decides what of them survives; each entry here
+        # says which CRT object the import comes from, not which port call.
+        "CreateFileW" = "the static CRT's stdio objects; no caller in the port or in bbhost's TUs"
+        "CreateDirectoryW" = "the static CRT's stdio objects; no caller in the port or in bbhost's TUs"
+        "DeleteFileW" = "the static CRT's stdio objects; no caller in the port or in bbhost's TUs"
+        "FindFirstFileExW" = "the static CRT's stdio objects; no caller in the port or in bbhost's TUs"
+        "MoveFileExW" = "the static CRT's stdio objects; no caller in the port or in bbhost's TUs"
         # libvcruntime's __GSHandlerCheck and heap init. VirtualProtect is the one
         # that matters on a console (W^X), which is why it stays forbidden
         # everywhere else: a port TU that calls it is still a failure.

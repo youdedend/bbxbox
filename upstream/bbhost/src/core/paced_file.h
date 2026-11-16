@@ -7,7 +7,7 @@
 #include <string>
 
 // Written to `tmp` a chunk at a time, each chunk on the device (fdatasync,
-// _commit) before the next is written, then renamed over `path`. Written at
+// FlushFileBuffers) before the next is written, then renamed over `path`. Written at
 // once, a cache of a few hundred MB was seconds of write-back that the other
 // threads' file operations queued behind on a slow or shared disk: over NFS a
 // read of a game file waited 0.6 s and a directory listing 1.5 s. A chunk at a
@@ -26,7 +26,16 @@ public:
 private:
     bool sync();
     std::string path_, tmp_;
+#if defined(BBX_UWP)
+    // On the console the staging file is opened through the port's host-fs seam
+    // (`CreateFile2FromApp`), not through stdio: the CRT's stdio is `CreateFileW`,
+    // which an AppContainer refuses on a dump folder the player granted, and a
+    // save's staged write is exactly a write there. There is no `FILE*` here at
+    // all - the seam's handle is the whole interface.
+    int handle_ = -1;
+#else
     std::FILE* f_ = nullptr;
+#endif
     std::size_t chunk_ = 0, unsynced_ = 0;
     bool ok_ = false, committed_ = false;
 };

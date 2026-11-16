@@ -428,14 +428,14 @@ run has to show before "boots" may be written down.
 Recorded, not hoped away. Each one is a call that compiles, packages and is
 refused (or wrong) only on the console, and each one has an owner in the tree.
 
-* **bbhost's `core/paced_file.cpp` still writes through `std::fopen`.** The static
-  CRT turns that into an import of `CreateFileW`, which an AppContainer accepts
-  for LocalState and refuses on a granted folder — and a paced write is the
-  guest's save path. Everything else in the port is on the `hostfs` seam
-  (`CreateFile2FromApp` and friends), including `log.cpp`'s `loader.log`. This is
-  the reason five symbols are listed in `check-imports.ps1`'s
-  `$KnownUncalledSymbols` instead of failing the audit, and removing it is what
-  lets them leave that list.
+* **The static CRT's own file layer is still in the image**, and no longer has a
+  caller: `log.cpp` writes `loader.log` through `hostfs`, the dump reads through
+  `CreateFile2FromApp`, and `core/paced_file.cpp` — the last `std::fopen` in the
+  tree — now stages a save through `hostfs` too (`Open`/`Write`/`Flush`/`Rename`
+  on the console, stdio on a build machine). The six symbols that remain in
+  `bbxbox.exe`'s import table are the CRT's own objects; `/OPT:REF` decides what
+  of them survives, and `check-imports.ps1` names each one instead of failing the
+  audit, because a *port* call to any of them is still a failure.
 * **`src/host/d3d12`'s sampled-resource and graphics paths** are still the counted
   refusals described under "Not verified"; the compute dispatch is the only
   D3D12 path that runs.
