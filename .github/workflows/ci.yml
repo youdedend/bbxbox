@@ -135,21 +135,78 @@ jobs:
         if: always()
         shell: bash
         # The import audit names the symbol; the link names nothing. This step
-        # names the file that still refers to it - an object, or a member of a
-        # static library - so a refusal is fenced at its source instead of
-        # guessed at. `grep` rather than `findstr`: the objects are binary, and
-        # the import reference is `__imp_<name>` with the ASCII name beside it.
-        # Annotations, not stdout: a run's log is not always reachable after.
+        # names the file that still refers to it - an object, a member of a
+        # static library in the dependency prefix, or the module the linked
+        # image finally takes it from - so a refusal is fenced at its source
+        # instead of guessed at. `grep` rather than `findstr`: the objects are
+        # binary. Annotations, not stdout: a run's log is not always reachable.
         run: |
           set +e
           for sym in MapViewOfFile CreateFile2 FindFirstFileExW FindFirstFileW \
                      CreateDirectoryW MoveFileExW DeleteFileW CreateFileA CreateFileW; do
             hits=$(grep -rl --binary-files=text -E "(^|[^A-Za-z0-9_])${sym}([^A-Za-z0-9_]|\$)" \
-                     build/xbox --include='*.obj' --include='*.lib' 2>/dev/null | head -20 | tr '\n' ' ')
-            [ -z "$hits" ] && continue
-            body=${hits//%/%25}
-            echo "::warning title=refused import ${sym}::${body}"
+                     build/xbox build-deps/prefix --include='*.obj' --include='*.lib' 2>/dev/null |
+                   head -20 | tr '\n' ' ')
+            [ -z "$hits" ] || echo "::warning title=refused import ${sym}::${hits//%/%25}"
           done
+          # And the image itself: which module the linked exe takes the symbol
+          # from, and what else it takes from that module.
+          python - build/xbox/bbxbox.exe <<'PY' || true
+          import struct, sys
+          path = sys.argv[1]
+          try:
+              data = open(path, 'rb').read()
+          except OSError:
+              raise SystemExit(0)
+          lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+          coff = lfanew + 4
+          nsec, = struct.unpack_from('<H', data, coff + 2)
+          optsz, = struct.unpack_from('<H', data, coff + 16)
+          opt = coff + 20
+          magic, = struct.unpack_from('<H', data, opt)
+          ddir = opt + (112 if magic == 0x20B else 96)
+          imp_rva, = struct.unpack_from('<I', data, ddir + 8)
+          secs = []
+          for i in range(nsec):
+              b = opt + optsz + 40 * i
+              vsize, vaddr, rsize, raddr = struct.unpack_from('<IIII', data, b + 8)
+              secs.append((vaddr, max(vsize, rsize), raddr))
+          def off(rva):
+              for vaddr, span, raddr in secs:
+                  if vaddr <= rva < vaddr + span:
+                      return raddr + (rva - vaddr)
+              return None
+          refused = ("MapViewOfFile", "CreateFile2", "FindFirstFileExW", "FindFirstFileW",
+                     "CreateDirectoryW", "MoveFileExW", "DeleteFileW")
+          d = off(imp_rva)
+          while d is not None and d + 20 <= len(data):
+              desc = data[d:d + 20]
+              if desc == b'\0' * 20:
+                  break
+              name_rva, = struct.unpack_from('<I', desc, 12)
+              thunk_rva, = struct.unpack_from('<I', desc, 16)
+              dll = ''
+              o = off(name_rva)
+              if o is not None:
+                  end_ = data.find(b'\0', o)
+                  dll = data[o:end_].decode('ascii', 'replace')
+              names, t = [], off(thunk_rva)
+              while t is not None and t + 8 <= len(data):
+                  entry, = struct.unpack_from('<Q', data, t)
+                  if entry == 0:
+                      break
+                  if not entry >> 63:
+                      no = off(entry & 0x7FFFFFFF)
+                      if no is not None:
+                          e = data.find(b'\0', no + 2)
+                          names.append(data[no + 2:e].decode('ascii', 'replace'))
+                  t += 8
+              hit = [n for n in names if n in refused]
+              if hit:
+                  print("::warning title=linked image takes %s from %s::%s" %
+                        (", ".join(hit), dll, "; ".join(names)))
+              d += 20
+          PY
           exit 0
       - name: package + check imports
         shell: pwsh
