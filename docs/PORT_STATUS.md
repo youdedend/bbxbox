@@ -187,6 +187,22 @@ space-1 descriptor from the dispatch's user data (which V#/T# a baked binding
 names is the translator's `ResourcePath`, and binding the wrong buffer is worse
 than binding none — the slots are null descriptors today), the whole graphics
 half (`host_gpu_draw`, render-target views, the blits), and sampled resources.
+
+**The first half of that is in and tested (5B-2b step 1).**
+`src/host/d3d12/bbx_guest_vsharp.{h,cpp}` decodes a V# the way the translator
+does (base in words 0/1[15:0], stride in word 1[29:16], `num_records` in word 2)
+and answers the only three questions that can be settled without a device: is
+this a null slot (GCN reads zeroes — the null descriptor already says so), is the
+range inside one 4 GiB region of the guest's window (the page table's `va_hi` has
+no carry, so a range that crosses one cannot be walked and is refused rather than
+mapped halfway), and is it aligned and non-empty. `tests/guest_vsharp_test.cpp`
+pins sixteen cases — the boundary ones included: a range ending exactly on the 4
+GiB line binds, one byte past it does not, and `base + bytes` saturates rather
+than wrapping into something that would look bindable. It is portable-core only
+until the dispatch path calls it: what the wiring needs is the one fact this step
+deliberately does not guess — which user-data slot carries the resource table's
+pointer — and `guest_compute.cpp`'s table is still null descriptors until that is
+read from the guest's own command stream rather than assumed.
 Every dispatch that cannot run says so once by key, with the reason in the log
 (`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
@@ -330,7 +346,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **229 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **245 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot
