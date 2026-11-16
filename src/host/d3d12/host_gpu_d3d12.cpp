@@ -29,8 +29,11 @@
 // which is where the compute PSO (PsoCache), the StageParams CBV and the space-3
 // tables are bound and `Dispatch`/`ExecuteIndirect` issued. Until that hook is
 // installed the dispatch is counted as `kNoPipeline` and refused. `host_gpu_draw`
-// and the render-target surface (`host_gpu_clear_view`, the copy/blit paths) stay
-// the stub's, counted, until the same slice.
+// decodes each draw's identity from the guest's own registers (5B-2b's graphics
+// half, first step), logs it once per unique draw, and refuses a draw it cannot
+// build for by name; recording the pipeline itself is the step that follows. The
+// render-target surface (`host_gpu_clear_view`, the copy/blit paths) stays the
+// stub's, counted, until then.
 //
 // Everything else in this file is `gpu_stub.cpp`'s answer, unchanged: the console
 // has one device and it is the D3D12 session's, so the Vulkan-only reporting,
@@ -42,11 +45,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include "host/gpu.h"
 #include "host/memory_policy.h"
 #include "host/shader_overrides.h"
+#include "src/host/d3d12/bbx_guest_draw.h"
 #include "src/host/d3d12/bbx_guest_mem.h"
 #include "src/host/d3d12/host_gpu_d3d12.h"
 
@@ -64,6 +69,13 @@ struct Counters {
     std::uint64_t no_device = 0;
     std::uint64_t bad_program = 0;
     std::uint64_t draws = 0;
+    std::uint64_t draws_identified = 0;   // a draw whose identity this port decoded
+    std::uint64_t draw_refusals = 0;      // ... and which it refused, by name
+    std::uint64_t draw_pipeline_missing = 0;  // identified, but the pipeline is not recorded yet
+    // Which draw identities have already put a line in the log (5B-2b): a level
+    // makes the same draw thousands of times and the answer is one line.
+    std::set<std::uint64_t> logged_draws;
+    std::set<std::uint64_t> logged_draw_refusals;
     std::uint64_t mem_writes = 0, mem_fills = 0, mem_copies = 0, mem_reads = 0;
     std::uint64_t mem_refused = 0;
     GuestGpuCounts published;  // the snapshot host_gpu_d3d12.h hands out
@@ -353,11 +365,43 @@ GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
 
 std::uint32_t host_gpu_dispatch_user_reads() { return 0; }
 
-bool host_gpu_draw(const GpuDraw&) {
-    // Slice 5B-2's half: counted, so a level's log says how many draws the
-    // console dropped rather than pretending they happened.
+bool host_gpu_draw(const GpuDraw& d) {
     std::lock_guard<std::mutex> lock(mutex());
-    ++counters().draws;
+    Counters& c = counters();
+    ++c.draws;
+    // Step 1 of the graphics half (5B-2b): what this draw is, from the guest's own
+    // registers and from nothing else - the two stage programs, the targets and
+    // their formats, the depth format, the scissor. No field is guessed, and an
+    // identity this port cannot build a pipeline for is refused by name here
+    // rather than dropped by a counter.
+    const DrawIdentity identity = DecodeDraw(d.sh, d.ctx, d.uconfig);
+    const std::uint64_t fingerprint = DrawFingerprint(identity);
+    if (identity.verdict != DrawVerdict::kOk) {
+        ++c.draw_refusals;
+        if (c.logged_draw_refusals.insert(fingerprint).second) {
+            std::fprintf(stderr, "host_gpu: draw %llu refused: %s\n", static_cast<unsigned long long>(c.draws),
+                         DrawIdentityLine(identity).c_str());
+        }
+        Publish();
+        return false;
+    }
+    ++c.draws_identified;
+    if (c.logged_draws.insert(fingerprint).second) {
+        std::fprintf(stderr, "host_gpu: draw %llu: %s\n", static_cast<unsigned long long>(c.draws),
+                     DrawIdentityLine(identity).c_str());
+    }
+    // The rest of the graphics half - root signature and PSO from the wired
+    // bindings, the render-target views, the tile and blit paths - is what turns
+    // this into a draw. Until it is recorded, the answer is that step's name and
+    // not a silent success: a draw reported as drawn while nothing was submitted
+    // is the one kind of stub this port does not keep.
+    ++c.draw_pipeline_missing;
+    if (c.logged_draws.size() <= 8 || c.draw_pipeline_missing == 1) {
+        std::fprintf(stderr,
+                     "host_gpu: draw %llu identified but not recorded: the graphics pipeline (root signature, PSO, "
+                     "render-target views) is the next step of 5B-2b\n",
+                     static_cast<unsigned long long>(c.draws));
+    }
     Publish();
     return false;
 }

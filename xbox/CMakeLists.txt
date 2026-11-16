@@ -179,6 +179,9 @@ set(BBX_D3D12_SOURCES
     # dispatch reads the first and writes from the second.
     ../src/host/d3d12/bbx_path_table.cpp
     ../src/host/d3d12/bbx_guest_binding.cpp
+    # The draw's identity, decoded from the guest's own registers: the graphics
+    # half's first step (host_gpu_d3d12.cpp's host_gpu_draw reads it).
+    ../src/host/d3d12/bbx_guest_draw.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
     platform/guest_compute.cpp
 )

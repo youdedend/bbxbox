@@ -249,6 +249,24 @@ per planned binding into the compute stage's slots, logging one line per key wit
 what was written and what was refused; a slot with no plan stays a null
 descriptor, never a default view.
 
+**The graphics half's first step is the draw's identity (5B-2b step 3a).**
+`src/host/d3d12/bbx_guest_draw.{h,cpp}` decodes what a draw *is* from the guest's
+own registers at the offsets `host/render.cpp`'s `draw_inputs_from_registers`
+reads: the two stage programs (address from PGM_LO/HI with the 40-bit form the
+compute stage uses, RSRC1/RSRC2, the sixteen user SGPRs), the render targets
+(CB_TARGET_MASK × CB_COLORn_BASE, with the format from CB_COLORn_INFO decoded by
+the port's own table — its NUMBER_TYPE field differs from a T#'s nfmt in exactly
+one value, sRGB 6 vs 9, which is written out rather than passed through), the
+target extent from PITCH and SLICE, the depth format from DB_Z_INFO's two bits and
+the stencil plane, and the scissor rectangle `draw_scissor` builds. It refuses
+four ways, each with the register values in the line: no vertex program, no pixel
+program, no enabled target, an unmapped target format (and a slice shorter than
+one row). `tests/guest_draw_test.cpp` pins fifteen cases and the fingerprint
+`host_gpu_draw` logs "once per unique draw" with. `host_gpu_draw` now decodes,
+logs, and refuses by name; it still returns false, because the pipeline that would
+make the draw real is the next step, and a draw reported as drawn while nothing
+was submitted is the one stub this port does not keep.
+
 Two honest limits of that step, both logged rather than hidden: the console's
 fixed choices keep constant buffers constant (`ConsoleStageOptions::kCbSsbo`), so
 the translator declares no storage-buffer binding today and the file records zero
@@ -410,7 +428,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **296 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **311 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot
