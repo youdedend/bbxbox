@@ -1058,27 +1058,6 @@ void note_display_buffer(std::uint64_t va, std::uint64_t attr) {
     }
 }
 
-bool hle_video_display_attribute(std::uint64_t va, std::uint32_t* format, std::uint32_t* tiling,
-                                 std::uint32_t* pitch) {
-    if (va == 0) return false;
-    std::uint64_t packed = 0;
-    bool found = false;
-    for (const DisplayBuffer& b : g_display_bufs) {
-        const std::uint64_t v = b.va.load(std::memory_order_acquire);
-        if (!v) break;
-        if (v == va) {
-            packed = b.attr.load(std::memory_order_acquire);
-            found = true;
-            break;
-        }
-    }
-    if (!found) { packed = g_last_display_attr.load(std::memory_order_acquire); }
-    if (format) *format = static_cast<std::uint32_t>(packed >> 32);
-    if (tiling) *tiling = static_cast<std::uint32_t>((packed >> 24) & 0xffu);
-    if (pitch) *pitch = static_cast<std::uint32_t>(packed & 0xffffffu);
-    return true;
-}
-
 GUEST_ABI int hle_video_register(int handle, int start, void** addrs, int n, const void* attr) {
     std::lock_guard<std::mutex> lock(g_vo_mu);
     if (!vo_get(handle)) {
@@ -1199,6 +1178,28 @@ bool hle_video_is_display_buffer(std::uint64_t va) {
         if (v == va) return true;
     }
     return true;  // more registered than kept: every address counts as one
+}
+// Outside the anonymous namespace, with the other readers of the table above:
+// an internal-linkage definition is a symbol the app cannot link against.
+bool hle_video_display_attribute(std::uint64_t va, std::uint32_t* format, std::uint32_t* tiling,
+                                 std::uint32_t* pitch) {
+    if (va == 0) return false;
+    std::uint64_t packed = 0;
+    bool found = false;
+    for (const DisplayBuffer& b : g_display_bufs) {
+        const std::uint64_t v = b.va.load(std::memory_order_acquire);
+        if (!v) break;
+        if (v == va) {
+            packed = b.attr.load(std::memory_order_acquire);
+            found = true;
+            break;
+        }
+    }
+    if (!found) { packed = g_last_display_attr.load(std::memory_order_acquire); }
+    if (format) *format = static_cast<std::uint32_t>(packed >> 32);
+    if (tiling) *tiling = static_cast<std::uint32_t>((packed >> 24) & 0xffu);
+    if (pitch) *pitch = static_cast<std::uint32_t>(packed & 0xffffffu);
+    return true;
 }
 std::uint64_t hle_video_last_tick_ns() { return g_last_tick_ns.load(std::memory_order_relaxed); }
 bool hle_video_test_exit_requested() { return g_test_exit.load(std::memory_order_relaxed); }
