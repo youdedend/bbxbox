@@ -10,8 +10,11 @@
 
    * x64, Windows.Universal (the console's app model), one Application whose
      Executable and EntryPoint agree with the code;
-   * capabilities: codeGeneration and removableStorage, nothing else - no
-     runFullTrust, no broadFileSystemAccess, no internetClient;
+   * capabilities: codeGeneration, expandedResources and removableStorage, all
+     three in rescap - the schema's restricted namespace - and nothing else: no
+     runFullTrust, no broadFileSystemAccess, no internetClient. codeGeneration
+     written as a plain <Capability> is a *failure* here, because makeappx
+     accepts it and the platform then grants nothing;
    * every Assets\*.png the manifest names exists on disk.
 
    * the Microsoft.VCLibs framework package is a dependency, with Microsoft's
@@ -92,11 +95,19 @@ $restricted = @($capabilityElements |
         ForEach-Object { $_.Name })
 $device = @($capabilityElements | Where-Object { $_.LocalName -eq 'DeviceCapability' } | ForEach-Object { $_.Name })
 
-foreach ($required in @("codeGeneration")) {
-    if ($names -notcontains $required) { $problems.Add("capability '$required' is required") }
+# codeGeneration and expandedResources are restricted capabilities in the appx
+# schema. In the wrong namespace they parse, package, install - and grant
+# nothing, which on a console is a JIT copy that faults and a title held to the
+# shared-memory limit.
+foreach ($required in @("codeGeneration", "expandedResources", "removableStorage")) {
+    if ($restricted -notcontains $required) {
+        $problems.Add("restricted capability '$required' is required as <rescap:Capability> (not a plain <Capability>, which grants nothing)")
+    }
 }
-if ($restricted -notcontains "removableStorage") {
-    $problems.Add("restricted capability 'removableStorage' is required (the dump lives on a USB drive)")
+foreach ($misplaced in @("codeGeneration", "expandedResources", "removableStorage")) {
+    if ($names -contains $misplaced) {
+        $problems.Add("capability '$misplaced' is in the default namespace; the schema defines it in rescap")
+    }
 }
 if ($device -notcontains "gamepad") { $problems.Add("device capability 'gamepad' is required") }
 foreach ($forbidden in @("runFullTrust", "broadFileSystemAccess", "internetClient", "internetClientServer", "privateNetworkClientServer", "microphone", "webcam", "documentsLibrary", "picturesLibrary", "videosLibrary", "enterpriseAuthentication", "sharedUserCertificates")) {

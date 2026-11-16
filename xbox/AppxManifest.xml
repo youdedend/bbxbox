@@ -3,13 +3,21 @@
 <!--
   bbxbox, Xbox Series X|S Retail Developer Mode, Game mode.
 
-  Capabilities are the minimum the port needs and nothing else:
+  Capabilities are the minimum the port needs and nothing else, and every one of
+  them is named in the schema's own namespace: `codeGeneration` is a *restricted*
+  capability, so it is `<rescap:Capability>` and not `<Capability>`. Written the
+  other way it is not a capability the platform grants - makeappx accepts it (it
+  is a valid element in the default namespace) and the app then calls
+  `VirtualProtect` on code pages it was never given.
 
-    codeGeneration    the guest is emitted and patched at run time (bbhost is a
-                      HLE, not an interpreter), and the D3D12 swapchain requires
-                      it anyway;
-    removableStorage  the dump is on a USB drive, picked once and remembered in
-                      the FutureAccessList.
+    codeGeneration     the guest is emitted and patched at run time (bbhost is
+                       an HLE, not an interpreter), and the D3D12 swapchain
+                       requires it anyway;
+    expandedResources  the Game-mode memory grant: without it a title is held to
+                       the shared-memory limit and the guest's 5,120 MiB budget
+                       is not there at all;
+    removableStorage   the dump is on a USB drive, picked once and remembered in
+                       the FutureAccessList.
 
   Deliberately absent: runFullTrust (not available to a Store-style app and not
   needed), broadFileSystemAccess (the dump is reached through the picker's
@@ -85,7 +93,14 @@
   </Applications>
 
   <Capabilities>
-    <Capability Name="codeGeneration" />
+    <!-- codeGeneration is rescap, not a plain capability: the schema lists it
+         among the restricted capabilities, and the plain element (which makeappx
+         accepts) grants nothing. -->
+    <rescap:Capability Name="codeGeneration" />
+    <!-- Game mode's memory grant. A title without it is capped at the
+         shared-memory limit and the guest's budget cannot be met
+         (docs/memory-budget.md). -->
+    <rescap:Capability Name="expandedResources" />
     <rescap:Capability Name="removableStorage" />
     <DeviceCapability Name="gamepad" />
   </Capabilities>
