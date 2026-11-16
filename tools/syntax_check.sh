@@ -64,7 +64,9 @@ for file in "${files[@]}"; do
     # accepts it, so the Windows job never sees the warning.
     extra=()
     if "$cxx" --version 2>/dev/null | grep -qi clang; then extra+=(-fms-extensions -fdeclspec); fi
-    output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror \
+    # -Wformat-truncation: CI's clang catches an over-long snprintf that this
+    # machine's GCC does not warn about by default, and it caught one that shipped.
+    output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror -Wformat-truncation=2 \
         "${extra[@]}" -fno-exceptions \
         -Wno-unused-parameter -Wno-ignored-attributes \
         -D_WIN32 -DBBX_UWP=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \

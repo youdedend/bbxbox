@@ -410,7 +410,7 @@ struct GuestCompute::Impl {
         bound_valid = planned != 0;
         if (planned != 0) {
             std::string text = "guest compute: key ";
-            char head[48];
+            char head[160];
             std::snprintf(head, sizeof(head), "%016llx: %u plan(s), %u slot(s) written, %u null, %u refused",
                           static_cast<unsigned long long>(key), planned, written, nulls, refused);
             text += head;
