@@ -171,9 +171,23 @@ PadState host_pad_state() {
 
 bool host_pad_present() { return g_pad != nullptr; }
 
-// The guest's scanout range, as this process can read it (defined beside the
-// image it reads): false when the address is not inside the mapped arena.
-bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels);
+// The guest arena, published for the flip (StartGuest sets it once the image is
+// loaded; the guest is the only writer of what it points at).
+std::atomic<std::uint8_t*> g_guest_base{nullptr};
+std::atomic<std::uint64_t> g_guest_slide{0};
+std::atomic<std::uint64_t> g_guest_size{0};
+
+// The guest's scanout range, as this process can read it: false when the address
+// (or the frame it addresses) is not inside the mapped arena.
+bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels) {
+    if (pixels != nullptr) *pixels = nullptr;
+    const std::uint8_t* const base = g_guest_base.load(std::memory_order_acquire);
+    const std::uint64_t slide = g_guest_slide.load(std::memory_order_relaxed);
+    const std::uint64_t size = g_guest_size.load(std::memory_order_relaxed);
+    if (base == nullptr || va < slide || va - slide >= size || bytes > size - (va - slide)) { return false; }
+    if (pixels != nullptr) *pixels = base + (va - slide);
+    return true;
+}
 
 // --- the flip --------------------------------------------------------------
 // Called by the guest's video HLE once per frame, on the guest's thread. What it
@@ -684,15 +698,6 @@ namespace {
 // `_start` runs on its own thread until the game either finishes or the player
 // closes the window, so none of it may live in a stack frame.
 ElfImage g_image;
-
-bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels) {
-    if (pixels != nullptr) *pixels = nullptr;
-    const std::uint64_t slide = g_image.mem.slide;
-    const std::uint64_t size = g_image.mem.size;
-    if (g_image.mem.base == nullptr || va < slide || va - slide >= size || bytes > size - (va - slide)) { return false; }
-    if (pixels != nullptr) *pixels = static_cast<const std::uint8_t*>(g_image.mem.base) + (va - slide);
-    return true;
-}
 std::string g_eboot_path;
 
 // The baked console shaders, loaded once at boot: the dump's copy, else the one
@@ -794,6 +799,12 @@ bool StartGuest(const GuestRequest& req) {
                         g_image.sha256.c_str(), static_cast<unsigned long long>(g_image.entry),
                         static_cast<unsigned long long>(g_image.mem.slide),
                         static_cast<std::size_t>(g_image.mem.size));
+    // The flip's view of the arena, before any guest instruction runs: the
+    // display buffers are registered once the game is up, and host_present
+    // resolves them here rather than trusting them.
+    g_guest_base.store(static_cast<std::uint8_t*>(g_image.mem.base), std::memory_order_release);
+    g_guest_slide.store(g_image.mem.slide, std::memory_order_relaxed);
+    g_guest_size.store(g_image.mem.size, std::memory_order_relaxed);
     const bool is_109 = g_image.sha256 == kEboot109Sha256;
     if (!is_109 && !req.modded_eboot_ok) {
         // Every patch, hook and engine address below is an address in 1.09; a
