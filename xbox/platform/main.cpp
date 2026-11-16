@@ -625,7 +625,43 @@ extern "C" HRESULT WINAPI BbxGetActivationFactory(HSTRING class_id, void** facto
 extern "C" HRESULT WINAPI BbxCanUnloadNow() noexcept { return S_FALSE; }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    winrt::Windows::ApplicationModel::Core::CoreApplication::Run(winrt::make<bbxbox::App>());
+    // The order here is the whole point of the function, and it is the order the
+    // console taught: the app that was installed on a Series X left LocalState
+    // empty because the *loader* failed (0xC0000135, VCRUNTIME140_APP.dll), and
+    // nothing this file can do sees that. What it can do is guarantee that every
+    // failure from the first instruction that *does* run onwards leaves a
+    // `loader.log` behind, so the next launch is a file on the player's stick
+    // instead of a black screen.
+    //
+    // The apartment comes first out of necessity, not preference: StorageInit
+    // asks ApplicationData for LocalState, and a WinRT call without an apartment
+    // fails with CO_E_NOTINITIALIZED - caught and lost, because the log does not
+    // exist yet. StorageInit has a kernel32-only fallback for exactly that case
+    // (xbox/platform/storage.cpp), and LogOpen is idempotent so the framework
+    // view opening it again cannot rotate these lines away.
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error&) {
+        // An apartment already on this thread is not a launch failure.
+    }
+    const bool storage_early = bbx::platform::StorageInit();
+    const bool log_early = bbx::platform::LogOpen(bbx::platform::Paths().local_state);
+    if (log_early) {
+        bbx::platform::LogMessage(bbx::platform::Level::kInfo,
+                                  "wWinMain: localstate %s, storage %s",
+                                  bbx::platform::Paths().local_state.c_str(),
+                                  storage_early ? "ok" : "FAILED (log open on a derived path)");
+    }
+    bbx::platform::InstallLastChanceLogger();
+    try {
+        winrt::Windows::ApplicationModel::Core::CoreApplication::Run(winrt::make<bbxbox::App>());
+    } catch (const winrt::hresult_error& error) {
+        // Before this existed, a launch that failed to activate was a window
+        // that closed: the reason went to the debugger output and nowhere else.
+        bbx::platform::LogMessage(bbx::platform::Level::kError, "wWinMain: activation failed (0x%08x)",
+                                  static_cast<unsigned>(error.code().value));
+        bbx::platform::LogClose();
+        return 1;
+    }
     return 0;
 }

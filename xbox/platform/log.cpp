@@ -265,6 +265,11 @@ void OnTerminate() {
 
 bool LogOpen(const std::string& local_state) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Idempotent, and it has to be: wWinMain opens the log before anything that
+    // can fail, and the framework view opens it again when the platform enters
+    // it. Rotating twice would move the lines written between the two into
+    // `loader.prev.log` - exactly the lines a launch that died needs to keep.
+    if (g_file != nullptr) return true;
     g_start = ::GetTickCount64();
     const std::string current = local_state + "\\loader.log";
     const std::string previous = local_state + "\\loader.prev.log";

@@ -9,6 +9,7 @@
 // package's own folders. They live in their own header, they are not in
 // <windows.h>, and the SDK declares them only when NTDDI_VERSION is at least
 // NTDDI_WIN10_RS3 (see xbox/CMakeLists.txt).
+#include <appmodel.h>
 #include <fileapifromapp.h>
 
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -85,6 +86,26 @@ bool StorageInit() {
         } catch (const winrt::hresult_error& error) {
             LogMessage(Level::kError, "storage: ApplicationData unavailable (0x%08x)",
                        static_cast<unsigned>(error.code().value));
+            // A launch that dies with an empty LocalState has no log to read, so
+            // the log cannot depend on WinRT activation. The folder is where the
+            // platform puts it - %LOCALAPPDATA%\Packages\<family>\LocalState -
+            // and both halves are reachable from an AppContainer with kernel32
+            // alone. If this path is wrong, LogOpen's fopen fails and the run is
+            // exactly as logless as it was before: nothing is lost by trying.
+            wchar_t local_app_data[MAX_PATH * 2] = {};
+            wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH] = {};
+            UINT32 family_len = PACKAGE_FAMILY_NAME_MAX_LENGTH;
+            if (::GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH * 2) > 0 &&
+                ::GetCurrentPackageFamilyName(&family_len, family) == ERROR_SUCCESS) {
+                std::wstring derived(local_app_data);
+                derived += L"\\Packages\\";
+                derived += family;
+                derived += L"\\LocalState";
+                g_paths.local_state = Narrow(derived);
+                ok = !g_paths.local_state.empty();
+                LogMessage(Level::kWarn, "storage: local state derived without WinRT: %s",
+                           g_paths.local_state.c_str());
+            }
         }
         if (ok) {
             ::CreateDirectoryFromAppW(Widen(Local("shadercache")).c_str(), nullptr);
