@@ -170,6 +170,10 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_scanout.cpp
     ../src/host/d3d12/bbx_barriers.cpp
     ../src/host/d3d12/bbx_guest_mem.cpp
+    # The resource table: the program's own instructions say which user SGPR holds
+    # the pointer (platform/guest_compute.cpp logs it per program).
+    ../src/host/d3d12/bbx_guest_vsharp.cpp
+    ../src/host/d3d12/bbx_guest_path.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
     platform/guest_compute.cpp
 )

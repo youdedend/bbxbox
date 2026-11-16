@@ -9,7 +9,13 @@ namespace bbx::d3d12 {
 
 VSharpView DecodeVSharp(const std::uint32_t words[4]) {
     VSharpView view;
-    view.base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32);
+    // base = word0 | ((word1 & 0xff) << 32): eight bits, not sixteen. The guest's
+    // addresses are 40-bit (a PS4 V# says so, and so does the port's own code
+    // address arithmetic), and upstream reads a V#'s base the same way -
+    // `interp_base(words, true)` in bbhost's render.cpp and gpu.cpp's
+    // "source V# base (user[4:7])" print both mask word 1 with 0xff. Sixteen bits
+    // here would lift a buffer's stride into its address.
+    view.base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffu) << 32);
     view.stride = (words[1] >> 16) & 0x3fffu;
     view.num_records = words[2];
     view.word3 = words[3];

@@ -198,11 +198,32 @@ no carry, so a range that crosses one cannot be walked and is refused rather tha
 mapped halfway), and is it aligned and non-empty. `tests/guest_vsharp_test.cpp`
 pins twenty cases — the boundary ones included: a range ending exactly on the 4
 GiB line binds, one byte past it does not, and `base + bytes` saturates rather
-than wrapping into something that would look bindable. It is portable-core only
-until the dispatch path calls it: what the wiring needs is the one fact this step
-deliberately does not guess — which user-data slot carries the resource table's
-pointer — and `guest_compute.cpp`'s table is still null descriptors until that is
-read from the guest's own command stream rather than assumed.
+than wrapping into something that would look bindable. **Where the table lives is now the program's answer, not the port's.**
+`src/host/d3d12/bbx_guest_path.{h,cpp}` restates bbhost's `resolve_resource_impl`
+walk (a user SGPR, a chain of dereferences, an offset in the last block, with the
+same two refusals: a pair past user SGPR 15, and a read the caller cannot supply),
+and then decodes the *instructions*: a compute program loads its resource table's
+address with `s_load_dwordx2 s[d:d+1], s[u:u+1], off` out of a user pair and then
+reads a V# through what it loaded, so `DecodeTableSlot` answers with the slot the
+program used and the two instructions it read it from. `tests/guest_path_test.cpp`
+builds those instructions as dwords (gcn/decode.cpp's SMRD layout: `0b11000` in
+bits 31:27, op 26:22, sdst 21:15, sbase 14:9 as a pair index, immediate flag bit
+8, byte offset 7:0) and asserts the slot: user data 0 when the program says
+`s[0:1]`, user data 8 when it says `s[8:9]`, and no slot when the loaded value is
+never dereferenced, when only a V# is loaded, when the load is a single dword, or
+when the instructions are past `s_endpgm`. `platform/guest_compute.cpp` runs that
+decode once per program and logs the slot, the evidence pair and the table offsets
+the program reads, so the next step is checked against a dump rather than a guess.
+
+The base a V# names is 40 bits (eight bits of word 1), which is the rule bbhost's
+`interp_base` and gpu.cpp's V# print both use; the first version of `DecodeVSharp`
+read sixteen, which would have lifted a buffer's stride into its address.
+
+What is left of 5B-2b: the bake's binding assignment. The port now knows where the
+table is and which entries the program reads; which `tN`/`uN` the baked HLSL
+declared for each entry is the translator's assignment and has to come out of the
+bake (it has it), not out of an offset-to-slot guess — so the space-1 slots are
+still null descriptors, and still counted.
 Every dispatch that cannot run says so once by key, with the reason in the log
 (`host_gpu_d3d12.cpp`'s `GuestDispatchReport()` and `guest_compute.Report()`).
 
@@ -346,7 +367,7 @@ run has to show before "boots" may be written down.
 
 ## Verified here (build machine)
 
-* **249 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **268 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot

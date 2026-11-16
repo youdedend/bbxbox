@@ -57,6 +57,7 @@
 #include "src/host/d3d12/bbx_psocache.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
 #include "src/host/d3d12/device.h"
+#include "src/host/d3d12/bbx_guest_path.h"
 #include "src/host/d3d12/pipeline.h"
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/log.h"
@@ -83,6 +84,37 @@ struct Program {
     std::vector<std::uint32_t> words;
     std::string name;
     std::uint64_t hash = 0;
+    // Where this program keeps its resource table, decoded from its own
+    // instructions (`s_load_dwordx2` out of a user SGPR pair, then a load through
+    // what it loaded): -1 when it keeps none, and the evidence is the instruction
+    // pair the answer came from, not a comment.
+    int table_slot = -1;
+    std::string table_evidence;
+    // The table offsets the program reads through that pointer, in the order it
+    // reads them. These are the bindings' bytes; matching them to the baked
+    // shader's `tN`/`uN` needs the translator's assignment, which the bake has and
+    // this side does not yet - so they are logged, not bound.
+    std::vector<std::uint32_t> table_reads_dw;
+    void DecodeTable() {
+        table_slot = d3d12::DecodeTableSlot(words.data(), words.size(), &table_evidence);
+        table_reads_dw.clear();
+        if (table_slot < 0) return;
+        const std::vector<d3d12::UserDataLoad> loads = d3d12::DecodeUserDataLoads(words.data(), words.size());
+        // The pair the pointer was loaded into is the source of the reads; find it
+        // again from the instruction that produced it.
+        std::uint32_t pair = 0;
+        for (const d3d12::UserDataLoad& load : loads) {
+            if (!load.buffer && load.op >= 1 && load.op <= 2 && load.from_user_data &&
+                static_cast<int>(load.sbase) == table_slot) {
+                pair = load.sdst;
+                break;
+            }
+        }
+        for (const d3d12::UserDataLoad& load : loads) {
+            if (load.sbase != pair) continue;
+            if (table_reads_dw.size() < 64) table_reads_dw.push_back(load.offset_dw);
+        }
+    }
 };
 
 // Same reading as host/gpu.cpp's extract_program: the ShaderBinaryInfo footer
@@ -111,6 +143,7 @@ bool ExtractProgram(std::uint64_t code_va, Program* out) {
         shader_patch_apply(out->name, out->words);
         out->hash = bbx::Fnv1a64(std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(out->words.data()), out->words.size() * sizeof(std::uint32_t)));
+        out->DecodeTable();
         return true;
     }
     // No footer: the program is what decodes up to its last s_endpgm.
@@ -126,6 +159,7 @@ bool ExtractProgram(std::uint64_t code_va, Program* out) {
     out->name = "no-footer";
     out->hash = bbx::Fnv1a64(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(out->words.data()), out->words.size() * sizeof(std::uint32_t)));
+    out->DecodeTable();
     return true;
 }
 
@@ -434,6 +468,28 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
             return 0;
         }
         program = impl.programs.emplace(d.code_va, std::move(read)).first;
+        // Said once per program, not per dispatch: a dispatch runs thousands of
+        // times and the answer is a property of the program. This is the line that
+        // makes the next step (binding the table's entries) checkable against a
+        // real dump instead of against a guess: the slot, the instruction it came
+        // from, and how many reads the program makes through it.
+        const Program& decoded = program->second;
+        if (decoded.table_slot >= 0) {
+            std::string offsets;
+            char one[16] = {};
+            for (const std::uint32_t dw : decoded.table_reads_dw) {
+                std::snprintf(one, sizeof(one), " 0x%x", dw * 4u);
+                offsets += one;
+            }
+            LogMessage(Level::kInfo,
+                       "guest compute: %s (0x%llx) resource table in user SGPR %d: %s; %zu read(s):%s",
+                       decoded.name.c_str(), static_cast<unsigned long long>(d.code_va), decoded.table_slot,
+                       decoded.table_evidence.c_str(), decoded.table_reads_dw.size(),
+                       offsets.empty() ? " none" : offsets.c_str());
+        } else {
+            LogMessage(Level::kWarn, "guest compute: %s (0x%llx) has no resource table pointer in its user data",
+                       decoded.name.c_str(), static_cast<unsigned long long>(d.code_va));
+        }
     }
     ConsoleStageKey key;
     key.stage = Stage::kCompute;

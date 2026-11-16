@@ -51,6 +51,16 @@ TEST(GuestVSharp_ZeroStrideIsAFlatByteRange) {
     CHECK_EQ(view.bytes, 4096ull);  // num_records are bytes when the stride is 0
 }
 
+TEST(GuestVSharp_TheBaseIsFortyBitsBecauseWordOneCarriesEightOfThem) {
+    // The guest's addresses are 40-bit, and word 1's low byte is base[39:32]:
+    // stride lives at [29:16], so bits 8..15 of word 1 belong to neither. Reading
+    // them as base bits would put a buffer's flags into its address.
+    std::uint32_t words[4] = {0x1234'5678u, 0xab00'0010u, 0x10, 0};
+    const VSharpView view = DecodeVSharp(words);
+    CHECK_EQ(view.base, 0x10'1234'5678ull);  // word 1's low byte 0x10 is base[39:32]
+    CHECK_EQ(view.stride, 0x2b00u);          // word 1[29:16], and 0xab00 & 0x3fff
+}
+
 TEST(GuestVSharp_StrideIsTenBitsAndClampedToFourteen) {
     // Word 1[29:16] is stride; the two bits above it belong to something else.
     std::uint32_t words[4] = {0, 0x4000'0000u | (0x3fffu << 16), 2, 0};
@@ -139,7 +149,8 @@ TEST(GuestVSharp_ABaseAboveTheWindowIsRefusedEvenWhenShort) {
     // mapped slabs, which are far below it. The address is legal for the guest
     // and not addressable by the page table, so it is refused, not truncated.
     std::uint32_t words[4] = {};
-    MakeVSharp(words, 1ull << 40, 0, 16);
+    // 8 GiB: representable in a V# (40-bit base) and above the 7.75 GiB window.
+    MakeVSharp(words, 0x2'0000'0000ull, 0, 16);
     const SlotDecision decision = DecideSlot(words);
     CHECK(decision.verdict == SlotVerdict::kOutsideGuest);
 }
