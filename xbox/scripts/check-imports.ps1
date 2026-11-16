@@ -115,7 +115,21 @@ foreach ($binary in $binaries) {
             }
             if (-not $own) { $notices.Add("$($binary.Name) (payload): imports a desktop-only symbol matching /$pattern/") }
             elseif ($allowed) { $notices.Add("$($binary.Name): imports $symbol, documented as never called") }
-            else { $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/") }
+            else {
+                # The symbol alone does not say where it came from: the module it
+                # is imported from, and the names around it, are what a reviewer
+                # needs to find the translation unit. Forty lines back is the
+                # module header dumpbin printed before the name.
+                $lines = @($imports)
+                $at = -1
+                for ($i = 0; $i -lt $lines.Count; ++$i) { if ($lines[$i] -match $pattern) { $at = $i; break } }
+                $detail = ""
+                if ($at -ge 0) {
+                    $lo = [Math]::Max(0, $at - 40)
+                    $detail = "`n" + (($lines[$lo..$at]) -join "`n")
+                }
+                $failures.Add("$($binary.Name): imports a desktop-only symbol matching /$pattern/$detail")
+            }
         }
     }
 }
