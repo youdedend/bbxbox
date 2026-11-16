@@ -107,6 +107,40 @@ whole P2 path in it (run `43734984657`). Six shader entry points are embedded as
 | P5 | DXIL precompile + PSO cache + quarantine + USB sync | Cache and quarantine landed and tested; DXIL compile and USB sync pending. |
 | P6 | 60 FPS pass | Pending. |
 
+**The guest's GPU is the port's device, not the stub (Slice 5B-1).** `host/gpu.h` is the
+surface `hle/gnm_exec.cpp` and `hle/video.cpp` call; upstream answers it from
+`host/gpu_stub.cpp` when Vulkan is not at build time, which means a boot never
+waits on a fence and never draws. The console now answers it from
+`src/host/d3d12/host_gpu_d3d12.cpp`, which is a seam over the port's own
+`D3d12Session` rather than a second device: the session installs a
+`GuestGpuBinding` (`src/host/d3d12/host_gpu_d3d12.h`) at `Create` and clears it
+before it destroys the device. What that makes real now:
+
+* **the timeline fence** — `host_gpu_submit`/`host_gpu_flush` signal the device's
+  fence and `host_gpu_submissions_completed`/`host_gpu_work_needs`/
+  `host_gpu_wait_completed` read it, so an EOP or label wait is a wait on work
+  that was actually submitted, and `g_flip_after_gpu` tracks submissions;
+* **the guest's memory** — `bbx_guest_mem` (`GuestPlan`, `GuestMemory`) builds the
+  two-level page table and the 256 MiB slabs `space3 t0`/`u0..u31` name, slab `0`
+  being the 64 KiB guard page every unmapped table entry points at; slabs are
+  resident only where the plan puts a window, so the console pays for what the
+  guest maps and not for 32 * 256 MiB out of Game Mode's 5,120 MiB. Every
+  unmapped L1/L2 entry points at slab 0 offset 0, so a stray lane reads the guard
+  page instead of faulting (or of corrupting a live one);
+* **the guest root signature** — `pipeline.cpp` creates a console 1.0 signature of
+  4 DWORDs (`bbx_guest_root.h`: the `StageParams` CBV at `b0, space1`, the
+  space-1 SRV/UAV/sampler table the emitted shaders declare, and the space-3
+  table for the page table and the 32 slabs), with no static samplers and no
+  `ID3D12PipelineLibrary`.
+
+Not yet: the pipeline itself. A dispatch resolves its shader identity, and a key
+the baked cache does not carry is counted and *refused once per key*, with the
+reason in the log (`host_gpu_d3d12.cpp`, `GuestDispatchReport()`) — never dispatched
+as something the console cannot run. Building the compute PSO from the cached
+DXIL and issuing the dispatch, and the whole graphics half
+(`host_gpu_draw`, render-target views, the blits) stay counted stubs until
+Slice 5B-2, which is the next slice.
+
 ## Verified on hardware (inherited, and what it changes here)
 
 | Hardware fact | Source | Enforced in this tree |
@@ -163,12 +197,15 @@ imports no desktop-only file, memory or loader API.
 
 ## Verified here (build machine)
 
-* **191 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
+* **226 host tests** — `./tools/build_host.sh`: format, budget, cache, quarantine, descriptors, present,
   stream, untile, precompile, barriers, dump layout, ini, launcher, chords/keyboard, overlay, spill,
   guest-memory ledger (W^X), caps, PSO cache, tessellation policy, display plan, the shader manifest,
   and the guest core's own invariants (SHA-256 against the NIST vectors, the NID table, the TEB slot
   arithmetic, the `fs:[0]` → `gs:[disp]` rewrite over a synthetic segment including the stack-cookie
-  read it must not touch, and `HostPacedFile` committing by rename).
+  read it must not touch, and `HostPacedFile` committing by rename), and the console's guest-memory
+  map (`tests/guest_mem_test.cpp`: every window's pages walk to the slab and offset the shaders compute,
+  the guard page catches the unmapped ones, the plan stays inside the slab table, and the root signature
+  is 4 DWORDs with the registers the emitted shaders declare).
 * **The fSELF unwrapper is checked against the real dump, not only fixtures.** Eleven cases cover plain ELF,
   stored and zlib segments, blocked zlib segments, a corrupt stream, a truncated wrapper, a wrapper whose
   segments are already in place, no-inflate builds and a retail-signed SELF; each synthetic fixture zeroes the
@@ -180,7 +217,8 @@ imports no desktop-only file, memory or loader API.
   `xbox/scripts/dxc-run.ps1`; the blobs are embedded in `bbx_shaders_generated.h`. The package carries
   no `dxcompiler.dll`/`dxil.dll` at all, and `check-imports.ps1` no longer allows them as modules.
 * **`./tools/syntax_check.sh`** — the Windows-only translation units
-  (`bbx_d3d12.cpp`, `device.cpp`, `swapchain.cpp`, `pipeline.cpp`, `replay.cpp` and
+  (`bbx_d3d12.cpp`, `device.cpp`, `swapchain.cpp`, `pipeline.cpp`, `replay.cpp`,
+  `host_gpu_d3d12.cpp`, `bbx_guest_mem.cpp`, `bbx_guest_root.cpp` and
   `xbox/platform/d3d12_session.cpp`) are type-checked on Linux against declaration-only stubs of
   `<windows.h>`, `<d3d12.h>`, `<dxgi1_6.h>` and `<wrl/client.h>` in
   `tools/stubs/win_d3d12/`. This is a type-and-signature check, not an emulator: it

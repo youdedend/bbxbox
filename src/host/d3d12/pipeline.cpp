@@ -2,7 +2,9 @@
 // Root signatures and PSO creation for the port's own passes (see pipeline.h).
 #include "src/host/d3d12/pipeline.h"
 
+#include <array>
 #include <cstdio>
+#include <vector>
 
 #include "src/host/d3d12/device.h"
 
@@ -107,6 +109,12 @@ Status PipelineSet::Create(Device& device) {
         const Status status = CreateRootSignature(static_cast<PassKind>(index));
         if (status != Status::kOk) { return status; }
     }
+    // The guest's signature is created with the port's own, so a boot report
+    // says whether guest dispatches can be built at all before one is tried.
+    if (const Status status = CreateGuestRootSignature(*device_, guest_root_.GetAddressOf()); status != Status::kOk) {
+        Log("pipelines: the guest root signature was not created (%s): guest dispatches will be refused",
+            StatusName(status));
+    }
     Log("pipelines: root signatures ready (%s)", Describe().c_str());
     return Status::kOk;
 }
@@ -202,6 +210,99 @@ Status PipelineSet::CreateRootSignature(PassKind kind) {
     }
     Log("root signature %s: %u parameter(s), %s", PassName(kind), count,
         compute ? "compute" : "graphics");
+    return Status::kOk;
+}
+
+std::string GuestRootDescription() {
+    // The layout is portable and tested; this is its own words, for the report.
+    return GuestRoot().Describe();
+}
+
+Status CreateGuestRootSignature(Device& device, ID3D12RootSignature** out) {
+    if (!out) { return Status::kInvalidArgument; }
+    *out = nullptr;
+    const GuestRootLayout layout = GuestRoot();
+    if (!layout.Valid()) {
+        Log("guest root signature: the layout is %u DWORDs, over the console's %u", layout.Dwords(),
+            GuestRootLayout::kMaxDwords);
+        return Status::kInvalidArgument;
+    }
+
+    // Ranges live as long as the desc does (D3D12SerializeRootSignature copies
+    // them), so they are this function's locals, summed per parameter.
+    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
+    std::vector<D3D12_ROOT_PARAMETER> parameters;
+    std::array<std::uint32_t, 4> range_first{};  // where each parameter's ranges start
+    for (const GuestRootParam& param : layout.params) {
+        D3D12_ROOT_PARAMETER p{};
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        if (param.kind == GuestRootParamKind::kParamsCbv) {
+            // A root CBV: the dispatcher writes the StageParams pointer into the
+            // command list, so the parameters cost no descriptor slot.
+            p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            p.Descriptor.ShaderRegister = kGuestParamsRegister;
+            p.Descriptor.RegisterSpace = kGuestParamsSpace;
+            parameters.push_back(p);
+            continue;
+        }
+        range_first[parameters.size()] = static_cast<std::uint32_t>(ranges.size());
+        for (const GuestRange& range : param.ranges) {
+            D3D12_DESCRIPTOR_RANGE r{};
+            r.RangeType = range.kind == GuestRangeKind::kSrv     ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                          : range.kind == GuestRangeKind::kUav   ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                                                                 : D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            r.NumDescriptors = range.count;
+            r.BaseShaderRegister = range.base_register;
+            r.RegisterSpace = range.space;
+            r.OffsetInDescriptorsFromTableStart = D3D12_APPEND_ALIGNED_ELEMENT;
+            ranges.push_back(r);
+        }
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(param.ranges.size());
+        p.DescriptorTable.pDescriptorRanges = nullptr;  // pointed into `ranges` below, once it has stopped growing
+        parameters.push_back(p);
+    }
+    // The table pointers are into `ranges`, which is stable now: assign them.
+    std::size_t param_index = 0;
+    for (const GuestRootParam& param : layout.params) {
+        if (param.kind != GuestRootParamKind::kParamsCbv) {
+            parameters[param_index].DescriptorTable.pDescriptorRanges = ranges.data() + range_first[param_index];
+        }
+        ++param_index;
+    }
+
+    // No static samplers: a guest shader's samplers come from its own s# range,
+    // with the console's D3D11-style state, because a static sampler cannot carry
+    // an aniso/border combination per binding.
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = static_cast<UINT>(parameters.size());
+    desc.pParameters = parameters.data();
+    desc.NumStaticSamplers = 0;
+    desc.pStaticSamplers = nullptr;
+    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3DBlob> error;
+    // 1.0, as the console's is: the versioned serializer is not used anywhere in
+    // this port (pipeline.h's rule), and 1.1's larger root is not on the console.
+    const HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, blob.GetAddressOf(),
+                                                   error.GetAddressOf());
+    if (FAILED(hr)) {
+        if (error) {
+            Log("guest root signature refused: %s", static_cast<const char*>(error->GetBufferPointer()));
+        } else {
+            Log("guest root signature: D3D12SerializeRootSignature failed 0x%08lX", static_cast<unsigned long>(hr));
+        }
+        return FromHresult(hr);
+    }
+    const HRESULT created = device.Get()->CreateRootSignature(
+        0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(out));
+    if (FAILED(created)) {
+        Log("guest root signature: CreateRootSignature failed 0x%08lX", static_cast<unsigned long>(created));
+        return FromHresult(created);
+    }
+    Log("guest root signature: %u parameter(s), %u/%u DWORDs", desc.NumParameters, layout.Dwords(),
+        GuestRootLayout::kMaxDwords);
     return Status::kOk;
 }
 
@@ -343,6 +444,7 @@ std::string PipelineSet::Describe() const {
 }
 
 void PipelineSet::Destroy() {
+    guest_root_.Reset();
     for (auto& pso : psos_) { pso.Reset(); }
     for (auto& root : roots_) { root.Reset(); }
     cache_.reset();

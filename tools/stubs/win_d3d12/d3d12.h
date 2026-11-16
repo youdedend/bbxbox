@@ -829,10 +829,18 @@ struct D3D12_ROOT_CONSTANTS {
     UINT Num32BitValues = 0;
 };
 
+// A root descriptor (CBV/SRV/UAV): the real SDK names this type and puts it in
+// D3D12_ROOT_PARAMETER's union, so a signature that binds one has to say so here.
+struct D3D12_ROOT_DESCRIPTOR {
+    UINT ShaderRegister = 0;
+    UINT RegisterSpace = 0;
+};
+
 struct D3D12_ROOT_PARAMETER {
     D3D12_ROOT_PARAMETER_TYPE ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     D3D12_ROOT_DESCRIPTOR_TABLE DescriptorTable;
     D3D12_ROOT_CONSTANTS Constants;
+    D3D12_ROOT_DESCRIPTOR Descriptor;  // a root CBV/SRV/UAV (a union in the SDK)
     D3D12_SHADER_VISIBILITY ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 };
 

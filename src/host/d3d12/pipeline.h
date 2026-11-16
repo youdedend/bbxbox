@@ -25,10 +25,18 @@
 #include "src/host/d3d12/bbx_d3d12.h"
 #include "src/host/d3d12/bbx_psocache.h"
 #include "src/host/d3d12/bbx_shaders.h"
+// The guest's memory and the signature its shaders name: portable headers, so
+// the build machine tests the numbers this file turns into D3D12 descriptors
+// (bbx_guest_mem.h, bbx_guest_root.h).
+#include "src/host/d3d12/bbx_guest_root.h"
 
 namespace bbx::d3d12 {
 
 class Device;
+
+// What a guest shader's signature costs, for the boot report: "guest root: 3
+// parameter(s), 4/64 DWORDs, ..." (bbx_guest_root.cpp's Describe).
+[[nodiscard]] std::string GuestRootDescription();
 
 // The port's own passes. `kCount` last; the guest's draws (P3) go through the
 // cache with keys of their own, not through this enum.
@@ -39,28 +47,6 @@ enum class PassKind : std::uint8_t {
     kSelftest,      // compute: the boot GPU self-test
     kCount,
 };
-
-// The console's guest memory, as the baked DXIL declares it (gcn/hlsl.cpp
-// console_memory_prelude; ARCHITECTURE_XBOX_D3D12.md §3.3). A compute shader
-// that touches a guest buffer binds two tables in space 3, and Slice 5B's root
-// signature must hand them out at exactly these registers - the numbers are in
-// the shaders, so a disagreement is a silent wrong read, not a compile error.
-//
-// A guest VA is two dwords: the page table (t0, space3) gives the page's slab
-// and its offset in that slab, and the access is a Load/Store/Interlocked* on
-// g_guest_slabs[slab] (u0..u31, space3). One buffer cannot span the VA space,
-// because a D3D12 raw buffer is addressed by a 32-bit byte offset.
-inline constexpr std::uint32_t kGuestSpace = 3;
-inline constexpr std::uint32_t kGuestPageTableRegister = 0;  // t0: ByteAddressBuffer, the walk
-inline constexpr std::uint32_t kGuestSlabRegister = 0;       // u0..u31: RWByteAddressBuffer, the data
-inline constexpr std::uint32_t kGuestSlabCount = 32;
-inline constexpr std::uint32_t kGuestSlabBytes = 256u << 20;  // 32 x 256 MiB = the 8 GiB a guest sees
-inline constexpr std::uint32_t kPageL1Entries = 4096;    // one dword per 4 GiB region, min(hi, n - 1)
-inline constexpr std::uint32_t kPageL2Entries = 65536;   // one 8-byte entry per 64 KiB page, per table
-inline constexpr std::uint32_t kPageShift = 16;          // 64 KiB pages: the console's own granularity
-// The bindings those constants name, spelled the way the shaders spell them: a
-// root signature parameter per table, and one range of kGuestSlabCount
-// descriptors at kGuestSlabRegister in the slab table.
 
 [[nodiscard]] const char* PassName(PassKind kind);
 
@@ -79,6 +65,12 @@ public:
     // The PSO for `kind`, created if this is the first use. Null on failure; the
     // reason is logged once and the pass is skipped rather than crashing.
     [[nodiscard]] ID3D12PipelineState* Ensure(PassKind kind);
+    // The guest shaders' signature (bbx_guest_root.h): created with the port's
+    // own, once, and used by every guest dispatch. Null when the device refused
+    // it, which the boot report says rather than failing a dispatch later.
+    [[nodiscard]] ID3D12RootSignature* GuestRootSignature() const { return guest_root_.Get(); }
+    [[nodiscard]] bool GuestRootReady() const { return guest_root_ != nullptr; }
+
     [[nodiscard]] ID3D12RootSignature* RootSignature(PassKind kind) const {
         return kind < PassKind::kCount ? roots_[static_cast<std::size_t>(kind)].Get() : nullptr;
     }
@@ -98,11 +90,18 @@ public:
 
 private:
     Status CreateRootSignature(PassKind kind);
+    // Builds a D3D12 signature out of a GuestRootLayout: the tables, the root
+    // CBV and - for a graphics stage - the static samplers the guest's samplers
+    // resolve against. Exposed as a free function so a test can ask a device for
+    // it without a PipelineSet.
+    Status CreateGuestRootSignature(Device& device, ID3D12RootSignature** out);
     Status CreateGraphicsPso(PassKind kind, const shaders::Blob& vs, const shaders::Blob& ps);
     Status CreateComputePso(PassKind kind, const shaders::Blob& cs);
 
     Device* device_ = nullptr;
     std::array<ComPtr<ID3D12RootSignature>, static_cast<std::size_t>(PassKind::kCount)> roots_{};
+    // The guest's: one signature for every baked shader (bbx_guest_root.h).
+    ComPtr<ID3D12RootSignature> guest_root_;
     std::array<ComPtr<ID3D12PipelineState>, static_cast<std::size_t>(PassKind::kCount)> psos_{};
     std::unique_ptr<PsoCache> cache_;
     std::uint64_t clock_ = 0;

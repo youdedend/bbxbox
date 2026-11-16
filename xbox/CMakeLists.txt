@@ -139,6 +139,8 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_untile.cpp
     ../src/host/d3d12/bbx_scanout.cpp
     ../src/host/d3d12/bbx_barriers.cpp
+    ../src/host/d3d12/bbx_guest_mem.cpp
+    ../src/host/d3d12/bbx_guest_root.cpp
 )
 
 set(BBX_APP_SOURCES

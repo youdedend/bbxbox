@@ -2,6 +2,9 @@
 // The console session (see d3d12_session.h): device, swapchain, pipelines, replay.
 #include "xbox/platform/d3d12_session.h"
 
+#include "src/host/d3d12/bbx_guest_mem.h"
+#include "src/host/d3d12/host_gpu_d3d12.h"
+
 #include <windows.h>
 
 #include <cstdio>
@@ -57,10 +60,70 @@ struct D3d12Session::Impl {
     bool frame_pending = false;
     std::uint64_t guest_frames = 0, guest_frames_dropped = 0;
 
+    // The guest's memory (Slice 5B-1): the page table and the lazily resident
+    // slabs, and the binding host/gpu.h's implementation sees. The hooks are
+    // static functions over this Impl, installed at Create and cleared at
+    // Destroy, so a boot without a device falls back to the stub's answers.
+    d3d12::GuestPlan guest_plan;
+    d3d12::GuestMemory guest_memory;
+    d3d12::GuestGpuBinding guest_binding;
+    std::string guest_memory_line;
+
     [[nodiscard]] d3d12::DeviceDesc Desc(bool debug) const {
         d3d12::DeviceDesc desc{};
         desc.enable_debug_layer = debug;
         return desc;
+    }
+
+    // The binding's hooks. Each one is the device's own answer, or a plain false
+    // when the thing it names does not exist: a null hook is never installed.
+    static std::uint64_t FenceSubmitted(void* user) { return static_cast<Impl*>(user)->device.SubmittedValue(); }
+    static std::uint64_t FenceCompleted(void* user) { return static_cast<Impl*>(user)->device.CompletedValue(); }
+    static std::uint64_t FenceSignal(void* user) { return static_cast<Impl*>(user)->device.Signal(); }
+    static bool FenceWait(void* user, std::uint64_t value, std::uint64_t timeout_ms) {
+        // Device::WaitFor takes a 32-bit timeout: a longer ask is a series of
+        // them, and a zero ask is "is it done", which the caller has asked.
+        Impl& impl = *static_cast<Impl*>(user);
+        while (true) {
+            const auto slice = static_cast<std::uint32_t>(timeout_ms > 0xffffffffull ? 0xffffffffull : timeout_ms);
+            if (impl.device.WaitFor(value, slice)) return true;
+            if (impl.device.DeviceLost() || timeout_ms <= 0xffffffffull) return false;
+            timeout_ms -= slice;
+        }
+    }
+    static bool MemWrite(void* user, std::uint64_t va, const void* data, std::size_t bytes) {
+        Impl& impl = *static_cast<Impl*>(user);
+        return impl.guest_memory.WriteGuest(impl.guest_plan.table, va, data, bytes) == d3d12::Status::kOk;
+    }
+    static bool MemFill(void* user, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
+        Impl& impl = *static_cast<Impl*>(user);
+        return impl.guest_memory.FillGuest(impl.guest_plan.table, va, value, bytes) == d3d12::Status::kOk;
+    }
+    static bool MemCopy(void* user, std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
+        Impl& impl = *static_cast<Impl*>(user);
+        return impl.guest_memory.CopyGuest(impl.guest_plan.table, dst, src, bytes) == d3d12::Status::kOk;
+    }
+    static bool ReadGuest(void* user, std::uint64_t va, void* out, std::size_t bytes) {
+        Impl& impl = *static_cast<Impl*>(user);
+        return impl.guest_memory.ReadGuest(impl.guest_plan.table, va, out, bytes) == d3d12::Status::kOk;
+    }
+
+    // Installs the binding the guest's HLE calls through (host_gpu_d3d12.h).
+    void InstallGuestBinding() {
+        guest_binding = d3d12::GuestGpuBinding{};
+        guest_binding.user = this;
+        guest_binding.fence_submitted = &Impl::FenceSubmitted;
+        guest_binding.fence_completed = &Impl::FenceCompleted;
+        guest_binding.fence_signal = &Impl::FenceSignal;
+        guest_binding.fence_wait = &Impl::FenceWait;
+        guest_binding.mem_write = &Impl::MemWrite;
+        guest_binding.mem_fill = &Impl::MemFill;
+        guest_binding.mem_copy = &Impl::MemCopy;
+        guest_binding.read_guest = &Impl::ReadGuest;
+        // dispatch_key and dispatch are Slice 5B-2's: the shader's identity and
+        // the compute pipeline. Until then a dispatch is counted and refused.
+        guest_binding.ready = ready && guest_memory.Ready();
+        d3d12::SetGuestGpuBinding(&guest_binding);
     }
 
     void FillReport() {
@@ -164,6 +227,25 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     }
 
     impl.ready = true;
+    // The guest's memory: the console's own windows (5 GiB of RAM and the GPU's
+    // 4 GiB alias over it) in 256 MiB slabs, and the two tables the shaders walk
+    // (bbx_guest_mem.h). A plan that does not fit is a boot report line, not a
+    // failed device: the rest of the port still runs.
+    impl.guest_plan = d3d12::PlanGuestMemory();
+    impl.guest_memory_line = impl.guest_plan.Report();
+    if (impl.guest_plan.ok()) {
+        const d3d12::Status memory = impl.guest_memory.Create(impl.device, impl.device.Memory(), impl.guest_plan);
+        if (memory != d3d12::Status::kOk) {
+            LogMessage(Level::kWarn, "d3d12: guest memory not created (%s): guest dispatches will be refused",
+                       d3d12::StatusName(memory));
+        }
+        LogMessage(Level::kInfo, "d3d12: %s", impl.guest_memory.Describe().c_str());
+    } else {
+        LogMessage(Level::kError, "d3d12: %s", impl.guest_plan.refused.c_str());
+    }
+    // The guest's HLE now sees the device's fence and the guest's slabs
+    // (host_gpu_d3d12.h): a dispatch checks `available` before anything else.
+    impl.InstallGuestBinding();
     // The guest's flips find this session from now on (guest_frames.h): the
     // swapchain is up, so a frame handed over has somewhere to go.
     g_frame_target = this;
@@ -368,6 +450,10 @@ void D3d12Session::Destroy() {
         SetGuestFrameSink(nullptr);
     }
     impl_->ready = false;
+    // The guest's HLE must stop calling into this device before it is destroyed.
+    d3d12::SetGuestGpuBinding(nullptr);
+    impl_->guest_memory.Destroy();
+    impl_->guest_binding = d3d12::GuestGpuBinding{};
     impl_->replay.Destroy();
     impl_->pipelines.Destroy();
     impl_->swapchain.Destroy();

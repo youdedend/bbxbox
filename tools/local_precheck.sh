@@ -95,7 +95,7 @@ for pair in "memory-budget.md:4,480" "memory-budget.md:5,120" "porting-plan.md:8
             "precompile-cache.md:precompile_inflight.txt" "console-ux.md:FutureAccessList" \
             "d3d12-backend.md:CreateSwapChainForCoreWindow" "d3d12-backend.md:6_4" \
             "ARCHITECTURE_XBOX_D3D12.md:3840" "ARCHITECTURE_XBOX_D3D12.md:pipeline library" \
-            "PORT_STATUS.md:191 host tests" ; do
+            "PORT_STATUS.md:226 host tests" ; do
   file="${pair%%:*}"; needle="${pair#*:}"
   if ! grep -q -- "$needle" "docs/$file" 2>/dev/null; then
     fail "docs/$file no longer mentions $needle"

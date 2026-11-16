@@ -27,6 +27,8 @@ sources=(
   "$root"/src/host/d3d12/bbx_stream.cpp
   "$root"/src/host/d3d12/bbx_untile.cpp
   "$root"/src/host/d3d12/bbx_scanout.cpp
+  "$root"/src/host/d3d12/bbx_guest_mem.cpp
+  "$root"/src/host/d3d12/bbx_guest_root.cpp
   "$root"/xbox/platform/dump.cpp
   "$root"/xbox/platform/ini_file.cpp
   "$root"/xbox/platform/launcher.cpp
@@ -46,6 +48,7 @@ sources=(
   "$root"/tests/stream_test.cpp
   "$root"/tests/untile_test.cpp
   "$root"/tests/scanout_test.cpp
+  "$root"/tests/guest_mem_test.cpp
   "$root"/tests/precompile_test.cpp
   "$root"/tests/barriers_test.cpp
   "$root"/tests/sfo_test.cpp

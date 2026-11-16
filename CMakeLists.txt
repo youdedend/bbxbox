@@ -66,6 +66,8 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_stream.cpp
     src/host/d3d12/bbx_untile.cpp
     src/host/d3d12/bbx_scanout.cpp
+    src/host/d3d12/bbx_guest_mem.cpp
+    src/host/d3d12/bbx_guest_root.cpp
     src/host/d3d12/bbx_psocache.cpp
     src/host/d3d12/bbx_tess.cpp
     src/host/core/bbx_self.cpp
@@ -109,6 +111,7 @@ set(BBX_CONSOLE_SOURCES
     src/host/d3d12/descriptors_d3d12.cpp
     src/host/d3d12/rootsig.cpp
     src/host/d3d12/pipeline.cpp
+    src/host/d3d12/host_gpu_d3d12.cpp
     src/host/d3d12/replay.cpp
     src/host/d3d12/labels.cpp
     src/host/d3d12/dxil.cpp
@@ -136,6 +139,7 @@ if(BBX_BUILD_TESTS)
         tests/stream_test.cpp
         tests/untile_test.cpp
         tests/scanout_test.cpp
+        tests/guest_mem_test.cpp
         tests/precompile_test.cpp
         tests/barriers_test.cpp
         tests/sfo_test.cpp

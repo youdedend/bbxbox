@@ -217,14 +217,23 @@ endif()
 # --- the portable host layer, for the console --------------------------------
 # `src/hle` reaches into its host (`src/host`) for the GPU executor, the audio
 # device, the bindings, the stats and the list plumbing. Most of that layer is
-# Vulkan-free already, and `host/gpu_stub.cpp` is upstream's own
-# no-Vulkan-at-build-time implementation of the whole `host_gpu_*` surface - the
-# single largest piece of the link. What is *not* here is desktop furniture the
+# Vulkan-free already. `host/gpu_stub.cpp` is upstream's own no-Vulkan build of
+# the whole `host_gpu_*` surface; the console does not use it - Slice 5B-1's
+# `src/host/d3d12/host_gpu_d3d12.cpp` answers that surface from the port's D3D12
+# device (the timeline fence and the guest's slabs), and keeps the stub's answers
+# only where the device has none yet, from `host_gpu_d3d12_stub.inc`. What is
+# *not* here is desktop furniture the
 # console does not want: the window/launcher (SDL3 window shell + ImGui), the
 # plugin loader (`dlopen`/`LoadLibrary`), the shader compiler host, the updater
 # and the Windows crash reporter.
 add_library(bbhost_host STATIC
-    "${BBX_BBHOST_ROOT}/src/host/gpu_stub.cpp"
+    # Not gpu_stub.cpp: the console's answer to host/gpu.h is
+    # src/host/d3d12/host_gpu_d3d12.cpp, which drives the port's own D3D12 device
+    # (the timeline fence and the guest's slabs) and keeps the stub's answers only
+    # for what the device does not implement yet - see that file's header.
+    # bbx_guest_mem.cpp and bbx_guest_root.cpp are the device's half (they reach
+    # for d3d12.h), so they are the app's, next to device.cpp and pipeline.cpp.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/d3d12/host_gpu_d3d12.cpp"
     "${BBX_BBHOST_ROOT}/src/host/audio.cpp"
     "${BBX_BBHOST_ROOT}/src/host/audio_crush.cpp"
     "${BBX_BBHOST_ROOT}/src/host/bindings.cpp"
