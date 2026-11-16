@@ -1020,11 +1020,14 @@ int SelfTest(const Options& options) {
         // The digest is what makes "signed" a measurement: DXBC and a non-zero
         // one. A runner's log is not always reachable afterwards, so the same
         // line goes out as an annotation in CI.
-        char digest[48] = "none";
-        if (!built.object.empty()) {
-            std::snprintf(digest, sizeof(digest), "%08x%08x%08x%08x",
-                          static_cast<unsigned>(built.object[4]), static_cast<unsigned>(built.object[5]),
-                          static_cast<unsigned>(built.object[6]), static_cast<unsigned>(built.object[7]));
+        char digest[40] = "none";
+        if (built.object.size() >= 20) {
+            // The sixteen bytes at 4..20: DXBC's checksum, which the signer
+            // fills and a DXC without libdxil leaves at zero.
+            for (int k = 0; k < 16; ++k) {
+                std::snprintf(digest + 2 * k, sizeof(digest) - 2 * static_cast<std::size_t>(k), "%02x",
+                              static_cast<unsigned>(built.object[4 + k]));
+            }
         }
         std::printf("  %-8s key %016llx  %s  %zu bytes of HLSL, %zu bytes of DXIL, %s, digest %s\n", c.name,
                     static_cast<unsigned long long>(built.key), built.lifted ? "lifted" : "translated",
