@@ -110,7 +110,10 @@ namespace {
 constexpr std::uint32_t kShare = 0x1, kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10,
                         kRight = 0x20, kDown = 0x40, kLeft = 0x80, kL2 = 0x100, kR2 = 0x200,
                         kL1 = 0x400, kR1 = 0x800, kTriangle = 0x1000, kCircle = 0x2000,
-                        kCross = 0x4000, kSquare = 0x8000, kTouchPad = 0x100000;
+                        kCross = 0x4000, kSquare = 0x8000;
+// kTouchPad (0x100000) has no source here: a GamepadReading carries buttons,
+// sticks and triggers, and no touchpad surface, so the touch bit is never set and
+// the constant is left out rather than defined and unused.
 
 // 0..255 with 127 at rest, from the pad's -1.0..1.0. The rest value lands exactly
 // on kStickRest and not on 128 (host/window.h explains why that matters).
