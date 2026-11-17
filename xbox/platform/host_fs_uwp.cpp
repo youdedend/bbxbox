@@ -14,16 +14,34 @@
 // rather than a close of whatever reused the value.
 #include "xbox/platform/host_fs.h"
 
+#include "xbox/platform/log.h"
+
 #include <windows.h>
+
+// A granted folder - the dump on a USB drive - is reachable through WinRT's
+// StorageFile/StorageFolder and *not* through the FromApp calls: those are
+// refused (ERROR_ACCESS_DENIED) on a path the app only holds a
+// `FutureAccessList` token for. That is what `sce_sys\param.sfo could not be
+// read` was. Everything below keeps the FromApp path as the fast path - it
+// works for LocalState, TemporaryFolder, RoamingState and the package - and
+// falls back to WinRT with its own handle table when it is refused.
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Storage.h>
 
 // The FromApp surface: its own header, and declared only when NTDDI_VERSION is
 // at least NTDDI_WIN10_RS3 (xbox/CMakeLists.txt sets it).
 #include <fileapifromapp.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace bbx::hostfs {
 namespace {
@@ -122,6 +140,141 @@ HANDLE Lookup(int number, bool take) {
     return file;
 }
 
+// --- the WinRT path --------------------------------------------------------
+//
+// Blocking on a WinRT operation is only safe off the thread that pumps the
+// CoreWindow dispatcher: `ui-main` opens dump files while it scans for the
+// layout, so every call here runs on a short-lived worker with its own MTA.
+template <typename Body>
+void OnStorageThread(Body&& body) {
+    std::string failure;
+    std::thread worker([&body, &failure]() {
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            body();
+        } catch (const winrt::hresult_error& error) {
+            failure = winrt::to_string(error.message());
+            char code[32];
+            std::snprintf(code, sizeof(code), "0x%08X",
+                          static_cast<unsigned>(error.code().value));
+            if (!failure.empty()) failure = std::string(code) + " " + failure;
+        } catch (...) {
+            failure = "unknown WinRT failure";
+        }
+    });
+    worker.join();
+    if (!failure.empty()) {
+        t_error = EACCES;
+        bbx::platform::LogF("hostfs: WinRT storage path failed: %s", failure.c_str());
+    }
+}
+
+struct RtFile {
+    winrt::Windows::Storage::Streams::IRandomAccessStream stream{nullptr};
+    std::uint64_t size = 0;
+};
+
+std::mutex g_rt_mu;
+std::unordered_map<int, std::shared_ptr<RtFile>> g_rt_files;
+
+int AdoptRt(std::shared_ptr<RtFile> file) {
+    std::lock_guard<std::mutex> lock(g_rt_mu);
+    const int number = g_next_handle++;
+    g_rt_files.emplace(number, std::move(file));
+    return number;
+}
+
+std::shared_ptr<RtFile> LookupRt(int number, bool take) {
+    std::lock_guard<std::mutex> lock(g_rt_mu);
+    auto it = g_rt_files.find(number);
+    if (it == g_rt_files.end()) return nullptr;
+    auto file = it->second;
+    if (take) g_rt_files.erase(it);
+    return file;
+}
+
+bool IsRtHandle(int number) {
+    std::lock_guard<std::mutex> lock(g_rt_mu);
+    return g_rt_files.find(number) != g_rt_files.end();
+}
+
+std::string HstringToUtf8(const winrt::hstring& text) { return winrt::to_string(text); }
+
+bool OpenRt(const std::string& path, std::uint64_t* size, int* handle) {
+    std::shared_ptr<RtFile> file;
+    OnStorageThread([&path, &file]() {
+        const auto item = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
+                              winrt::to_hstring(path))
+                              .get();
+        auto created = std::make_shared<RtFile>();
+        created->stream = item.OpenAsync(winrt::Windows::Storage::FileAccessMode::Read).get();
+        created->size = created->stream.Size();
+        file = created;
+    });
+    if (file == nullptr) return false;
+    if (size != nullptr) *size = file->size;
+    if (handle != nullptr) *handle = AdoptRt(std::move(file));
+    return true;
+}
+
+bool StatRt(const std::string& path, FileStat* out) {
+    bool found = false;
+    OnStorageThread([&path, out, &found]() {
+        const auto item = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
+                              winrt::to_hstring(path))
+                              .get();
+        const auto properties = item.GetBasicPropertiesAsync().get();
+        out->size = properties.Size();
+        out->is_dir = false;
+        out->mtime = 0;
+        found = true;
+    });
+    if (found) return true;
+    OnStorageThread([&path, out, &found]() {
+        const auto folder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(
+                                winrt::to_hstring(path))
+                                .get();
+        (void)folder;
+        out->size = 0;
+        out->is_dir = true;
+        out->mtime = 0;
+        found = true;
+    });
+    return found;
+}
+
+bool IsDirectoryRt(const std::string& path);
+
+bool ListRt(const std::string& path, std::vector<DirEntry>* out) {
+    std::vector<DirEntry> entries;
+    OnStorageThread([&path, &entries]() {
+        const auto folder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(
+                                winrt::to_hstring(path))
+                                .get();
+        for (const auto& child : folder.GetItemsAsync().get()) {
+            DirEntry entry;
+            entry.name = HstringToUtf8(child.Name());
+            entry.is_dir = child.IsOfType(winrt::Windows::Storage::StorageItemTypes::Folder);
+            entries.push_back(std::move(entry));
+        }
+    });
+    if (entries.empty() && !IsDirectoryRt(path)) return false;
+    *out = std::move(entries);
+    return true;
+}
+
+bool IsDirectoryRt(const std::string& path) {
+    bool is_dir = false;
+    OnStorageThread([&path, &is_dir]() {
+        const auto folder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(
+                                winrt::to_hstring(path))
+                                .get();
+        (void)folder;
+        is_dir = true;
+    });
+    return is_dir;
+}
+
 // --- operations ------------------------------------------------------------
 bool StatImpl(const char* path, FileStat* out) {
     const std::wstring wide = Widen(path);
@@ -131,7 +284,15 @@ bool StatImpl(const char* path, FileStat* out) {
     }
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!::GetFileAttributesExFromAppW(wide.c_str(), GetFileExInfoStandard, &data)) {
-        FailWin32();
+        const DWORD code = ::GetLastError();
+        // A granted folder is not on the FromApp list; ask WinRT before failing.
+        if (StatRt(path, out)) {
+            t_error = 0;
+            return true;
+        }
+        bbx::platform::LogF("hostfs: stat refused %s (win32=%lu)", path,
+                            static_cast<unsigned long>(code));
+        Fail(ErrnoFrom(code));
         return false;
     }
     out->is_dir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -203,7 +364,14 @@ bool ListImpl(const char* path, std::vector<DirEntry>* out) {
     HANDLE find = ::FindFirstFileExFromAppW(wide.c_str(), FindExInfoBasic, &found, FindExSearchNameMatch,
                                             nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (find == INVALID_HANDLE_VALUE) {
-        FailWin32();
+        const DWORD code = ::GetLastError();
+        if (ListRt(Slashify(path != nullptr ? path : ""), out)) {
+            t_error = 0;
+            return true;
+        }
+        bbx::platform::LogF("hostfs: list refused %s (win32=%lu)", path,
+                            static_cast<unsigned long>(code));
+        Fail(ErrnoFrom(code));
         return false;
     }
     do {
@@ -253,11 +421,41 @@ int OpenImpl(const char* path, int flags, int mode) {
     // reader of its own), and the console's own file system allows it.
     HANDLE file = ::CreateFile2FromAppW(wide.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                         disposition, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return FailWin32();
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        // Read-only opens of a granted tree go through WinRT. A write to such a
+        // path is still refused, and says so: the dump is read-only by design.
+        const bool wants_write = (flags & (kWrite | kCreate | kTruncate | kAppend)) != 0;
+        if ((flags & kDirectory) == 0 && !wants_write) {
+            int rt_handle = -1;
+            if (OpenRt(path, nullptr, &rt_handle)) {
+                t_error = 0;
+                return rt_handle;
+            }
+        }
+        bbx::platform::LogF("hostfs: open refused %s (win32=%lu, flags=0x%x)", path,
+                            static_cast<unsigned long>(code), flags);
+        return Fail(ErrnoFrom(code));
+    }
     return Adopt(file);
 }
 
 std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
+    if (const auto rt = LookupRt(handle, false)) {
+        DWORD want = count > 0x40000000ull ? 0x40000000u : static_cast<DWORD>(count);
+        if (want == 0) return 0;
+        std::int64_t got = -1;
+        OnStorageThread([&rt, buffer, want, &got]() {
+            auto stream = rt->stream;
+            const auto bytes = winrt::Windows::Storage::Streams::Buffer(want);
+            const auto read = stream.ReadAsync(bytes, want).get();
+            const auto length = read.Length();
+            if (length > 0) std::memcpy(buffer, read.data(), length);
+            got = static_cast<std::int64_t>(length);
+        });
+        if (got < 0) return Fail(EIO);
+        return got;
+    }
     HANDLE file = Lookup(handle, false);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -275,6 +473,7 @@ std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
 }
 
 std::int64_t WriteImpl(int handle, const void* buffer, std::uint64_t count) {
+    if (IsRtHandle(handle)) return Fail(EACCES);  // the dump is read-only
     HANDLE file = Lookup(handle, false);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -290,6 +489,18 @@ std::int64_t WriteImpl(int handle, const void* buffer, std::uint64_t count) {
 }
 
 std::int64_t SeekImpl(int handle, std::int64_t offset, int whence) {
+    if (const auto rt = LookupRt(handle, false)) {
+        std::uint64_t base = 0;
+        if (whence == kSeekCur) {
+            base = rt->stream.Position();
+        } else if (whence == kSeekEnd) {
+            base = rt->size;
+        }
+        const std::int64_t target = static_cast<std::int64_t>(base) + offset;
+        if (target < 0) return Fail(EINVAL);
+        rt->stream.Seek(static_cast<std::uint64_t>(target));
+        return target;
+    }
     HANDLE file = Lookup(handle, false);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -309,6 +520,7 @@ std::int64_t SeekImpl(int handle, std::int64_t offset, int whence) {
 }
 
 bool TruncateImpl(int handle, std::int64_t length) {
+    if (IsRtHandle(handle)) return Fail(EACCES);
     HANDLE file = Lookup(handle, false);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -324,6 +536,7 @@ bool TruncateImpl(int handle, std::int64_t length) {
 }
 
 bool FlushImpl(int handle) {
+    if (IsRtHandle(handle)) return true;  // nothing buffered on the WinRT side
     HANDLE file = Lookup(handle, false);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -337,6 +550,10 @@ bool FlushImpl(int handle) {
 }
 
 bool CloseImpl(int handle) {
+    if (const auto rt = LookupRt(handle, true)) {
+        (void)rt;
+        return true;
+    }
     HANDLE file = Lookup(handle, true);
     if (file == INVALID_HANDLE_VALUE) {
         Fail(EBADF);
@@ -414,8 +631,14 @@ bool CanonicalImpl(const char* path, std::string* out) {
     const std::wstring wide = Widen(text.c_str());
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!::GetFileAttributesExFromAppW(wide.c_str(), GetFileExInfoStandard, &data)) {
-        FailWin32();
-        return false;
+        const DWORD code = ::GetLastError();
+        FileStat probed{};
+        if (!StatRt(path, &probed)) {
+            bbx::platform::LogF("hostfs: canonicalise refused %s (win32=%lu)", path,
+                                static_cast<unsigned long>(code));
+            Fail(ErrnoFrom(code));
+            return false;
+        }
     }
     while (text.size() > 1 && text.back() == '/') text.pop_back();
     *out = text;
