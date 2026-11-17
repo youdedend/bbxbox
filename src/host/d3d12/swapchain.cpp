@@ -139,6 +139,19 @@ D3D12_CPU_DESCRIPTOR_HANDLE Swapchain::Rtv(std::uint32_t index) const {
 }
 
 Status Swapchain::ApplyMatrixTransform(const platform::OutputPlan& plan) {
+    // The matrix transform is how a swapchain smaller than the panel lands on it
+    // without the compositor stretching it. It is cosmetic: at identity it does
+    // nothing at all, and on some swapchains the call is refused outright with
+    // DXGI_ERROR_INVALID_CALL (0x887A0001). Neither case is a reason to throw
+    // away a swapchain that CreateSwapChainForCoreWindow already created - doing
+    // that left the console on a black screen that never presented a frame.
+    const bool identity = plan.matrix[0] == 1.0f && plan.matrix[1] == 0.0f &&
+                          plan.matrix[2] == 0.0f && plan.matrix[3] == 1.0f;
+    if (identity) {
+        Log("matrix transform: identity, skipped (swapchain %ux%u lands 1:1 on the panel)",
+            width_, height_);
+        return Status::kOk;
+    }
     ComPtr<IDXGISwapChain2> swapchain2;
     if (FAILED(swapchain_.As(&swapchain2))) {
         // Without the matrix transform a 4K swapchain is stretched by the
@@ -157,9 +170,12 @@ Status Swapchain::ApplyMatrixTransform(const platform::OutputPlan& plan) {
     matrix._32 = 0.0f;
     const HRESULT hr = swapchain2->SetMatrixTransform(&matrix);
     if (FAILED(hr)) {
-        Log("SetMatrixTransform(%.4f %.4f %.4f %.4f) failed: 0x%08lX", matrix._11, matrix._12,
-            matrix._21, matrix._22, static_cast<unsigned long>(hr));
-        return FromHresult(hr);
+        // Present anyway: the picture is composited at window scale instead of
+        // being inverse-scaled, which is a quality loss and not a dead display.
+        Log("SetMatrixTransform(%.4f %.4f %.4f %.4f) failed: 0x%08lX; keeping the swapchain and "
+            "presenting at window scale",
+            matrix._11, matrix._12, matrix._21, matrix._22, static_cast<unsigned long>(hr));
+        return Status::kOk;
     }
     if (plan.scaled()) {
         Log("swapchain %ux%u with matrix inverse scale %.3f (%s)", width_, height_, plan.scale,
