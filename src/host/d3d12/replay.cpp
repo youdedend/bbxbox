@@ -41,14 +41,17 @@ D3D12_RESOURCE_DESC BufferDesc(std::uint64_t bytes, D3D12_RESOURCE_FLAGS flags) 
 }
 
 D3D12_HEAP_PROPERTIES HeapProperties(D3D12_HEAP_TYPE type) {
+    // Only Type may be set for the three standard heap types. CPUPageProperty and
+    // MemoryPoolPreference describe *custom* heaps; the runtime rejects anything
+    // else with E_INVALIDARG (0x80070057), which is exactly what the first
+    // CreateCommittedResource (the upload ring) returned on the console:
+    //     d3d12: replay: upload ring failed: 0x80070057
+    // and the display was then reported as unavailable. Both fields stay
+    // D3D12_CPU_PAGE_PROPERTY_UNKNOWN / D3D12_MEMORY_POOL_UNKNOWN - i.e. zero.
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = type;
-    if (type == D3D12_HEAP_TYPE_UPLOAD) {
-        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
-        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-    } else if (type == D3D12_HEAP_TYPE_DEFAULT) {
-        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-    }
+    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
     return heap;
 }
 

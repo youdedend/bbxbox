@@ -93,12 +93,28 @@ SelfTestResult RunMemorySelfTest(bool guest_arena_probe) {
     result.detail += result.wx ? "PASS" : "FAIL";
 
     // The arena: either the guest's, or a probe of the same shape.
+    // The probe must not use 0x100000000: the launcher has already reserved the
+    // guest dmem window there (guest windows: dmem [0x100000000,+0x1f0000000)),
+    // so an exact-slide allocation at that address always fails and the report
+    // said "guest arena below 1 TiB: FAIL" on every boot. Probe in free guest
+    // space that is still under the 1 TiB line, and name the address used.
     bbx::guest::Arena arena;
-    if (bbx::guest::Alloc(arena, 0x100000000ull, 64ull << 20)) {
-        result.guest_arena = bbx::guest::RangeIsGuest(arena, 0x100000000ull, 64ull << 20) &&
-                            (0x100000000ull + (64ull << 20)) <= bbx::guest::kAddressLimit;
+    constexpr std::uint64_t kProbeSize = 64ull << 20;
+    constexpr std::uint64_t kProbeSlides[] = {0x2000000000ull, 0x4000000000ull, 0x8000000000ull};
+    std::uint64_t probed_at = 0;
+    for (const std::uint64_t slide : kProbeSlides) {
+        if (bbx::guest::Alloc(arena, slide, kProbeSize)) {
+            probed_at = slide;
+            break;
+        }
+    }
+    if (probed_at != 0) {
+        result.guest_arena = bbx::guest::RangeIsGuest(arena, probed_at, kProbeSize) &&
+                            (probed_at + kProbeSize) <= bbx::guest::kAddressLimit;
         result.guest_mib = bbx::guest::CommittedMib(arena);
         bbx::guest::Free(arena);
+    } else {
+        result.detail += "\n(no probe slide below 1 TiB could be reserved)";
     }
     if (guest_arena_probe) {
         bbx::guest::Arena& global = bbx::guest::GlobalArena();
