@@ -16,21 +16,28 @@
 #include <winstring.h>
 
 #include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.ApplicationModel.Activation.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Gaming.Input.h>
+#include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.ViewManagement.h>
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "xbox/platform/boot_steps.h"
@@ -75,6 +82,10 @@ struct Session {
 };
 
 Session g_session;
+winrt::agile_ref<winrt::Windows::UI::Core::CoreWindow> g_core_window;
+std::atomic<bool> g_window_closed{false};
+std::atomic<bool> g_app_visible{true};
+std::atomic<std::uint64_t> g_present_count{0};
 
 // Process-lifetime boot step + heartbeat tracker: heap-owned so App::~App() and
 // std::atexit handlers never race static destruction order.
@@ -100,7 +111,17 @@ void StartBootInstrumentation() {
     static std::once_flag once;
     std::call_once(once, []() {
         (void)std::atexit(&OnBootAtExit);
-        Steps().StartHeartbeatThread();
+        Steps().StartHeartbeatThread(
+            std::chrono::milliseconds(bbx::platform::kHeartbeatPeriodMs),
+            []() {
+                const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+                (void)pthread_setname_np(pthread_self(), "boot-heartbeat");
+                Steps().RegisterThread(tid, "boot-heartbeat");
+            },
+            []() {
+                const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+                Steps().UnregisterThread(tid);
+            });
     });
 }
 
@@ -108,6 +129,174 @@ void ReplayStorageOnce() {
     static std::once_flag once;
     std::call_once(once, []() { bbx::platform::ReplayStorageResults(); });
 }
+
+bbx::platform::TelemetrySample QueryTelemetrySample() {
+    bbx::platform::TelemetrySample sample;
+    try {
+        sample.used_mib = winrt::Windows::System::MemoryManager::AppMemoryUsage() >> 20;
+        sample.limit_mib = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit() >> 20;
+        sample.usage_level = static_cast<std::uint32_t>(
+            winrt::Windows::System::MemoryManager::AppMemoryUsageLevel());
+    } catch (const winrt::hresult_error&) {
+    }
+    sample.presents = g_present_count.load(std::memory_order_relaxed);
+    sample.visible = g_app_visible.load(std::memory_order_relaxed);
+    return sample;
+}
+
+struct BbxThreadEntry32 {
+    DWORD dwSize;
+    DWORD cntUsage;
+    DWORD th32ThreadID;
+    DWORD th32OwnerProcessID;
+    LONG tpBasePri;
+    LONG tpDeltaPri;
+    DWORD dwFlags;
+};
+
+FARPROC ResolveKernelSymbol(const char* symbol) {
+    HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+    if (kb != nullptr) {
+        if (const FARPROC fn = ::GetProcAddress(kb, symbol)) return fn;
+    }
+    HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+    if (k32 != nullptr) {
+        if (const FARPROC fn = ::GetProcAddress(k32, symbol)) return fn;
+    }
+    return nullptr;
+}
+
+std::vector<bbx::platform::ThreadDiagnostic> SnapshotProcessThreads() {
+    std::vector<bbx::platform::ThreadDiagnostic> known = Steps().RegisteredThreads();
+    const auto find_known_name = [&known](DWORD tid) -> std::string {
+        for (const auto& item : known) {
+            if (item.tid == static_cast<std::uint32_t>(tid) && !item.name.empty()) {
+                return item.name;
+            }
+        }
+        return {};
+    };
+
+    using CreateSnapshotFn = HANDLE(WINAPI*)(DWORD, DWORD);
+    using ThreadWalkFn = BOOL(WINAPI*)(HANDLE, BbxThreadEntry32*);
+    using OpenThreadFn = HANDLE(WINAPI*)(DWORD, BOOL, DWORD);
+    using GetThreadDescFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    using LocalFreeFn = HLOCAL(WINAPI*)(HLOCAL);
+
+    static const auto create_snapshot =
+        reinterpret_cast<CreateSnapshotFn>(ResolveKernelSymbol("CreateToolhelp32Snapshot"));
+    static const auto thread_first =
+        reinterpret_cast<ThreadWalkFn>(ResolveKernelSymbol("Thread32First"));
+    static const auto thread_next =
+        reinterpret_cast<ThreadWalkFn>(ResolveKernelSymbol("Thread32Next"));
+    static const auto open_thread =
+        reinterpret_cast<OpenThreadFn>(ResolveKernelSymbol("OpenThread"));
+    static const auto get_thread_desc =
+        reinterpret_cast<GetThreadDescFn>(ResolveKernelSymbol("GetThreadDescription"));
+    static const auto local_free =
+        reinterpret_cast<LocalFreeFn>(ResolveKernelSymbol("LocalFree"));
+
+    if (create_snapshot == nullptr || thread_first == nullptr || thread_next == nullptr) {
+        return known;
+    }
+
+    constexpr DWORD kSnapThread = 0x00000004u;
+    constexpr DWORD kThreadQueryLimited = 0x0800u;
+    const HANDLE snap = create_snapshot(kSnapThread, 0);
+    if (snap == INVALID_HANDLE_VALUE || snap == nullptr) {
+        return known;
+    }
+
+    const DWORD self_pid = ::GetCurrentProcessId();
+    std::vector<bbx::platform::ThreadDiagnostic> out;
+    BbxThreadEntry32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = thread_first(snap, &entry); ok != FALSE; ok = thread_next(snap, &entry)) {
+        if (entry.th32OwnerProcessID == self_pid) {
+            bbx::platform::ThreadDiagnostic diag;
+            diag.tid = static_cast<std::uint32_t>(entry.th32ThreadID);
+            diag.base_priority = static_cast<std::int32_t>(entry.tpBasePri);
+            diag.name = find_known_name(entry.th32ThreadID);
+            if (diag.name.empty() && open_thread != nullptr && get_thread_desc != nullptr) {
+                const HANDLE th = open_thread(kThreadQueryLimited, FALSE, entry.th32ThreadID);
+                if (th != nullptr) {
+                    PWSTR wide = nullptr;
+                    if (SUCCEEDED(get_thread_desc(th, &wide)) && wide != nullptr) {
+                        char narrow[96] = {};
+                        const int wrote = ::WideCharToMultiByte(
+                            CP_UTF8, 0, wide, -1, narrow, static_cast<int>(sizeof(narrow)),
+                            nullptr, nullptr);
+                        if (wrote > 0) {
+                            narrow[sizeof(narrow) - 1] = '\0';
+                            diag.name = narrow;
+                        }
+                        if (local_free != nullptr) (void)local_free(wide);
+                    }
+                    ::CloseHandle(th);
+                }
+            }
+            out.push_back(std::move(diag));
+        }
+        entry.dwSize = sizeof(entry);
+    }
+    ::CloseHandle(snap);
+    return out.empty() ? known : out;
+}
+
+class ScopedTelemetryThread {
+public:
+    ScopedTelemetryThread()
+        : thread_([this]() {
+              try {
+                  winrt::init_apartment(winrt::apartment_type::multi_threaded);
+              } catch (const winrt::hresult_error&) {
+              }
+              const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+              (void)pthread_setname_np(pthread_self(), "telemetry");
+              Steps().RegisterThread(tid, "telemetry");
+
+              bbx::platform::StallWatchdog watchdog(
+                  Steps(),
+                  [](bbx::platform::Level level, const std::string& line) {
+                      bbx::platform::LogMirroredMessage(level, "%s", line.c_str());
+                  },
+                  []() { return bbx::platform::LogRecentLines(); },
+                  []() { return SnapshotProcessThreads(); },
+                  g_present_count.load(std::memory_order_relaxed),
+                  /*threshold_samples=*/2);
+
+              std::unique_lock<std::mutex> lock(mu_);
+              while (!cv_.wait_for(
+                  lock, std::chrono::seconds(bbx::platform::kTelemetryPeriodSeconds),
+                  [this]() { return stop_; })) {
+                  lock.unlock();
+                  (void)watchdog.OnSample(QueryTelemetrySample());
+                  lock.lock();
+              }
+
+              Steps().UnregisterThread(tid);
+          }) {}
+
+    ~ScopedTelemetryThread() { Stop(); }
+
+    ScopedTelemetryThread(const ScopedTelemetryThread&) = delete;
+    ScopedTelemetryThread& operator=(const ScopedTelemetryThread&) = delete;
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    std::thread thread_;
+};
 
 bbx::platform::ButtonMask MaskFromPad(SDL_Gamepad* pad) {
     using bbx::platform::Bit;
@@ -317,6 +506,7 @@ void DrawFrame() {
         const bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
         const bbx::d3d12::Status status = g_session.gpu->Present(hud);
         if (status == bbx::d3d12::Status::kOk) {
+            g_present_count.fetch_add(1, std::memory_order_relaxed);
             (void)Steps().FirstFramePresented();
             return;
         }
@@ -380,6 +570,7 @@ void DrawLauncher() {
         }
     }
     SDL_RenderPresent(g_session.renderer);
+    g_present_count.fetch_add(1, std::memory_order_relaxed);
     (void)Steps().FirstFramePresented();
 }
 
@@ -397,8 +588,11 @@ bool InitSdl() {
     // television, and the HUD. Only when it cannot come up does the SDL renderer
     // exist at all.
     {
-        const winrt::Windows::UI::Core::CoreWindow core_window =
+        winrt::Windows::UI::Core::CoreWindow core_window =
             winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (!core_window) {
+            core_window = g_core_window.get();
+        }
         IUnknown* window_abi = nullptr;
         std::uint32_t window_width = 1920;
         std::uint32_t window_height = 1080;
@@ -576,111 +770,148 @@ namespace {
 
 struct LauncherView : winrt::implements<LauncherView, winrt::Windows::ApplicationModel::Core::IFrameworkView> {
     winrt::Windows::UI::Core::CoreWindow window{nullptr};
-    winrt::event_token suspend_token{};
-    bool has_suspend_token = false;
-    winrt::event_token closed_token{};
-    bool has_closed_token = false;
 
-    void Initialize(const winrt::Windows::ApplicationModel::Core::CoreApplicationView&) {
-        bbx::platform::InstallLastChanceLogger();
-        // Trap: the guest's windows are fixed addresses and the heap, the stack
-        // and every DLL are placed before this runs. They are taken here, first,
-        // because a UWP title cannot relaunch itself the way a desktop build
-        // does when the reservation loses.
-        (void)bbx::platform::ReserveGuestWindows();
+    void Initialize(const winrt::Windows::ApplicationModel::Core::CoreApplicationView& app) {
+        app.Activated([](const auto&, const auto&) {
+            winrt::Windows::UI::Core::CoreWindow target = g_core_window.get();
+            if (!target) {
+                target = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+            }
+            if (target) {
+                target.Activate();
+                Steps().LogCallback("Activated (window.Activate() called)");
+            } else {
+                Steps().LogCallback("Activated (no CoreWindow yet)");
+            }
+        });
+        winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(
+            [](const auto&, const winrt::Windows::ApplicationModel::SuspendingEventArgs& args) {
+                winrt::Windows::ApplicationModel::SuspendingDeferral deferral{nullptr};
+                try {
+                    if (args) deferral = args.SuspendingOperation().GetDeferral();
+                } catch (...) {
+                }
+                const bbx::platform::TelemetrySample mem = QueryTelemetrySample();
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo,
+                    "view: Suspending (memory=%llu/%llu MiB, presents=%llu)",
+                    static_cast<unsigned long long>(mem.used_mib),
+                    static_cast<unsigned long long>(mem.limit_mib),
+                    static_cast<unsigned long long>(mem.presents));
+                Steps().Shutdown("suspend event");
+                bbx::platform::LogFlush();
+                if (deferral) {
+                    try {
+                        deferral.Complete();
+                    } catch (...) {
+                    }
+                }
+            });
+        winrt::Windows::ApplicationModel::Core::CoreApplication::Resuming(
+            [](const auto&, const auto&) {
+                Steps().LogCallback("Resuming");
+                bbx::platform::LogFlush();
+            });
+        Steps().LogCallback("Initialize (registered Activated, Suspending, Resuming)");
+    }
+
+    void SetWindow(const winrt::Windows::UI::Core::CoreWindow& value) {
+        window = value;
+        g_core_window = winrt::agile_ref<winrt::Windows::UI::Core::CoreWindow>(value);
+
+        window.Closed([](const auto&, const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
+            g_window_closed.store(true, std::memory_order_relaxed);
+            g_session.quit = true;
+            Steps().LogCallback("Closed");
+            Steps().Shutdown("window closed event");
+            bbx::platform::LogFlush();
+        });
+
+        window.VisibilityChanged(
+            [](const auto&, const winrt::Windows::UI::Core::VisibilityChangedEventArgs& ev) {
+                const bool vis = ev.Visible();
+                g_app_visible.store(vis, std::memory_order_relaxed);
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo, "view: VisibilityChanged (visible=%u)",
+                    static_cast<unsigned>(vis));
+            });
+
+        window.KeyDown([](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
+            const auto vk = static_cast<unsigned>(ev.VirtualKey());
+            const unsigned repeat = ev.KeyStatus().WasKeyDown ? 1u : 0u;
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kInfo, "view: KeyDown (vk=%u, repeat=%u)", vk, repeat);
+        });
+
+        window.KeyUp([](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
+            const auto vk = static_cast<unsigned>(ev.VirtualKey());
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kInfo, "view: KeyUp (vk=%u)", vk);
+        });
+
+        Steps().LogCallback(
+            "SetWindow (stored CoreWindow + agile_ref; registered Closed, VisibilityChanged, KeyDown, KeyUp)");
+    }
+
+    void Load(const winrt::hstring&) {}
+
+    void Run() {
+        const auto ui_tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        Steps().RegisterThread(ui_tid, "ui-main");
+        Steps().LogCallback("Run entered");
+
         const bbx::platform::StorageInitResult& storage = bbx::platform::StorageInit();
-        if (bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
-            ReplayStorageOnce();
-        }
+        (void)bbx::platform::LogOpen(bbx::platform::Paths().local_state);
         StartBootInstrumentation();
+        bbx::platform::InstallLastChanceLogger();
+
+        // 5 s telemetry + 2-sample stall detector starts immediately in Run so
+        // pre-loop initialization and dump scanning cannot freeze silently.
+        ScopedTelemetryThread telemetry;
+
+        // One-time startup work moved out of Initialize/Load into Run before the loop.
+        ReplayStorageOnce();
         if (!storage.ok) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "%s",
                                       bbx::platform::FormatStorageFailureLine(storage).c_str());
         }
-        try {
-            suspend_token = winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(
-                [](const winrt::Windows::Foundation::IInspectable&,
-                   const winrt::Windows::ApplicationModel::SuspendingEventArgs& args) {
-                    winrt::Windows::ApplicationModel::SuspendingDeferral deferral{nullptr};
-                    try {
-                        if (args) deferral = args.SuspendingOperation().GetDeferral();
-                    } catch (...) {
-                    }
-                    Steps().Shutdown("suspend event");
-                    bbx::platform::LogFlush();
-                    if (deferral) {
-                        try {
-                            deferral.Complete();
-                        } catch (...) {
-                        }
-                    }
-                });
-            has_suspend_token = true;
-        } catch (const winrt::hresult_error& error) {
-            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                      "launcher: Suspending hook unavailable (0x%08x)",
-                                      static_cast<unsigned>(error.code().value));
-        }
+        (void)bbx::platform::ReserveGuestWindows();
         bbx::platform::LogMessage(bbx::platform::Level::kInfo, "bbxbox launcher starting");
-        // The guest's file system, exercised once at boot: the HLE's reads and
-        // saves go through this seam (`xbox/platform/host_fs.h`), and an
-        // AppContainer that refuses one of its calls refuses it here, in one
-        // logged line, instead of in the game's first save.
         {
             std::string why;
             const bool fs_ok = bbx::hostfs::SelfTest(bbx::platform::Local("guestfs"), &why);
             bbx::platform::LogF("host fs: %s (%s)", fs_ok ? "ok" : "FAILED",
                                 fs_ok ? bbx::hostfs::Table().name : why.c_str());
         }
-        // The guest runtime's threads are the shim's (`xbox/winpthreads_shim`):
-        // the guest makes up to eighty of them, and every one of them is a
-        // mutex, a condition variable and an SRW lock away from a hang nobody
-        // can read off a console. Proven once here, before the launcher is up.
         {
             char why[64] = {0};
             const int step = bbx::winpthreads::SelfTest(why, sizeof(why));
             bbx::platform::LogF("winpthreads: %s%s%s", step == 0 ? "PASS" : "FAILED",
                                 step == 0 ? "" : " at ", step == 0 ? "" : why);
         }
+        (void)pthread_setname_np(pthread_self(), "ui-main");
         LoadSettings();
         RefreshLauncher();
-    }
 
-    void SetWindow(const winrt::Windows::UI::Core::CoreWindow& value) {
-        if (window && has_closed_token) {
-            try {
-                window.Closed(closed_token);
-            } catch (...) {
-            }
-            has_closed_token = false;
-        }
-        window = value;
-        if (window) {
-            try {
-                closed_token = window.Closed(
-                    [](const winrt::Windows::UI::Core::CoreWindow&,
-                       const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
-                        g_session.quit = true;
-                        Steps().Shutdown("window closed event");
-                        bbx::platform::LogFlush();
-                    });
-                has_closed_token = true;
-            } catch (const winrt::hresult_error& error) {
-                bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                          "launcher: CoreWindow::Closed hook unavailable (0x%08x)",
-                                          static_cast<unsigned>(error.code().value));
-            }
-        }
-    }
-
-    void Load(winrt::hstring) {}
-
-    void Run() {
         if (!InitSdl()) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL unavailable; exiting");
+            telemetry.Stop();
+            Steps().UnregisterThread(ui_tid);
             bbx::platform::LogFlush();
             return;
         }
+
+        winrt::Windows::UI::Core::CoreWindow active_window = window ? window : g_core_window.get();
+        if (!active_window) {
+            active_window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        }
+        if (active_window) {
+            active_window.Activate();
+            Steps().LogCallback("window.Activate() completed before first present");
+            active_window.Dispatcher().ProcessEvents(
+                winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
+        }
+
         // Present the initial launcher frame before scanning removable storage so
         // step 3 precedes step 4 and PLM sees an active swapchain immediately.
         DrawFrame();
@@ -689,7 +920,11 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         const bbx::platform::SelfTestResult self_test = bbx::platform::RunMemorySelfTest(false);
 
         bbx::platform::ButtonMask previous = 0;
-        while (!g_session.quit) {
+        while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
+            if (active_window) {
+                active_window.Dispatcher().ProcessEvents(
+                    winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
+            }
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_EVENT_QUIT) g_session.quit = true;
@@ -707,6 +942,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         g_session.keyboard.Append(static_cast<char>(event.key.key));
                 }
             }
+            if (g_window_closed.load(std::memory_order_relaxed)) break;
 
             const bbx::platform::ButtonMask held = MaskFromPad(g_session.pad);
             bbx::platform::PadEdges edges;
@@ -741,27 +977,14 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             }
             SDL_Delay(8);
         }
+        telemetry.Stop();
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         ShutdownSdl();
+        Steps().UnregisterThread(ui_tid);
         bbx::platform::LogFlush();
     }
 
-    void Uninitialize() {
-        if (window && has_closed_token) {
-            try {
-                window.Closed(closed_token);
-            } catch (...) {
-            }
-            has_closed_token = false;
-        }
-        if (has_suspend_token) {
-            try {
-                winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(suspend_token);
-            } catch (...) {
-            }
-            has_suspend_token = false;
-        }
-    }
+    void Uninitialize() { Steps().LogUninitialize(); }
 };
 
 }  // namespace
@@ -781,9 +1004,7 @@ struct App : winrt::implements<App, winrt::Windows::ApplicationModel::Core::IFra
 
     winrt::Windows::ApplicationModel::Core::IFrameworkView CreateView() {
         (void)bbx::platform::StorageInit();
-        if (bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
-            ReplayStorageOnce();
-        }
+        (void)bbx::platform::LogOpen(bbx::platform::Paths().local_state);
         StartBootInstrumentation();
         Steps().LauncherViewCreated();
         return winrt::make<LauncherView>();
@@ -848,7 +1069,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const bbx::platform::StorageInitResult& storage_early = bbx::platform::StorageInit();
     const bool log_early = bbx::platform::LogOpen(bbx::platform::Paths().local_state);
     if (log_early) {
-        ReplayStorageOnce();
         if (storage_early.ok) {
             bbx::platform::LogMessage(bbx::platform::Level::kInfo,
                                       "wWinMain: localstate %s, storage ok",
@@ -868,6 +1088,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     } catch (const winrt::hresult_error& error) {
         // Before this existed, a launch that failed to activate was a window
         // that closed: the reason went to the debugger output and nowhere else.
+        ReplayStorageOnce();
         bbx::platform::LogMessage(bbx::platform::Level::kError, "wWinMain: activation failed (0x%08x)",
                                   static_cast<unsigned>(error.code().value));
         Steps().Shutdown("return from wWinMain");
