@@ -24,6 +24,7 @@ namespace bbx::platform {
 
 inline constexpr std::uint64_t kHeartbeatPeriodMs = 100;
 inline constexpr std::uint64_t kTelemetryPeriodSeconds = 5;
+inline constexpr std::uint64_t kAcquireGatePeriodMs = 1000;
 
 enum class BootStep : std::uint32_t {
     kBoot = 0,
@@ -443,5 +444,35 @@ private:
     unsigned stalled_samples_ = 0;
     bool stall_dumped_ = false;
 };
+
+struct AcquireGateSnapshot {
+    bool acquire_entered = false;
+    bool display_ready = false;
+    bool stored_window_present = false;
+    bool visible = false;
+    std::uint32_t visibility_events = 0;
+    std::string ui_blocker;
+};
+
+[[nodiscard]] inline std::string FormatAcquireGateLine(const StepSnapshot& step,
+                                                       const AcquireGateSnapshot& gate) {
+    std::string line = "acquire-gate: entered=";
+    line += gate.acquire_entered ? '1' : '0';
+    line += " ready=";
+    line += gate.display_ready ? '1' : '0';
+    line += " step=";
+    line += std::to_string(step.counter);
+    line += " (";
+    line += BootStepName(step.step);
+    line += ") stored_window=";
+    line += gate.stored_window_present ? '1' : '0';
+    line += " visible=";
+    line += gate.visible ? '1' : '0';
+    line += " vis_events=";
+    line += std::to_string(gate.visibility_events);
+    line += " ui_blocker=";
+    line += gate.ui_blocker.empty() ? "none" : gate.ui_blocker;
+    return line;
+}
 
 }  // namespace bbx::platform

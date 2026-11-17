@@ -79,13 +79,24 @@ struct Session {
     std::unique_ptr<bbx::platform::D3d12Session> gpu;
     SDL_Renderer* renderer = nullptr;
     SDL_Gamepad* pad = nullptr;
+    bool sdl_inited = false;
 };
 
 Session g_session;
 winrt::agile_ref<winrt::Windows::UI::Core::CoreWindow> g_core_window;
+std::atomic<std::uint32_t> g_view_thread_id{0};
+std::atomic<void*> g_stored_window_abi{nullptr};
 std::atomic<bool> g_window_closed{false};
 std::atomic<bool> g_app_visible{true};
+std::atomic<std::uint32_t> g_visibility_events{0};
+std::atomic<bool> g_display_acquire_entered{false};
+std::atomic<bool> g_display_ready{false};
+std::atomic<const char*> g_ui_blocker{"none"};
 std::atomic<std::uint64_t> g_present_count{0};
+
+void SetUiBlocker(const char* blocker) noexcept {
+    g_ui_blocker.store(blocker != nullptr ? blocker : "none", std::memory_order_relaxed);
+}
 
 // Process-lifetime boot step + heartbeat tracker: heap-owned so App::~App() and
 // std::atexit handlers never race static destruction order.
@@ -298,9 +309,99 @@ private:
     std::thread thread_;
 };
 
+// 1 s pre-acquisition gate/blocker monitor (Point 3): while display acquisition
+// has not yet entered or completed, logs the step gate, ready/entered flags,
+// visibility state, stored CoreWindow presence, and whatever call or wait
+// primitive `ui-main` is currently blocked on.
+class ScopedAcquireWatch {
+public:
+    ScopedAcquireWatch()
+        : thread_([this]() {
+              const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+              (void)pthread_setname_np(pthread_self(), "acquire-watch");
+              Steps().RegisterThread(tid, "acquire-watch");
+
+              std::unique_lock<std::mutex> lock(mu_);
+              while (!cv_.wait_for(
+                  lock, std::chrono::milliseconds(bbx::platform::kAcquireGatePeriodMs),
+                  [this]() { return stop_ || g_display_ready.load(std::memory_order_relaxed); })) {
+                  lock.unlock();
+                  bbx::platform::AcquireGateSnapshot gate;
+                  gate.acquire_entered =
+                      g_display_acquire_entered.load(std::memory_order_relaxed);
+                  gate.display_ready = g_display_ready.load(std::memory_order_relaxed);
+                  gate.stored_window_present =
+                      (g_stored_window_abi.load(std::memory_order_relaxed) != nullptr);
+                  gate.visible = g_app_visible.load(std::memory_order_relaxed);
+                  gate.visibility_events =
+                      g_visibility_events.load(std::memory_order_relaxed);
+                  const char* blocker = g_ui_blocker.load(std::memory_order_relaxed);
+                  gate.ui_blocker = blocker != nullptr ? blocker : "none";
+                  const std::string line =
+                      bbx::platform::FormatAcquireGateLine(Steps().SnapshotStep(), gate);
+                  bbx::platform::LogMirroredMessage(bbx::platform::Level::kWarn, "%s",
+                                                    line.c_str());
+                  lock.lock();
+              }
+
+              Steps().UnregisterThread(tid);
+          }) {}
+
+    ~ScopedAcquireWatch() { Stop(); }
+
+    ScopedAcquireWatch(const ScopedAcquireWatch&) = delete;
+    ScopedAcquireWatch& operator=(const ScopedAcquireWatch&) = delete;
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+bbx::platform::ButtonMask MaskFromWinrtPad() {
+    using bbx::platform::Bit;
+    using winrt::Windows::Gaming::Input::Gamepad;
+    using winrt::Windows::Gaming::Input::GamepadButtons;
+    bbx::platform::ButtonMask mask = 0;
+    try {
+        const auto pads = Gamepad::Gamepads();
+        if (pads.Size() == 0) return 0;
+        const GamepadButtons buttons = pads.GetAt(0).GetCurrentReading().Buttons;
+        const auto has = [buttons](GamepadButtons flag) {
+            return (buttons & flag) == flag;
+        };
+        if (has(GamepadButtons::A)) mask |= Bit(Pad::kSouth);
+        if (has(GamepadButtons::B)) mask |= Bit(Pad::kEast);
+        if (has(GamepadButtons::X)) mask |= Bit(Pad::kWest);
+        if (has(GamepadButtons::Y)) mask |= Bit(Pad::kNorth);
+        if (has(GamepadButtons::View)) mask |= Bit(Pad::kView);
+        if (has(GamepadButtons::Menu)) mask |= Bit(Pad::kMenu);
+        if (has(GamepadButtons::LeftThumbstick)) mask |= Bit(Pad::kLeftStick);
+        if (has(GamepadButtons::RightThumbstick)) mask |= Bit(Pad::kRightStick);
+        if (has(GamepadButtons::LeftShoulder)) mask |= Bit(Pad::kLeftBumper);
+        if (has(GamepadButtons::RightShoulder)) mask |= Bit(Pad::kRightBumper);
+        if (has(GamepadButtons::DPadUp)) mask |= Bit(Pad::kDpadUp);
+        if (has(GamepadButtons::DPadDown)) mask |= Bit(Pad::kDpadDown);
+        if (has(GamepadButtons::DPadLeft)) mask |= Bit(Pad::kDpadLeft);
+        if (has(GamepadButtons::DPadRight)) mask |= Bit(Pad::kDpadRight);
+    } catch (...) {
+    }
+    return mask;
+}
+
 bbx::platform::ButtonMask MaskFromPad(SDL_Gamepad* pad) {
     using bbx::platform::Bit;
-    bbx::platform::ButtonMask mask = 0;
+    bbx::platform::ButtonMask mask = MaskFromWinrtPad();
     if (pad == nullptr) return mask;
     const auto down = [pad](SDL_GamepadButton button) { return SDL_GetGamepadButton(pad, button); };
     if (down(SDL_GAMEPAD_BUTTON_SOUTH)) mask |= Bit(Pad::kSouth);
@@ -496,22 +597,84 @@ std::vector<std::string> WrapLines(const std::string& text) {
     return lines;
 }
 
+void AppendLauncherToHud(bbx::platform::Hud& hud) {
+    if (bbx::bridge::Flips() != 0) return;
+    const float width = hud.Width();
+    const std::uint32_t scale = width >= 3000.0f ? 6u : 3u;
+    const float margin = static_cast<float>(scale) * 8.0f;
+    const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
+
+    const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer());
+    const std::size_t body_rows =
+        g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size();
+    const float panel_height =
+        line * static_cast<float>(2 + footer_lines.size() + body_rows) + margin;
+    hud.Panel(margin, margin, width - margin * 2.0f, panel_height, bbx::platform::HudColor::Panel());
+
+    float y = margin + static_cast<float>(scale) * 4.0f;
+    const float x = margin * 1.5f;
+    hud.Text(x, y, scale, g_session.model.Title(), bbx::platform::HudColor::White());
+    y += line * 1.2f;
+
+    for (const std::string& info : footer_lines) {
+        hud.Text(x, y, scale, info, bbx::platform::HudColor::Grey());
+        y += line;
+    }
+    y += line * 0.4f;
+
+    if (g_session.keyboard_open) {
+        hud.Text(x, y, scale, "HUNTER NAME: " + g_session.keyboard.Text(),
+                 bbx::platform::HudColor::Amber());
+        y += line;
+        for (std::size_t row = 0; row < g_session.keyboard.RowCount(); ++row) {
+            std::string label = g_session.keyboard.Row(row);
+            if (row == g_session.keyboard.CursorRow()) {
+                const std::size_t column = g_session.keyboard.CursorColumn() * 2;
+                if (column < label.size()) label[column] = '>';
+            }
+            hud.Text(x + margin * 0.5f, y, scale, label, bbx::platform::HudColor::White());
+            y += line;
+        }
+    } else {
+        for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
+            const bbx::platform::Item& item = g_session.model.items[i];
+            const bool selected = (i == g_session.model.selected);
+            bbx::platform::HudColor colour = bbx::platform::HudColor::Grey();
+            if (item.enabled) {
+                if (item.dangerous) {
+                    colour = bbx::platform::HudColor::Amber();
+                } else if (selected) {
+                    colour = bbx::platform::HudColor::Green();
+                } else {
+                    colour = bbx::platform::HudColor::White();
+                }
+            }
+            const std::string label = std::string(selected ? "> " : "  ") + item.label;
+            hud.Text(x, y, scale, label, colour);
+            y += line;
+        }
+    }
+}
+
 void DrawLauncher();
 
 // One frame of whichever renderer owns the window. The GPU path draws the boot
-// report; a present that fails (a removed device) falls back to SDL once and logs
-// why, rather than presenting into a dead swapchain every frame.
+// report and launcher menu; a present that fails (a removed device) falls back
+// to SDL once and logs why, rather than presenting into a dead swapchain every frame.
 void DrawFrame() {
     if (g_session.gpu) {
-        const bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
+        bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
+        AppendLauncherToHud(hud);
         const bbx::d3d12::Status status = g_session.gpu->Present(hud);
         if (status == bbx::d3d12::Status::kOk) {
             g_present_count.fetch_add(1, std::memory_order_relaxed);
             (void)Steps().FirstFramePresented();
             return;
         }
-        bbx::platform::LogF("d3d12: present failed (%s); SDL takes over",
-                            bbx::d3d12::StatusName(status));
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: present failed (%s); SDL fallback requested",
+            bbx::d3d12::StatusName(status));
         g_session.gpu->Destroy();
         g_session.gpu.reset();
         if (g_session.renderer == nullptr && g_session.window != nullptr) {
@@ -574,76 +737,116 @@ void DrawLauncher() {
     (void)Steps().FirstFramePresented();
 }
 
-bool InitSdl() {
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
-        bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_Init: %s", SDL_GetError());
-        return false;
-    }
-    g_session.window = SDL_CreateWindow("bbxbox", 1920, 1080, SDL_WINDOW_FULLSCREEN);
-    if (g_session.window == nullptr) {
-        bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_CreateWindow: %s", SDL_GetError());
-        return false;
-    }
-    // The console's own path first: the D3D12 device, a swapchain sized for the
-    // television, and the HUD. Only when it cannot come up does the SDL renderer
-    // exist at all.
-    {
-        winrt::Windows::UI::Core::CoreWindow core_window =
-            winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
-        if (!core_window) {
-            core_window = g_core_window.get();
-        }
-        IUnknown* window_abi = nullptr;
-        std::uint32_t window_width = 1920;
-        std::uint32_t window_height = 1080;
-        if (core_window) {
-            const winrt::Windows::Foundation::Rect bounds = core_window.Bounds();
+// Acquires the console's D3D12 display directly on the CoreWindow stored in
+// SetWindow (Point 5: never re-fetched via CoreWindow::GetForCurrentThread),
+// without gating on SDL_INIT_VIDEO or SDL_CreateWindow. Falls back to SDL's 2D
+// renderer only when D3D12 cannot come up.
+bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
+    IUnknown* window_abi = nullptr;
+    std::uint32_t window_width = 1920;
+    std::uint32_t window_height = 1080;
+    if (stored_window) {
+        try {
+            const winrt::Windows::Foundation::Rect bounds = stored_window.Bounds();
             if (bounds.Width >= 320.0f && bounds.Height >= 240.0f) {
                 window_width = static_cast<std::uint32_t>(bounds.Width);
                 window_height = static_cast<std::uint32_t>(bounds.Height);
             }
-            window_abi = static_cast<IUnknown*>(winrt::get_abi(core_window));
+        } catch (const winrt::hresult_error& err) {
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kWarn,
+                "display: stored_window.Bounds() threw 0x%08x; keeping 1920x1080",
+                static_cast<unsigned>(err.code().value));
         }
-        g_session.gpu = std::make_unique<bbx::platform::D3d12Session>();
-        const bbx::d3d12::Status status = g_session.gpu->Create(window_abi, window_width,
-                                                               window_height, false);
-        if (status == bbx::d3d12::Status::kOk) {
-            const bbx::platform::GpuReport& report = g_session.gpu->Report();
-            bbx::platform::LogF("d3d12: %s, %s, self-test %s", report.adapter.c_str(),
-                                report.swapchain.c_str(), report.selftest.c_str());
-            if (!report.guest.empty()) {
-                bbx::platform::LogF("d3d12: %s", report.guest.c_str());
-            }
-        } else {
-            bbx::platform::LogF("d3d12: unavailable (%s); the SDL renderer stays in use",
-                                bbx::d3d12::StatusName(status));
-            g_session.gpu.reset();
-        }
+        window_abi = static_cast<IUnknown*>(winrt::get_abi(stored_window));
     }
-    // No GPU path means the launcher needs a renderer; when the GPU path works, a
-    // renderer here would draw over the swapchain's backbuffer.
-    if (g_session.gpu == nullptr) {
-        g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
-        if (g_session.renderer == nullptr) {
-            bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL_CreateRenderer: %s",
-                                      SDL_GetError());
-            return false;
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "display: using stored CoreWindow=%p (%ux%u, not CoreWindow::GetForCurrentThread)",
+        static_cast<const void*>(window_abi), window_width, window_height);
+
+    SetUiBlocker("D3d12Session::Create");
+    g_session.gpu = std::make_unique<bbx::platform::D3d12Session>();
+    const bbx::d3d12::Status status =
+        g_session.gpu->Create(window_abi, window_width, window_height, false);
+    if (status == bbx::d3d12::Status::kOk) {
+        const bbx::platform::GpuReport& report = g_session.gpu->Report();
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kInfo, "d3d12: %s, %s, self-test %s",
+            report.adapter.c_str(), report.swapchain.c_str(), report.selftest.c_str());
+        if (!report.guest.empty()) {
+            bbx::platform::LogF("d3d12: %s", report.guest.c_str());
         }
+        g_display_ready.store(true, std::memory_order_relaxed);
+        SetUiBlocker("none");
+        Steps().DisplayAcquired("d3d12");
+        return true;
     }
-    int pads = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&pads);
-    if (ids != nullptr && pads > 0) g_session.pad = SDL_OpenGamepad(ids[0]);
-    SDL_free(ids);
-    // A null renderer is not an error any more: that is the GPU path, where the
-    // swapchain owns the window.
-    const char* renderer_name =
-        g_session.renderer ? SDL_GetRendererName(g_session.renderer) : nullptr;
-    const char* display_backend =
-        g_session.gpu ? "d3d12" : (renderer_name ? renderer_name : "sdl");
-    bbx::platform::LogF("SDL: window %s, gamepads %d", display_backend,
-                        g_session.pad ? 1 : 0);
+
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kError,
+        "d3d12: unavailable (%s); attempting SDL renderer fallback",
+        bbx::d3d12::StatusName(status));
+    g_session.gpu.reset();
+
+    SetUiBlocker("SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD)");
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_Init: %s",
+                                          SDL_GetError());
+        SetUiBlocker("none");
+        return false;
+    }
+    g_session.sdl_inited = true;
+    SetUiBlocker("SDL_CreateWindow");
+    g_session.window = SDL_CreateWindow("bbxbox", 1920, 1080, SDL_WINDOW_FULLSCREEN);
+    if (g_session.window == nullptr) {
+        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_CreateWindow: %s",
+                                          SDL_GetError());
+        SetUiBlocker("none");
+        return false;
+    }
+    SetUiBlocker("SDL_CreateRenderer");
+    g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
+    if (g_session.renderer == nullptr) {
+        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_CreateRenderer: %s",
+                                          SDL_GetError());
+        SetUiBlocker("none");
+        return false;
+    }
+    const char* renderer_name = SDL_GetRendererName(g_session.renderer);
+    const char* display_backend = renderer_name ? renderer_name : "sdl";
+    g_display_ready.store(true, std::memory_order_relaxed);
+    SetUiBlocker("none");
     Steps().DisplayAcquired(display_backend);
     return true;
+}
+
+void InitGamepadInput() {
+    if (!g_session.sdl_inited) {
+        if (SDL_Init(SDL_INIT_GAMEPAD)) {
+            g_session.sdl_inited = true;
+        } else {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                      "SDL_Init(SDL_INIT_GAMEPAD): %s (WinRT Gamepad active)",
+                                      SDL_GetError());
+        }
+    }
+    if (g_session.sdl_inited && g_session.pad == nullptr) {
+        int pads = 0;
+        SDL_JoystickID* ids = SDL_GetGamepads(&pads);
+        if (ids != nullptr && pads > 0) {
+            g_session.pad = SDL_OpenGamepad(ids[0]);
+            if (g_session.pad != nullptr) bbx::bridge::SetPad(g_session.pad);
+        }
+        SDL_free(ids);
+    }
+    unsigned winrt_pads = 0;
+    try {
+        winrt_pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size();
+    } catch (...) {
+    }
+    bbx::platform::LogF("input: sdl_gamepad=%d winrt_gamepads=%u",
+                        g_session.pad ? 1 : 0, winrt_pads);
 }
 
 void ShutdownSdl() {
@@ -654,10 +857,22 @@ void ShutdownSdl() {
         g_session.gpu->Destroy();
         g_session.gpu.reset();
     }
-    if (g_session.pad) SDL_CloseGamepad(g_session.pad);
-    if (g_session.renderer) SDL_DestroyRenderer(g_session.renderer);
-    if (g_session.window) SDL_DestroyWindow(g_session.window);
-    SDL_Quit();
+    if (g_session.pad) {
+        SDL_CloseGamepad(g_session.pad);
+        g_session.pad = nullptr;
+    }
+    if (g_session.renderer) {
+        SDL_DestroyRenderer(g_session.renderer);
+        g_session.renderer = nullptr;
+    }
+    if (g_session.window) {
+        SDL_DestroyWindow(g_session.window);
+        g_session.window = nullptr;
+    }
+    if (g_session.sdl_inited) {
+        SDL_Quit();
+        g_session.sdl_inited = false;
+    }
 }
 
 void LoadSettings() {
@@ -770,18 +985,31 @@ namespace {
 
 struct LauncherView : winrt::implements<LauncherView, winrt::Windows::ApplicationModel::Core::IFrameworkView> {
     winrt::Windows::UI::Core::CoreWindow window{nullptr};
+    winrt::event_token closed_token_{};
+    winrt::event_token visibility_token_{};
+    winrt::event_token key_down_token_{};
+    winrt::event_token key_up_token_{};
 
     void Initialize(const winrt::Windows::ApplicationModel::Core::CoreApplicationView& app) {
+        const auto init_tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        std::uint32_t expected = 0;
+        (void)g_view_thread_id.compare_exchange_strong(expected, init_tid,
+                                                       std::memory_order_relaxed);
+
         app.Activated([](const auto&, const auto&) {
+            // Point 5: use the stored CoreWindow from SetWindow, never re-fetching
+            // via CoreWindow::GetForCurrentThread().
             winrt::Windows::UI::Core::CoreWindow target = g_core_window.get();
-            if (!target) {
-                target = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
-            }
             if (target) {
                 target.Activate();
-                Steps().LogCallback("Activated (window.Activate() called)");
+                Steps().LogCallback("Activated (window.Activate() called on stored CoreWindow)");
+                try {
+                    target.Dispatcher().ProcessEvents(
+                        winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
+                } catch (...) {
+                }
             } else {
-                Steps().LogCallback("Activated (no CoreWindow yet)");
+                Steps().LogCallback("Activated (no stored CoreWindow yet)");
             }
         });
         winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(
@@ -818,39 +1046,59 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
     void SetWindow(const winrt::Windows::UI::Core::CoreWindow& value) {
         window = value;
         g_core_window = winrt::agile_ref<winrt::Windows::UI::Core::CoreWindow>(value);
+        const auto view_tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        g_view_thread_id.store(view_tid, std::memory_order_relaxed);
+        void* const stored_abi = winrt::get_abi(value);
+        g_stored_window_abi.store(stored_abi, std::memory_order_relaxed);
 
-        window.Closed([](const auto&, const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
-            g_window_closed.store(true, std::memory_order_relaxed);
-            g_session.quit = true;
-            Steps().LogCallback("Closed");
-            Steps().Shutdown("window closed event");
-            bbx::platform::LogFlush();
-        });
+        bool initial_visible = false;
+        try {
+            if (window) initial_visible = window.Visible();
+        } catch (...) {
+        }
+        g_app_visible.store(initial_visible, std::memory_order_relaxed);
 
-        window.VisibilityChanged(
+        closed_token_ = window.Closed(
+            [](const auto&, const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
+                g_window_closed.store(true, std::memory_order_relaxed);
+                g_session.quit = true;
+                Steps().LogCallback("Closed");
+                Steps().Shutdown("window closed event");
+                bbx::platform::LogFlush();
+            });
+
+        visibility_token_ = window.VisibilityChanged(
             [](const auto&, const winrt::Windows::UI::Core::VisibilityChangedEventArgs& ev) {
                 const bool vis = ev.Visible();
                 g_app_visible.store(vis, std::memory_order_relaxed);
+                const std::uint32_t count =
+                    g_visibility_events.fetch_add(1, std::memory_order_relaxed) + 1u;
                 bbx::platform::LogMirroredMessage(
-                    bbx::platform::Level::kInfo, "view: VisibilityChanged (visible=%u)",
-                    static_cast<unsigned>(vis));
+                    bbx::platform::Level::kInfo,
+                    "view: VisibilityChanged fired (visible=%u, count=%u)",
+                    static_cast<unsigned>(vis), count);
             });
 
-        window.KeyDown([](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
-            const auto vk = static_cast<unsigned>(ev.VirtualKey());
-            const unsigned repeat = ev.KeyStatus().WasKeyDown ? 1u : 0u;
-            bbx::platform::LogMirroredMessage(
-                bbx::platform::Level::kInfo, "view: KeyDown (vk=%u, repeat=%u)", vk, repeat);
-        });
+        key_down_token_ = window.KeyDown(
+            [](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
+                const auto vk = static_cast<unsigned>(ev.VirtualKey());
+                const unsigned repeat = ev.KeyStatus().WasKeyDown ? 1u : 0u;
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo, "view: KeyDown (vk=%u, repeat=%u)", vk, repeat);
+            });
 
-        window.KeyUp([](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
-            const auto vk = static_cast<unsigned>(ev.VirtualKey());
-            bbx::platform::LogMirroredMessage(
-                bbx::platform::Level::kInfo, "view: KeyUp (vk=%u)", vk);
-        });
+        key_up_token_ = window.KeyUp(
+            [](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
+                const auto vk = static_cast<unsigned>(ev.VirtualKey());
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo, "view: KeyUp (vk=%u)", vk);
+            });
 
-        Steps().LogCallback(
-            "SetWindow (stored CoreWindow + agile_ref; registered Closed, VisibilityChanged, KeyDown, KeyUp)");
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kInfo,
+            "view: SetWindow (stored CoreWindow=%p + agile_ref on tid=%u, initial_visible=%u; "
+            "registered Closed, VisibilityChanged, KeyDown, KeyUp)",
+            stored_abi, view_tid, static_cast<unsigned>(initial_visible));
     }
 
     void Load(const winrt::hstring&) {}
@@ -865,81 +1113,148 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         StartBootInstrumentation();
         bbx::platform::InstallLastChanceLogger();
 
-        // 5 s telemetry + 2-sample stall detector starts immediately in Run so
-        // pre-loop initialization and dump scanning cannot freeze silently.
+        // 5 s telemetry + 2-sample stall detector and 1 s pre-acquisition gate
+        // logger start immediately so nothing before the loop can block silently.
         ScopedTelemetryThread telemetry;
+        ScopedAcquireWatch acquire_watch;
 
-        // One-time startup work moved out of Initialize/Load into Run before the loop.
+        // Point 5: always use the CoreWindow stored in SetWindow, never re-fetching
+        // via CoreWindow::GetForCurrentThread().
+        winrt::Windows::UI::Core::CoreWindow stored_window = window ? window : g_core_window.get();
+        if (stored_window) {
+            SetUiBlocker("Dispatcher::ProcessEvents(initial)");
+            stored_window.Dispatcher().ProcessEvents(
+                winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
+        }
+
+        SetUiBlocker("ReplayStorageOnce");
         ReplayStorageOnce();
         if (!storage.ok) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "%s",
                                       bbx::platform::FormatStorageFailureLine(storage).c_str());
         }
+        SetUiBlocker("ReserveGuestWindows");
         (void)bbx::platform::ReserveGuestWindows();
         bbx::platform::LogMessage(bbx::platform::Level::kInfo, "bbxbox launcher starting");
         {
+            SetUiBlocker("hostfs::SelfTest");
             std::string why;
             const bool fs_ok = bbx::hostfs::SelfTest(bbx::platform::Local("guestfs"), &why);
-            bbx::platform::LogF("host fs: %s (%s)", fs_ok ? "ok" : "FAILED",
-                                fs_ok ? bbx::hostfs::Table().name : why.c_str());
+            bbx::platform::LogMirroredMessage(
+                fs_ok ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+                "host fs: %s (%s)", fs_ok ? "ok" : "FAILED",
+                fs_ok ? bbx::hostfs::Table().name : why.c_str());
         }
-        {
-            char why[64] = {0};
-            const int step = bbx::winpthreads::SelfTest(why, sizeof(why));
-            bbx::platform::LogF("winpthreads: %s%s%s", step == 0 ? "PASS" : "FAILED",
-                                step == 0 ? "" : " at ", step == 0 ? "" : why);
-        }
-        (void)pthread_setname_np(pthread_self(), "ui-main");
-        LoadSettings();
-        RefreshLauncher();
 
-        if (!InitSdl()) {
-            bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL unavailable; exiting");
+        // Point 1: immediately after "host fs: ok", log "display: acquire begin"
+        // with tid, whether this is the view thread, and the CoreWindow pointer
+        // stored in SetWindow; on ui-main also log CoreWindow::GetForCurrentThread()
+        // and state explicitly whether it is null.
+        const auto acquire_tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        const auto view_tid = g_view_thread_id.load(std::memory_order_relaxed);
+        const bool is_view_thread = (view_tid != 0 && acquire_tid == view_tid);
+        void* const stored_abi = stored_window ? winrt::get_abi(stored_window)
+                                               : g_stored_window_abi.load(std::memory_order_relaxed);
+        g_display_acquire_entered.store(true, std::memory_order_relaxed);
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kInfo,
+            "display: acquire begin (tid=%u, is_view_thread=%s [view_tid=%u], stored_core_window=%p)",
+            acquire_tid, is_view_thread ? "yes" : "no", view_tid, stored_abi);
+        if (acquire_tid == ui_tid) {
+            void* current_abi = nullptr;
+            try {
+                const auto current_win =
+                    winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+                current_abi = winrt::get_abi(current_win);
+            } catch (const winrt::hresult_error& err) {
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kWarn,
+                    "display: CoreWindow::GetForCurrentThread() on ui-main threw 0x%08x",
+                    static_cast<unsigned>(err.code().value));
+            }
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kInfo,
+                "display: ui-main CoreWindow::GetForCurrentThread()=%p (%s)",
+                current_abi, current_abi == nullptr ? "null" : "non-null");
+        }
+
+        if (stored_window) {
+            SetUiBlocker("stored_window.Activate");
+            stored_window.Activate();
+            Steps().LogCallback("window.Activate() completed before first present");
+            SetUiBlocker("Dispatcher::ProcessEvents(post-Activate)");
+            stored_window.Dispatcher().ProcessEvents(
+                winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
+            bool now_visible = g_app_visible.load(std::memory_order_relaxed);
+            try {
+                now_visible = stored_window.Visible();
+                g_app_visible.store(now_visible, std::memory_order_relaxed);
+            } catch (...) {
+            }
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kInfo,
+                "view: post-Activate window.Visible()=%u (VisibilityChanged_count=%u)",
+                static_cast<unsigned>(now_visible),
+                g_visibility_events.load(std::memory_order_relaxed));
+        }
+
+        RefreshLauncher();
+        if (!AcquireDisplay(stored_window)) {
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kError, "display: acquisition failed; exiting");
+            acquire_watch.Stop();
             telemetry.Stop();
             Steps().UnregisterThread(ui_tid);
             bbx::platform::LogFlush();
             return;
         }
 
-        winrt::Windows::UI::Core::CoreWindow active_window = window ? window : g_core_window.get();
-        if (!active_window) {
-            active_window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
-        }
-        if (active_window) {
-            active_window.Activate();
-            Steps().LogCallback("window.Activate() completed before first present");
-            active_window.Dispatcher().ProcessEvents(
-                winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
-        }
-
-        // Present the initial launcher frame before scanning removable storage so
-        // step 3 precedes step 4 and PLM sees an active swapchain immediately.
+        // Present the initial frame immediately so step 3 fires and PLM sees an
+        // active swapchain before any background self-test or USB dump scan runs.
+        SetUiBlocker("first DrawFrame");
         DrawFrame();
+        SetUiBlocker("none");
+        acquire_watch.Stop();
+
+        InitGamepadInput();
+        {
+            char why[64] = {0};
+            const int step = bbx::winpthreads::SelfTest(why, sizeof(why));
+            bbx::platform::LogMirroredMessage(
+                step == 0 ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+                "winpthreads: %s%s%s", step == 0 ? "PASS" : "FAILED",
+                step == 0 ? "" : " at ", step == 0 ? "" : why);
+        }
+        (void)pthread_setname_np(pthread_self(), "ui-main");
+        LoadSettings();
         RestoreDump();
         RefreshLauncher();
+        DrawFrame();
         const bbx::platform::SelfTestResult self_test = bbx::platform::RunMemorySelfTest(false);
 
         bbx::platform::ButtonMask previous = 0;
         while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
-            if (active_window) {
-                active_window.Dispatcher().ProcessEvents(
+            if (stored_window) {
+                stored_window.Dispatcher().ProcessEvents(
                     winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
             }
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_EVENT_QUIT) g_session.quit = true;
-                if (event.type == SDL_EVENT_GAMEPAD_ADDED && g_session.pad == nullptr) {
-                    g_session.pad = SDL_OpenGamepad(event.gdevice.which);
-                    // The same pad the launcher draws its menus with is the one
-                    // the game reads (platform/bbhost_bridge.cpp).
-                    bbx::bridge::SetPad(g_session.pad);
-                }
-                if (event.type == SDL_EVENT_KEY_DOWN && g_session.keyboard_open) {
-                    if (event.key.key == SDLK_BACKSPACE) g_session.keyboard.Backspace();
-                    else if (event.key.key == SDLK_RETURN)
-                        OnAction(PadAction::kConfirm);
-                    else if (event.key.key >= 0x20 && event.key.key < 0x7f)
-                        g_session.keyboard.Append(static_cast<char>(event.key.key));
+            if (g_session.sdl_inited) {
+                SDL_Event event;
+                while (SDL_PollEvent(&event)) {
+                    if (event.type == SDL_EVENT_QUIT) g_session.quit = true;
+                    if (event.type == SDL_EVENT_GAMEPAD_ADDED && g_session.pad == nullptr) {
+                        g_session.pad = SDL_OpenGamepad(event.gdevice.which);
+                        // The same pad the launcher draws its menus with is the one
+                        // the game reads (platform/bbhost_bridge.cpp).
+                        bbx::bridge::SetPad(g_session.pad);
+                    }
+                    if (event.type == SDL_EVENT_KEY_DOWN && g_session.keyboard_open) {
+                        if (event.key.key == SDLK_BACKSPACE) g_session.keyboard.Backspace();
+                        else if (event.key.key == SDLK_RETURN)
+                            OnAction(PadAction::kConfirm);
+                        else if (event.key.key >= 0x20 && event.key.key < 0x7f)
+                            g_session.keyboard.Append(static_cast<char>(event.key.key));
+                    }
                 }
             }
             if (g_window_closed.load(std::memory_order_relaxed)) break;
@@ -975,8 +1290,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                               "launcher: the guest did not start; staying in the launcher");
                 }
             }
-            SDL_Delay(8);
+            ::Sleep(8);
         }
+        acquire_watch.Stop();
         telemetry.Stop();
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         ShutdownSdl();

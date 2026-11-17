@@ -499,3 +499,42 @@ TEST(BootSteps_StallWatchdogDumpsStepLogsAndThreadsAfterTwoVisibleStalledSamples
     CHECK_EQ(tracker.RegisteredThreads().size(), static_cast<std::size_t>(2));
 }
 
+TEST(BootSteps_AcquireGateLineReportsStepReadyFlagsAndUiBlocker) {
+    std::uint64_t now_ms = 1000;
+    std::vector<std::string> lines;
+    BootStepTracker tracker(
+        [&lines](Level, const std::string& line) { lines.push_back(line); },
+        [&now_ms]() { return now_ms; });
+
+    tracker.LauncherViewCreated();
+
+    AcquireGateSnapshot blocked;
+    blocked.acquire_entered = false;
+    blocked.display_ready = false;
+    blocked.stored_window_present = true;
+    blocked.visible = true;
+    blocked.visibility_events = 0;
+    blocked.ui_blocker = "winpthreads::SelfTest/pthread_join(cond_worker)";
+
+    const std::string line1 = FormatAcquireGateLine(tracker.SnapshotStep(), blocked);
+    CHECK_EQ(line1,
+             std::string("acquire-gate: entered=0 ready=0 step=1 (launcher view created) "
+                         "stored_window=1 visible=1 vis_events=0 "
+                         "ui_blocker=winpthreads::SelfTest/pthread_join(cond_worker)"));
+
+    AcquireGateSnapshot in_d3d12;
+    in_d3d12.acquire_entered = true;
+    in_d3d12.display_ready = false;
+    in_d3d12.stored_window_present = true;
+    in_d3d12.visible = true;
+    in_d3d12.visibility_events = 1;
+    in_d3d12.ui_blocker = "D3d12Session::Create";
+
+    const std::string line2 = FormatAcquireGateLine(tracker.SnapshotStep(), in_d3d12);
+    CHECK_EQ(line2,
+             std::string("acquire-gate: entered=1 ready=0 step=1 (launcher view created) "
+                         "stored_window=1 visible=1 vis_events=1 "
+                         "ui_blocker=D3d12Session::Create"));
+}
+
+
