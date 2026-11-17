@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace bbx::platform {
 
@@ -50,6 +51,10 @@ void InstallLastChanceLogger();
 
 // The last line logged, for the crash handler (no allocation on that path).
 const char* LastLine();
+
+// Snapshot of the most recent formatted log lines (chronological, up to 16),
+// read by the stall detector when present count freezes while visible.
+[[nodiscard]] std::vector<std::string> LogRecentLines();
 
 // --- the black box on the player's stick -----------------------------------
 //

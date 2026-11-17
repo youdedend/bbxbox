@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "xbox/platform/guest_memory.h"
 #include "xbox/platform/host_fs.h"
@@ -28,6 +29,10 @@ int g_errors = -1;
 Level g_level = Level::kInfo;
 std::uint64_t g_start = 0;
 char g_last_line[512] = {};
+constexpr std::size_t kRecentLineCap = 16;
+char g_recent_lines[kRecentLineCap][512] = {};
+std::size_t g_recent_next = 0;
+std::size_t g_recent_count = 0;
 std::atomic<bool> g_installed{false};
 
 // --- the black box on the player's stick ----------------------------------
@@ -308,6 +313,15 @@ void FormatAndWrite(Level level, bool mirror_to_errors, const char* format, std:
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         std::snprintf(g_last_line, sizeof(g_last_line), "%s", message);
+        std::size_t recent_len = std::strlen(line);
+        if (recent_len > 0 && line[recent_len - 1] == '\n') --recent_len;
+        if (recent_len >= sizeof(g_recent_lines[0])) {
+            recent_len = sizeof(g_recent_lines[0]) - 1;
+        }
+        std::memcpy(g_recent_lines[g_recent_next], line, recent_len);
+        g_recent_lines[g_recent_next][recent_len] = '\0';
+        g_recent_next = (g_recent_next + 1) % kRecentLineCap;
+        if (g_recent_count < kRecentLineCap) ++g_recent_count;
         WriteRaw(line, mirror_to_errors || level >= Level::kError);
     }
 }
@@ -322,6 +336,8 @@ bool LogOpen(const std::string& local_state) {
     // `loader.prev.log` - exactly the lines a launch that died needs to keep.
     if (g_file >= 0) return true;
     g_start = ::GetTickCount64();
+    g_recent_next = 0;
+    g_recent_count = 0;
     const std::string current = local_state + "\\loader.log";
     const std::string previous = local_state + "\\loader.prev.log";
     (void)hostfs::Unlink(previous);
@@ -471,6 +487,19 @@ void InstallLastChanceLogger() {
 }
 
 const char* LastLine() { return g_last_line; }
+
+std::vector<std::string> LogRecentLines() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::vector<std::string> out;
+    out.reserve(g_recent_count);
+    const std::size_t start =
+        (g_recent_next + kRecentLineCap - g_recent_count) % kRecentLineCap;
+    for (std::size_t i = 0; i < g_recent_count; ++i) {
+        const std::size_t idx = (start + i) % kRecentLineCap;
+        out.emplace_back(g_recent_lines[idx]);
+    }
+    return out;
+}
 
 void LogFlush() {
     std::lock_guard<std::mutex> lock(g_mutex);

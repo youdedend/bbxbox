@@ -355,3 +355,147 @@ TEST(BootSteps_BackgroundHeartbeatThreadStopsBeforeShutdownReturns) {
     CHECK(final_errors.back().rfind(
               "shutdown: window closed event (step=3: first frame presented, elapsed=", 0) == 0);
 }
+
+TEST(BootSteps_FrameworkViewCallbackAndUninitializeSequence) {
+    TempLogDir temp("viewseq");
+    DualLogRecorder logs(temp.Path());
+    std::uint64_t now_ms = 8;
+
+    BootStepTracker tracker(
+        [&logs](Level level, const std::string& line) { logs.EmitMirrored(level, line); },
+        [&now_ms]() { return now_ms; });
+
+    tracker.LauncherViewCreated();
+    now_ms = 10;
+    tracker.LogCallback("Initialize (registered Activated, Suspending, Resuming)");
+    now_ms = 14;
+    tracker.LogCallback(
+        "SetWindow (stored CoreWindow + agile_ref; registered Closed, VisibilityChanged, KeyDown, KeyUp)");
+    now_ms = 18;
+    tracker.LogCallback("Activated (window.Activate() called)");
+    tracker.LogCallback("VisibilityChanged (visible=1)");
+    now_ms = 22;
+    tracker.LogCallback("Run entered");
+    now_ms = 36;
+    tracker.DisplayAcquired("d3d12");
+    now_ms = 37;
+    tracker.LogCallback("window.Activate() completed before first present");
+    now_ms = 41;
+    CHECK(tracker.FirstFramePresented());
+    now_ms = 43;
+    tracker.DumpScanStarted();
+    now_ms = 88;
+    tracker.DumpScanFinished(1);
+    now_ms = 320;
+    tracker.SelectionAccepted("Quit");
+    now_ms = 330;
+    tracker.LogUninitialize();
+
+    const std::vector<std::string> expected = {
+        "step 1: launcher view created",
+        "view: Initialize (registered Activated, Suspending, Resuming)",
+        "view: SetWindow (stored CoreWindow + agile_ref; registered Closed, VisibilityChanged, KeyDown, KeyUp)",
+        "view: Activated (window.Activate() called)",
+        "view: VisibilityChanged (visible=1)",
+        "view: Run entered",
+        "step 2: display acquired (d3d12)",
+        "view: window.Activate() completed before first present",
+        "step 3: first frame presented",
+        "step 4: dump scan started",
+        "step 5: dump scan finished (found 1)",
+        "step 6: selection accepted (Quit)",
+        "view: Uninitialize (step=6: selection accepted, elapsed=330ms)",
+    };
+
+    const std::vector<std::string> lines = logs.ErrorsLines();
+    CHECK_EQ(lines.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        CHECK_EQ(lines[i], expected[i]);
+    }
+}
+
+TEST(BootSteps_StallWatchdogDumpsStepLogsAndThreadsAfterTwoVisibleStalledSamples) {
+    TempLogDir temp("stall");
+    DualLogRecorder logs(temp.Path());
+    std::uint64_t now_ms = 25;
+
+    BootStepTracker tracker(
+        [&logs](Level level, const std::string& line) { logs.EmitMirrored(level, line); },
+        [&now_ms]() { return now_ms; });
+
+    tracker.RegisterThread(1001, "ui-main");
+    tracker.RegisterThread(1002, "boot-heartbeat");
+    tracker.RegisterThread(1003, "telemetry");
+
+    tracker.LauncherViewCreated();
+    tracker.DisplayAcquired("d3d12");
+
+    StallWatchdog watchdog(
+        tracker,
+        [&logs](Level level, const std::string& line) { logs.EmitMirrored(level, line); },
+        [&logs]() { return logs.LoaderLines(); },
+        [&tracker]() { return tracker.RegisteredThreads(); },
+        /*initial_presents=*/0, /*threshold_samples=*/2);
+
+    // Sample 1 at 5 s: presents still 0 while visible -> 1 stalled sample, no dump yet.
+    now_ms = 5005;
+    CHECK(!watchdog.OnSample(TelemetrySample{412, 5120, 0, 0, true}));
+    CHECK_EQ(watchdog.StalledSamples(), 1u);
+    CHECK(!watchdog.StallDumped());
+
+    // Sample 2 at 10 s: presents still 0 while visible -> 2nd sample dumps step, logs, threads.
+    now_ms = 10012;
+    CHECK(watchdog.OnSample(TelemetrySample{414, 5120, 0, 0, true}));
+    CHECK_EQ(watchdog.StalledSamples(), 2u);
+    CHECK(watchdog.StallDumped());
+
+    const std::vector<std::string> after_dump = logs.ErrorsLines();
+    bool saw_header = false;
+    bool saw_recent_section = false;
+    bool saw_thread_section = false;
+    bool saw_ui_thread = false;
+    for (const std::string& line : after_dump) {
+        if (line ==
+            "STALL DETECTED: presents stuck at 0 for 10s while visible (step=2: display acquired, elapsed=10012ms)") {
+            saw_header = true;
+        }
+        if (line.rfind("stall: last log lines (", 0) == 0) saw_recent_section = true;
+        if (line.rfind("stall: thread list (3):", 0) == 0) saw_thread_section = true;
+        if (line == "  thread tid=1001 pri=0 name=ui-main") saw_ui_thread = true;
+        // The recent-lines snapshot must not contain the stall header itself.
+        CHECK(line.find("STALL DETECTED") == std::string::npos || line.rfind("  log[", 0) != 0);
+    }
+    CHECK(saw_header);
+    CHECK(saw_recent_section);
+    CHECK(saw_thread_section);
+    CHECK(saw_ui_thread);
+
+    // Sample 3 at 15 s while still stuck at 0: must not spam-repeat the same dump.
+    now_ms = 15020;
+    CHECK(!watchdog.OnSample(TelemetrySample{414, 5120, 0, 0, true}));
+
+    // Sample 4 at 20 s: presents advance -> resets stall state and re-arms.
+    now_ms = 20025;
+    CHECK(!watchdog.OnSample(TelemetrySample{450, 5120, 1, 120, true}));
+    CHECK_EQ(watchdog.StalledSamples(), 0u);
+    CHECK(!watchdog.StallDumped());
+
+    // Samples 5 & 6 while hidden (visible=false): unchanging presents must NOT trigger stall.
+    now_ms = 25030;
+    CHECK(!watchdog.OnSample(TelemetrySample{450, 5120, 1, 120, false}));
+    now_ms = 30035;
+    CHECK(!watchdog.OnSample(TelemetrySample{450, 5120, 1, 120, false}));
+    CHECK_EQ(watchdog.StalledSamples(), 0u);
+    CHECK(!watchdog.StallDumped());
+
+    // Samples 7 & 8 visible again and stuck at 120: dumps after two samples.
+    now_ms = 35040;
+    CHECK(!watchdog.OnSample(TelemetrySample{455, 5120, 2, 120, true}));
+    now_ms = 40045;
+    CHECK(watchdog.OnSample(TelemetrySample{455, 5120, 2, 120, true}));
+
+    // Unregistering a thread removes it from subsequent snapshots.
+    tracker.UnregisterThread(1003);
+    CHECK_EQ(tracker.RegisteredThreads().size(), static_cast<std::size_t>(2));
+}
+
