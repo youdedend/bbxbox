@@ -223,7 +223,8 @@ bool StatRt(const std::string& path, FileStat* out) {
         const auto item = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
                               winrt::to_hstring(path))
                               .get();
-        const auto properties = item.GetBasicPropertiesAsync().get();
+        const winrt::Windows::Storage::FileProperties::BasicProperties properties =
+            item.GetBasicPropertiesAsync().get();
         out->size = properties.Size();
         out->is_dir = false;
         out->mtime = 0;
@@ -251,7 +252,10 @@ bool ListRt(const std::string& path, std::vector<DirEntry>* out) {
         const auto folder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(
                                 winrt::to_hstring(path))
                                 .get();
-        for (const auto& child : folder.GetItemsAsync().get()) {
+        const winrt::Windows::Foundation::Collections::IVectorView<
+            winrt::Windows::Storage::IStorageItem>
+            children = folder.GetItemsAsync().get();
+        for (const auto& child : children) {
             DirEntry entry;
             entry.name = HstringToUtf8(child.Name());
             entry.is_dir = child.IsOfType(winrt::Windows::Storage::StorageItemTypes::Folder);
@@ -447,8 +451,12 @@ std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
         std::int64_t got = -1;
         OnStorageThread([&rt, buffer, want, &got]() {
             auto stream = rt->stream;
-            const auto bytes = winrt::Windows::Storage::Streams::Buffer(want);
-            const auto read = stream.ReadAsync(bytes, want).get();
+            const winrt::Windows::Storage::Streams::IBuffer bytes =
+                winrt::Windows::Storage::Streams::Buffer(want);
+            const winrt::Windows::Storage::Streams::IBuffer read =
+                stream.ReadAsync(bytes, want,
+                                 winrt::Windows::Storage::Streams::InputStreamOptions::Partial)
+                    .get();
             const auto length = read.Length();
             if (length > 0) std::memcpy(buffer, read.data(), length);
             got = static_cast<std::int64_t>(length);
