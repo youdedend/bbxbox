@@ -49,7 +49,8 @@ std::vector<std::uint8_t> MakeSfo(const std::string& app_ver, const std::string&
         index.emplace_back(key_at, data_at);
     }
     std::vector<std::uint8_t> out;
-    PutBe32(out, 0x46535000u);
+    // The four bytes a real param.sfo starts with: 00 50 53 46 ("\0PSF").
+    PutBe32(out, 0x00505346u);
     PutBe32(out, 0x101);
     const std::uint32_t key_table =
         20 + static_cast<std::uint32_t>(fields.size()) * 16;

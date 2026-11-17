@@ -7,7 +7,12 @@
 namespace bbx::platform {
 namespace {
 
-constexpr std::uint32_t kSfoMagic = 0x46535000u;  // "\0PSF"
+// A real param.sfo starts with the four bytes 00 50 53 46 - "\0PSF" - read
+// big-endian, which is 0x00505346. The constant here used to be 0x46535000,
+// the same four bytes in the wrong order, so every genuine SFO was rejected
+// and the launcher said "sce_sys\\param.sfo could not be read" for a file it
+// had just read 1,760 bytes of, magic and all.
+constexpr std::uint32_t kSfoMagic = 0x00505346u;  // "\0PSF" as ReadBe32 sees it
 constexpr std::uint32_t kMaxSfoBytes = 1u << 20;
 constexpr std::uint16_t kFormatUtf8 = 0x0204;
 
