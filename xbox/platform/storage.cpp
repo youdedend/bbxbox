@@ -422,7 +422,27 @@ DumpFs MakeDumpFs() {
     fs.read = [](const std::string& path, std::size_t cap) {
         std::vector<std::uint8_t> bytes;
         const bool ok = ReadBinary(path, bytes, cap);
-        if (!ok) return std::vector<std::uint8_t>{};
+        if (!ok) {
+            // "could not be read" folded four different failures into one line:
+            // missing file, refused open, short read and an unparsable SFO. Say
+            // which one it was.
+            bbx::hostfs::FileStat info{};
+            const bool stat_ok = bbx::hostfs::Stat(path, &info);
+            LogMessage(Level::kWarn, "dump: read failed for %s (stat=%d size=%llu errno=%d)",
+                       path.c_str(), stat_ok ? 1 : 0,
+                       static_cast<unsigned long long>(stat_ok ? info.size : 0),
+                       bbx::hostfs::LastError());
+            return std::vector<std::uint8_t>{};
+        }
+        std::uint32_t magic = 0;
+        if (bytes.size() >= 4) {
+            magic = (static_cast<std::uint32_t>(bytes[0]) << 24) |
+                    (static_cast<std::uint32_t>(bytes[1]) << 16) |
+                    (static_cast<std::uint32_t>(bytes[2]) << 8) |
+                    static_cast<std::uint32_t>(bytes[3]);
+        }
+        LogMessage(Level::kInfo, "dump: read %zu bytes from %s (magic=0x%08X)", bytes.size(),
+                   path.c_str(), magic);
         return bytes;
     };
     fs.list_dirs = [](const std::string& path) { return ListDirs(path); };
