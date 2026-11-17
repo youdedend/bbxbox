@@ -33,7 +33,22 @@ struct SfoInfo {
     std::string title;      // "Bloodborne"
 
     [[nodiscard]] std::string Version() const {
-        return !app_ver.empty() ? app_ver : BbPrepare::UpdateVersionFromContentId(content_id);
+        if (!app_ver.empty()) return app_ver;
+        const std::string from_content = BbPrepare::UpdateVersionFromContentId(content_id);
+        if (!from_content.empty()) return from_content;
+        // A base dump's CONTENT_ID carries no version group at all -
+        // UP9000-CUSA03173_00-BLOODBORNE0000000 - because a dump of the disc is
+        // 1.00. Treating that as "no version" made every real dump fail with
+        // "sce_sys\\param.sfo could not be read" after reading it correctly.
+        // A patch container still has to name its own version.
+        if (!content_id.empty() && !IsPatchContainer()) return "01.00";
+        return {};
+    }
+    // Every field the layout decision used, for a log line that explains a
+    // rejection instead of repeating "could not be read".
+    [[nodiscard]] std::string Describe() const {
+        return "app_type='" + app_type + "' title_id='" + TitleId() + "' version='" + Version() +
+               "' content_id='" + content_id + "'";
     }
     [[nodiscard]] bool IsPatchContainer() const { return BbPrepare::IsPatchAppType(app_type); }
     [[nodiscard]] bool Valid() const { return !TitleId().empty() && !Version().empty(); }
@@ -90,7 +105,10 @@ struct DumpLayout {
 [[nodiscard]] bool IsDumpRoot(const DumpFs& fs, const std::string& path);
 
 // Reads and validates one dump folder's metadata.
-[[nodiscard]] std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path);
+// `why`, when given, receives a sentence naming what was wrong: a read failure,
+// an SFO that does not parse, or the fields that made it unusable.
+[[nodiscard]] std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path,
+                                                  std::string* why = nullptr);
 
 // The candidate update folders for `base`: the player's saved/preferred path
 // first, then siblings named "<base>-patch" / "<base>-update" / "<base> patch".

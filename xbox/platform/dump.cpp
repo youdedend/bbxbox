@@ -112,12 +112,28 @@ bool IsDumpRoot(const DumpFs& fs, const std::string& path) {
            fs.is_dir(Join(path, "dvdroot_ps4"));
 }
 
-std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path) {
-    if (!fs.read) return std::nullopt;
+std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path,
+                                    std::string* why) {
+    if (!fs.read) {
+        if (why) *why = "no reader for this path";
+        return std::nullopt;
+    }
     const std::vector<std::uint8_t> bytes = fs.read(Join(path, "sce_sys\\param.sfo"), kMaxSfoBytes);
-    if (bytes.empty()) return std::nullopt;
+    if (bytes.empty()) {
+        if (why) *why = "the file could not be read";
+        return std::nullopt;
+    }
     const std::optional<SfoInfo> info = ParseParamSfo(bytes);
-    if (!info || !info->Valid()) return std::nullopt;
+    if (!info) {
+        if (why) {
+            *why = "not a well-formed SFO (" + std::to_string(bytes.size()) + " bytes)";
+        }
+        return std::nullopt;
+    }
+    if (!info->Valid()) {
+        if (why) *why = "SFO is not usable: " + info->Describe();
+        return std::nullopt;
+    }
     return info;
 }
 
@@ -192,9 +208,10 @@ DumpLayout DetectLayout(const DumpFs& fs, const std::string& picked,
             "dvdroot_ps4";
         return layout;
     }
-    const std::optional<SfoInfo> base_info = ReadDumpInfo(fs, base_path);
+    std::string why;
+    const std::optional<SfoInfo> base_info = ReadDumpInfo(fs, base_path, &why);
     if (!base_info) {
-        layout.problem = "sce_sys\\param.sfo could not be read";
+        layout.problem = "sce_sys\\param.sfo could not be read: " + why;
         return layout;
     }
     layout.base_path = base_path;

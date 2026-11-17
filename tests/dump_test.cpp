@@ -131,6 +131,28 @@ TEST(SfoParsesItsFields) {
     CHECK(info->title == "Bloodborne");
 }
 
+TEST(SfoAcceptsABaseDumpWhoseContentIdHasNoVersionGroup) {
+    // The disc dump's CONTENT_ID is UP9000-CUSA03173_00-BLOODBORNE0000000: there
+    // is no -A0100-V0100 group, so a version parsed only from CONTENT_ID is
+    // empty and the whole dump used to be refused.
+    const auto bytes = MakeSfo("", "gp", "CUSA03173", "UP9000-CUSA03173_00-BLOODBORNE0000000");
+    const auto info = ParseParamSfo(bytes);
+    CHECK(info.has_value());
+    if (info) {
+        CHECK(info->TitleId() == "CUSA03173");
+        CHECK(info->Version() == "01.00");
+        CHECK(info->Valid());
+        CHECK(!info->IsPatchContainer());
+    }
+}
+
+TEST(PatchSfoStillNeedsItsOwnVersion) {
+    const auto bytes = MakeSfo("", "patch", "CUSA03173", "UP0001-CUSA03173_00-BLOODBORNE0000000");
+    const auto info = ParseParamSfo(bytes);
+    CHECK(info.has_value());
+    if (info) CHECK(!info->Valid());  // a patch with no version group is not usable
+}
+
 TEST(SfoRejectsGarbageRatherThanGuessing) {
     CHECK(!ParseParamSfo({}).has_value());
     CHECK(!ParseParamSfo({0, 0, 0, 0, 1, 2, 3, 4}).has_value());
