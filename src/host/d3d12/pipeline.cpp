@@ -84,9 +84,9 @@ const char* PassName(PassKind kind) {
 
 std::uint32_t PipelineSet::RootConstants(PassKind kind) {
     switch (kind) {
-        // PresentParams and OverlayParams are 16 bytes each (a float4 / two
-        // float2s and padding): 4 dwords.
-        case PassKind::kPresent: return 4;
+        // PresentParams is two float4s (32 bytes = 8 dwords); OverlayParams is
+        // float2 viewport + float2 padding (16 bytes = 4 dwords).
+        case PassKind::kPresent: return 8;
         case PassKind::kOverlay: return 4;
         // UntileParams: 8 dwords (two uint2s and four uints). SelftestParams: 4.
         case PassKind::kUntile: return 8;

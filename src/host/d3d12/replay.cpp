@@ -17,7 +17,7 @@ namespace {
 constexpr std::uint64_t kUploadRingBytes = 4ull << 20;  // 4 MiB a frame
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT: a texture upload's source rows land on it,
 // which is now the plan's own dst_row_pitch (bbx_untile aligns it when it plans).
-constexpr std::uint64_t kOverlayBytes = 64ull << 10;    // 2,048 quads
+constexpr std::uint64_t kOverlayBytes = 1ull << 20;     // 32,768 vertices (~5,461 6-vertex quads)
 constexpr std::uint32_t kFrameImageSize = 256;  // the placeholder final image
 
 // The CPU's copy of stream_selftest.hlsl's Pattern(). Both must agree; the
@@ -332,7 +332,30 @@ Status Replay::UploadFrame(const std::uint8_t* pixels, const ScanoutDesc& desc) 
 
 Status Replay::CreateWhiteTexture() {
     constexpr std::uint32_t kWhitePixel = 0xFFFFFFFFu;
-    const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    constexpr std::uint32_t kPitchAlignment = 256;
+
+    // D3D12_HEAP_TYPE_UPLOAD only permits BUFFER resources; a 1x1 TEXTURE2D must
+    // live in D3D12_HEAP_TYPE_DEFAULT and receive its pixel through a 256-byte
+    // aligned UPLOAD buffer copy.
+    ComPtr<ID3D12Resource> staging;
+    const D3D12_HEAP_PROPERTIES upload_heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC staging_desc = BufferDesc(kPitchAlignment, D3D12_RESOURCE_FLAG_NONE);
+    HRESULT hr = device_->Get()->CreateCommittedResource(
+        &upload_heap, D3D12_HEAP_FLAG_NONE, &staging_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(staging.GetAddressOf()));
+    if (FAILED(hr)) {
+        Log("replay: white staging buffer failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
+    }
+    void* mapped = nullptr;
+    if (FAILED(staging->Map(0, &kNoRead, &mapped)) || mapped == nullptr) {
+        Log("replay: white staging buffer could not be mapped");
+        return Status::kUnavailable;
+    }
+    std::memset(mapped, 0, kPitchAlignment);
+    std::memcpy(mapped, &kWhitePixel, sizeof(kWhitePixel));
+    staging->Unmap(0, nullptr);
+
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = 1;
@@ -341,19 +364,45 @@ Status Replay::CreateWhiteTexture() {
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const D3D12_HEAP_PROPERTIES default_heap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
     ComPtr<ID3D12Resource> white;
-    const HRESULT hr = device_->Get()->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+    hr = device_->Get()->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
         __uuidof(ID3D12Resource), reinterpret_cast<void**>(white.GetAddressOf()));
-    if (FAILED(hr)) { return FromHresult(hr); }
-    void* mapped = nullptr;
-    if (FAILED(white->Map(0, &kNoRead, &mapped)) || mapped == nullptr) {
-        Log("replay: white texture could not be mapped");
-        return Status::kUnavailable;
+    if (FAILED(hr)) {
+        Log("replay: white texture failed: 0x%08lX", static_cast<unsigned long>(hr));
+        return FromHresult(hr);
     }
-    std::memcpy(mapped, &kWhitePixel, sizeof(kWhitePixel));
-    white->Unmap(0, nullptr);
+
+    ID3D12CommandAllocator* allocator = device_->FrameAllocator();
+    const HRESULT reset = allocator->Reset();
+    if (FAILED(reset)) { return FromHresult(reset); }
+    if (FAILED(command_list_->Reset(allocator, nullptr))) { return Status::kUnavailable; }
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = staging.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Offset = 0;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    source.PlacedFootprint.Footprint.Width = 1;
+    source.PlacedFootprint.Footprint.Height = 1;
+    source.PlacedFootprint.Footprint.Depth = 1;
+    source.PlacedFootprint.Footprint.RowPitch = kPitchAlignment;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = white.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    command_list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    (void)TransitionBarrier(white.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const Status submitted = CloseAndSubmit();
+    if (submitted != Status::kOk) { return submitted; }
+    if (!device_->WaitFor(device_->SubmittedValue())) {
+        Log("replay: white texture upload fence did not pass");
+        return device_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+    }
+    device_->NextFrame();
     white_ = std::move(white);
 
     white_srv_ = AllocateCbvSrvUav();
@@ -510,10 +559,10 @@ Status Replay::DrawPresent(float red, float green, float blue) {
     command_list_->ClearRenderTargetView(rtv, clear, 0, nullptr);
     command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-    const float present_constants[4] = {red, green, blue, 1.0f};
+    const float present_constants[8] = {red, green, blue, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f};
     command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kPresent));
     command_list_->SetPipelineState(pso);
-    command_list_->SetGraphicsRoot32BitConstants(0, 4, present_constants, 0);
+    command_list_->SetGraphicsRoot32BitConstants(0, 8, present_constants, 0);
     if (frame_srv_.gpu.ptr != 0) {
         command_list_->SetGraphicsRootDescriptorTable(1, frame_srv_.gpu);
     } else if (white_srv_.gpu.ptr != 0) {
@@ -522,7 +571,11 @@ Status Replay::DrawPresent(float red, float green, float blue) {
     // The fullscreen triangle is generated in present.hlsl from SV_VertexID.
     const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(frame_width_),
                                   static_cast<float>(frame_height_), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(frame_width_),
+                             static_cast<LONG>(frame_height_)};
+    command_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     command_list_->RSSetViewports(1, &viewport);
+    command_list_->RSSetScissorRects(1, &scissor);
     command_list_->DrawInstanced(3, 1, 0, 0);
     return Status::kOk;
 }
@@ -629,7 +682,7 @@ void Replay::ResetOverlay() { overlay_count_ = 0; }
 
 void Replay::AddOverlayQuad(float x, float y, float width, float height, float u0, float v0,
                             float u1, float v1, const float rgba[4]) {
-    if (overlay_count_ + 4 > overlay_capacity_ || overlay_mapped_ == nullptr) { return; }
+    if (overlay_count_ + 6 > overlay_capacity_ || overlay_mapped_ == nullptr) { return; }
     auto* vertices = static_cast<OverlayVertex*>(overlay_mapped_);
     auto push = [&](float px, float py, float tu, float tv) {
         OverlayVertex& vertex = vertices[overlay_count_++];
@@ -645,7 +698,9 @@ void Replay::AddOverlayQuad(float x, float y, float width, float height, float u
     push(x, y, u0, v0);
     push(x + width, y, u1, v0);
     push(x, y + height, u0, v1);
+    push(x + width, y, u1, v0);
     push(x + width, y + height, u1, v1);
+    push(x, y + height, u0, v1);
 }
 
 void Replay::AddOverlaySolid(float x, float y, float width, float height, const float rgba[4]) {
@@ -679,7 +734,11 @@ Status Replay::DrawOverlay() {
     command_list_->IASetVertexBuffers(0, 1, &view);
     const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(frame_width_),
                                   static_cast<float>(frame_height_), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(frame_width_),
+                             static_cast<LONG>(frame_height_)};
+    command_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     command_list_->RSSetViewports(1, &viewport);
+    command_list_->RSSetScissorRects(1, &scissor);
     command_list_->DrawInstanced(overlay_count_, 1, 0, 0);
     return Status::kOk;
 }

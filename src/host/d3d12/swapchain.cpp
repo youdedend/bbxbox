@@ -4,6 +4,7 @@
 #include "src/host/d3d12/swapchain.h"
 
 #include "src/host/d3d12/device.h"
+#include "xbox/platform/log.h"
 
 namespace bbx::d3d12 {
 
@@ -12,11 +13,20 @@ Swapchain::~Swapchain() { Destroy(); }
 Status Swapchain::Create(Device& device, IUnknown* core_window, const platform::OutputPlan& plan,
                          bool allow_tearing) {
     Destroy();
+    first_present_done_ = false;
     if (core_window == nullptr) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: CreateSwapChainForCoreWindow refused (core_window=null, hr=0x%08lX)",
+            static_cast<unsigned long>(E_INVALIDARG));
         Log("swapchain: no CoreWindow; the device cannot present");
         return Status::kInvalidArgument;
     }
     if (device.Get() == nullptr || device.GraphicsQueue() == nullptr || device.Factory() == nullptr) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: CreateSwapChainForCoreWindow refused (device not ready, hr=0x%08lX)",
+            static_cast<unsigned long>(E_INVALIDARG));
         Log("swapchain: the device is not ready");
         return Status::kInvalidArgument;
     }
@@ -50,14 +60,27 @@ Status Swapchain::Create(Device& device, IUnknown* core_window, const platform::
     desc.Flags = allow_tearing ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
 
     ComPtr<IDXGISwapChain1> swapchain1;
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "d3d12: CreateSwapChainForCoreWindow enter (core_window=%p, %ux%u, buffers=%u)",
+        static_cast<const void*>(core_window), width_, height_, kBufferCount);
     HRESULT hr = device.Factory()->CreateSwapChainForCoreWindow(
         device.GraphicsQueue(), core_window, &desc, nullptr, swapchain1.GetAddressOf());
+    bbx::platform::LogMirroredMessage(
+        hr == S_OK ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+        "d3d12: CreateSwapChainForCoreWindow exit (hr=0x%08lX)",
+        static_cast<unsigned long>(hr));
     if (FAILED(hr)) {
         Log("CreateSwapChainForCoreWindow(%ux%u, 3 buffers, flip-discard) failed: 0x%08lX", width_,
             height_, static_cast<unsigned long>(hr));
         return FromHresult(hr);
     }
-    if (FAILED(swapchain1.As(&swapchain_))) {
+    const HRESULT qi_hr = swapchain1.As(&swapchain_);
+    if (FAILED(qi_hr)) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: CreateSwapChainForCoreWindow QueryInterface(IDXGISwapChain3) failed (hr=0x%08lX)",
+            static_cast<unsigned long>(qi_hr));
         Log("the swapchain is not IDXGISwapChain3; no matrix transform and no frame index");
         return Status::kUnavailable;
     }
@@ -70,10 +93,22 @@ Status Swapchain::Create(Device& device, IUnknown* core_window, const platform::
 }
 
 Status Swapchain::CreateRenderTargets() {
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "d3d12: RTV creation enter (buffers=%u, rtv_stride=%u)",
+        buffer_count_, rtv_stride_);
+    HRESULT rtv_hr = S_OK;
     for (std::uint32_t index = 0; index < buffer_count_; ++index) {
         HRESULT hr = swapchain_->GetBuffer(index, __uuidof(ID3D12Resource),
                                           reinterpret_cast<void**>(buffers_[index].GetAddressOf()));
+        if (hr != S_OK) {
+            rtv_hr = hr;
+        }
         if (FAILED(hr)) {
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kError,
+                "d3d12: RTV creation exit (GetBuffer[%u] hr=0x%08lX)",
+                index, static_cast<unsigned long>(hr));
             Log("swapchain GetBuffer(%u) failed: 0x%08lX", index, static_cast<unsigned long>(hr));
             return FromHresult(hr);
         }
@@ -86,6 +121,10 @@ Status Swapchain::CreateRenderTargets() {
         handle.ptr += static_cast<SIZE_T>(index) * rtv_stride_;
         device_->Get()->CreateRenderTargetView(buffers_[index].Get(), &view, handle);
     }
+    bbx::platform::LogMirroredMessage(
+        rtv_hr == S_OK ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+        "d3d12: RTV creation exit (hr=0x%08lX, buffers=%u)",
+        static_cast<unsigned long>(rtv_hr), buffer_count_);
     return Status::kOk;
 }
 
@@ -160,12 +199,37 @@ Status Swapchain::Resize(const platform::OutputPlan& plan) {
 }
 
 Status Swapchain::Present(bool vsync) {
-    if (swapchain_ == nullptr) { return Status::kInvalidArgument; }
+    if (swapchain_ == nullptr) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: Present refused (swapchain=null, hr=0x%08lX)",
+            static_cast<unsigned long>(E_INVALIDARG));
+        return Status::kInvalidArgument;
+    }
     // A flip-model swapchain with ALLOW_TEARING may only pass the tearing flag
     // with sync interval 0; the reverse pair is E_INVALIDARG.
     const UINT sync_interval = vsync ? 1u : 0u;
     const UINT flags = (!vsync && tearing_allowed_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    const bool is_first = !first_present_done_;
+    if (is_first) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kInfo,
+            "d3d12: first Present enter (sync_interval=%u, flags=0x%X)",
+            sync_interval, flags);
+    }
     const HRESULT hr = swapchain_->Present(sync_interval, flags);
+    if (is_first) {
+        first_present_done_ = true;
+        bbx::platform::LogMirroredMessage(
+            hr == S_OK ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+            "d3d12: first Present exit (hr=0x%08lX)",
+            static_cast<unsigned long>(hr));
+    } else if (hr != S_OK) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: Present exit (hr=0x%08lX, sync_interval=%u, flags=0x%X)",
+            static_cast<unsigned long>(hr), sync_interval, flags);
+    }
     if (hr == static_cast<HRESULT>(0x887A0005L)) {  // DXGI_ERROR_DEVICE_REMOVED
         if (device_ != nullptr) { device_->NoteDeviceLost(hr); }
         return Status::kDeviceLost;
@@ -183,6 +247,7 @@ void Swapchain::Destroy() {
     ReleaseRenderTargets();
     swapchain_.Reset();
     device_ = nullptr;
+    first_present_done_ = false;
 }
 
 }  // namespace bbx::d3d12

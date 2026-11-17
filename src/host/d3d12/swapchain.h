@@ -82,6 +82,7 @@ private:
     std::uint32_t height_ = 0;
     std::uint32_t buffer_count_ = kBufferCount;
     bool tearing_allowed_ = false;
+    bool first_present_done_ = false;
 };
 
 }  // namespace bbx::d3d12

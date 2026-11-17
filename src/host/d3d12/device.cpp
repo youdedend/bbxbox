@@ -21,6 +21,7 @@
 #include <cstdio>
 
 #include "src/host/d3d12/bbx_caps.h"
+#include "xbox/platform/log.h"
 
 namespace bbx::d3d12 {
 namespace {
@@ -82,8 +83,16 @@ Status Device::Create(const DeviceDesc& desc) {
     }
 
     // 11_0: the console's part. See the header comment.
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "d3d12: D3D12CreateDevice enter (adapter=%p, feature_level=11_0)",
+        static_cast<const void*>(adapter_.Get()));
     HRESULT hr = D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0,
                                    __uuidof(ID3D12Device), reinterpret_cast<void**>(device_.GetAddressOf()));
+    bbx::platform::LogMirroredMessage(
+        hr == S_OK ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
+        "d3d12: D3D12CreateDevice exit (hr=0x%08lX)",
+        static_cast<unsigned long>(hr));
     if (FAILED(hr)) {
         Log("D3D12CreateDevice at 11_0 failed: 0x%08lX", static_cast<unsigned long>(hr));
         return FromHresult(hr);
@@ -122,6 +131,12 @@ Status Device::PickAdapter(bool debug_layer) {
         hr = CreateDXGIFactory2(0u, __uuidof(IDXGIFactory6),
                                 reinterpret_cast<void**>(factory_.GetAddressOf()));
     }
+    if (hr != S_OK) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: CreateDXGIFactory2 failed (hr=0x%08lX)",
+            static_cast<unsigned long>(hr));
+    }
     if (FAILED(hr)) {
         Log("no DXGI factory: 0x%08lX", static_cast<unsigned long>(hr));
         return FromHresult(hr);
@@ -133,6 +148,12 @@ Status Device::PickAdapter(bool debug_layer) {
     hr = factory_->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
                                               __uuidof(IDXGIAdapter4),
                                               reinterpret_cast<void**>(adapter_.GetAddressOf()));
+    if (hr != S_OK) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: EnumAdapterByGpuPreference failed (hr=0x%08lX)",
+            static_cast<unsigned long>(hr));
+    }
     if (FAILED(hr)) {
         Log("EnumAdapterByGpuPreference failed: 0x%08lX", static_cast<unsigned long>(hr));
         return FromHresult(hr);
