@@ -165,10 +165,9 @@ void OnStorageThread(Body&& body) {
         }
     });
     worker.join();
-    if (!failure.empty()) {
-        t_error = EACCES;
-        bbx::platform::LogF("hostfs: WinRT storage path failed: %s", failure.c_str());
-    }
+    // The caller logs the failure once both paths have been refused; a probe of
+    // a file that simply is not there is not worth a line of its own.
+    if (!failure.empty()) t_error = EACCES;
 }
 
 struct RtFile {

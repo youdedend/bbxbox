@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "xbox/platform/storage.h"
 
+#include "xbox/platform/host_fs.h"
+
 #include "xbox/platform/log.h"
 
 #include <windows.h>
@@ -173,23 +175,40 @@ std::string Local(const std::string& relative) {
 
 bool ReadBinary(const std::string& path, std::vector<std::uint8_t>& out, std::size_t cap) {
     out.clear();
-    const std::wstring wide = Widen(path);
-    HANDLE file = ::CreateFile2FromAppW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER size{};
-    if (!::GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
-        static_cast<std::uint64_t>(size.QuadPart) > cap) {
-        ::CloseHandle(file);
+    // CreateFile2FromApp is refused on a folder the app holds only a
+    // FutureAccessList token for - the dump on USB - so the read goes through
+    // the host_fs seam, whose console backend falls back to WinRT for exactly
+    // that case. Attributes on such a path are readable, which is why the dump
+    // looked present and only param.sfo "could not be read".
+    const int handle = bbx::hostfs::Open(path, bbx::hostfs::kRead);
+    if (handle < 0) {
+        LogMessage(Level::kWarn, "storage: %s could not be opened (errno=%d)", path.c_str(),
+                   bbx::hostfs::LastError());
         return false;
     }
-    out.resize(static_cast<std::size_t>(size.QuadPart));
-    DWORD read = 0;
-    const bool ok = out.empty() || (::ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read,
-                                               nullptr) &&
-                                    read == out.size());
-    ::CloseHandle(file);
-    if (!ok) out.clear();
-    return ok;
+    bbx::hostfs::FileStat info{};
+    if (!bbx::hostfs::Stat(path, &info) || info.is_dir || info.size > cap) {
+        (void)bbx::hostfs::Close(handle);
+        LogMessage(Level::kWarn, "storage: %s is not a readable file under the %zu byte cap",
+                   path.c_str(), cap);
+        return false;
+    }
+    out.resize(static_cast<std::size_t>(info.size));
+    std::size_t done = 0;
+    while (done < out.size()) {
+        const std::int64_t got =
+            bbx::hostfs::Read(handle, out.data() + done, out.size() - done);
+        if (got <= 0) break;
+        done += static_cast<std::size_t>(got);
+    }
+    (void)bbx::hostfs::Close(handle);
+    if (done != out.size()) {
+        LogMessage(Level::kWarn, "storage: %s read %zu of %zu bytes", path.c_str(), done,
+                   out.size());
+        out.clear();
+        return false;
+    }
+    return true;
 }
 
 bool ReadText(const std::string& path, std::string& out, std::size_t cap) {
@@ -231,40 +250,30 @@ bool AppendText(const std::string& path, const std::string& text) {
     return WriteText(path, existing + text);
 }
 
-bool Exists(const std::string& path) {
-    const std::wstring wide = Widen(path);
-    const DWORD attributes = AttributesOf(wide);
-    return attributes != INVALID_FILE_ATTRIBUTES;
-}
+bool Exists(const std::string& path) { return bbx::hostfs::Exists(path); }
 
-bool IsDir(const std::string& path) {
-    const DWORD attributes = AttributesOf(Widen(path));
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-}
+bool IsDir(const std::string& path) { return bbx::hostfs::IsDir(path); }
 
 std::uint64_t FileSize(const std::string& path) {
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!::GetFileAttributesExW(Widen(path).c_str(), GetFileExInfoStandard, &data)) return 0;
-    return (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    bbx::hostfs::FileStat info{};
+    if (!bbx::hostfs::Stat(path, &info) || info.is_dir) return 0;
+    return info.size;
 }
 
 namespace {
 
 std::vector<std::string> ListEntries(const std::string& path, bool want_dirs) {
+    std::vector<bbx::hostfs::DirEntry> entries;
+    if (!bbx::hostfs::ListDir(path, &entries)) {
+        LogMessage(Level::kWarn, "storage: %s could not be listed (errno=%d)", path.c_str(),
+                   bbx::hostfs::LastError());
+        return {};
+    }
     std::vector<std::string> out;
-    const std::string pattern = Join(path.empty() ? "." : path, "*");
-    WIN32_FIND_DATAW data{};
-    HANDLE find = ::FindFirstFileExFromAppW(Widen(pattern).c_str(), FindExInfoBasic, &data,
-                                           FindExSearchNameMatch, nullptr, 0);
-    if (find == INVALID_HANDLE_VALUE) return out;
-    do {
-        const std::wstring name = data.cFileName;
-        if (name == L"." || name == L"..") continue;
-        const bool is_dir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        if (is_dir != want_dirs) continue;
-        out.push_back(Narrow(name));
-    } while (::FindNextFileW(find, &data));
-    ::FindClose(find);
+    for (const auto& entry : entries) {
+        if (entry.is_dir != want_dirs) continue;
+        out.push_back(entry.name);
+    }
     std::sort(out.begin(), out.end());
     return out;
 }
