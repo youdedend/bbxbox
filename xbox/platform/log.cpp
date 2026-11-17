@@ -24,6 +24,7 @@ std::mutex g_mutex;
 // seam that is FromApp on the console (xbox/platform/host_fs.h), and it is what
 // the USB mirror already used.
 int g_file = -1;
+int g_errors = -1;
 Level g_level = Level::kInfo;
 std::uint64_t g_start = 0;
 char g_last_line[512] = {};
@@ -40,8 +41,9 @@ std::atomic<bool> g_installed{false};
 // The mirror goes through `xbox/platform/host_fs.h`, not `std::fopen`: the
 // granted folder is reached through a `FutureAccessList` token, and a CRT
 // stream is a `CreateFileW` stream, which the AppContainer refuses there.
-int g_mirror = -1;      // <dump>\bbxbox_logs\loader.log, appended
-int g_crash = -1;       // <dump>\bbxbox_logs\crash.log, appended
+int g_mirror = -1;         // <dump>\bbxbox_logs\loader.log, appended
+int g_mirror_errors = -1;  // <dump>\bbxbox_logs\errors.log, appended
+int g_crash = -1;          // <dump>\bbxbox_logs\crash.log, appended
 std::mutex g_mirror_mu; // serialises the mirrors, never held across a fault path
 char g_crumb[160] = {}; // the last thing the backend was doing
 long g_device_reason = 0;
@@ -63,23 +65,21 @@ void MirrorWrite(int handle, const char* text) {
     }
 }
 
+void WriteAndFlush(int handle, const char* text) {
+    if (handle < 0) return;
+    MirrorWrite(handle, text);
+    (void)hostfs::Flush(handle);
+}
+
 // The handler must not allocate or lock: take the mutex only if it is free.
-void WriteRaw(const char* text) {
-    if (g_file >= 0) {
-        const std::size_t size = std::strlen(text);
-        std::size_t put = 0;
-        while (put < size) {
-            const std::int64_t written = hostfs::Write(g_file, text + put, size - put);
-            if (written <= 0) break;
-            put += static_cast<std::size_t>(written);
-        }
-        (void)hostfs::Flush(g_file);
-    }
-    if (g_mirror >= 0) {
+void WriteRaw(const char* text, bool also_errors = false) {
+    WriteAndFlush(g_file, text);
+    if (also_errors) WriteAndFlush(g_errors, text);
+    if (g_mirror >= 0 || (also_errors && g_mirror_errors >= 0)) {
         std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
         if (lock.owns_lock()) {
-            MirrorWrite(g_mirror, text);
-            (void)hostfs::Flush(g_mirror);
+            WriteAndFlush(g_mirror, text);
+            if (also_errors) WriteAndFlush(g_mirror_errors, text);
         }
     }
     ::OutputDebugStringA(text);
@@ -274,12 +274,12 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (action == bbx::core::FaultAction::kSuppressed) {
-        WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n");
+        WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n", true);
         gate.Leave();
         return EXCEPTION_CONTINUE_SEARCH;
     }
     ReportFault(info, "fault");
-    WriteRaw(g_report);
+    WriteRaw(g_report, true);
     if (g_crash >= 0) {
         std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
         if (lock.owns_lock()) {
@@ -292,8 +292,24 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
 }
 
 void OnTerminate() {
-    WriteRaw("\n! std::terminate: unhandled exception\n");
+    WriteRaw("\n! std::terminate: unhandled exception\n", true);
     std::abort();
+}
+
+void FormatAndWrite(Level level, bool mirror_to_errors, const char* format, std::va_list args) {
+    if (level < g_level) return;
+    char message[1024];
+    std::vsnprintf(message, sizeof(message), format, args);
+    char line[1200];
+    const unsigned long long ms = g_start == 0 ? 0 : ::GetTickCount64() - g_start;
+    static const char* kNames[] = {"D", "I", "W", "E"};
+    std::snprintf(line, sizeof(line), "[%7llu.%03llu %s] %s\n", ms / 1000, ms % 1000,
+                  kNames[static_cast<int>(level)], message);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        std::snprintf(g_last_line, sizeof(g_last_line), "%s", message);
+        WriteRaw(line, mirror_to_errors || level >= Level::kError);
+    }
 }
 
 }  // namespace
@@ -311,6 +327,12 @@ bool LogOpen(const std::string& local_state) {
     (void)hostfs::Unlink(previous);
     (void)hostfs::Rename(current, previous, true);
     g_file = hostfs::Open(current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+
+    const std::string errors_current = local_state + "\\errors.log";
+    const std::string errors_previous = local_state + "\\errors.prev.log";
+    (void)hostfs::Unlink(errors_previous);
+    (void)hostfs::Rename(errors_current, errors_previous, true);
+    g_errors = hostfs::Open(errors_current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
     return g_file >= 0;
 }
 
@@ -318,24 +340,21 @@ void LogClose() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file >= 0) (void)hostfs::Close(g_file);
     g_file = -1;
+    if (g_errors >= 0) (void)hostfs::Close(g_errors);
+    g_errors = -1;
+    std::lock_guard<std::mutex> mirror(g_mirror_mu);
+    if (g_mirror >= 0) (void)hostfs::Close(g_mirror);
+    g_mirror = -1;
+    if (g_mirror_errors >= 0) (void)hostfs::Close(g_mirror_errors);
+    g_mirror_errors = -1;
+    if (g_crash >= 0) (void)hostfs::Close(g_crash);
+    g_crash = -1;
 }
 
 void LogSetLevel(Level level) { g_level = level; }
 
 void LogVF(Level level, const char* format, std::va_list args) {
-    if (level < g_level) return;
-    char message[1024];
-    std::vsnprintf(message, sizeof(message), format, args);
-    char line[1200];
-    const unsigned long long ms = g_start == 0 ? 0 : ::GetTickCount64() - g_start;
-    static const char* kNames[] = {"D", "I", "W", "E"};
-    std::snprintf(line, sizeof(line), "[%7llu.%03llu %s] %s\n", ms / 1000, ms % 1000,
-                  kNames[static_cast<int>(level)], message);
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        std::snprintf(g_last_line, sizeof(g_last_line), "%s", message);
-        WriteRaw(line);
-    }
+    FormatAndWrite(level, /*mirror_to_errors=*/false, format, args);
 }
 
 void LogMessage(Level level, const char* format, ...) {
@@ -343,6 +362,18 @@ void LogMessage(Level level, const char* format, ...) {
     va_start(args, format);
     LogVF(level, format, args);
     va_end(args);
+}
+
+void LogMirroredMessage(Level level, const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    FormatAndWrite(level, /*mirror_to_errors=*/true, format, args);
+    va_end(args);
+    LogFlush();
+}
+
+std::uint64_t LogElapsedMs() {
+    return g_start == 0 ? 0 : static_cast<std::uint64_t>(::GetTickCount64() - g_start);
 }
 
 void LogLastChance(const char* what, std::uintptr_t address, std::uintptr_t module_base) {
@@ -379,6 +410,7 @@ bool LogMirrorToUsb(const std::string& dump_root) {
         return false;
     }
     const std::string live = hostfs::JoinPath(dir, "loader.log");
+    const std::string errors_live = hostfs::JoinPath(dir, "errors.log");
     const std::string crash = hostfs::JoinPath(dir, "crash.log");
 
     std::lock_guard<std::mutex> lock(g_mirror_mu);
@@ -391,10 +423,16 @@ bool LogMirrorToUsb(const std::string& dump_root) {
                    MirrorError());
         return false;
     }
+    g_mirror_errors = hostfs::Open(errors_live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
     g_crash = hostfs::Open(crash, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
     MirrorWrite(g_mirror,
                 "\n=== bbxbox log mirror: written on the console, readable on a PC ===\n");
     (void)hostfs::Flush(g_mirror);
+    if (g_mirror_errors >= 0) {
+        MirrorWrite(g_mirror_errors,
+                    "\n=== bbxbox errors.log mirror: steps, heartbeats, shutdowns, errors ===\n");
+        (void)hostfs::Flush(g_mirror_errors);
+    }
     LogMessage(Level::kInfo, "log mirror: %s", live.c_str());
     return true;
 }
@@ -419,7 +457,7 @@ void InstallLastChanceLogger() {
     }
     ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* info) -> LONG {
         ReportFault(info, "unhandled");
-        WriteRaw(g_report);
+        WriteRaw(g_report, true);
         if (g_crash >= 0) {
             std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
             if (lock.owns_lock()) {
@@ -437,9 +475,13 @@ const char* LastLine() { return g_last_line; }
 void LogFlush() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file >= 0) (void)hostfs::Flush(g_file);
-    if (g_mirror >= 0) {
+    if (g_errors >= 0) (void)hostfs::Flush(g_errors);
+    if (g_mirror >= 0 || g_mirror_errors >= 0) {
         std::unique_lock<std::mutex> mirror(g_mirror_mu, std::try_to_lock_t());
-        if (mirror.owns_lock()) (void)hostfs::Flush(g_mirror);
+        if (mirror.owns_lock()) {
+            if (g_mirror >= 0) (void)hostfs::Flush(g_mirror);
+            if (g_mirror_errors >= 0) (void)hostfs::Flush(g_mirror_errors);
+        }
     }
 }
 

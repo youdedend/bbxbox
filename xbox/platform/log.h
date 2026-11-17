@@ -2,10 +2,11 @@
 // Logging that survives a crash: everything is unbuffered, timestamped, and
 // also reachable from the last-chance logger.
 //
-// Two files in LocalState, rotated at startup: `loader.log` (the run) and
-// `loader.prev.log` (the run that crashed). A crash report that says
-// "bbxbox.exe+0x2A1F30, last line: compile shader 0x9A3C..." is actionable; one
-// that says "the app closed" is not.
+// Two pairs of files in LocalState, rotated at startup: `loader.log` /
+// `loader.prev.log` (the full run) and `errors.log` / `errors.prev.log` (errors,
+// faults, boot steps, the 100 ms heartbeat, and shutdown paths). A crash report
+// that says "bbxbox.exe+0x2A1F30, last line: compile shader 0x9A3C..." is
+// actionable; one that says "the app closed" is not.
 #pragma once
 
 #include <cstdarg>
@@ -23,6 +24,13 @@ void LogSetLevel(Level level);
 
 void LogMessage(Level level, const char* format, ...);
 void LogVF(Level level, const char* format, std::va_list args);
+
+// Writes one line at `level` to both `loader.log` and `errors.log` (plus their
+// USB mirrors when active) and flushes immediately.
+void LogMirroredMessage(Level level, const char* format, ...);
+
+// Elapsed milliseconds since LogOpen, matching the `[seconds.ms]` prefix.
+[[nodiscard]] std::uint64_t LogElapsedMs();
 
 // Shorthands: the log is written from guest threads too, so these are
 // internally locked and never throw.

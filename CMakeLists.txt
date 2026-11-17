@@ -159,6 +159,7 @@ if(BBX_BUILD_TESTS)
         tests/ini_test.cpp
         tests/launcher_test.cpp
         tests/storage_test.cpp
+        tests/boot_steps_test.cpp
         tests/overlay_test.cpp
         tests/swap_test.cpp
         tests/guest_memory_test.cpp

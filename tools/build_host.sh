@@ -68,6 +68,7 @@ sources=(
   "$root"/tests/ini_test.cpp
   "$root"/tests/launcher_test.cpp
   "$root"/tests/storage_test.cpp
+  "$root"/tests/boot_steps_test.cpp
   "$root"/tests/overlay_test.cpp
   "$root"/tests/swap_test.cpp
   "$root"/tests/guest_memory_test.cpp

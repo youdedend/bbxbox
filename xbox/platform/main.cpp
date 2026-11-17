@@ -15,6 +15,7 @@
 // HSTRING, so the string ABI has to be visible.
 #include <winstring.h>
 
+#include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Gaming.Input.h>
@@ -23,12 +24,16 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include "xbox/platform/boot_steps.h"
 #include "xbox/platform/d3d12_session.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
@@ -70,6 +75,39 @@ struct Session {
 };
 
 Session g_session;
+
+// Process-lifetime boot step + heartbeat tracker: heap-owned so App::~App() and
+// std::atexit handlers never race static destruction order.
+bbx::platform::BootStepTracker& Steps() {
+    static auto* tracker = new bbx::platform::BootStepTracker(
+        [](bbx::platform::Level level, const std::string& line) {
+            bbx::platform::LogMirroredMessage(level, "%s", line.c_str());
+        },
+        []() { return bbx::platform::LogElapsedMs(); });
+    return *tracker;
+}
+
+void OnBootAtExit() noexcept {
+    try {
+        Steps().Shutdown("atexit");
+        bbx::platform::LogFlush();
+        bbx::platform::LogClose();
+    } catch (...) {
+    }
+}
+
+void StartBootInstrumentation() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        (void)std::atexit(&OnBootAtExit);
+        Steps().StartHeartbeatThread();
+    });
+}
+
+void ReplayStorageOnce() {
+    static std::once_flag once;
+    std::call_once(once, []() { bbx::platform::ReplayStorageResults(); });
+}
 
 bbx::platform::ButtonMask MaskFromPad(SDL_Gamepad* pad) {
     using bbx::platform::Bit;
@@ -208,6 +246,9 @@ void OnAction(PadAction action) {
         return;
     case PadAction::kConfirm: {
         const bbx::platform::Action selected = g_session.model.Activate();
+        if (selected != bbx::platform::Action::kNone) {
+            Steps().SelectionAccepted(bbx::platform::ActionName(selected));
+        }
         bbx::platform::LogF("launcher: %s", bbx::platform::ActionName(selected));
         switch (selected) {
         case bbx::platform::Action::kPickDump:
@@ -275,7 +316,10 @@ void DrawFrame() {
     if (g_session.gpu) {
         const bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
         const bbx::d3d12::Status status = g_session.gpu->Present(hud);
-        if (status == bbx::d3d12::Status::kOk) return;
+        if (status == bbx::d3d12::Status::kOk) {
+            (void)Steps().FirstFramePresented();
+            return;
+        }
         bbx::platform::LogF("d3d12: present failed (%s); SDL takes over",
                             bbx::d3d12::StatusName(status));
         g_session.gpu->Destroy();
@@ -336,6 +380,7 @@ void DrawLauncher() {
         }
     }
     SDL_RenderPresent(g_session.renderer);
+    (void)Steps().FirstFramePresented();
 }
 
 bool InitSdl() {
@@ -399,8 +444,11 @@ bool InitSdl() {
     // swapchain owns the window.
     const char* renderer_name =
         g_session.renderer ? SDL_GetRendererName(g_session.renderer) : nullptr;
-    bbx::platform::LogF("SDL: window %s, gamepads %d", renderer_name ? renderer_name : "d3d12",
+    const char* display_backend =
+        g_session.gpu ? "d3d12" : (renderer_name ? renderer_name : "sdl");
+    bbx::platform::LogF("SDL: window %s, gamepads %d", display_backend,
                         g_session.pad ? 1 : 0);
+    Steps().DisplayAcquired(display_backend);
     return true;
 }
 
@@ -436,24 +484,90 @@ void LoadSettings() {
     g_session.model.modded_eboot_ok = bbx::platform::IniFlag(g_session.ini, "dump.modded_eboot", false);
 }
 
+std::string NormalizeScanPath(std::string path) {
+    for (char& ch : path) {
+        if (ch == '/') ch = '\\';
+    }
+    while (path.size() > 3 && path.back() == '\\') {
+        path.pop_back();
+    }
+    return path;
+}
+
+std::string JoinScanPath(const std::string& parent, const std::string& child) {
+    if (parent.empty()) return NormalizeScanPath(child);
+    std::string joined = parent;
+    if (joined.back() != '\\' && joined.back() != '/') joined.push_back('\\');
+    joined += child;
+    return NormalizeScanPath(std::move(joined));
+}
+
 void RestoreDump() {
+    Steps().DumpScanStarted();
+    const bbx::platform::DumpFs fs = bbx::platform::MakeDumpFs();
     const std::string token = bbx::platform::IniGet(g_session.ini, "dump.token", "");
     std::string path = bbx::platform::IniGet(g_session.ini, "dump.path", "");
     if (!token.empty()) {
         std::string granted;
-        if (bbx::platform::ResolveGrant(token, granted)) path = granted;
+        if (bbx::platform::ResolveGrant(token, granted)) {
+            path = granted;
+            g_session.usb_token = token;
+        }
     }
-    g_session.layout = bbx::platform::DetectLayout(
-        bbx::platform::MakeDumpFs(), path, bbx::platform::IniGet(g_session.ini, "dump.patch_path", ""),
-        bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true), false);
+
+    std::vector<std::string> candidates;
+    const auto add_candidate = [&candidates](const std::string& raw) {
+        if (raw.empty()) return;
+        const std::string norm = NormalizeScanPath(raw);
+        if (norm.empty()) return;
+        if (std::find(candidates.begin(), candidates.end(), norm) == candidates.end()) {
+            candidates.push_back(norm);
+        }
+    };
+
+    add_candidate(path);
+    for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
+        add_candidate(root);
+        if (fs.list_dirs) {
+            for (const std::string& child : fs.list_dirs(root)) {
+                if (child == "." || child == ".." || child == "bbxbox_logs") continue;
+                add_candidate(JoinScanPath(root, child));
+            }
+        }
+    }
+
+    std::vector<std::string> found_dumps;
+    for (const std::string& candidate : candidates) {
+        if (!bbx::platform::IsDumpRoot(fs, candidate)) continue;
+        const std::optional<bbx::platform::SfoInfo> info =
+            bbx::platform::ReadDumpInfo(fs, candidate);
+        if (info && !info->IsPatchContainer()) {
+            found_dumps.push_back(candidate);
+        }
+    }
+
+    if (path.empty() && !found_dumps.empty()) {
+        path = found_dumps.front();
+    }
+
+    const std::string preferred_patch = bbx::platform::IniGet(g_session.ini, "dump.patch_path", "");
+    const bool use_patch = bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true);
+    g_session.layout = bbx::platform::DetectLayout(fs, path, preferred_patch, use_patch, false);
+    if (!g_session.layout.layout_ok() && !found_dumps.empty() &&
+        NormalizeScanPath(path) != found_dumps.front()) {
+        g_session.layout =
+            bbx::platform::DetectLayout(fs, found_dumps.front(), preferred_patch, use_patch, false);
+    }
     bbx::platform::LogMessage(bbx::platform::Level::kInfo, "%s",
                               bbx::platform::LayoutLogLine(g_session.layout).c_str());
     // The black box: from here on every line is also written to
-    // `<dump>\bbxbox_logs\loader.log` (and a fault's report to `crash.log`), so
-    // a run that dies on the console is read off the player's USB stick.
+    // `<dump>\bbxbox_logs\loader.log` and `errors.log` (and a fault's report to
+    // `crash.log`), so a run that dies on the console is read off the player's
+    // USB stick.
     if (g_session.layout.layout_ok() && !g_session.layout.base_path.empty()) {
         (void)bbx::platform::LogMirrorToUsb(g_session.layout.base_path);
     }
+    Steps().DumpScanFinished(found_dumps.size());
 }
 
 }  // namespace
@@ -462,6 +576,10 @@ namespace {
 
 struct LauncherView : winrt::implements<LauncherView, winrt::Windows::ApplicationModel::Core::IFrameworkView> {
     winrt::Windows::UI::Core::CoreWindow window{nullptr};
+    winrt::event_token suspend_token{};
+    bool has_suspend_token = false;
+    winrt::event_token closed_token{};
+    bool has_closed_token = false;
 
     void Initialize(const winrt::Windows::ApplicationModel::Core::CoreApplicationView&) {
         bbx::platform::InstallLastChanceLogger();
@@ -471,13 +589,37 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         // does when the reservation loses.
         (void)bbx::platform::ReserveGuestWindows();
         const bbx::platform::StorageInitResult& storage = bbx::platform::StorageInit();
-        if (!bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
-            // Without a log the run is still worth doing; the crash handler's
-            // OutputDebugStringA path remains.
+        if (bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
+            ReplayStorageOnce();
         }
+        StartBootInstrumentation();
         if (!storage.ok) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "%s",
                                       bbx::platform::FormatStorageFailureLine(storage).c_str());
+        }
+        try {
+            suspend_token = winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(
+                [](const winrt::Windows::Foundation::IInspectable&,
+                   const winrt::Windows::ApplicationModel::SuspendingEventArgs& args) {
+                    winrt::Windows::ApplicationModel::SuspendingDeferral deferral{nullptr};
+                    try {
+                        if (args) deferral = args.SuspendingOperation().GetDeferral();
+                    } catch (...) {
+                    }
+                    Steps().Shutdown("suspend event");
+                    bbx::platform::LogFlush();
+                    if (deferral) {
+                        try {
+                            deferral.Complete();
+                        } catch (...) {
+                        }
+                    }
+                });
+            has_suspend_token = true;
+        } catch (const winrt::hresult_error& error) {
+            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                      "launcher: Suspending hook unavailable (0x%08x)",
+                                      static_cast<unsigned>(error.code().value));
         }
         bbx::platform::LogMessage(bbx::platform::Level::kInfo, "bbxbox launcher starting");
         // The guest's file system, exercised once at boot: the HLE's reads and
@@ -501,20 +643,49 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 step == 0 ? "" : " at ", step == 0 ? "" : why);
         }
         LoadSettings();
-        RestoreDump();
         RefreshLauncher();
     }
 
-    void SetWindow(const winrt::Windows::UI::Core::CoreWindow& value) { window = value; }
+    void SetWindow(const winrt::Windows::UI::Core::CoreWindow& value) {
+        if (window && has_closed_token) {
+            try {
+                window.Closed(closed_token);
+            } catch (...) {
+            }
+            has_closed_token = false;
+        }
+        window = value;
+        if (window) {
+            try {
+                closed_token = window.Closed(
+                    [](const winrt::Windows::UI::Core::CoreWindow&,
+                       const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
+                        g_session.quit = true;
+                        Steps().Shutdown("window closed event");
+                        bbx::platform::LogFlush();
+                    });
+                has_closed_token = true;
+            } catch (const winrt::hresult_error& error) {
+                bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                          "launcher: CoreWindow::Closed hook unavailable (0x%08x)",
+                                          static_cast<unsigned>(error.code().value));
+            }
+        }
+    }
 
     void Load(winrt::hstring) {}
 
     void Run() {
         if (!InitSdl()) {
             bbx::platform::LogMessage(bbx::platform::Level::kError, "SDL unavailable; exiting");
-            bbx::platform::LogClose();
+            bbx::platform::LogFlush();
             return;
         }
+        // Present the initial launcher frame before scanning removable storage so
+        // step 3 precedes step 4 and PLM sees an active swapchain immediately.
+        DrawFrame();
+        RestoreDump();
+        RefreshLauncher();
         const bbx::platform::SelfTestResult self_test = bbx::platform::RunMemorySelfTest(false);
 
         bbx::platform::ButtonMask previous = 0;
@@ -573,10 +744,24 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         ShutdownSdl();
         bbx::platform::LogFlush();
-        bbx::platform::LogClose();
     }
 
-    void Uninitialize() {}
+    void Uninitialize() {
+        if (window && has_closed_token) {
+            try {
+                window.Closed(closed_token);
+            } catch (...) {
+            }
+            has_closed_token = false;
+        }
+        if (has_suspend_token) {
+            try {
+                winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(suspend_token);
+            } catch (...) {
+            }
+            has_suspend_token = false;
+        }
+    }
 };
 
 }  // namespace
@@ -586,7 +771,21 @@ namespace bbxbox {
 // The activation object: the view-provider factory. This is what the manifest's
 // EntryPoint="bbxbox.App" names.
 struct App : winrt::implements<App, winrt::Windows::ApplicationModel::Core::IFrameworkViewSource> {
+    ~App() noexcept {
+        try {
+            Steps().Shutdown("App destructor");
+            bbx::platform::LogFlush();
+        } catch (...) {
+        }
+    }
+
     winrt::Windows::ApplicationModel::Core::IFrameworkView CreateView() {
+        (void)bbx::platform::StorageInit();
+        if (bbx::platform::LogOpen(bbx::platform::Paths().local_state)) {
+            ReplayStorageOnce();
+        }
+        StartBootInstrumentation();
+        Steps().LauncherViewCreated();
         return winrt::make<LauncherView>();
     }
 };
@@ -649,7 +848,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const bbx::platform::StorageInitResult& storage_early = bbx::platform::StorageInit();
     const bool log_early = bbx::platform::LogOpen(bbx::platform::Paths().local_state);
     if (log_early) {
-        bbx::platform::ReplayStorageResults();
+        ReplayStorageOnce();
         if (storage_early.ok) {
             bbx::platform::LogMessage(bbx::platform::Level::kInfo,
                                       "wWinMain: localstate %s, storage ok",
@@ -662,6 +861,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 bbx::platform::FormatStorageFailureLine(storage_early).c_str());
         }
     }
+    StartBootInstrumentation();
     bbx::platform::InstallLastChanceLogger();
     try {
         winrt::Windows::ApplicationModel::Core::CoreApplication::Run(winrt::make<bbxbox::App>());
@@ -670,8 +870,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         // that closed: the reason went to the debugger output and nowhere else.
         bbx::platform::LogMessage(bbx::platform::Level::kError, "wWinMain: activation failed (0x%08x)",
                                   static_cast<unsigned>(error.code().value));
-        bbx::platform::LogClose();
+        Steps().Shutdown("return from wWinMain");
+        bbx::platform::LogFlush();
         return 1;
     }
+    Steps().Shutdown("return from wWinMain");
+    bbx::platform::LogFlush();
     return 0;
 }
