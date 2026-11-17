@@ -470,13 +470,17 @@ void RefreshLauncher() {
     g_session.model.Rebuild();
 }
 
-void PickDump() {
-    std::string path;
-    std::string token;
-    if (!bbx::platform::PickFolderGrant(path, token)) {
-        bbx::platform::LogMessage(bbx::platform::Level::kWarn, "dump picker cancelled");
-        return;
-    }
+// The launcher loop is the thread that pumps the CoreWindow dispatcher, and the
+// folder picker can only run on that dispatcher. Calling PickFolderGrant here
+// blocked the pump thread on an event only the picker could signal, so picking a
+// dump folder froze the launcher. The pick starts on a worker thread and the
+// loop collects the result on a later frame.
+std::atomic<int> g_pick_state{0};  // 0 idle, 1 pending, 2 granted, -1 failed
+std::string g_pick_path;
+std::string g_pick_token;
+
+void FinishDumpGrant(const std::string& path, const std::string& token) {
+    (void)token;
     bbx::platform::LogF("dump folder granted: %s", path.c_str());
     const bbx::platform::DumpFs fs = bbx::platform::MakeDumpFs();
     g_session.layout = bbx::platform::DetectLayout(
@@ -490,6 +494,41 @@ void PickDump() {
     }
     SaveLayoutSettings();
     RefreshLauncher();
+}
+
+void PickDump() {
+    if (g_pick_state.load() == 1) {
+        bbx::platform::LogMessage(bbx::platform::Level::kInfo,
+                                  "picker: already waiting for the system folder picker");
+        return;
+    }
+    g_pick_state.store(1);
+    std::thread([] {
+        std::string path;
+        std::string token;
+        if (bbx::platform::PickFolderGrant(path, token) && !path.empty()) {
+            g_pick_path = path;
+            g_pick_token = token;
+            g_pick_state.store(2);
+        } else {
+            g_pick_state.store(-1);
+        }
+    }).detach();
+    bbx::platform::LogMessage(bbx::platform::Level::kInfo,
+                              "picker: the system folder picker is open; the launcher keeps drawing");
+}
+
+void PollDumpPick() {
+    const int state = g_pick_state.load();
+    if (state == 2) {
+        const std::string path = g_pick_path;
+        const std::string token = g_pick_token;
+        g_pick_state.store(0);
+        FinishDumpGrant(path, token);
+    } else if (state == -1) {
+        g_pick_state.store(0);
+        bbx::platform::LogMessage(bbx::platform::Level::kWarn, "dump picker cancelled");
+    }
 }
 
 void OnAction(PadAction action) {
@@ -1177,6 +1216,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             previous = held;
             const PadAction action = g_session.chords.Update(edges);
             if (action != PadAction::kNone) OnAction(action);
+            PollDumpPick();
 
             DrawFrame();
 

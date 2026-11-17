@@ -275,60 +275,98 @@ std::vector<std::string> ListDirs(const std::string& path) { return ListEntries(
 std::vector<std::string> ListFiles(const std::string& path) { return ListEntries(path, false); }
 
 bool PickFolderGrant(std::string& path_out, std::string& token_out) {
-    // The picker is a UI-thread call. Run it there and wait here, which is the
-    // pattern the SDL3-uwp picker uses; calling .get() on the UI thread would
-    // deadlock the only thread that can complete it.
-    struct Result {
+    // The picker is a UI-thread call, and blocking the dispatcher here stopped the
+    // only thread that can pump the picker: choosing a dump folder froze the
+    // launcher until the ten-minute timeout expired and nothing ever appeared.
+    // The folder is therefore asked for with a completion handler - the
+    // dispatcher returns immediately and keeps pumping - while the caller waits
+    // on a worker thread.
+    struct Shared {
+        std::mutex mutex;
         std::string path;
         std::string token;
-    } result;
+    };
+    auto shared = std::make_shared<Shared>();
     HANDLE done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (done == nullptr) return false;
 
-    std::thread([&result, done]() {
-        auto dispatcher = winrt::Windows::ApplicationModel::Core::CoreApplication::MainView()
-                              .CoreWindow()
-                              .Dispatcher();
-        dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [&result, done]() {
-            try {
+    std::thread([shared, done]() {
+        try {
+            auto dispatcher = winrt::Windows::ApplicationModel::Core::CoreApplication::MainView()
+                                  .CoreWindow()
+                                  .Dispatcher();
+            dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                                [shared, done]() {
                 using winrt::Windows::Storage::Pickers::FolderPicker;
-                namespace Collections = winrt::Windows::Foundation::Collections;
                 namespace AccessCache = winrt::Windows::Storage::AccessCache;
-                FolderPicker picker;
-                picker.SuggestedStartLocation(
-                    winrt::Windows::Storage::Pickers::PickerLocationId::ComputerFolder);
-                // A FolderPicker shows nothing until its filter has an entry; the
-                // filter is an IVector<hstring>, so the '*' is a real hstring.
-                Collections::IVector<winrt::hstring> filters = picker.FileTypeFilter();
-                const winrt::hstring any_file = L"*";
-                filters.Append(any_file);
-                winrt::Windows::Storage::StorageFolder folder = picker.PickSingleFolderAsync().get();
-                if (folder) {
-                    result.path = winrt::to_string(folder.Path());
-                    // The token is what survives a restart; the path is what
-                    // this run streams from.
-                    AccessCache::StorageItemAccessList recent =
-                        AccessCache::StorageApplicationPermissions::FutureAccessList();
-                    const winrt::Windows::Storage::IStorageItem item = folder;
-                    // Add, not AddOrReplace: clang's C++/WinRT projection does not
-                    // resolve the two-argument AddOrReplace overload here, and an
-                    // extra entry in a 1,000-entry list costs nothing. The list is
-                    // pruned on load (see RestoreDump's ContainsItem check).
-                    result.token = winrt::to_string(recent.Add(item));
+                namespace Collections = winrt::Windows::Foundation::Collections;
+                namespace Foundation = winrt::Windows::Foundation;
+                try {
+                    FolderPicker picker;
+                    picker.SuggestedStartLocation(
+                        winrt::Windows::Storage::Pickers::PickerLocationId::ComputerFolder);
+                    // A FolderPicker shows nothing until its filter has an entry;
+                    // the filter is an IVector<hstring>, so the '*' is a real
+                    // hstring.
+                    Collections::IVector<winrt::hstring> filters = picker.FileTypeFilter();
+                    const winrt::hstring any_file = L"*";
+                    filters.Append(any_file);
+                    // Keep the picker alive until its operation completes, and
+                    // complete on the handler so this callback can return.
+                    auto keep = std::make_shared<FolderPicker>(picker);
+                    auto operation = picker.PickSingleFolderAsync();
+                    operation.Completed([shared, done, keep](
+                                            const Foundation::IAsyncOperation<
+                                                winrt::Windows::Storage::StorageFolder>& async,
+                                            Foundation::AsyncStatus status) {
+                        try {
+                            if (status == Foundation::AsyncStatus::Completed) {
+                                const auto folder = async.GetResults();
+                                if (folder) {
+                                    std::lock_guard<std::mutex> lock(shared->mutex);
+                                    shared->path = winrt::to_string(folder.Path());
+                                    auto recent =
+                                        AccessCache::StorageApplicationPermissions::FutureAccessList();
+                                    const winrt::Windows::Storage::IStorageItem item = folder;
+                                    // Add, not AddOrReplace: an extra entry in a
+                                    // 1,000-entry list costs nothing and the list
+                                    // is pruned on load (see RestoreDump).
+                                    shared->token = winrt::to_string(recent.Add(item));
+                                }
+                            } else {
+                                LogMessage(Level::kWarn,
+                                           "storage: folder picker finished with status %d",
+                                           static_cast<int>(status));
+                            }
+                        } catch (const winrt::hresult_error& error) {
+                            LogMessage(Level::kWarn, "storage: folder picker failed (0x%08x)",
+                                       static_cast<unsigned>(error.code().value));
+                        }
+                        ::SetEvent(done);
+                    });
+                } catch (const winrt::hresult_error& error) {
+                    LogMessage(Level::kWarn, "storage: folder picker could not start (0x%08x)",
+                               static_cast<unsigned>(error.code().value));
+                    ::SetEvent(done);
                 }
-            } catch (const winrt::hresult_error& error) {
-                LogMessage(Level::kWarn, "storage: folder picker failed (0x%08x)",
-                           static_cast<unsigned>(error.code().value));
-            }
+            });
+        } catch (const winrt::hresult_error& error) {
+            LogMessage(Level::kWarn, "storage: no dispatcher for the folder picker (0x%08x)",
+                       static_cast<unsigned>(error.code().value));
             ::SetEvent(done);
-        });
+        }
     }).detach();
 
     const DWORD waited = ::WaitForSingleObject(done, 10 * 60 * 1000);
     ::CloseHandle(done);
-    if (waited != WAIT_OBJECT_0 || result.path.empty()) return false;
-    path_out = result.path;
-    token_out = result.token;
+    if (waited != WAIT_OBJECT_0) {
+        LogMessage(Level::kWarn, "storage: folder picker timed out after ten minutes");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(shared->mutex);
+    if (shared->path.empty()) return false;
+    path_out = shared->path;
+    token_out = shared->token;
     return true;
 }
 
