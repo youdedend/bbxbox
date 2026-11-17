@@ -26,7 +26,16 @@
 namespace bbx::d3d12 {
 namespace {
 
-// What the device reports, in the port's own vocabulary, so Validate() can refuse
+// The port's shader-model constants and the SDK's enumerators are the same
+// units (6.4 is 0x64, i.e. one hundred), and this is where that is proved rather
+// than assumed: a mismatch fails the build instead of refusing a device that
+// D3D12CreateDevice already created.
+static_assert(kShaderModel64 == D3D_SHADER_MODEL_6_4,
+              "kShaderModel64 must be D3D_SHADER_MODEL_6_4 (0x64), not the decimal 64");
+static_assert(ShaderModelMinor(kShaderModel64) == 4, "0x64 is shader model 6.4");
+static_assert(ShaderModelMajor(kShaderModel64) == 6, "0x64 is shader model 6.4");
+
+// What the device reports, in the port's own vocabulary, so Validate() can log
 // a mismatch instead of leaving it to a PSO that fails to create much later.
 Caps CapsFromDevice(ID3D12Device* device) {
     Caps caps = XboxSeriesCaps();
@@ -41,15 +50,29 @@ Caps CapsFromDevice(ID3D12Device* device) {
         caps.descriptor_heap_indexing = false;
     }
 
+    // The device's own answer, in D3D_SHADER_MODEL units. The query is seeded
+    // with the enumerator, never with a literal, and its result is stored
+    // unclamped in `device_shader_model`: that is the number the log quotes.
     D3D12_FEATURE_DATA_SHADER_MODEL shader_model{};
     shader_model.HighestShaderModel = D3D_SHADER_MODEL_6_4;
-    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model,
-                                             sizeof(shader_model)))) {
-        // A device that reports more than 6.4 is fine; the port's shaders are 6.4.
-        caps.shader_model = shader_model.HighestShaderModel < D3D_SHADER_MODEL_6_4
-                                ? shader_model.HighestShaderModel
-                                : D3D_SHADER_MODEL_6_4;
+    const HRESULT sm_hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model,
+                                                      sizeof(shader_model));
+    if (SUCCEEDED(sm_hr)) {
+        caps.device_shader_model = shader_model.HighestShaderModel;
+    } else {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "d3d12: CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL) failed (hr=0x%08lX); "
+            "assuming SM 6.4",
+            static_cast<unsigned long>(sm_hr));
+        caps.device_shader_model = D3D_SHADER_MODEL_6_4;
     }
+    // What the shaders may target: the console's ceiling, and never more than the
+    // device answered. A device that reports newer is fine; the port's shaders
+    // are 6.4.
+    caps.shader_model = caps.device_shader_model < D3D_SHADER_MODEL_6_4
+                            ? caps.device_shader_model
+                            : static_cast<std::uint32_t>(D3D_SHADER_MODEL_6_4);
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
     if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1,
@@ -181,18 +204,46 @@ Status Device::QueryAndValidate(bool debug_layer) {
     // The console is UMA; a desktop development build is not, and `IsUma()` is what
     // tells the budget that a texture's size is charged once, not twice.
     const Caps expected = XboxSeriesCaps();
+
+    // Point 1: the device's value, the expected value and both in hex on one
+    // line, so a units mistake can never be read as a version again.
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo, "d3d12: %s",
+        FormatShaderModelLine(reported.device_shader_model, expected.shader_model).c_str());
+
+    // A caps mismatch is a log line, never a failed device: D3D12CreateDevice
+    // already created this device at feature level 11_0, so the port continues to
+    // swapchain creation and the first Present regardless. Only the two faults the
+    // hardware work documented (a pipeline library on a console, which removes the
+    // device) still stop it here.
     const CapsCheck check = Validate(expected, reported);
     if (!check.ok) {
-        Log("caps check failed: %s", check.problem.c_str());
-        return Status::kUnavailable;
+        if (expected.gpu_class == GpuClass::kXboxSeries && reported.pipeline_library) {
+            bbx::platform::LogMirroredMessage(bbx::platform::Level::kError,
+                                              "d3d12: caps check failed: %s",
+                                              check.problem.c_str());
+            return Status::kUnavailable;
+        }
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "d3d12: caps note: %s; continuing (the device is already created)",
+            check.problem.c_str());
     }
-    if (reported.shader_model < expected.shader_model) {
-        Log("device reports SM %u, shaders are compiled for %u", reported.shader_model,
-            expected.shader_model);
-        return Status::kUnavailable;
+    if (reported.device_shader_model < expected.shader_model) {
+        // The shaders are DXIL 6.4; a device below that will fail PSO creation.
+        // That is worth an error line, but it is not a reason to hide the window.
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "d3d12: device SM %s is below the shaders' SM %s; PSO creation may fail",
+            ShaderModelText(reported.device_shader_model).c_str(),
+            ShaderModelText(expected.shader_model).c_str());
     }
-    Log("caps: SM %u, binding tier %u, %u-lane waves, %s", reported.shader_model,
-        reported.binding_tier, reported.wave_lanes, debug_layer ? "validation on" : "validation off");
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "d3d12: caps: SM %s (%s), binding tier %u, %u-lane waves, %s",
+        ShaderModelText(reported.shader_model).c_str(),
+        ShaderModelValues(reported.shader_model).c_str(), reported.binding_tier,
+        reported.wave_lanes, debug_layer ? "validation on" : "validation off");
     return Status::kOk;
 }
 

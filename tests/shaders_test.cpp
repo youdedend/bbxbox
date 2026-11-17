@@ -84,7 +84,8 @@ TEST(NoShaderTargetIsNewerThanTheConsoleShaderModel) {
         const EntryPoint& point = manifest.items[i];
         // SM 6.4 is the console's ceiling; 6.5/6.6 targets fail PSO creation.
         CHECK(ProfileMinor(point.profile) >= 0);
-        CHECK_EQ(static_cast<unsigned>(ProfileMinor(point.profile)), caps.shader_model % 10);
+        CHECK_EQ(static_cast<unsigned>(ProfileMinor(point.profile)),
+                 bbx::d3d12::ShaderModelMinor(caps.shader_model));
         CHECK_EQ(ProfileStage(point.profile), EntryStage(point.entry));
         // A .hlsl under xbox/shaders, not a path: the build globs that directory.
         CHECK(std::strchr(point.source, '/') == nullptr);

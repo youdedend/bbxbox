@@ -14,9 +14,59 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace bbx::d3d12 {
+
+// --- shader model, in D3D_SHADER_MODEL's units --------------------------------
+//
+// D3D_SHADER_MODEL encodes the version in two nibbles: 6.4 is 0x64, which is one
+// hundred as a decimal and *not* sixty-four. The port once stored 64 here while
+// the device answered 0x64, so a device that D3D12CreateDevice had already
+// created at feature level 11_0 was refused by the caps check ("device reports
+// SM 100 but the shaders are compiled for 64") and nothing ever reached the
+// swapchain. Every shader-model value below is this encoding and nothing else;
+// device.cpp static_asserts these against the SDK's own enumerators.
+inline constexpr std::uint32_t kShaderModel64 = 0x64u;  // D3D_SHADER_MODEL_6_4
+inline constexpr std::uint32_t kShaderModel68 = 0x68u;  // D3D_SHADER_MODEL_6_8
+
+// 0x64 -> 6.
+[[nodiscard]] constexpr std::uint32_t ShaderModelMajor(std::uint32_t shader_model) {
+    return shader_model >> 4;
+}
+
+// 0x64 -> 4: the digit in the profile's `_6_4`.
+[[nodiscard]] constexpr std::uint32_t ShaderModelMinor(std::uint32_t shader_model) {
+    return shader_model & 0xFu;
+}
+
+// "6.4": what a person reads.
+[[nodiscard]] inline std::string ShaderModelText(std::uint32_t shader_model) {
+    return std::to_string(ShaderModelMajor(shader_model)) + "." +
+           std::to_string(ShaderModelMinor(shader_model));
+}
+
+// "100 (0x64)": the decimal and the hex together, so a units mistake can never
+// be read as a version again.
+[[nodiscard]] inline std::string ShaderModelValues(std::uint32_t shader_model) {
+    char buffer[32] = {0};
+    std::snprintf(buffer, sizeof(buffer), "%u (0x%02X)", shader_model, shader_model);
+    return std::string(buffer);
+}
+
+// The one line the device logs when it compares what the hardware reports with
+// what the shaders were compiled for: the device's value, the expected value,
+// and both of them in hex on the same line.
+[[nodiscard]] inline std::string FormatShaderModelLine(std::uint32_t device_shader_model,
+                                                       std::uint32_t expected_shader_model) {
+    std::string line = "shader model: device=SM " + ShaderModelText(device_shader_model) + " " +
+                       ShaderModelValues(device_shader_model) + ", expected=SM " +
+                       ShaderModelText(expected_shader_model) + " " +
+                       ShaderModelValues(expected_shader_model) + ", adequate=";
+    line += device_shader_model >= expected_shader_model ? "1" : "0";
+    return line;
+}
 
 // The two devices the port can meet.
 enum class GpuClass : std::uint8_t {
@@ -28,7 +78,11 @@ struct Caps {
     GpuClass gpu_class = GpuClass::kXboxSeries;
     std::uint32_t feature_level_major = 11;
     std::uint32_t feature_level_minor = 0;
-    std::uint32_t shader_model = 64;   // 6.4
+    // What the shaders may target: the console's ceiling, 6.4 = 0x64.
+    std::uint32_t shader_model = kShaderModel64;
+    // What the device itself answered, before the ceiling was applied. This is
+    // the value the log quotes and the value the check reads.
+    std::uint32_t device_shader_model = kShaderModel64;
     std::uint32_t binding_tier = 3;    // descriptor tables, unbounded arrays
     std::uint32_t wave_lanes = 64;
     std::uint32_t max_group_shared_bytes = 32u << 10;  // G15
@@ -51,7 +105,8 @@ struct Caps {
     caps.gpu_class = GpuClass::kDesktop;
     caps.feature_level_major = 12;
     caps.feature_level_minor = 0;
-    caps.shader_model = 68;
+    caps.shader_model = kShaderModel68;
+    caps.device_shader_model = kShaderModel68;
     caps.native_16_bit = true;
     caps.descriptor_heap_indexing = true;
     caps.mesh_shaders = true;
@@ -64,8 +119,8 @@ struct Caps {
 
 // `ps_6_4` / `cs_6_4` / ... for the given caps. DXC's `-T` argument.
 [[nodiscard]] inline std::string ShaderTarget(const char* stage, const Caps& caps) {
-    return std::string(stage) + "_" + std::to_string(caps.shader_model / 10) + "_" +
-           std::to_string(caps.shader_model % 10);
+    return std::string(stage) + "_" + std::to_string(ShaderModelMajor(caps.shader_model)) + "_" +
+           std::to_string(ShaderModelMinor(caps.shader_model));
 }
 
 // What the compiler is allowed to use. `-enable-16bit-types` must never appear
@@ -104,8 +159,7 @@ struct CompileFlags {
     text += caps.gpu_class == GpuClass::kXboxSeries ? "Xbox Series (SraKmd_arden)" : "desktop";
     text += "; FL " + std::to_string(caps.feature_level_major) + "_" +
             std::to_string(caps.feature_level_minor);
-    text += "; SM " + std::to_string(caps.shader_model / 10) + "." +
-            std::to_string(caps.shader_model % 10);
+    text += "; SM " + ShaderModelText(caps.shader_model);
     text += "; binding tier " + std::to_string(caps.binding_tier);
     text += "; wave " + std::to_string(caps.wave_lanes);
     text += caps.native_16_bit ? "; 16-bit ALU" : "; no 16-bit ALU (lowered)";
@@ -124,10 +178,16 @@ struct CapsCheck {
 
 [[nodiscard]] inline CapsCheck Validate(const Caps& expected, const Caps& actual) {
     CapsCheck check;
-    if (actual.shader_model > expected.shader_model) {
+    // Both sides are D3D_SHADER_MODEL units (6.4 is 0x64). A device that reports
+    // newer than the shaders need is fine; one that reports older is a line in
+    // the log, not a refused device - device.cpp's QueryAndValidate says why.
+    if (actual.device_shader_model < expected.shader_model) {
         check.ok = false;
-        check.problem = "device reports SM " + std::to_string(actual.shader_model) +
-                        " but the shaders are compiled for " + std::to_string(expected.shader_model);
+        check.problem = "device reports SM " + ShaderModelText(actual.device_shader_model) + " (" +
+                        ShaderModelValues(actual.device_shader_model) +
+                        ") but the shaders are compiled for SM " +
+                        ShaderModelText(expected.shader_model) + " (" +
+                        ShaderModelValues(expected.shader_model) + ")";
     }
     if (expected.gpu_class == GpuClass::kXboxSeries && actual.pipeline_library) {
         check.ok = false;
