@@ -102,9 +102,18 @@ SelfTestResult RunMemorySelfTest(bool guest_arena_probe) {
     }
     if (guest_arena_probe) {
         bbx::guest::Arena& global = bbx::guest::GlobalArena();
-        result.guest_arena = result.guest_arena && global.base != nullptr &&
-                            (global.slide + global.size) <= bbx::guest::kAddressLimit;
-        result.guest_mib = bbx::guest::CommittedMib(global);
+        if (global.base != nullptr) {
+            result.guest_arena = result.guest_arena &&
+                                 (global.slide + global.size) <= bbx::guest::kAddressLimit;
+            result.guest_mib = bbx::guest::CommittedMib(global);
+        } else {
+            // No guest has been loaded this boot, which is the normal state when
+            // no dump folder has been chosen yet. The probe above is what the P0
+            // contract checks; failing the whole line for an arena nobody asked
+            // for reported "guest arena below 1 TiB: FAIL" on every boot without
+            // a game and hid the real result.
+            result.detail += "\n(global arena not allocated: no guest loaded this boot)";
+        }
     }
     result.detail += "\nguest arena below 1 TiB: ";
     result.detail += result.guest_arena ? "PASS" : "FAIL";
