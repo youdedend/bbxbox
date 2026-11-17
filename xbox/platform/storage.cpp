@@ -34,16 +34,6 @@ namespace {
 StorageInitResult g_storage;
 std::once_flag g_once;
 
-// GetFileAttributesExFromApp is the APP-partition way to ask about a path;
-// GetFileAttributesW is desktop-only.
-DWORD AttributesOf(const std::wstring& wide) {
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!::GetFileAttributesExFromAppW(wide.c_str(), GetFileExInfoStandard, &data)) {
-        return INVALID_FILE_ATTRIBUTES;
-    }
-    return data.dwFileAttributes;
-}
-
 std::wstring Widen(const std::string& text) {
     if (text.empty()) return {};
     const int need = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
