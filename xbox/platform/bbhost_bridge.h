@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // What the launcher asks of the guest's half of the port.
 //
-// Two things cross this line. The controller, because the launcher opens the one
-// the player holds and the game has to read the same pad; and the boot, because
-// the launcher's Start is the moment the guest is loaded, patched and given its
-// thread. Everything else in `platform/bbhost_bridge.cpp` answers bbhost's own
-// headers and is never named here.
+// Two things cross this line. The controller, which is Windows.Gaming.Input's on
+// both sides (the launcher's menus and the guest read the same Gamepads vector,
+// so nothing has to be handed over); and the boot, because the launcher's Start
+// is the moment the guest is loaded, patched and given its thread. Everything
+// else in `platform/bbhost_bridge.cpp` answers bbhost's own headers and is never
+// named here.
 #pragma once
 
 #include <cstdint>
 #include <string>
 
-struct SDL_Gamepad;
-
 namespace bbx::bridge {
-
-// The pad the launcher's event loop is reading. Called once when a controller
-// arrives; the game's reads translate it (host/window.h's PadState).
-void SetPad(SDL_Gamepad* pad);
 
 // Where the dump is, in the terms the HLE's file system wants: the folder with
 // eboot.bin, the update overlay when the player is running a patched build, the

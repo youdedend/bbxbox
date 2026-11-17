@@ -202,10 +202,13 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     Impl& impl = *impl_;
     impl.ready = false;
     if (core_window == nullptr) {
-        // Without a CoreWindow there is nothing to present into. The launcher
-        // treats this as "no GPU path" and falls back to SDL's renderer.
+        // Without a CoreWindow there is nothing to present into. There is no SDL
+        // fallback on this target: the launcher keeps its window up and reports
+        // this line once a second from its gate line.
         impl.report.status = d3d12::Status::kInvalidArgument;
-        LogMessage(Level::kWarn, "d3d12: no CoreWindow; the SDL renderer stays in use");
+        LogMessage(Level::kError,
+                   "d3d12: no CoreWindow was stored in SetWindow, so there is nothing to "
+                   "create a swapchain for; there is no SDL fallback on this target");
         return impl.report.status;
     }
 

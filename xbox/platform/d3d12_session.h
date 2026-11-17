@@ -21,8 +21,9 @@
 namespace bbx::platform {
 
 // What the launcher's boot report says about the GPU, in the strings it prints.
-// A failed creation is not an exception: the report carries the reason and the
-// session stays unusable, so the launcher falls back to SDL's renderer.
+// A failed creation is not an exception: the report carries the reason, the
+// session stays unusable, and the launcher keeps its window up with no SDL
+// fallback (SDL cannot initialise under UWP).
 struct GpuReport {
     bbx::d3d12::Status status = bbx::d3d12::Status::kUnavailable;
     bool ready = false;

@@ -537,4 +537,36 @@ TEST(BootSteps_AcquireGateLineReportsStepReadyFlagsAndUiBlocker) {
                          "ui_blocker=D3d12Session::Create"));
 }
 
+// There is no SDL fallback any more: a device that cannot be created is a fault
+// this line states in words, once a second, while the window stays up.
+TEST(BootSteps_AcquireGateLineStatesTheDisplayFaultWhenThereIsNoDevice) {
+    std::uint64_t now_ms = 1000;
+    std::vector<std::string> lines;
+    BootStepTracker tracker(
+        [&lines](Level, const std::string& line) { lines.push_back(line); },
+        [&now_ms]() { return now_ms; });
+
+    tracker.LauncherViewCreated();
+
+    AcquireGateSnapshot down;
+    down.acquire_entered = true;
+    down.display_ready = false;
+    down.stored_window_present = true;
+    down.visible = true;
+    down.visibility_events = 2;
+    down.ui_blocker = "display down (no D3D12 device)";
+    down.fault = "d3d12 unavailable (device lost)";
+
+    const std::string line = FormatAcquireGateLine(tracker.SnapshotStep(), down);
+    CHECK_EQ(line,
+             std::string("acquire-gate: entered=1 ready=0 step=1 (launcher view created) "
+                         "stored_window=1 visible=1 vis_events=2 "
+                         "ui_blocker=display down (no D3D12 device) "
+                         "fault=d3d12 unavailable (device lost)"));
+    // A healthy line carries no fault field at all.
+    AcquireGateSnapshot up;
+    up.display_ready = true;
+    CHECK(FormatAcquireGateLine(tracker.SnapshotStep(), up).find("fault=") == std::string::npos);
+}
+
 

@@ -452,6 +452,10 @@ struct AcquireGateSnapshot {
     bool visible = false;
     std::uint32_t visibility_events = 0;
     std::string ui_blocker;
+    // Why the display is not up, in plain English. Printed once a second for as
+    // long as it is set: there is no SDL fallback on this target, so a device
+    // that cannot be created must not turn into a silent window.
+    std::string fault;
 };
 
 [[nodiscard]] inline std::string FormatAcquireGateLine(const StepSnapshot& step,
@@ -472,6 +476,10 @@ struct AcquireGateSnapshot {
     line += std::to_string(gate.visibility_events);
     line += " ui_blocker=";
     line += gate.ui_blocker.empty() ? "none" : gate.ui_blocker;
+    if (!gate.fault.empty()) {
+        line += " fault=";
+        line += gate.fault;
+    }
     return line;
 }
 

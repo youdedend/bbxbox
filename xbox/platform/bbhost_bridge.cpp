@@ -4,7 +4,8 @@
 // bbhost is a desktop program: `main.cpp` opens an SDL window, a Vulkan
 // presenter and a pad, then hands the game a host API it calls into. This port
 // has none of that. The window belongs to the launcher (a CoreWindow), the
-// presenter is `d3d12_session`, and the pad arrives through SDL3-uwp. The
+// presenter is `d3d12_session`, and the pad arrives through WinRT
+// (Windows.Gaming.Input, in xbox/platform/main.cpp). The
 // archives are the same code, so they still call the API declared in their own
 // headers - `host/window.h`, `host/options.h`, `host/gpu.h` and the rest - and
 // something has to answer.
@@ -33,7 +34,12 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <SDL3/SDL.h>
+
+// No <SDL3/SDL.h>: SDL cannot initialise under UWP, so this target has no SDL
+// input stack at all. The pad is Windows.Gaming.Input's, read below, and it is
+// the same pad the launcher's menus read.
+#include <winrt/Windows.Gaming.Input.h>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #include "engine/graphics_patch.h"
 #include "engine/frame_rate.h"
@@ -81,17 +87,16 @@
 
 namespace {
 
-// The player's controller, handed in by the launcher's event loop. It is the
-// one the launcher opens for its own menus, so the pad the game reads and the
-// pad the launcher draws with can never be two different controllers.
-SDL_Gamepad* g_pad = nullptr;
+// The player's controller is the console's own: Windows.Gaming.Input hands the
+// launcher and the game the same Gamepads vector, so the pad the launcher draws
+// its menus with and the pad the guest reads can never be two different
+// controllers. There is no SetPad on this target and no SDL handle to keep.
 std::uint64_t g_flips = 0;
 
 }  // namespace
 
 namespace bbx::bridge {
 
-void SetPad(SDL_Gamepad* pad) { g_pad = pad; }
 std::uint64_t Flips() { return g_flips; }
 
 }  // namespace bbx::bridge
@@ -99,82 +104,100 @@ std::uint64_t Flips() { return g_flips; }
 // --- the controller --------------------------------------------------------
 // ScePadButtonDataOffset bits, as the HLE reports them - the same word
 // host/window.cpp builds from the desktop build's pad. The PS4's Cross is the
-// button at the bottom of the diamond, which is where SDL puts South on both an
-// Xbox and a Nintendo-layout pad, so South goes to Cross either way.
+// button at the bottom of the diamond, which is Windows.Gaming.Input's `A` on an
+// Xbox pad, so A goes to Cross.
 namespace {
 constexpr std::uint32_t kShare = 0x1, kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10,
                         kRight = 0x20, kDown = 0x40, kLeft = 0x80, kL2 = 0x100, kR2 = 0x200,
                         kL1 = 0x400, kR1 = 0x800, kTriangle = 0x1000, kCircle = 0x2000,
                         kCross = 0x4000, kSquare = 0x8000, kTouchPad = 0x100000;
+
+// 0..255 with 127 at rest, from the pad's -1.0..1.0. The rest value lands exactly
+// on kStickRest and not on 128 (host/window.h explains why that matters).
+std::uint8_t StickFromFloat(double value) {
+    if (value > 1.0) value = 1.0;
+    if (value < -1.0) value = -1.0;
+    const int scaled = static_cast<int>((value + 1.0) * 127.5 + 0.5);
+    return static_cast<std::uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
+}
+
+// A trigger is 0..1 on the pad and 0..255 here; `host/window.cpp` divides by 128
+// and treats 8000 as held, so the same scale is kept.
+std::uint8_t TriggerFromFloat(double value) {
+    if (value < 0.0) value = 0.0;
+    if (value > 1.0) value = 1.0;
+    const int scaled = static_cast<int>(value * 255.0 + 0.5);
+    return static_cast<std::uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
+}
 }  // namespace
 
 PadState host_pad_state() {
     PadState s;
-    SDL_Gamepad* pad = g_pad;
-    if (pad == nullptr) return s;
-    s.connected = true;
-    const auto held = [pad](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
-    const auto bit = [&s](bool down, std::uint32_t value) {
-        if (down) s.buttons |= value;
-    };
-    bit(held(SDL_GAMEPAD_BUTTON_SOUTH), kCross);
-    bit(held(SDL_GAMEPAD_BUTTON_EAST), kCircle);
-    bit(held(SDL_GAMEPAD_BUTTON_WEST), kSquare);
-    bit(held(SDL_GAMEPAD_BUTTON_NORTH), kTriangle);
-    bit(held(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER), kL1);
-    bit(held(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER), kR1);
-    bit(held(SDL_GAMEPAD_BUTTON_BACK), kShare);
-    bit(held(SDL_GAMEPAD_BUTTON_START), kOptions);
-    bit(held(SDL_GAMEPAD_BUTTON_LEFT_STICK), kL3);
-    bit(held(SDL_GAMEPAD_BUTTON_RIGHT_STICK), kR3);
-    bit(held(SDL_GAMEPAD_BUTTON_DPAD_UP), kUp);
-    bit(held(SDL_GAMEPAD_BUTTON_DPAD_DOWN), kDown);
-    bit(held(SDL_GAMEPAD_BUTTON_DPAD_LEFT), kLeft);
-    bit(held(SDL_GAMEPAD_BUTTON_DPAD_RIGHT), kRight);
+    try {
+        const auto pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads();
+        if (pads.Size() == 0) return s;
+        const winrt::Windows::Gaming::Input::Gamepad pad = pads.GetAt(0);
+        if (!pad) return s;
+        const winrt::Windows::Gaming::Input::GamepadReading reading = pad.GetCurrentReading();
+        const auto buttons = reading.Buttons;
+        const auto held = [buttons](winrt::Windows::Gaming::Input::GamepadButtons flag) {
+            return (buttons & flag) == flag;
+        };
+        using winrt::Windows::Gaming::Input::GamepadButtons;
+        s.connected = true;
+        const auto bit = [&s](bool down, std::uint32_t value) {
+            if (down) s.buttons |= value;
+        };
+        bit(held(GamepadButtons::A), kCross);
+        bit(held(GamepadButtons::B), kCircle);
+        bit(held(GamepadButtons::X), kSquare);
+        bit(held(GamepadButtons::Y), kTriangle);
+        bit(held(GamepadButtons::LeftShoulder), kL1);
+        bit(held(GamepadButtons::RightShoulder), kR1);
+        bit(held(GamepadButtons::View), kShare);
+        bit(held(GamepadButtons::Menu), kOptions);
+        bit(held(GamepadButtons::LeftThumbstick), kL3);
+        bit(held(GamepadButtons::RightThumbstick), kR3);
+        bit(held(GamepadButtons::DPadUp), kUp);
+        bit(held(GamepadButtons::DPadDown), kDown);
+        bit(held(GamepadButtons::DPadLeft), kLeft);
+        bit(held(GamepadButtons::DPadRight), kRight);
 
-    // Sticks: SDL reports -32768..32767 with y down; the pad reports 0..255 with
-    // 127 at rest, y down as well. The conversion is a shift, so the rest value
-    // lands on 127 and not on 128 (host/window.h explains why that matters).
-    const auto axis = [pad](SDL_GamepadAxis a) {
-        const Sint16 raw = SDL_GetGamepadAxis(pad, a);
-        const int scaled = (static_cast<int>(raw) + 32768) * 255 / 65535;
-        return static_cast<std::uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
-    };
-    s.lx = axis(SDL_GAMEPAD_AXIS_LEFTX);
-    s.ly = axis(SDL_GAMEPAD_AXIS_LEFTY);
-    s.rx = axis(SDL_GAMEPAD_AXIS_RIGHTX);
-    s.ry = axis(SDL_GAMEPAD_AXIS_RIGHTY);
-    // Triggers: SDL gives 0..32767, the pad 0..255 (host/window.cpp divides by
-    // 128 and treats 8000 as held).
-    const auto trigger = [pad](SDL_GamepadAxis a) {
-        const Sint16 raw = SDL_GetGamepadAxis(pad, a);
-        const int v = static_cast<int>(raw) / 128;
-        return static_cast<std::uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
-    };
-    s.l2 = trigger(SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-    s.r2 = trigger(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-    if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
-    if (s.r2 > 62) s.buttons |= kR2;
+        s.lx = StickFromFloat(reading.LeftThumbstickX);
+        s.ly = StickFromFloat(reading.LeftThumbstickY);
+        s.rx = StickFromFloat(reading.RightThumbstickX);
+        s.ry = StickFromFloat(reading.RightThumbstickY);
+        s.l2 = TriggerFromFloat(reading.LeftTrigger);
+        s.r2 = TriggerFromFloat(reading.RightTrigger);
+        if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
+        if (s.r2 > 62) s.buttons |= kR2;
 
-    // The touchpad: the controller's own surface, in its own pixels (kPadTouchW
-    // by kPadTouchH). SDL gives a finger in 0..1.
-    for (int finger = 0; finger < 2; ++finger) {
-        bool down = false;
-        float x = 0.0f, y = 0.0f, pressure = 0.0f;
-        if (!SDL_GetGamepadTouchpadFinger(pad, 0, finger, &down, &x, &y, &pressure)) continue;
-        if (!down) continue;
-        if (s.touch_count == 0) s.buttons |= kTouchPad;
-        PadState::Touch& t = s.touch[s.touch_count++];
-        t.x = static_cast<std::uint16_t>(x * static_cast<float>(kPadTouchW));
-        t.y = static_cast<std::uint16_t>(y * static_cast<float>(kPadTouchH));
-        t.id = static_cast<std::uint8_t>(finger + 1);
-        t.down = true;
+        // A GamepadReading carries no timestamp of its own; the pad reports
+        // microseconds and the guest only compares successive reads, so the
+        // launch-relative clock is the honest thing to hand it.
+        LARGE_INTEGER frequency{};
+        LARGE_INTEGER counter{};
+        ::QueryPerformanceFrequency(&frequency);
+        ::QueryPerformanceCounter(&counter);
+        if (frequency.QuadPart != 0) {
+            s.timestamp = static_cast<std::uint64_t>(
+                (counter.QuadPart * 1000000ull) / static_cast<std::uint64_t>(frequency.QuadPart));
+        }
+    } catch (...) {
+        // A pad that is unplugged between Gamepads() and GetCurrentReading()
+        // throws; the guest reads "no controller" for this frame and retries.
+        s.connected = false;
     }
-    s.timestamp = SDL_GetTicksNS() / 1000;  // the pad reports microseconds
     return s;
 }
 
-bool host_pad_present() { return g_pad != nullptr; }
+bool host_pad_present() {
+    try {
+        return winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0;
+    } catch (...) {
+        return false;
+    }
+}
 
 // The guest arena, published for the flip (StartGuest sets it once the image is
 // loaded; the guest is the only writer of what it points at).

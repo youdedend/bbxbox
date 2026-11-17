@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// P0: the shell. A WinRT view owns the CoreWindow, SDL3-uwp provides the window,
-// input, audio and gamepads, and the launcher runs on that thread until the
-// player starts the game (P1 hands the same thread to bbhost's guest).
+// P0: the shell. A C++/WinRT view owns the CoreWindow, D3D12 owns the television,
+// and the launcher runs on that thread until the player starts the game (P1 hands
+// the same thread to bbhost's guest).
 //
-// Why the view is C++/WinRT and not SDL's own app class: SDL3-uwp's app class is
-// C++/CX (/ZW) and the port's translation units are clang-cl (bbhost's guest
-// thunks need __attribute__((sysv_abi))). SDL3 is still the platform layer - the
-// window, the gamepad, the audio device and the text renderer all come from it -
-// it is only the activation object that the port provides. SDL3 is initialised
-// explicitly (`SDL_Init`), so there is no SDL main to set ready.
+// There is no SDL on this target, and there is no SDL fallback. SDL cannot
+// initialise under UWP - its video subsystem wants an SDL_main that a packaged
+// view provider does not have - so the window is the CoreWindow this view is
+// handed, the display is a D3D12 swapchain created for it, and the pad comes
+// from WinRT's Windows.Gaming.Input. A device that cannot be created is a
+// plain-English log line plus the once-a-second gate line, and the window stays
+// alive; it is never a reason to start a second renderer or to exit.
 #include <windows.h>
 
 // HSTRING and WindowsGetStringRawBuffer: the activation export takes a raw
@@ -25,7 +26,9 @@
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.ViewManagement.h>
 
-#include <SDL3/SDL.h>
+// No <SDL3/SDL.h>: nothing in this translation unit initialises SDL, opens an
+// SDL window, or draws with SDL_Renderer. The pad comes from WinRT (MaskFromPad)
+// and the frame from the D3D12 session.
 
 #include <algorithm>
 #include <atomic>
@@ -72,15 +75,13 @@ struct Session {
     bool quit = false;
     bool start_requested = false;
     std::string usb_token;
-    SDL_Window* window = nullptr;
-    // The console path: device, 4K swapchain, pipelines, replay and the HUD. When
-    // it comes up the SDL renderer is never created, because two renderers on one
-    // CoreWindow fight over the backbuffer. A failed creation leaves it null and
-    // the launcher draws with SDL exactly as before.
+    // The only renderer: device, 4K swapchain, pipelines, replay and the HUD. A
+    // failed creation leaves it null, which the launcher survives (the window stays
+    // up and the gate line keeps printing); there is no SDL renderer to fall to.
     std::unique_ptr<bbx::platform::D3d12Session> gpu;
-    SDL_Renderer* renderer = nullptr;
-    SDL_Gamepad* pad = nullptr;
-    bool sdl_inited = false;
+    // Why the display is not up, in plain English. Mirrored into g_display_fault
+    // (a static pointer) for the 1 Hz gate line.
+    std::string display_fault;
 };
 
 Session g_session;
@@ -93,11 +94,29 @@ std::atomic<std::uint32_t> g_visibility_events{0};
 std::atomic<bool> g_display_acquire_entered{false};
 std::atomic<bool> g_display_ready{false};
 std::atomic<const char*> g_ui_blocker{"none"};
+// Why the display is not up, for the gate line. A pointer to a static string, so
+// the 1 Hz watcher thread can read it without a lock and without touching a
+// std::string that ui-main is assigning.
+std::atomic<const char*> g_display_fault{""};
 std::atomic<std::uint64_t> g_present_count{0};
 
 void SetUiBlocker(const char* blocker) noexcept {
     g_ui_blocker.store(blocker != nullptr ? blocker : "none", std::memory_order_relaxed);
 }
+
+// The display's fault, as a pointer the watcher thread can read. The strings are
+// static literals or a small ring of buffers that ui-main owns, so the pointer is
+// valid for the life of the process and reading it never races a std::string.
+void SetDisplayFault(const std::string& fault) noexcept {
+    static char ring[4][160];
+    static std::atomic<unsigned> next{0};
+    const unsigned slot = next.fetch_add(1, std::memory_order_relaxed) % 4u;
+    char* buffer = ring[slot];
+    std::snprintf(buffer, sizeof(ring[slot]), "%s", fault.c_str());
+    g_display_fault.store(buffer, std::memory_order_relaxed);
+}
+
+void ClearDisplayFault() noexcept { g_display_fault.store("", std::memory_order_relaxed); }
 
 // Process-lifetime boot step + heartbeat tracker: heap-owned so App::~App() and
 // std::atexit handlers never race static destruction order.
@@ -338,6 +357,10 @@ public:
                       g_visibility_events.load(std::memory_order_relaxed);
                   const char* blocker = g_ui_blocker.load(std::memory_order_relaxed);
                   gate.ui_blocker = blocker != nullptr ? blocker : "none";
+                  // A static string owned by the display code, so reading it here
+                  // cannot race a std::string assignment on ui-main.
+                  const char* fault = g_display_fault.load(std::memory_order_relaxed);
+                  gate.fault = fault != nullptr ? fault : "";
                   const std::string line =
                       bbx::platform::FormatAcquireGateLine(Steps().SnapshotStep(), gate);
                   bbx::platform::LogMirroredMessage(bbx::platform::Level::kWarn, "%s",
@@ -369,7 +392,10 @@ private:
     std::thread thread_;
 };
 
-bbx::platform::ButtonMask MaskFromWinrtPad() {
+// The player's controller, read from WinRT. There is no SDL pad: SDL never
+// initialises on this target, and Windows.Gaming.Input is what the console
+// actually exposes to a packaged app.
+bbx::platform::ButtonMask MaskFromPad() {
     using bbx::platform::Bit;
     using winrt::Windows::Gaming::Input::Gamepad;
     using winrt::Windows::Gaming::Input::GamepadButtons;
@@ -397,28 +423,6 @@ bbx::platform::ButtonMask MaskFromWinrtPad() {
         if (has(GamepadButtons::DPadRight)) mask |= Bit(Pad::kDpadRight);
     } catch (...) {
     }
-    return mask;
-}
-
-bbx::platform::ButtonMask MaskFromPad(SDL_Gamepad* pad) {
-    using bbx::platform::Bit;
-    bbx::platform::ButtonMask mask = MaskFromWinrtPad();
-    if (pad == nullptr) return mask;
-    const auto down = [pad](SDL_GamepadButton button) { return SDL_GetGamepadButton(pad, button); };
-    if (down(SDL_GAMEPAD_BUTTON_SOUTH)) mask |= Bit(Pad::kSouth);
-    if (down(SDL_GAMEPAD_BUTTON_EAST)) mask |= Bit(Pad::kEast);
-    if (down(SDL_GAMEPAD_BUTTON_WEST)) mask |= Bit(Pad::kWest);
-    if (down(SDL_GAMEPAD_BUTTON_NORTH)) mask |= Bit(Pad::kNorth);
-    if (down(SDL_GAMEPAD_BUTTON_BACK)) mask |= Bit(Pad::kView);
-    if (down(SDL_GAMEPAD_BUTTON_START)) mask |= Bit(Pad::kMenu);
-    if (down(SDL_GAMEPAD_BUTTON_LEFT_STICK)) mask |= Bit(Pad::kLeftStick);
-    if (down(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) mask |= Bit(Pad::kRightStick);
-    if (down(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) mask |= Bit(Pad::kLeftBumper);
-    if (down(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) mask |= Bit(Pad::kRightBumper);
-    if (down(SDL_GAMEPAD_BUTTON_DPAD_UP)) mask |= Bit(Pad::kDpadUp);
-    if (down(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) mask |= Bit(Pad::kDpadDown);
-    if (down(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) mask |= Bit(Pad::kDpadLeft);
-    if (down(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) mask |= Bit(Pad::kDpadRight);
     return mask;
 }
 
@@ -512,14 +516,14 @@ void OnAction(PadAction action) {
         }
     }
 
+    // No rumble call here: the pad belongs to WinRT on this target and a launcher
+    // menu does not need haptics badly enough to initialise a second input stack.
     switch (action) {
     case PadAction::kNavigateUp:
         g_session.model.Move(-1);
-        if (g_session.pad) SDL_RumbleGamepad(g_session.pad, 0x2000, 0x2000, 40);
         return;
     case PadAction::kNavigateDown:
         g_session.model.Move(1);
-        if (g_session.pad) SDL_RumbleGamepad(g_session.pad, 0x2000, 0x2000, 40);
         return;
     case PadAction::kMenu:
         g_session.keyboard_open = true;
@@ -527,7 +531,6 @@ void OnAction(PadAction action) {
         return;
     case PadAction::kOpenPcSettings:
         bbx::platform::LogF("PC settings menu requested (L3+R3)");
-        if (g_session.pad) SDL_RumbleGamepad(g_session.pad, 0x8000, 0x8000, 120);
         return;
     case PadAction::kPersonalEffects:
         bbx::platform::LogF("personal effects requested (touchpad)");
@@ -657,11 +660,10 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     }
 }
 
-void DrawLauncher();
-
-// One frame of whichever renderer owns the window. The GPU path draws the boot
-// report and launcher menu; a present that fails (a removed device) falls back
-// to SDL once and logs why, rather than presenting into a dead swapchain every frame.
+// One frame, drawn by the only renderer this target has. When the device is not
+// up - or a present fails because it went away - the loop keeps running and the
+// 1 Hz gate line keeps printing why; there is no second renderer to fall back to
+// and no reason to exit.
 void DrawFrame() {
     if (g_session.gpu) {
         bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
@@ -672,76 +674,28 @@ void DrawFrame() {
             (void)Steps().FirstFramePresented();
             return;
         }
+        g_session.display_fault = std::string("present failed (") +
+                                  bbx::d3d12::StatusName(status) + ")";
+        SetDisplayFault(g_session.display_fault);
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kError,
-            "d3d12: present failed (%s); SDL fallback requested",
+            "d3d12: present failed (%s); the window stays up and the gate line keeps "
+            "reporting, with no SDL fallback",
             bbx::d3d12::StatusName(status));
+        // A removed device is not a renderer problem: drop the session, keep the
+        // window and the loop, and say why once per second from the gate line.
         g_session.gpu->Destroy();
         g_session.gpu.reset();
-        if (g_session.renderer == nullptr && g_session.window != nullptr) {
-            g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
-            if (g_session.renderer == nullptr) {
-                bbx::platform::LogF("SDL_CreateRenderer after D3D12: %s", SDL_GetError());
-            }
-        }
+        SetUiBlocker("display down (no D3D12 device)");
     }
-    DrawLauncher();
 }
 
-void DrawLauncher() {
-    if (g_session.renderer == nullptr) return;
-    const std::string caption = g_session.model.Title();
-    SDL_SetRenderDrawColor(g_session.renderer, 12, 14, 18, 255);
-    SDL_RenderClear(g_session.renderer);
-
-    float y = 24.0f;
-    SDL_SetRenderDrawColor(g_session.renderer, 226, 226, 226, 255);
-    SDL_RenderDebugText(g_session.renderer, 24.0f, y, caption.c_str());
-    y += 26.0f;
-
-    for (const std::string& line : WrapLines(g_session.model.Footer())) {
-        SDL_RenderDebugText(g_session.renderer, 24.0f, y, line.c_str());
-        y += 16.0f;
-    }
-    y += 12.0f;
-
-    if (g_session.keyboard_open) {
-        SDL_SetRenderDrawColor(g_session.renderer, 220, 200, 120, 255);
-        const std::string name = "Hunter name: " + g_session.keyboard.Text();
-        SDL_RenderDebugText(g_session.renderer, 24.0f, y, name.c_str());
-        y += 24.0f;
-        for (std::size_t row = 0; row < g_session.keyboard.RowCount(); ++row) {
-            std::string label = g_session.keyboard.Row(row);
-            if (row == g_session.keyboard.CursorRow()) {
-                const std::size_t column = g_session.keyboard.CursorColumn() * 2;
-                if (column < label.size()) label[column] = '>';
-            }
-            SDL_SetRenderDrawColor(g_session.renderer, 200, 200, 200, 255);
-            SDL_RenderDebugText(g_session.renderer, 48.0f, y, label.c_str());
-            y += 14.0f;
-        }
-    } else {
-        for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
-            const bbx::platform::Item& item = g_session.model.items[i];
-            const bool selected = i == g_session.model.selected;
-            const bool enabled = item.enabled;
-            SDL_SetRenderDrawColor(g_session.renderer, enabled ? (selected ? 255 : 190) : 90,
-                                    enabled ? (item.dangerous ? 180 : (selected ? 255 : 190)) : 90,
-                                    enabled ? (selected ? 255 : 190) : 90, 255);
-            const std::string text = std::string(selected ? "> " : "  ") + item.label;
-            SDL_RenderDebugText(g_session.renderer, 24.0f, y, text.c_str());
-            y += 18.0f;
-        }
-    }
-    SDL_RenderPresent(g_session.renderer);
-    g_present_count.fetch_add(1, std::memory_order_relaxed);
-    (void)Steps().FirstFramePresented();
-}
-
-// Acquires the console's D3D12 display directly on the CoreWindow stored in
-// SetWindow (Point 5: never re-fetched via CoreWindow::GetForCurrentThread),
-// without gating on SDL_INIT_VIDEO or SDL_CreateWindow. Falls back to SDL's 2D
-// renderer only when D3D12 cannot come up.
+// Acquires the console's display on the CoreWindow stored in SetWindow (never
+// re-fetched via CoreWindow::GetForCurrentThread) and on nothing else: no
+// SDL_Init, no SDL_CreateWindow, no SDL renderer. SDL cannot initialise under
+// UWP, so a fallback to it is not a fallback - it is a guaranteed failure that
+// hides the real reason. When D3D12 cannot come up the reason is logged in plain
+// English, the window stays alive, and the 1 Hz gate line keeps saying so.
 bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
     IUnknown* window_abi = nullptr;
     std::uint32_t window_width = 1920;
@@ -778,79 +732,64 @@ bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
         if (!report.guest.empty()) {
             bbx::platform::LogF("d3d12: %s", report.guest.c_str());
         }
+        g_session.display_fault.clear();
+        ClearDisplayFault();
         g_display_ready.store(true, std::memory_order_relaxed);
         SetUiBlocker("none");
         Steps().DisplayAcquired("d3d12");
         return true;
     }
 
+    // No SDL fallback exists on this target. Say what failed, in words, and leave
+    // the window up: the loop below keeps pumping the dispatcher and the gate line
+    // reports the same line once a second.
+    g_session.display_fault = std::string("d3d12 unavailable (") +
+                              bbx::d3d12::StatusName(status) + ")";
+    SetDisplayFault(g_session.display_fault);
     bbx::platform::LogMirroredMessage(
         bbx::platform::Level::kError,
-        "d3d12: unavailable (%s); attempting SDL renderer fallback",
+        "display: the D3D12 display could not be acquired (%s). This console build "
+        "has no SDL fallback - SDL cannot initialise under UWP - so the window stays "
+        "up and the gate line below repeats this once a second.",
         bbx::d3d12::StatusName(status));
+    if (!stored_window) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kError,
+            "display: no CoreWindow was ever stored in SetWindow, so there is nothing "
+            "to create a swapchain for");
+    }
+    if (g_session.gpu) {
+        const bbx::platform::GpuReport& report = g_session.gpu->Report();
+        if (!report.adapter.empty() || !report.swapchain.empty()) {
+            bbx::platform::LogMirroredMessage(bbx::platform::Level::kError,
+                                              "display: adapter \"%s\", swapchain \"%s\"",
+                                              report.adapter.c_str(),
+                                              report.swapchain.c_str());
+        }
+    }
     g_session.gpu.reset();
-
-    SetUiBlocker("SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD)");
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_Init: %s",
-                                          SDL_GetError());
-        SetUiBlocker("none");
-        return false;
-    }
-    g_session.sdl_inited = true;
-    SetUiBlocker("SDL_CreateWindow");
-    g_session.window = SDL_CreateWindow("bbxbox", 1920, 1080, SDL_WINDOW_FULLSCREEN);
-    if (g_session.window == nullptr) {
-        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_CreateWindow: %s",
-                                          SDL_GetError());
-        SetUiBlocker("none");
-        return false;
-    }
-    SetUiBlocker("SDL_CreateRenderer");
-    g_session.renderer = SDL_CreateRenderer(g_session.window, nullptr);
-    if (g_session.renderer == nullptr) {
-        bbx::platform::LogMirroredMessage(bbx::platform::Level::kError, "SDL_CreateRenderer: %s",
-                                          SDL_GetError());
-        SetUiBlocker("none");
-        return false;
-    }
-    const char* renderer_name = SDL_GetRendererName(g_session.renderer);
-    const char* display_backend = renderer_name ? renderer_name : "sdl";
-    g_display_ready.store(true, std::memory_order_relaxed);
-    SetUiBlocker("none");
-    Steps().DisplayAcquired(display_backend);
-    return true;
+    SetUiBlocker("display down (no D3D12 device)");
+    g_display_ready.store(false, std::memory_order_relaxed);
+    return false;
 }
 
 void InitGamepadInput() {
-    if (!g_session.sdl_inited) {
-        if (SDL_Init(SDL_INIT_GAMEPAD)) {
-            g_session.sdl_inited = true;
-        } else {
-            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                      "SDL_Init(SDL_INIT_GAMEPAD): %s (WinRT Gamepad active)",
-                                      SDL_GetError());
-        }
-    }
-    if (g_session.sdl_inited && g_session.pad == nullptr) {
-        int pads = 0;
-        SDL_JoystickID* ids = SDL_GetGamepads(&pads);
-        if (ids != nullptr && pads > 0) {
-            g_session.pad = SDL_OpenGamepad(ids[0]);
-            if (g_session.pad != nullptr) bbx::bridge::SetPad(g_session.pad);
-        }
-        SDL_free(ids);
-    }
     unsigned winrt_pads = 0;
     try {
         winrt_pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size();
-    } catch (...) {
+    } catch (const winrt::hresult_error& err) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "input: Windows.Gaming.Input threw 0x%08x while listing gamepads",
+            static_cast<unsigned>(err.code().value));
     }
-    bbx::platform::LogF("input: sdl_gamepad=%d winrt_gamepads=%u",
-                        g_session.pad ? 1 : 0, winrt_pads);
+    bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo,
+                                      "input: winrt_gamepads=%u (no SDL input stack)", winrt_pads);
 }
 
-void ShutdownSdl() {
+// Only the device and the swapchain go away here: there is no SDL window, pad or
+// renderer to shut down.
+void ShutdownDisplay() {
     if (g_session.gpu) {
         // Waits for the GPU before the device and the swapchain go away: a released
         // swapchain with a frame in flight is a device-removed in the log.
@@ -858,22 +797,7 @@ void ShutdownSdl() {
         g_session.gpu->Destroy();
         g_session.gpu.reset();
     }
-    if (g_session.pad) {
-        SDL_CloseGamepad(g_session.pad);
-        g_session.pad = nullptr;
-    }
-    if (g_session.renderer) {
-        SDL_DestroyRenderer(g_session.renderer);
-        g_session.renderer = nullptr;
-    }
-    if (g_session.window) {
-        SDL_DestroyWindow(g_session.window);
-        g_session.window = nullptr;
-    }
-    if (g_session.sdl_inited) {
-        SDL_Quit();
-        g_session.sdl_inited = false;
-    }
+    g_display_ready.store(false, std::memory_order_relaxed);
 }
 
 void LoadSettings() {
@@ -1200,22 +1124,25 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         }
 
         RefreshLauncher();
-        if (!AcquireDisplay(stored_window)) {
-            bbx::platform::LogMirroredMessage(
-                bbx::platform::Level::kError, "display: acquisition failed; exiting");
-            acquire_watch.Stop();
-            telemetry.Stop();
-            Steps().UnregisterThread(ui_tid);
-            bbx::platform::LogFlush();
-            return;
-        }
 
-        // Present the initial frame immediately so step 3 fires and PLM sees an
-        // active swapchain before any background self-test or USB dump scan runs.
-        SetUiBlocker("first DrawFrame");
-        DrawFrame();
-        SetUiBlocker("none");
-        acquire_watch.Stop();
+        // The display comes up (or does not) with no SDL in the path. A failure is
+        // not fatal and never a fallback: the window stays up and the acquire
+        // watch below keeps printing the reason once a second.
+        const bool display_up = AcquireDisplay(stored_window);
+        if (display_up) {
+            // Present the initial frame immediately so step 3 fires and PLM sees an
+            // active swapchain before any background self-test or USB dump scan runs.
+            SetUiBlocker("first DrawFrame");
+            DrawFrame();
+            SetUiBlocker("none");
+        } else {
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kError,
+                "display: staying up without a swapchain (%s); the gate line repeats "
+                "this once a second until the window closes",
+                g_session.display_fault.empty() ? "no device" : g_session.display_fault.c_str());
+        }
+        if (display_up) acquire_watch.Stop();
 
         InitGamepadInput();
         {
@@ -1239,28 +1166,10 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 stored_window.Dispatcher().ProcessEvents(
                     winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
             }
-            if (g_session.sdl_inited) {
-                SDL_Event event;
-                while (SDL_PollEvent(&event)) {
-                    if (event.type == SDL_EVENT_QUIT) g_session.quit = true;
-                    if (event.type == SDL_EVENT_GAMEPAD_ADDED && g_session.pad == nullptr) {
-                        g_session.pad = SDL_OpenGamepad(event.gdevice.which);
-                        // The same pad the launcher draws its menus with is the one
-                        // the game reads (platform/bbhost_bridge.cpp).
-                        bbx::bridge::SetPad(g_session.pad);
-                    }
-                    if (event.type == SDL_EVENT_KEY_DOWN && g_session.keyboard_open) {
-                        if (event.key.key == SDLK_BACKSPACE) g_session.keyboard.Backspace();
-                        else if (event.key.key == SDLK_RETURN)
-                            OnAction(PadAction::kConfirm);
-                        else if (event.key.key >= 0x20 && event.key.key < 0x7f)
-                            g_session.keyboard.Append(static_cast<char>(event.key.key));
-                    }
-                }
-            }
             if (g_window_closed.load(std::memory_order_relaxed)) break;
 
-            const bbx::platform::ButtonMask held = MaskFromPad(g_session.pad);
+            // The pad is WinRT's; there is no SDL event queue on this target.
+            const bbx::platform::ButtonMask held = MaskFromPad();
             bbx::platform::PadEdges edges;
             edges.held = held;
             edges.pressed = held & ~previous;
@@ -1296,7 +1205,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         acquire_watch.Stop();
         telemetry.Stop();
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
-        ShutdownSdl();
+        ShutdownDisplay();
         Steps().UnregisterThread(ui_tid);
         bbx::platform::LogFlush();
     }
