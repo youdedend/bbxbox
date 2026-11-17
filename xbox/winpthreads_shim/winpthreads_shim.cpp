@@ -479,10 +479,12 @@ int pthread_cond_destroy(pthread_cond_t* cond) {
 
 namespace {
 
-// The wait itself: the mutex's full recursion count is dropped, the caller
-// sleeps on the condition variable, and the count comes back as it was. A
-// recursive mutex held twice must still be held twice on return - the guest's
-// `scePthreadCondWait` inherits that from libc.
+// The wait itself: `SleepConditionVariableSRW` requires `&m->srw` to be held
+// exclusively on entry, atomically releases it while sleeping, and re-acquires
+// it before returning (even on timeout). Drop the logical owner/recursion count
+// while keeping `&m->srw` held so another thread can acquire the mutex cleanly
+// while we sleep, then restore the full recursion count once `&m->srw` is ours
+// again.
 int cond_wait_impl(pthread_cond_t* cond, pthread_mutex_t* mutex, const struct timespec* abstime) {
     Mutex* m = mutex_ensure(mutex);
     Cond* c = cond_ensure(cond);
@@ -490,28 +492,22 @@ int cond_wait_impl(pthread_cond_t* cond, pthread_mutex_t* mutex, const struct ti
     if (m->owner != GetCurrentThreadId()) return EPERM;
     const unsigned held = m->count;
     const DWORD me = GetCurrentThreadId();
-    m->count = 1;
-    m->owner = 0;
-    ReleaseSRWLockExclusive(&m->srw);
-    BOOL ok = TRUE;
-    bool slept = true;
-    if (abstime == nullptr) {
-        ok = SleepConditionVariableSRW(&c->cv, &m->srw, INFINITE, 0);
-    } else {
+    if (abstime != nullptr) {
         const long long ms = ms_until(abstime);
         if (ms <= 0) {
-            // Already past the deadline: return without sleeping. The lock is
-            // taken back below, which is what a timed wait guarantees.
-            ok = FALSE;
-            slept = false;
-        } else {
-            ok = SleepConditionVariableSRW(&c->cv, &m->srw, static_cast<DWORD>(ms > 0x7fffffff ? 0x7fffffff : ms), 0);
+            return ETIMEDOUT;
         }
+        m->count = 0;
+        m->owner = 0;
+        const BOOL ok = SleepConditionVariableSRW(
+            &c->cv, &m->srw, static_cast<DWORD>(ms > 0x7fffffff ? 0x7fffffff : ms), 0);
+        m->owner = me;
+        m->count = held;
+        return ok ? 0 : ETIMEDOUT;
     }
-    // `SleepConditionVariableSRW` re-acquires the lock before returning,
-    // including on a timeout, so only the path that never called it takes the
-    // lock here (an SRW lock is not recursive: taking it twice would hang).
-    if (!slept) AcquireSRWLockExclusive(&m->srw);
+    m->count = 0;
+    m->owner = 0;
+    const BOOL ok = SleepConditionVariableSRW(&c->cv, &m->srw, INFINITE, 0);
     m->owner = me;
     m->count = held;
     return ok ? 0 : ETIMEDOUT;
@@ -645,8 +641,9 @@ struct Waiter {
 void* cond_worker(void* arg) {
     auto* w = static_cast<Waiter*>(arg);
     pthread_mutex_lock(&w->m);
-    while (w->stage == 0) pthread_cond_wait(&w->c, &w->m);
-    w->stage = 2;
+    w->stage = 1;
+    while (w->stage == 1) pthread_cond_wait(&w->c, &w->m);
+    w->stage = 3;
     pthread_mutex_unlock(&w->m);
     return nullptr;
 }
@@ -729,19 +726,21 @@ int SelfTest(char* why, std::size_t len) {
     pthread_cond_init(&w.c, nullptr);
     pthread_t cw = nullptr;
     if (pthread_create(&cw, &attr, cond_worker, &w) != 0) return fail(why, len, "cond_create"), 14;
+    bool waiter_asleep = false;
     for (int spin = 0; spin < 2000; ++spin) {
         pthread_mutex_lock(&w.m);
-        const int stage = w.stage;
+        waiter_asleep = (w.stage == 1);
         pthread_mutex_unlock(&w.m);
-        if (stage == 0) break;  // the waiter is asleep (or about to be)
+        if (waiter_asleep) break;
         Sleep(1);
     }
+    if (!waiter_asleep) return fail(why, len, "cond_enter"), 14;
     pthread_mutex_lock(&w.m);
-    w.stage = 1;
+    w.stage = 2;
     pthread_cond_signal(&w.c);
     pthread_mutex_unlock(&w.m);
     pthread_join(cw, nullptr);
-    if (w.stage != 2) return fail(why, len, "cond_wake"), 15;
+    if (w.stage != 3) return fail(why, len, "cond_wake"), 15;
 
     Waiter tw{nullptr, nullptr, 0};
     pthread_mutex_init(&tw.m, nullptr);
