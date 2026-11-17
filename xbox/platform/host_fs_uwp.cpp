@@ -25,7 +25,9 @@
 // read` was. Everything below keeps the FromApp path as the fast path - it
 // works for LocalState, TemporaryFolder, RoamingState and the package - and
 // falls back to WinRT with its own handle table when it is refused.
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Storage.FileProperties.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Storage.h>
 
@@ -255,7 +257,9 @@ bool ListRt(const std::string& path, std::vector<DirEntry>* out) {
         const winrt::Windows::Foundation::Collections::IVectorView<
             winrt::Windows::Storage::IStorageItem>
             children = folder.GetItemsAsync().get();
-        for (const auto& child : children) {
+        const std::uint32_t count = children.Size();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const winrt::Windows::Storage::IStorageItem child = children.GetAt(i);
             DirEntry entry;
             entry.name = HstringToUtf8(child.Name());
             entry.is_dir = child.IsOfType(winrt::Windows::Storage::StorageItemTypes::Folder);
