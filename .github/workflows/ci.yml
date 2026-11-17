@@ -279,8 +279,8 @@ jobs:
       - name: rolling Xbox release
         # One direct download link for the box: the appx, its certificate and the
         # Dependencies folder the title's CRT needs, in one zip, on a tag that says
-        # which build it is. Prerelease, because nothing here is a boot.
-        if: github.event_name == 'push'
+        # which arena/** commit it came from. Prerelease, because nothing here is a boot.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/arena/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -295,7 +295,7 @@ jobs:
           $map = Get-ChildItem -Path build/xbox -Recurse -Filter bbxbox.map -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($map) { Compress-Archive -Path $map.FullName -DestinationPath $zip -Update }
           $body = @"
-          Unsigned-trust UWP build of bbxbox for Xbox Series X|S, made from ${{ github.sha }}.
+          Unsigned-trust UWP build of bbxbox for Xbox Series X|S, made from ${{ github.sha }} (${{ github.ref_name }}).
 
           **Install the Microsoft.VCLibs.140.00.UWPDesktop framework package first**
           (it is in `Dependencies/` inside the zip, and the app will not launch without
@@ -305,7 +305,13 @@ jobs:
           This is a prerelease: it packages the port, and it does not claim the game
           boots. The build's own gates are in the run that produced it.
           "@
-          gh release create $tag $zip --prerelease --title $tag --notes $body
+          $same = gh release list --limit 100 --json tagName |
+            ConvertFrom-Json |
+            Where-Object { $_.tagName -eq $tag }
+          foreach ($s in $same) {
+            gh release delete $s.tagName --yes --cleanup-tag
+          }
+          gh release create $tag $zip --target "${{ github.sha }}" --prerelease --title $tag --notes $body
           # Rolling: the previous builds go, so the tag list is one link and not a
           # museum. Only this repository's own pre-release tags are pruned.
           $old = gh release list --limit 100 --json tagName,isPrerelease |
