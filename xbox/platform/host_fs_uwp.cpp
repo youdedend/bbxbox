@@ -194,7 +194,8 @@ public:
     StorageWorker() : thread_([this]() { Run(); }) { thread_.detach(); }
 
     int RunSync(const std::function<void()>& body) {
-        Job job{&body};
+        Job job;
+        job.body = &body;
         {
             std::lock_guard<std::mutex> lock(mu_);
             queue_.push_back(&job);
