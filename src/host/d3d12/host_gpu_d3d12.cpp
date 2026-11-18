@@ -157,9 +157,9 @@ GuestGpuCounts GuestGpuStats() {
     return counters().published;
 }
 
-std::string GuestGpuReport() {
-    std::lock_guard<std::mutex> lock(mutex());
-    const Counters& c = counters();
+namespace {
+
+std::string FormatGuestGpuReportLocked(const Counters& c) {
     char line[512];
     std::snprintf(line, sizeof(line),
                   "guest gpu: %llu dispatch(es) (%llu dispatched, %llu cache miss, %llu no pipeline, %llu no device, "
@@ -172,9 +172,16 @@ std::string GuestGpuReport() {
     return line;
 }
 
+}  // namespace
+
+std::string GuestGpuReport() {
+    std::lock_guard<std::mutex> lock(mutex());
+    return FormatGuestGpuReportLocked(counters());
+}
+
 std::string GuestDispatchReport() {
     std::lock_guard<std::mutex> lock(mutex());
-    std::string out = GuestGpuReport();
+    std::string out = FormatGuestGpuReportLocked(counters());
     for (const auto& [key, why] : counters().refused) {
         char line[128];
         std::snprintf(line, sizeof(line), "\n  key %016llx: %s", static_cast<unsigned long long>(key), RefusalName(why));

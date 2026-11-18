@@ -102,10 +102,17 @@ public:
                         float v1, const float rgba[4]);
     void AddOverlaySolid(float x, float y, float width, float height, const float rgba[4]);
 
+    // Permanent CBV/SRV/UAV descriptor slots owned by Replay at the start of the
+    // device's single shader-visible heap; the guest descriptor arena begins after
+    // this block so the two never overlap.
+    static constexpr std::uint32_t kReservedCbvSrvUavDescriptors = 16;
+
     // The untiling compute pass: one Dispatch per planned tile row block, with the
     // plan's own group counts (bbx_untile decides them, not this file).
     Status DispatchUntile(const UntilePlan& plan, ID3D12Resource* tiled_source,
-                          ID3D12Resource* linear_destination, std::uint32_t bytes_per_tile);
+                          std::uint64_t source_bytes, ID3D12Resource* linear_destination,
+                          std::uint64_t destination_bytes, std::uint32_t bytes_per_tile,
+                          bool source_is_upload = false);
 
     Status EndFrame(bool vsync);
 
@@ -162,6 +169,8 @@ private:
     Slice frame_srv_{};
     Slice atlas_srv_{};
     Slice white_srv_{};
+    Slice untile_srv_{};
+    Slice untile_uav_{};
 
     ComPtr<ID3D12Resource> overlay_vertices_;
     void* overlay_mapped_ = nullptr;

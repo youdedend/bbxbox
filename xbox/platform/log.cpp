@@ -77,7 +77,7 @@ void WriteAndFlush(int handle, const char* text) {
 }
 
 // The handler must not allocate or lock: take the mutex only if it is free.
-void WriteRaw(const char* text, bool also_errors = false) {
+void WriteRaw(const char* text, bool also_errors = false, bool to_debugger = true) {
     WriteAndFlush(g_file, text);
     if (also_errors) WriteAndFlush(g_errors, text);
     if (g_mirror >= 0 || (also_errors && g_mirror_errors >= 0)) {
@@ -87,7 +87,7 @@ void WriteRaw(const char* text, bool also_errors = false) {
             if (also_errors) WriteAndFlush(g_mirror_errors, text);
         }
     }
-    ::OutputDebugStringA(text);
+    if (to_debugger) ::OutputDebugStringA(text);
 }
 
 // --- the crash report ------------------------------------------------------
@@ -197,6 +197,12 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
         record != nullptr ? record->ExceptionAddress : nullptr);
     std::size_t used = 0;
     const std::size_t cap = sizeof(g_report);
+    auto advance = [&](int n) {
+        if (n <= 0) return;
+        const std::size_t avail = cap > used ? cap - used - 1 : 0;
+        const std::size_t added = static_cast<std::size_t>(n);
+        used += added < avail ? added : avail;
+    };
 
     char at[192];
     DescribePc(fault, at, sizeof(at));
@@ -204,7 +210,7 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
                               "\n! %s code=0x%08lx at %s (0x%llx)\n", lead,
                               record != nullptr ? record->ExceptionCode : 0ul, at,
                               static_cast<unsigned long long>(fault));
-    if (wrote > 0) used = static_cast<std::size_t>(wrote);
+    advance(wrote);
 
     if (record != nullptr && record->NumberParameters >= 2 &&
         (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
@@ -216,7 +222,7 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
         wrote = std::snprintf(g_report + used, cap - used, "  %s of 0x%llx%s\n",
                               FaultKind(record->ExceptionInformation[0]),
                               static_cast<unsigned long long>(address), target);
-        if (wrote > 0) used += static_cast<std::size_t>(wrote);
+        advance(wrote);
     }
 
     if (context != nullptr) {
@@ -244,12 +250,12 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
                               static_cast<unsigned long long>(context->R13),
                               static_cast<unsigned long long>(context->R14),
                               static_cast<unsigned long long>(context->R15));
-        if (wrote > 0) used += static_cast<std::size_t>(wrote);
+        advance(wrote);
         wrote = std::snprintf(g_report + used, cap - used, "  stack:\n");
-        if (wrote > 0) used += static_cast<std::size_t>(wrote);
+        advance(wrote);
         const int frames = AppendFrames(*context, g_report, cap, &used);
         wrote = std::snprintf(g_report + used, cap - used, "  (%d of 32 frame(s))\n", frames);
-        if (wrote > 0) used += static_cast<std::size_t>(wrote);
+        advance(wrote);
     }
 
     wrote = std::snprintf(g_report + used, cap - used,
@@ -257,7 +263,11 @@ void ReportFault(const EXCEPTION_POINTERS* info, const char* lead) {
                           g_crumb[0] != '\0' ? g_crumb : "(nothing recorded)",
                           g_device_removed ? "removed" : "present",
                           g_device_removed ? "" : " ", g_last_line);
-    if (wrote < 0) g_report[used] = '\0';
+    if (wrote < 0) {
+        g_report[used] = '\0';
+    } else {
+        advance(wrote);
+    }
 }
 
 // The first-chance handler. The console run at 954a97c died here: it logged
@@ -279,12 +289,13 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (action == bbx::core::FaultAction::kSuppressed) {
-        WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n", true);
+        WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n", true,
+                 /*to_debugger=*/false);
         gate.Leave();
         return EXCEPTION_CONTINUE_SEARCH;
     }
     ReportFault(info, "fault");
-    WriteRaw(g_report, true);
+    WriteRaw(g_report, true, /*to_debugger=*/false);
     if (g_crash >= 0) {
         std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
         if (lock.owns_lock()) {
@@ -297,7 +308,7 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
 }
 
 void OnTerminate() {
-    WriteRaw("\n! std::terminate: unhandled exception\n", true);
+    WriteRaw("\n! std::terminate: unhandled exception\n", true, /*to_debugger=*/false);
     std::abort();
 }
 
@@ -429,25 +440,35 @@ bool LogMirrorToUsb(const std::string& dump_root) {
     const std::string errors_live = hostfs::JoinPath(dir, "errors.log");
     const std::string crash = hostfs::JoinPath(dir, "crash.log");
 
-    std::lock_guard<std::mutex> lock(g_mirror_mu);
-    if (g_mirror >= 0) {  // already mirroring: the folder did not change
-        return true;
-    }
-    g_mirror = hostfs::Open(live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
-    if (g_mirror < 0) {
-        LogMessage(Level::kWarn, "log mirror: cannot open %s (errno %d)", live.c_str(),
-                   MirrorError());
-        return false;
-    }
-    g_mirror_errors = hostfs::Open(errors_live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
-    g_crash = hostfs::Open(crash, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
-    MirrorWrite(g_mirror,
-                "\n=== bbxbox log mirror: written on the console, readable on a PC ===\n");
-    (void)hostfs::Flush(g_mirror);
-    if (g_mirror_errors >= 0) {
-        MirrorWrite(g_mirror_errors,
+    bool opened = false;
+    int open_err = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mirror_mu);
+        if (g_mirror >= 0) {  // already mirroring: the folder did not change
+            return true;
+        }
+        g_mirror = hostfs::Open(live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
+        if (g_mirror < 0) {
+            open_err = MirrorError();
+        } else {
+            opened = true;
+            g_mirror_errors =
+                hostfs::Open(errors_live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
+            g_crash = hostfs::Open(crash, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
+            MirrorWrite(g_mirror,
+                        "\n=== bbxbox log mirror: written on the console, readable on a PC ===\n");
+            (void)hostfs::Flush(g_mirror);
+            if (g_mirror_errors >= 0) {
+                MirrorWrite(
+                    g_mirror_errors,
                     "\n=== bbxbox errors.log mirror: steps, heartbeats, shutdowns, errors ===\n");
-        (void)hostfs::Flush(g_mirror_errors);
+                (void)hostfs::Flush(g_mirror_errors);
+            }
+        }
+    }
+    if (!opened) {
+        LogMessage(Level::kWarn, "log mirror: cannot open %s (errno %d)", live.c_str(), open_err);
+        return false;
     }
     LogMessage(Level::kInfo, "log mirror: %s", live.c_str());
     return true;
@@ -473,7 +494,7 @@ void InstallLastChanceLogger() {
     }
     ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* info) -> LONG {
         ReportFault(info, "unhandled");
-        WriteRaw(g_report, true);
+        WriteRaw(g_report, true, /*to_debugger=*/false);
         if (g_crash >= 0) {
             std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
             if (lock.owns_lock()) {

@@ -75,6 +75,7 @@ struct Session {
     bool quit = false;
     bool start_requested = false;
     std::string usb_token;
+    std::string patch_token;
     // The only renderer: device, 4K swapchain, pipelines, replay and the HUD. A
     // failed creation leaves it null, which the launcher survives (the window stays
     // up and the gate line keeps printing); there is no SDL renderer to fall to.
@@ -428,15 +429,17 @@ bbx::platform::ButtonMask MaskFromPad() {
 
 void SaveLayoutSettings() {
     const std::string path = bbx::platform::Local("bbxbox.ini");
-    const bool keyed = bbx::platform::IniSet(g_session.ini_text, "dump", "path", g_session.layout.base_path) &&
-                       bbx::platform::IniSet(g_session.ini_text, "dump", "patch_path", g_session.layout.patch_path) &&
-                       bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0") &&
-                       bbx::platform::IniSet(g_session.ini_text, "dump", "mods", g_session.model.mods_enabled ? "1" : "0") &&
-                       bbx::platform::IniSet(g_session.ini_text, "dump", "modded_eboot",
-                                             g_session.model.modded_eboot_ok ? "1" : "0");
-    if (!keyed) {
-        bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not key the layout settings");
-    }
+    // IniSet returns false when a key's value is unchanged; never short-circuit
+    // across keys with && or later toggled settings will be skipped.
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "path", g_session.layout.base_path);
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "token", g_session.usb_token);
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "patch_path", g_session.layout.patch_path);
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "patch_token", g_session.patch_token);
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "use_patch", g_session.layout.use_patch ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "mods", g_session.model.mods_enabled ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "dump", "modded_eboot",
+                                g_session.model.modded_eboot_ok ? "1" : "0");
+    g_session.ini = bbx::platform::ParseIni(g_session.ini_text);
     if (!bbx::platform::WriteText(path, g_session.ini_text)) {
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
     }
@@ -476,16 +479,23 @@ void RefreshLauncher() {
 // dump folder froze the launcher. The pick starts on a worker thread and the
 // loop collects the result on a later frame.
 std::atomic<int> g_pick_state{0};  // 0 idle, 1 pending, 2 granted, -1 failed
+bool g_pick_for_patch = false;
 std::string g_pick_path;
 std::string g_pick_token;
 
-void FinishDumpGrant(const std::string& path, const std::string& token) {
-    (void)token;
-    bbx::platform::LogF("dump folder granted: %s", path.c_str());
+void FinishDumpGrant(const std::string& path, const std::string& token, bool for_patch) {
     const bbx::platform::DumpFs fs = bbx::platform::MakeDumpFs();
-    g_session.layout = bbx::platform::DetectLayout(
-        fs, path, bbx::platform::IniGet(g_session.ini, "dump.patch_path", ""),
-        bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true), false);
+    if (for_patch && !g_session.layout.base_path.empty()) {
+        bbx::platform::LogF("patch folder granted: %s", path.c_str());
+        if (!token.empty()) g_session.patch_token = token;
+        g_session.layout = bbx::platform::DetectLayout(fs, g_session.layout.base_path, path, true, false);
+    } else {
+        bbx::platform::LogF("dump folder granted: %s", path.c_str());
+        if (!token.empty()) g_session.usb_token = token;
+        g_session.layout = bbx::platform::DetectLayout(
+            fs, path, bbx::platform::IniGet(g_session.ini, "dump.patch_path", ""),
+            bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true), false);
+    }
     bbx::platform::LogMessage(bbx::platform::Level::kInfo, "%s",
                               bbx::platform::LayoutLogLine(g_session.layout).c_str());
     if (!g_session.layout.layout_ok()) {
@@ -496,12 +506,13 @@ void FinishDumpGrant(const std::string& path, const std::string& token) {
     RefreshLauncher();
 }
 
-void PickDump() {
-    if (g_pick_state.load() == 1) {
+void PickDump(bool for_patch) {
+    if (g_pick_state.load() != 0) {
         bbx::platform::LogMessage(bbx::platform::Level::kInfo,
                                   "picker: already waiting for the system folder picker");
         return;
     }
+    g_pick_for_patch = for_patch;
     g_pick_state.store(1);
     std::thread([] {
         std::string path;
@@ -523,8 +534,9 @@ void PollDumpPick() {
     if (state == 2) {
         const std::string path = g_pick_path;
         const std::string token = g_pick_token;
+        const bool for_patch = g_pick_for_patch;
         g_pick_state.store(0);
-        FinishDumpGrant(path, token);
+        FinishDumpGrant(path, token, for_patch);
     } else if (state == -1) {
         g_pick_state.store(0);
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "dump picker cancelled");
@@ -584,8 +596,8 @@ void OnAction(PadAction action) {
         }
         bbx::platform::LogF("launcher: %s", bbx::platform::ActionName(selected));
         switch (selected) {
-        case bbx::platform::Action::kPickDump:
-        case bbx::platform::Action::kPickPatch: PickDump(); return;
+        case bbx::platform::Action::kPickDump: PickDump(false); return;
+        case bbx::platform::Action::kPickPatch: PickDump(true); return;
         case bbx::platform::Action::kTogglePatch:
             g_session.layout.use_patch = !g_session.layout.use_patch;
             g_session.layout.effective_ver =
@@ -923,7 +935,15 @@ void RestoreDump() {
         path = found_dumps.front();
     }
 
-    const std::string preferred_patch = bbx::platform::IniGet(g_session.ini, "dump.patch_path", "");
+    std::string preferred_patch = bbx::platform::IniGet(g_session.ini, "dump.patch_path", "");
+    const std::string patch_token = bbx::platform::IniGet(g_session.ini, "dump.patch_token", "");
+    if (!patch_token.empty()) {
+        std::string granted_patch;
+        if (bbx::platform::ResolveGrant(patch_token, granted_patch)) {
+            preferred_patch = granted_patch;
+            g_session.patch_token = patch_token;
+        }
+    }
     const bool use_patch = bbx::platform::IniFlag(g_session.ini, "dump.use_patch", true);
     g_session.layout = bbx::platform::DetectLayout(fs, path, preferred_patch, use_patch, false);
     if (!g_session.layout.layout_ok() && !found_dumps.empty() &&
@@ -1229,8 +1249,13 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 // that presents it is this one (platform/bbhost_bridge.cpp).
                 bbx::bridge::GuestRequest req;
                 req.app0 = g_session.layout.base_path;
-                if (g_session.layout.Patched()) req.data = g_session.layout.patch_path;
-                req.eboot = g_session.layout.base_path + "\\eboot.bin";
+                req.data = bbx::platform::Local("data");
+                req.tmp = bbx::platform::Local("tmp");
+                (void)bbx::hostfs::MkDir(req.data, true);
+                (void)bbx::hostfs::MkDir(req.tmp, true);
+                const std::string& eboot_dir =
+                    g_session.layout.CanRunPatched() ? g_session.layout.patch_path : g_session.layout.base_path;
+                req.eboot = eboot_dir + "\\eboot.bin";
                 if (g_session.model.mods_enabled && g_session.model.mods_present) {
                     req.mods = g_session.layout.base_path + "\\mods";
                 }

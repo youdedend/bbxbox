@@ -36,7 +36,7 @@ namespace {
 // (detached); whoever drops the last one frees it and closes the handle.
 struct Mutex {
     SRWLOCK srw = SRWLOCK_INIT;
-    DWORD owner = 0;
+    std::atomic<DWORD> owner{0};
     unsigned count = 0;
     int type = PTHREAD_MUTEX_NORMAL;
 };
@@ -78,7 +78,8 @@ Rec* self_rec() {
 
 void release(Rec* r) {
     if (r != nullptr && r->refs.fetch_sub(1) == 1) {
-        if (r->handle != nullptr) CloseHandle(r->handle);
+        HANDLE h = InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&r->handle), nullptr);
+        if (h != nullptr) CloseHandle(h);
         delete r;
     }
 }
@@ -172,19 +173,19 @@ Cond* cond_ensure(pthread_cond_t* c) {
 
 void lock_mutex(Mutex* m) {
     const DWORD me = GetCurrentThreadId();
-    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner == me) {
+    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner.load(std::memory_order_relaxed) == me) {
         ++m->count;
         return;
     }
     AcquireSRWLockExclusive(&m->srw);
-    m->owner = me;
+    m->owner.store(me, std::memory_order_relaxed);
     m->count = 1;
 }
 
 void unlock_mutex(Mutex* m) {
-    if (m->owner != GetCurrentThreadId()) return;  // not the owner: a no-op, as glibc's would be UB
+    if (m->owner.load(std::memory_order_relaxed) != GetCurrentThreadId()) return;  // not the owner: a no-op, as glibc's would be UB
     if (--m->count == 0) {
-        m->owner = 0;
+        m->owner.store(0, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&m->srw);
     }
 }
@@ -245,8 +246,10 @@ int pthread_detach(pthread_t thread) {
     Rec* rec = reinterpret_cast<Rec*>(thread);
     if (rec == nullptr) return EINVAL;
     // The caller gives up its join; the thread's own reference keeps the
-    // record alive until it exits.
-    if (rec->handle != nullptr) CloseHandle(rec->handle), rec->handle = nullptr;
+    // record alive until it exits. Swap handle atomically so a concurrent
+    // thread exit in release() can never double-close it.
+    HANDLE h = InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&rec->handle), nullptr);
+    if (h != nullptr) CloseHandle(h);
     release(rec);
     return 0;
 }
@@ -391,12 +394,12 @@ int pthread_mutex_trylock(pthread_mutex_t* mutex) {
     Mutex* m = mutex_ensure(mutex);
     if (m == nullptr) return EINVAL;
     const DWORD me = GetCurrentThreadId();
-    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner == me) {
+    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner.load(std::memory_order_relaxed) == me) {
         ++m->count;
         return 0;
     }
     if (!TryAcquireSRWLockExclusive(&m->srw)) return EBUSY;
-    m->owner = me;
+    m->owner.store(me, std::memory_order_relaxed);
     m->count = 1;
     return 0;
 }
@@ -405,7 +408,7 @@ int pthread_mutex_timedlock(pthread_mutex_t* mutex, const struct timespec* absti
     Mutex* m = mutex_ensure(mutex);
     if (m == nullptr || abstime == nullptr) return EINVAL;
     const DWORD me = GetCurrentThreadId();
-    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner == me) {
+    if (m->type == PTHREAD_MUTEX_RECURSIVE && m->owner.load(std::memory_order_relaxed) == me) {
         ++m->count;
         return 0;
     }
@@ -413,7 +416,7 @@ int pthread_mutex_timedlock(pthread_mutex_t* mutex, const struct timespec* absti
     // Only used where a timeout is a policy choice, never on a hot path.
     for (;;) {
         if (TryAcquireSRWLockExclusive(&m->srw)) {
-            m->owner = me;
+            m->owner.store(me, std::memory_order_relaxed);
             m->count = 1;
             return 0;
         }
@@ -453,9 +456,9 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t* attr, int* type) {
 }
 
 int pthread_mutex_gettype(const pthread_mutex_t* mutex, int* type) {
+    if (mutex == nullptr || type == nullptr) return EINVAL;
     const Mutex* m = reinterpret_cast<const Mutex*>(*mutex);
-    if (m == nullptr || type == nullptr) return EINVAL;
-    *type = m->type;
+    *type = m != nullptr ? m->type : PTHREAD_MUTEX_NORMAL;
     return 0;
 }
 
@@ -489,26 +492,26 @@ int cond_wait_impl(pthread_cond_t* cond, pthread_mutex_t* mutex, const struct ti
     Mutex* m = mutex_ensure(mutex);
     Cond* c = cond_ensure(cond);
     if (m == nullptr || c == nullptr) return EINVAL;
-    if (m->owner != GetCurrentThreadId()) return EPERM;
-    const unsigned held = m->count;
     const DWORD me = GetCurrentThreadId();
+    if (m->owner.load(std::memory_order_relaxed) != me) return EPERM;
+    const unsigned held = m->count;
     if (abstime != nullptr) {
         const long long ms = ms_until(abstime);
         if (ms <= 0) {
             return ETIMEDOUT;
         }
         m->count = 0;
-        m->owner = 0;
+        m->owner.store(0, std::memory_order_relaxed);
         const BOOL ok = SleepConditionVariableSRW(
             &c->cv, &m->srw, static_cast<DWORD>(ms > 0x7fffffff ? 0x7fffffff : ms), 0);
-        m->owner = me;
+        m->owner.store(me, std::memory_order_relaxed);
         m->count = held;
         return ok ? 0 : ETIMEDOUT;
     }
     m->count = 0;
-    m->owner = 0;
+    m->owner.store(0, std::memory_order_relaxed);
     const BOOL ok = SleepConditionVariableSRW(&c->cv, &m->srw, INFINITE, 0);
-    m->owner = me;
+    m->owner.store(me, std::memory_order_relaxed);
     m->count = held;
     return ok ? 0 : ETIMEDOUT;
 }
@@ -656,7 +659,7 @@ void* timed_worker(void* arg) {
     // Five milliseconds from now, in CLOCK_REALTIME terms.
     const long long now = (static_cast<long long>(ft.dwHighDateTime) << 32 | ft.dwLowDateTime) - 116444736000000000LL;
     const long long want = now + 5 * 10000LL;
-    ts.tv_sec = static_cast<long>(want / 10000000LL);
+    ts.tv_sec = static_cast<decltype(ts.tv_sec)>(want / 10000000LL);
     ts.tv_nsec = static_cast<long>((want % 10000000LL) * 100);
     pthread_mutex_lock(&w->m);
     const int rc = pthread_cond_timedwait(&w->c, &w->m, &ts);

@@ -49,6 +49,7 @@
 #include "xbox/platform/guest_compute.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -240,6 +241,7 @@ struct GuestCompute::Impl {
 
     ShaderCache cache;
     bool cache_tried = false;
+    std::string cache_dir;
     std::string cache_line = "shader cache: not loaded";
 
     // The bake's binding assignment (bbx_shaders.paths), paired with the cache's
@@ -247,10 +249,11 @@ struct GuestCompute::Impl {
     d3d12::PathTable paths;
     bool paths_tried = false;
     std::string paths_line = "binding table: not loaded";
-    // Which key's plans are in the compute stage's slots right now. The region is
-    // one per stage, not one per program, so a key change has to put the previous
-    // key's writes back to null - and only once nothing is reading them.
+    // Which key's plans (and user_data SGPRs) are in the compute stage's slots
+    // right now. The region is one per stage, not one per program, so a key or
+    // user_data change has to wait for idle and rewrite the region.
     std::uint64_t bound_key = 0;
+    std::array<std::uint32_t, 16> bound_user_data{};
     bool bound_valid = false;
 
     std::unordered_map<std::uint64_t, Program> programs;              // code VA -> program
@@ -347,12 +350,14 @@ struct GuestCompute::Impl {
     }
 
     // The plans for `key`, written into this stage's slots. Called before the
-    // command list that reads them, and - when another key's plans are in place -
-    // after the device is idle, because a submission still reading the previous
-    // key's descriptors is a race the API would not report.
+    // command list that reads them, and - when another key's or user_data's
+    // plans are in place - after the device is idle, because a submission still
+    // reading the previous descriptors is a race the API would not report.
     void BindResources(std::uint64_t key, const GpuDispatch& d) {
         if (paths.status() != d3d12::PathTableStatus::kOk) return;
-        if (bound_valid && bound_key == key) return;
+        const bool same_user_data =
+            std::memcmp(bound_user_data.data(), d.user_data, sizeof(bound_user_data)) == 0;
+        if (bound_valid && bound_key == key && same_user_data) return;
         if (bound_valid) {
             (void)device->WaitIdle();
             WriteNullRegion();
@@ -407,6 +412,7 @@ struct GuestCompute::Impl {
         counts.bindings_refused += refused;
         counts.bindings_null += nulls;
         bound_key = key;
+        std::memcpy(bound_user_data.data(), d.user_data, sizeof(bound_user_data));
         bound_valid = planned != 0;
         if (planned != 0) {
             std::string text = "guest compute: key ";
@@ -422,20 +428,38 @@ struct GuestCompute::Impl {
     // --- cache -------------------------------------------------------------------
     void LoadCache() {
         if (cache_tried) return;
+        std::vector<std::string> dirs;
+        const auto add_dir = [&dirs](const char* raw) {
+            if (raw == nullptr || raw[0] == '\0') return;
+            const std::string d(raw);
+            if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) dirs.push_back(d);
+        };
+        add_dir(hle_fs_update_root());
+        add_dir(hle_fs_app0_root());
+        add_dir(hle_fs_data_root());
+        if (dirs.empty()) {
+            cache_line = "shader cache: no dump or data root yet; every guest dispatch is refused until the dump is mounted";
+            LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+            return;
+        }
         cache_tried = true;
-        const char* root = hle_fs_data_root();
-        const std::string dir = root != nullptr ? root : "";
-        if (dir.empty()) {
-            cache_line = "shader cache: no data root yet; every guest dispatch is refused until the dump is mounted";
+        std::string dir;
+        std::string path;
+        for (const std::string& candidate : dirs) {
+            const std::string probe = Join(candidate, "bbx_shaders.cache");
+            if (bbx::hostfs::Exists(probe)) {
+                dir = candidate;
+                path = probe;
+                break;
+            }
+        }
+        if (path.empty()) {
+            cache_line = "shader cache: bbx_shaders.cache is missing under " + dirs.front() +
+                         "; no guest dispatch can be built (run the bake)";
             LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
             return;
         }
-        const std::string path = Join(dir, "bbx_shaders.cache");
-        if (!bbx::hostfs::Exists(path)) {
-            cache_line = "shader cache: " + path + " is missing; no guest dispatch can be built (run the bake)";
-            LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
-            return;
-        }
+        cache_dir = dir;
         bbx::hostfs::FileStat stat{};
         if (!bbx::hostfs::Stat(path, &stat) || stat.size == 0 || stat.size > (256u << 20)) {
             cache_line = "shader cache: " + path + " is empty or implausible; refused";
@@ -461,10 +485,13 @@ struct GuestCompute::Impl {
             LogMessage(Level::kError, "guest compute: %s", cache_line.c_str());
             return;
         }
-        // The stamp beside it: the bake's compiler and signer, which this build
-        // pairs with its own target (dxil-6.4, tables, 11_0) and compares.
+        // The stamp beside it: `bbx_bake_cache` writes `<cache>.stamp.txt`, with
+        // a legacy fallback to `bbx_shaders.stamp`.
         std::string stamp;
-        const std::string stamp_path = Join(dir, "bbx_shaders.stamp");
+        std::string stamp_path = path + ".stamp.txt";
+        if (!bbx::hostfs::Exists(stamp_path)) {
+            stamp_path = Join(dir, "bbx_shaders.stamp");
+        }
         if (bbx::hostfs::Exists(stamp_path)) {
             bbx::hostfs::FileStat stamp_stat{};
             if (bbx::hostfs::Stat(stamp_path, &stamp_stat) && stamp_stat.size < (1u << 16)) {
@@ -497,15 +524,15 @@ struct GuestCompute::Impl {
     // once, at load, because it is a property of the dump and not of a dispatch.
     void LoadPaths() {
         if (paths_tried) return;
+        if (!cache_tried) return;
         paths_tried = true;
         if (cache.status() != d3d12::CacheStatus::kOk) {
             paths_line = "binding table: not read (the shader cache did not validate)";
             return;
         }
-        const char* root = hle_fs_data_root();
-        const std::string dir = root != nullptr ? root : "";
+        const std::string dir = !cache_dir.empty() ? cache_dir : (hle_fs_data_root() != nullptr ? hle_fs_data_root() : "");
         if (dir.empty()) {
-            paths_line = "binding table: no data root yet; no space-1 descriptor is bound until the dump is mounted";
+            paths_line = "binding table: no cache directory yet; no space-1 descriptor is bound until the dump is mounted";
             return;
         }
         const std::string path = Join(dir, "bbx_shaders.paths");
@@ -612,14 +639,15 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
 
     // ExecuteIndirect's command signature: one DISPATCH argument (three
     // workgroup counts, 4-byte stride), so an indirect dispatch reads the guest's
-    // own {x,y,z} where the title wrote it.
+    // own {x,y,z} where the title wrote it. D3D12 requires pRootSignature == nullptr
+    // when the command signature does not modify any root arguments.
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     D3D12_COMMAND_SIGNATURE_DESC signature{};
     signature.ByteStride = 3 * sizeof(std::uint32_t);
     signature.NumArgumentDescs = 1;
     signature.pArgumentDescs = &argument;
-    if (FAILED(device.Get()->CreateCommandSignature(&signature, impl.root,
+    if (FAILED(device.Get()->CreateCommandSignature(&signature, nullptr,
                                                     IID_PPV_ARGS(impl.indirect.GetAddressOf())))) {
         LogMessage(Level::kWarn, "guest compute: no indirect command signature; indirect dispatches are refused");
         impl.indirect.Reset();
@@ -633,6 +661,10 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
 void GuestCompute::Destroy() {
     if (impl_ == nullptr) return;
     Impl& impl = *impl_;
+    for (auto& [key, pso] : impl.pso_objects) {
+        (void)key;
+        if (pso != nullptr) pso->Release();
+    }
     impl.pso_objects.clear();
     impl.psos.reset();
     if (impl.params != nullptr && impl.params_mapped != nullptr) {
@@ -645,7 +677,10 @@ void GuestCompute::Destroy() {
     impl.keys.clear();
     impl.paths = d3d12::PathTable{};
     impl.paths_tried = false;
+    impl.cache_tried = false;
+    impl.cache_dir.clear();
     impl.bound_key = 0;
+    impl.bound_user_data.fill(0);
     impl.bound_valid = false;
     impl.device = nullptr;
     impl.pipelines = nullptr;
@@ -703,7 +738,6 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     if (!PredictPaths(program->second, d.rsrc1, d.rsrc2, &key, &why)) {
         // A program the translator cannot read has no key in the bake either: it
         // was counted there and refused here, by name.
-        ++impl.counts.bad_program;
         if (++impl.counts.bad_program <= 4) {
             LogMessage(Level::kWarn, "guest compute: dispatch at 0x%llx has no key (%s)",
                        static_cast<unsigned long long>(d.code_va), why.c_str());

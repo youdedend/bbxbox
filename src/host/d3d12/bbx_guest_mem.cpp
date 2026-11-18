@@ -225,7 +225,7 @@ bool SlabRuns(const GuestPageTable& table, std::uint64_t va, std::size_t bytes, 
         if (slot.guard()) return false;  // the guard page is not a place for the title's data
         const std::uint64_t in_page = at & (kPageBytes - 1);
         const std::uint64_t offset = slot.offset + in_page;
-        if (offset > kGuestSlabBytes) continue;
+        if (offset >= kGuestSlabBytes) return false;
         const std::size_t take = static_cast<std::size_t>(
             std::min<std::uint64_t>(bytes - done, std::min<std::uint64_t>(kPageBytes - in_page, kGuestSlabBytes - offset)));
         if (take == 0) return false;
@@ -257,17 +257,19 @@ constexpr std::uint64_t kGuardBytes = kPageBytes;
 // host_gpu_mem_write's documented ceiling (host/gpu.h): one upload at a time.
 constexpr std::uint64_t kStagingBytes = 64ull << 10;
 
-D3D12_RESOURCE_DESC RawBuffer(std::uint64_t bytes) {
-    // A ByteAddressBuffer's view of a buffer: R32_TYPELESS, one element per dword.
+D3D12_RESOURCE_DESC RawBuffer(std::uint64_t bytes, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
+    // D3D12 requires DXGI_FORMAT_UNKNOWN on BUFFER resources; R32_TYPELESS is
+    // specified on the raw SRV/UAV descriptors created over the buffer.
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = bytes;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
     return desc;
 }
 
@@ -323,9 +325,9 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
     // The page table: one committed buffer, written once per boot, read by every
-    // dispatch. The plan's tables are ~1 MiB and already in the shader's shape.
+    // dispatch. The plan's tables are ~1-2 MiB and uploaded via a dedicated staging buffer.
     const std::vector<std::uint8_t> bytes = plan.table.Bytes();
-    if (bytes.size() > kStagingBytes) return Status::kInvalidArgument;
+    if (bytes.empty() || bytes.size() % 4 != 0) return Status::kInvalidArgument;
     D3D12_RESOURCE_DESC desc = RawBuffer(bytes.size());
     if (FAILED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                 nullptr, IID_PPV_ARGS(page_table_.GetAddressOf())))) {
@@ -345,7 +347,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     // The guard page: 64 KiB that is never the title's data. Slab 0's UAV and
     // every slab not yet resident point at it, so all 32 descriptors are valid
     // from the first dispatch while an untouched table costs 64 KiB, not 8 GiB.
-    const D3D12_RESOURCE_DESC guard_desc = RawBuffer(kGuardBytes);
+    const D3D12_RESOURCE_DESC guard_desc = RawBuffer(kGuardBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (FAILED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &guard_desc, D3D12_RESOURCE_STATE_COMMON,
                                                 nullptr, IID_PPV_ARGS(guard_.GetAddressOf())))) {
         return Status::kOutOfMemory;
@@ -408,7 +410,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     if (!owner_->WaitFor(value)) return owner_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
 
     committed_bytes_ = bytes.size() + kGuardBytes;
-    slabs_resident_ = std::min(plan.slabs_resident, kGuestSlabCount);
+    slabs_resident_ = 1;  // only the guard slab is resident until EnsureSlab commits a data slab
     return Status::kOk;
 }
 
@@ -443,7 +445,7 @@ Status GuestMemory::EnsureSlab(std::uint32_t slab) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     ComPtr<ID3D12Resource> buffer;
-    const D3D12_RESOURCE_DESC desc = RawBuffer(kGuestSlabBytes);
+    const D3D12_RESOURCE_DESC desc = RawBuffer(kGuestSlabBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                 IID_PPV_ARGS(buffer.GetAddressOf())))) {
         budget_->Free(Owner::kGuest, kGuestSlabBytes);
@@ -543,9 +545,10 @@ Status GuestMemory::WriteGuest(const GuestPageTable& table, std::uint64_t va, co
 }
 
 Status GuestMemory::FillGuest(const GuestPageTable& table, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
+    if (!device_ || bytes == 0 || bytes % 4 != 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
     // A fill is a write of one dword repeated, through the same upload path so
     // there is one rule for what reaches the slabs.
-    std::vector<std::uint8_t> pattern(static_cast<std::size_t>(bytes), 0);
+    std::vector<std::uint8_t> pattern(bytes, 0);
     for (std::size_t at = 0; at + 4 <= bytes; at += 4) std::memcpy(pattern.data() + at, &value, 4);
     return WriteGuest(table, va, pattern.data(), bytes);
 }
@@ -593,15 +596,24 @@ Status GuestMemory::ReadGuest(const GuestPageTable& table, std::uint64_t va, voi
     if (status != Status::kOk || !copied) return status;
     void* mapped = nullptr;
     if (FAILED(readback_->Map(0, nullptr, &mapped))) return Status::kOutOfMemory;
-    std::memcpy(out, mapped, bytes);
+    const auto* src = static_cast<const std::uint8_t*>(mapped);
+    auto* dst = static_cast<std::uint8_t*>(out);
+    std::size_t out_at = 0;
+    for (const GuestRun& run : runs) {
+        if (slabs_.find(run.slab) != slabs_.end()) {
+            std::memcpy(dst + out_at, src + out_at, run.bytes);
+        }
+        out_at += run.bytes;
+    }
     readback_->Unmap(0, nullptr);
     return Status::kOk;
 }
 
 Status GuestMemory::CopyGuest(const GuestPageTable& table, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) {
+    if (!device_ || bytes == 0 || bytes % 4 != 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
     // Read back and write again: the source's bytes are the ones the GPU wrote,
     // and a shadow copy here would be a second answer to what guest memory holds.
-    std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
+    std::vector<std::uint8_t> staging(bytes);
     if (const Status status = ReadGuest(table, src_va, staging.data(), bytes); status != Status::kOk) return status;
     return WriteGuest(table, dst_va, staging.data(), bytes);
 }

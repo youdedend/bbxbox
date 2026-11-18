@@ -115,12 +115,12 @@ constexpr std::uint32_t kShare = 0x1, kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp 
 // sticks and triggers, and no touchpad surface, so the touch bit is never set and
 // the constant is left out rather than defined and unused.
 
-// 0..255 with 127 at rest, from the pad's -1.0..1.0. The rest value lands exactly
-// on kStickRest and not on 128 (host/window.h explains why that matters).
+// 0..255 with 127 at rest, from the pad's -1.0..1.0. Matches upstream's
+// axis_to_u8 so 0.0 lands on kStickRest (127) and not 128.
 std::uint8_t StickFromFloat(double value) {
     if (value > 1.0) value = 1.0;
     if (value < -1.0) value = -1.0;
-    const int scaled = static_cast<int>((value + 1.0) * 127.5 + 0.5);
+    const int scaled = (static_cast<int>(value * 32767.0) + 32768) / 257;
     return static_cast<std::uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
 }
 
@@ -166,10 +166,12 @@ PadState host_pad_state() {
         bit(held(GamepadButtons::DPadLeft), kLeft);
         bit(held(GamepadButtons::DPadRight), kRight);
 
+        // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
+        // 0 for up and 255 for down; negate both Y axes to match PS4 convention.
         s.lx = StickFromFloat(reading.LeftThumbstickX);
-        s.ly = StickFromFloat(reading.LeftThumbstickY);
+        s.ly = StickFromFloat(-reading.LeftThumbstickY);
         s.rx = StickFromFloat(reading.RightThumbstickX);
-        s.ry = StickFromFloat(reading.RightThumbstickY);
+        s.ry = StickFromFloat(-reading.RightThumbstickY);
         s.l2 = TriggerFromFloat(reading.LeftTrigger);
         s.r2 = TriggerFromFloat(reading.RightTrigger);
         if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
@@ -182,9 +184,10 @@ PadState host_pad_state() {
         LARGE_INTEGER counter{};
         ::QueryPerformanceFrequency(&frequency);
         ::QueryPerformanceCounter(&counter);
-        if (frequency.QuadPart != 0) {
-            s.timestamp = static_cast<std::uint64_t>(
-                (counter.QuadPart * 1000000ull) / static_cast<std::uint64_t>(frequency.QuadPart));
+        if (frequency.QuadPart > 0 && counter.QuadPart >= 0) {
+            const std::uint64_t ticks = static_cast<std::uint64_t>(counter.QuadPart);
+            const std::uint64_t freq = static_cast<std::uint64_t>(frequency.QuadPart);
+            s.timestamp = (ticks / freq) * 1000000ull + ((ticks % freq) * 1000000ull) / freq;
         }
     } catch (...) {
         // A pad that is unplugged between Gamepads() and GetCurrentReading()

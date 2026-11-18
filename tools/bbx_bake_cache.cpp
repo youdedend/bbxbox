@@ -1400,8 +1400,7 @@ int main(int argc, char** argv) {
         for (fs::recursive_directory_iterator it(options.root, ec), end; it != end && !ec; it.increment(ec)) {
             if (!it->is_regular_file()) continue;
             const std::string name = it->path().filename().string();
-            if (name.size() > 12 && (name.compare(name.size() - 12, 12, "shaderbnd.dcx") == 0 ||
-                                     name.compare(name.size() - 17, 17, "shaderbnddebug.dcx") == 0)) {
+            if (name.ends_with("shaderbnd.dcx") || name.ends_with("shaderbnddebug.dcx")) {
                 bundles.push_back(it->path());
             }
         }

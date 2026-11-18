@@ -99,6 +99,8 @@ Status Replay::Create(Device& device, Swapchain& swapchain, PipelineSet& pipelin
     // was uploaded.
     status = CreateWhiteTexture();
     if (status != Status::kOk) { return status; }
+    untile_srv_ = AllocateCbvSrvUav();
+    untile_uav_ = AllocateCbvSrvUav();
 
     // The pipelines are created lazily by PipelineSet::Ensure; ask for the two the
     // frame needs now so a missing PSO is reported at boot, not mid-frame.
@@ -271,7 +273,9 @@ Status Replay::UploadFrame(const std::uint8_t* pixels, const ScanoutDesc& desc) 
             }
             frame_linear_bytes_ = bytes;
         }
-        const Status untiled = DispatchUntile(scanout.plan, frame_staging_.Get(), frame_linear_.Get(), 4);
+        const Status untiled =
+            DispatchUntile(scanout.plan, frame_staging_.Get(), staging_bytes, frame_linear_.Get(),
+                           bytes, scanout.bytes_per_pixel * 64u, /*source_is_upload=*/true);
         if (untiled != Status::kOk) {
             Log("replay: the tiled scanout was not detiled (%s); the frame is dropped",
                 StatusName(untiled));
@@ -428,11 +432,11 @@ Replay::Slice Replay::AllocateCbvSrvUav(std::uint32_t count) {
     slice.cpu.ptr += static_cast<SIZE_T>(next_cbv_srv_uav_) * stride;
     slice.gpu.ptr += static_cast<UINT64>(next_cbv_srv_uav_) * stride;
     next_cbv_srv_uav_ += count;
-    if (next_cbv_srv_uav_ >= Device::kCbvSrvUavDescriptors) {
+    if (next_cbv_srv_uav_ >= kReservedCbvSrvUavDescriptors) {
         // The permanent descriptors are bounded; a boot that allocated them all is
         // a bug in the port, not a guest's doing. Wrap and log once.
         Log("replay: the permanent descriptor block is full (%u used)",
-            Device::kCbvSrvUavDescriptors);
+            kReservedCbvSrvUavDescriptors);
         next_cbv_srv_uav_ = 0;
     }
     return slice;
@@ -747,37 +751,44 @@ Status Replay::DrawOverlay() {
 }
 
 Status Replay::DispatchUntile(const UntilePlan& plan, ID3D12Resource* tiled_source,
-                              ID3D12Resource* linear_destination, std::uint32_t bytes_per_tile) {
+                              std::uint64_t source_bytes, ID3D12Resource* linear_destination,
+                              std::uint64_t destination_bytes, std::uint32_t bytes_per_tile,
+                              bool source_is_upload) {
     if (!in_frame_) { return Status::kInvalidArgument; }
     if (!plan.valid || plan.dispatches.empty()) {
         Log("untile: no plan (%s); the copy is skipped", plan.reason.c_str());
         return Status::kInvalidArgument;
     }
-    if (tiled_source == nullptr || linear_destination == nullptr) {
+    if (tiled_source == nullptr || linear_destination == nullptr || source_bytes < 4 ||
+        destination_bytes < 4 || bytes_per_tile == 0) {
         return Status::kInvalidArgument;
     }
     ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kUntile);
     if (pso == nullptr) { return Status::kUnavailable; }
 
-    // Source readable, destination writable: both non-pixel shader resource on one
-    // side and UAV on the other, and a UAV barrier between the pairs.
-    (void)TransitionBarrier(tiled_source, D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Source readable, destination writable: UPLOAD heap buffers must remain in
+    // GENERIC_READ, while DEFAULT heap sources transition from COPY_DEST.
+    if (!source_is_upload) {
+        (void)TransitionBarrier(tiled_source, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     (void)TransitionBarrier(linear_destination, D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    const Slice source = AllocateCbvSrvUav();
-    const Slice destination = AllocateCbvSrvUav();
+    const Slice source = untile_srv_;
+    const Slice destination = untile_uav_;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     // ByteAddressBuffer in untile.hlsl: a raw buffer, so R32_TYPELESS + RAW.
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = static_cast<UINT>(source_bytes / 4u);
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     device_->Get()->CreateShaderResourceView(tiled_source, &srv, source.cpu);
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = DXGI_FORMAT_R32_TYPELESS;
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(destination_bytes / 4u);
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->Get()->CreateUnorderedAccessView(linear_destination, nullptr, &uav, destination.cpu);
 
@@ -1020,10 +1031,14 @@ void Replay::Destroy() {
     selftest_readback_.Reset();
     selftest_uav_.Reset();
     selftest_descriptor_ = Slice{};
+    untile_srv_ = Slice{};
+    untile_uav_ = Slice{};
     overlay_vertices_.Reset();
     atlas_.Reset();
     white_.Reset();
     frame_image_.Reset();
+    frame_linear_.Reset();
+    frame_linear_bytes_ = 0;
     if (frame_staging_ != nullptr && frame_staging_mapped_ != nullptr) {
         frame_staging_->Unmap(0, nullptr);
     }

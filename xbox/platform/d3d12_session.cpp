@@ -270,8 +270,14 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
                                                                   ? d3d12::Device::kCbvSrvUavDescriptors
                                                                   : 0);
     impl.guest_sampler_arena = std::make_unique<d3d12::DescriptorRing>(d3d12::Device::kSamplerDescriptors);
+    // Reserve Replay's own descriptors at the front of the shader-visible heap
+    // so GuestMemory/GuestCompute never overwrite frame_srv_/white_srv_/atlas_srv_.
+    const std::optional<d3d12::DescriptorSlice> replay_reserved =
+        impl.guest_arena->ReservePermanent(d3d12::Replay::kReservedCbvSrvUavDescriptors);
     const std::optional<d3d12::DescriptorSlice> arena =
-        impl.guest_arena->ReservePermanent(d3d12::GuestHeapLayout::kCbvSrvUavDescriptors);
+        replay_reserved.has_value()
+            ? impl.guest_arena->ReservePermanent(d3d12::GuestHeapLayout::kCbvSrvUavDescriptors)
+            : std::nullopt;
     const std::optional<d3d12::DescriptorSlice> samplers =
         impl.guest_sampler_arena->ReservePermanent(d3d12::GuestHeapLayout::kStageRegions *
                                                    d3d12::GuestHeapLayout::kSamplerCount);
@@ -426,13 +432,17 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
         const d3d12::Status uploaded = impl.replay.UploadFrame(frame.data(), frame_desc);
         if (uploaded != d3d12::Status::kOk) {
             LogCrumb("replay: guest frame dropped");
-            ++impl.guest_frames_dropped;
-        } else {
-            ++impl.guest_frames;
         }
         // It goes back to the pool for the next flip, with its capacity intact.
-        std::lock_guard<std::mutex> lk(impl.frame_mutex);
-        impl.frame_upload.swap(frame);
+        {
+            std::lock_guard<std::mutex> lk(impl.frame_mutex);
+            if (uploaded != d3d12::Status::kOk) {
+                ++impl.guest_frames_dropped;
+            } else {
+                ++impl.guest_frames;
+            }
+            impl.frame_upload.swap(frame);
+        }
     }
     // The boot colour: near-black, so a missed quad is visible rather than hidden.
     status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f);

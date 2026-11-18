@@ -7,24 +7,23 @@
 namespace bbx::platform {
 namespace {
 
-// A real param.sfo starts with the four bytes 00 50 53 46 - "\0PSF" - read
-// big-endian, which is 0x00505346. The constant here used to be 0x46535000,
-// the same four bytes in the wrong order, so every genuine SFO was rejected
-// and the launcher said "sce_sys\\param.sfo could not be read" for a file it
-// had just read 1,760 bytes of, magic and all.
-constexpr std::uint32_t kSfoMagic = 0x00505346u;  // "\0PSF" as ReadBe32 sees it
+// A real PS4 param.sfo starts with the four magic bytes 00 50 53 46 ("\0PSF"),
+// followed by little-endian header and index-table fields (matching
+// upstream/bbhost/src/core/sfo.cpp).
 constexpr std::uint32_t kMaxSfoBytes = 1u << 20;
+constexpr std::uint16_t kFormatUtf8Special = 0x0004;
 constexpr std::uint16_t kFormatUtf8 = 0x0204;
 
-std::uint32_t ReadBe32(const std::vector<std::uint8_t>& b, std::size_t at) {
+std::uint32_t ReadLe32(const std::vector<std::uint8_t>& b, std::size_t at) {
     if (at + 4 > b.size()) return 0;
-    return (static_cast<std::uint32_t>(b[at]) << 24) | (static_cast<std::uint32_t>(b[at + 1]) << 16) |
-           (static_cast<std::uint32_t>(b[at + 2]) << 8) | static_cast<std::uint32_t>(b[at + 3]);
+    return static_cast<std::uint32_t>(b[at]) | (static_cast<std::uint32_t>(b[at + 1]) << 8) |
+           (static_cast<std::uint32_t>(b[at + 2]) << 16) | (static_cast<std::uint32_t>(b[at + 3]) << 24);
 }
 
-std::uint16_t ReadBe16(const std::vector<std::uint8_t>& b, std::size_t at) {
+std::uint16_t ReadLe16(const std::vector<std::uint8_t>& b, std::size_t at) {
     if (at + 2 > b.size()) return 0;
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(b[at]) << 8) | b[at + 1]);
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(b[at]) |
+                                      (static_cast<std::uint16_t>(b[at + 1]) << 8));
 }
 
 std::string Join(const std::string& a, const std::string& b) {
@@ -68,21 +67,21 @@ std::string SfoInfo::TitleId() const {
 
 std::optional<SfoInfo> ParseParamSfo(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() < 20 || bytes.size() > kMaxSfoBytes) return std::nullopt;
-    if (ReadBe32(bytes, 0) != kSfoMagic) return std::nullopt;
-    const std::uint32_t key_table = ReadBe32(bytes, 8);
-    const std::uint32_t data_table = ReadBe32(bytes, 12);
-    const std::uint32_t count = ReadBe32(bytes, 16);
+    if (std::memcmp(bytes.data(), "\0PSF", 4) != 0) return std::nullopt;
+    const std::uint32_t key_table = ReadLe32(bytes, 8);
+    const std::uint32_t data_table = ReadLe32(bytes, 12);
+    const std::uint32_t count = ReadLe32(bytes, 16);
     if (key_table >= bytes.size() || data_table >= bytes.size() || count > 512) return std::nullopt;
     if (20ull + static_cast<unsigned long long>(count) * 16 > bytes.size()) return std::nullopt;
 
     SfoInfo info;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::size_t entry = 20 + static_cast<std::size_t>(i) * 16;
-        const std::uint16_t key_offset = ReadBe16(bytes, entry);
-        const std::uint16_t format = ReadBe16(bytes, entry + 2);
-        const std::uint32_t length = ReadBe32(bytes, entry + 4);
-        const std::uint32_t data_offset = ReadBe32(bytes, entry + 12);
-        if (format != kFormatUtf8) continue;
+        const std::uint16_t key_offset = ReadLe16(bytes, entry);
+        const std::uint16_t format = ReadLe16(bytes, entry + 2);
+        const std::uint32_t length = ReadLe32(bytes, entry + 4);
+        const std::uint32_t data_offset = ReadLe32(bytes, entry + 12);
+        if (format != kFormatUtf8 && format != kFormatUtf8Special) continue;
         const std::size_t key_at = key_table + key_offset;
         const std::size_t data_at = data_table + data_offset;
         if (key_at >= bytes.size() || data_at >= bytes.size()) continue;

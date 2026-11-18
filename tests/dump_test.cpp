@@ -12,19 +12,19 @@ using namespace bbx::platform;
 
 namespace {
 
-void PutBe32(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    out.push_back(static_cast<std::uint8_t>(v >> 24));
+void PutLe32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+    out.push_back(static_cast<std::uint8_t>(v));
+    out.push_back(static_cast<std::uint8_t>(v >> 8));
     out.push_back(static_cast<std::uint8_t>(v >> 16));
-    out.push_back(static_cast<std::uint8_t>(v >> 8));
-    out.push_back(static_cast<std::uint8_t>(v));
+    out.push_back(static_cast<std::uint8_t>(v >> 24));
 }
 
-void PutBe16(std::vector<std::uint8_t>& out, std::uint16_t v) {
-    out.push_back(static_cast<std::uint8_t>(v >> 8));
+void PutLe16(std::vector<std::uint8_t>& out, std::uint16_t v) {
     out.push_back(static_cast<std::uint8_t>(v));
+    out.push_back(static_cast<std::uint8_t>(v >> 8));
 }
 
-// A minimal param.sfo with the fields the port reads.
+// A minimal little-endian param.sfo with the fields the port reads.
 std::vector<std::uint8_t> MakeSfo(const std::string& app_ver, const std::string& app_type,
                                   const std::string& title_id, const std::string& content_id) {
     struct Field {
@@ -48,22 +48,26 @@ std::vector<std::uint8_t> MakeSfo(const std::string& app_ver, const std::string&
         data.push_back(0);
         index.emplace_back(key_at, data_at);
     }
-    std::vector<std::uint8_t> out;
-    // The four bytes a real param.sfo starts with: 00 50 53 46 ("\0PSF").
-    PutBe32(out, 0x00505346u);
-    PutBe32(out, 0x101);
     const std::uint32_t key_table =
         20 + static_cast<std::uint32_t>(fields.size()) * 16;
     const std::uint32_t data_table = key_table + static_cast<std::uint32_t>(keys.size());
-    PutBe32(out, key_table);
-    PutBe32(out, data_table);
-    PutBe32(out, static_cast<std::uint32_t>(fields.size()));
+    std::vector<std::uint8_t> out;
+    out.reserve(static_cast<std::size_t>(data_table) + data.size());
+    // The four bytes a real param.sfo starts with: 00 50 53 46 ("\0PSF").
+    out.push_back(0x00);
+    out.push_back(0x50);
+    out.push_back(0x53);
+    out.push_back(0x46);
+    PutLe32(out, 0x00000101u);
+    PutLe32(out, key_table);
+    PutLe32(out, data_table);
+    PutLe32(out, static_cast<std::uint32_t>(fields.size()));
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        PutBe16(out, index[i].first);
-        PutBe16(out, 0x0204);
-        PutBe32(out, static_cast<std::uint32_t>(fields[i].value.size() + 1));
-        PutBe32(out, static_cast<std::uint32_t>(fields[i].value.size() + 1));
-        PutBe32(out, index[i].second);
+        PutLe16(out, index[i].first);
+        PutLe16(out, 0x0204);
+        PutLe32(out, static_cast<std::uint32_t>(fields[i].value.size() + 1));
+        PutLe32(out, static_cast<std::uint32_t>(fields[i].value.size() + 1));
+        PutLe32(out, index[i].second);
     }
     out.insert(out.end(), keys.begin(), keys.end());
     out.insert(out.end(), data.begin(), data.end());
@@ -129,6 +133,50 @@ TEST(SfoParsesItsFields) {
     CHECK(!info->IsPatchContainer());
     CHECK(info->Valid());
     CHECK(info->title == "Bloodborne");
+}
+
+TEST(SfoParsesRealLittleEndianPs4Layout) {
+    // Matches the on-disk byte layout of a genuine PS4 param.sfo:
+    // "\0PSF" magic, LE version 0x00000101, LE offsets/counts, uint32 APP_TYPE
+    // (0x0404), UTF-8 NUL-terminated APP_VER/TITLE_ID (0x0204), and UTF-8
+    // non-NUL TITLE (0x0004).
+    std::vector<std::uint8_t> sfo = {
+        0x00, 0x50, 0x53, 0x46,  // "\0PSF"
+        0x01, 0x01, 0x00, 0x00,  // version 1.1 (LE)
+        0x54, 0x00, 0x00, 0x00,  // key_table = 20 + 4*16 = 84 (0x54)
+        0x78, 0x00, 0x00, 0x00,  // data_table = 84 + 36 = 120 (0x78)
+        0x04, 0x00, 0x00, 0x00,  // count = 4
+        // Entry 0: APP_TYPE (uint32 0x0404, skipped as non-string)
+        0x00, 0x00, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Entry 1: APP_VER (UTF-8 0x0204, "01.09\0")
+        0x09, 0x00, 0x04, 0x02, 0x06, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        // Entry 2: TITLE (UTF-8 special 0x0004, "Bloodborne" without NUL)
+        0x11, 0x00, 0x04, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+        // Entry 3: TITLE_ID (UTF-8 0x0204, "CUSA00900\0")
+        0x17, 0x00, 0x04, 0x02, 0x0a, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00,
+    };
+    const std::string keys = std::string("APP_TYPE\0APP_VER\0TITLE\0TITLE_ID\0", 32);
+    sfo.insert(sfo.end(), keys.begin(), keys.end());
+    sfo.insert(sfo.end(), 4, 0x00);  // align key table to 36 bytes (offset 0x78)
+    // Data: APP_TYPE=1 (4B), APP_VER="01.09\0\0\0" (8B), TITLE="Bloodborne\0\0" (12B), TITLE_ID="CUSA00900\0\0\0" (12B)
+    const std::vector<std::uint8_t> data = {
+        0x01, 0x00, 0x00, 0x00,
+        '0',  '1',  '.',  '0',  '9',  0x00, 0x00, 0x00,
+        'B',  'l',  'o',  'o',  'd',  'b',  'o',  'r',  'n',  'e',  0x00, 0x00,
+        'C',  'U',  'S',  'A',  '0',  '0',  '9',  '0',  '0',  0x00, 0x00, 0x00,
+    };
+    sfo.insert(sfo.end(), data.begin(), data.end());
+
+    const std::optional<SfoInfo> info = ParseParamSfo(sfo);
+    CHECK(info.has_value());
+    if (info) {
+        CHECK(info->app_ver == "01.09");
+        CHECK(info->app_type.empty());
+        CHECK(info->TitleId() == "CUSA00900");
+        CHECK(info->title == "Bloodborne");
+        CHECK(!info->IsPatchContainer());
+        CHECK(info->Valid());
+    }
 }
 
 TEST(SfoAcceptsABaseDumpWhoseContentIdHasNoVersionGroup) {
