@@ -910,13 +910,42 @@ void RestoreDump() {
         }
     };
 
+    const auto ascii_lower = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    const auto equals_icase = [&ascii_lower](const std::string& a, const char* b) {
+        std::size_t i = 0;
+        for (; i < a.size() && b[i] != '\0'; ++i) {
+            if (ascii_lower(a[i]) != ascii_lower(b[i])) return false;
+        }
+        return i == a.size() && b[i] == '\0';
+    };
+    const auto starts_with_icase = [&ascii_lower](const std::string& a, const char* prefix) {
+        std::size_t i = 0;
+        for (; prefix[i] != '\0'; ++i) {
+            if (i >= a.size() || ascii_lower(a[i]) != ascii_lower(prefix[i])) return false;
+        }
+        return true;
+    };
+
     add_candidate(path);
     for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
         add_candidate(root);
         if (fs.list_dirs) {
+            const bool dev_files_root = starts_with_icase(root, "D:\\DevelopmentFiles");
             for (const std::string& child : fs.list_dirs(root)) {
                 if (child == "." || child == ".." || child == "bbxbox_logs") continue;
-                add_candidate(JoinScanPath(root, child));
+                const std::string child_path = JoinScanPath(root, child);
+                add_candidate(child_path);
+                // Also inspect common 2-level layouts such as E:\dumps\Bloodborne or
+                // D:\DevelopmentFiles\Games\Bloodborne without walking the whole disk.
+                if (dev_files_root || equals_icase(child, "dumps") ||
+                    equals_icase(child, "games") || equals_icase(child, "ps4")) {
+                    for (const std::string& grandchild : fs.list_dirs(child_path)) {
+                        if (grandchild == "." || grandchild == ".." || grandchild == "bbxbox_logs") continue;
+                        add_candidate(JoinScanPath(child_path, grandchild));
+                    }
+                }
             }
         }
     }
@@ -1220,6 +1249,12 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         const bbx::platform::SelfTestResult self_test = bbx::platform::RunMemorySelfTest(false);
 
         bbx::platform::ButtonMask previous = 0;
+        bool guest_ever_started = false;
+        bool emergency_holding = false;
+        std::chrono::steady_clock::time_point emergency_hold_start{};
+        const bbx::platform::ButtonMask kEmergencyQuitMask =
+            bbx::platform::Bit(Pad::kView) | bbx::platform::Bit(Pad::kMenu);
+
         while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
             if (stored_window) {
                 stored_window.Dispatcher().ProcessEvents(
@@ -1229,14 +1264,37 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
 
             // The pad is WinRT's; there is no SDL event queue on this target.
             const bbx::platform::ButtonMask held = MaskFromPad();
-            bbx::platform::PadEdges edges;
-            edges.held = held;
-            edges.pressed = held & ~previous;
-            edges.released = previous & ~held;
-            previous = held;
-            const PadAction action = g_session.chords.Update(edges);
-            if (action != PadAction::kNone) OnAction(action);
-            PollDumpPick();
+            if (bbx::bridge::Running()) {
+                // Once the guest is running, do not feed gameplay buttons into
+                // the launcher menu (pressing Menu/D-pad/A in-game would open
+                // the virtual keyboard or activate hidden launcher items).
+                // Keep only a 3-second View+Menu emergency exit chord.
+                if ((held & kEmergencyQuitMask) == kEmergencyQuitMask) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!emergency_holding) {
+                        emergency_holding = true;
+                        emergency_hold_start = now;
+                    } else if (now - emergency_hold_start >= std::chrono::seconds(3)) {
+                        bbx::platform::LogMirroredMessage(
+                            bbx::platform::Level::kInfo,
+                            "launcher: View+Menu held for 3 s; exiting running guest");
+                        g_session.quit = true;
+                    }
+                } else {
+                    emergency_holding = false;
+                }
+                previous = held;
+            } else {
+                emergency_holding = false;
+                bbx::platform::PadEdges edges;
+                edges.held = held;
+                edges.pressed = held & ~previous;
+                edges.released = previous & ~held;
+                previous = held;
+                const PadAction action = g_session.chords.Update(edges);
+                if (action != PadAction::kNone) OnAction(action);
+                PollDumpPick();
+            }
 
             DrawFrame();
 
@@ -1260,16 +1318,27 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     req.mods = g_session.layout.base_path + "\\mods";
                 }
                 req.modded_eboot_ok = g_session.model.modded_eboot_ok;
-                if (!bbx::bridge::StartGuest(req)) {
+                if (bbx::bridge::StartGuest(req)) {
+                    guest_ever_started = true;
+                } else {
                     bbx::platform::LogMessage(bbx::platform::Level::kError,
                                               "launcher: the guest did not start; staying in the launcher");
                 }
             }
             ::Sleep(8);
         }
+        bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
+        if (guest_ever_started || bbx::bridge::Running()) {
+            // Normal UWP exit runs static destructors and DLL teardown while
+            // detached guest threads are still running, hanging the console on
+            // the last frame for minutes. Flush logs and terminate cleanly.
+            Steps().Shutdown("guest exit");
+            bbx::platform::LogFlush();
+            bbx::platform::LogClose();
+            ::TerminateProcess(::GetCurrentProcess(), 0);
+        }
         acquire_watch.Stop();
         telemetry.Stop();
-        bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         ShutdownDisplay();
         Steps().UnregisterThread(ui_tid);
         bbx::platform::LogFlush();

@@ -279,7 +279,19 @@ bool range_recorded(std::uintptr_t lo, std::uintptr_t hi) {
 }
 
 int host_prot(int sce_prot) {
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    // Strict AppContainer W^X: never request PAGE_EXECUTE_READWRITE. Direct and
+    // private sections on UWP are backed by PAGE_READWRITE | SEC_RESERVE, so
+    // writable requests map RW and execute-only/read-execute requests map RX.
+    const bool r = sce_prot & kProtCpuRead, w = sce_prot & kProtCpuWrite, x = sce_prot & kProtCpuExec;
+    if (w) {
+        return PAGE_READWRITE;
+    }
+    if (x) {
+        return PAGE_EXECUTE_READ;
+    }
+    return r ? PAGE_READONLY : PAGE_NOACCESS;
+#elif defined(_WIN32)
     const bool r = sce_prot & kProtCpuRead, w = sce_prot & kProtCpuWrite, x = sce_prot & kProtCpuExec;
     if (x) {
         return w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
@@ -476,8 +488,12 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
 bool host_protect(std::uintptr_t p, std::uint64_t len, int sce_prot) {
 #if defined(BBX_UWP)
     DWORD old = 0;
-    return VirtualProtectFromApp(reinterpret_cast<void*>(p), static_cast<std::size_t>(len),
-                                 static_cast<DWORD>(host_prot(sce_prot)), &old) != 0;
+    const DWORD prot = static_cast<DWORD>(host_prot(sce_prot));
+    const bool ok = VirtualProtectFromApp(reinterpret_cast<void*>(p), static_cast<std::size_t>(len), prot, &old) != 0;
+    if (ok && prot == PAGE_EXECUTE_READ) {
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(p), static_cast<SIZE_T>(len));
+    }
+    return ok;
 #elif defined(_WIN32)
     DWORD old = 0;
     return VirtualProtect(reinterpret_cast<void*>(p), static_cast<std::size_t>(len),

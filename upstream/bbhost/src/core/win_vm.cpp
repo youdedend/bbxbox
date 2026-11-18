@@ -109,6 +109,23 @@ struct View {
 };
 std::mutex g_mu;
 std::map<std::uintptr_t, View> g_views;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> g_reserved_windows;
+
+#if defined(BBX_UWP)
+// Strict AppContainer W^X: never pass PAGE_EXECUTE_READWRITE to FromApp VM calls.
+inline DWORD sanitize_prot(DWORD prot) {
+    if (prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY) {
+        return PAGE_EXECUTE_READ;
+    }
+    return prot;
+}
+inline bool is_exec_prot(DWORD prot) {
+    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+}
+#else
+inline DWORD sanitize_prot(DWORD prot) { return prot; }
+#endif
 
 bool aligned(std::uint64_t v) { return (v & (kGran - 1)) == 0; }
 
@@ -177,18 +194,27 @@ bool unmap_view_part_locked(std::uintptr_t vb, const View& v, std::uintptr_t at,
         if (!(run_base == vb && run_len == copy.len)) {
             VirtualFree(reinterpret_cast<void*>(run_base), run_len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
         }
+#if defined(BBX_UWP)
+        // AppContainer enforces W^X and our dmem/private sections are created
+        // with PAGE_READWRITE | SEC_RESERVE (not executable), so remapping kept
+        // slices with PAGE_EXECUTE_READWRITE always fails with ERROR_ACCESS_DENIED.
+        constexpr DWORD kRemapProt = PAGE_READWRITE;
+#else
+        constexpr DWORD kRemapProt = PAGE_EXECUTE_READWRITE;
+#endif
         void* p = api().MapViewOfFile3(copy.section, GetCurrentProcess(), reinterpret_cast<void*>(run_base),
                                        copy.offset + (run_base - vb), run_len, MEM_REPLACE_PLACEHOLDER,
-                                       PAGE_EXECUTE_READWRITE, nullptr, 0);
+                                       kRemapProt, nullptr, 0);
         if (!p) {
             host_log("win-vm: remapping the kept part at %p (0x%llx) failed: error %lu",
                      reinterpret_cast<void*>(run_base), static_cast<unsigned long long>(run_len), GetLastError());
         } else {
             g_views[run_base] = View{copy.section, copy.offset + (run_base - vb), run_len, copy.owned};
             for (const Part& k : kept) {
-                if (k.base >= run_base && k.base < run_base + run_len && k.protect != PAGE_EXECUTE_READWRITE) {
+                const DWORD target_prot = sanitize_prot(k.protect);
+                if (k.base >= run_base && k.base < run_base + run_len && target_prot != kRemapProt) {
                     DWORD old = 0;
-                    VmProtect(reinterpret_cast<void*>(k.base), k.len, k.protect, &old);
+                    VmProtect(reinterpret_cast<void*>(k.base), k.len, target_prot, &old);
                 }
             }
         }
@@ -317,6 +343,18 @@ bool win_vm_available() { return api().ok; }
 
 bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
     if (!api().ok) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        for (const auto& r : g_reserved_windows) {
+            if (base >= r.first && len <= r.second && base - r.first <= r.second - len) {
+                MEMORY_BASIC_INFORMATION m{};
+                if (VirtualQuery(reinterpret_cast<void*>(static_cast<std::uintptr_t>(base)), &m, sizeof(m)) &&
+                    m.State != MEM_FREE) {
+                    return true;
+                }
+            }
+        }
+    }
     void* p = api().VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(static_cast<std::uintptr_t>(base)),
                                   len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     if (!p) {
@@ -326,6 +364,10 @@ bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
                  static_cast<unsigned long long>(base), static_cast<unsigned long long>(len), GetLastError(),
                  state_name(m.State), m.AllocationBase, static_cast<unsigned long long>(m.RegionSize));
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_reserved_windows.emplace_back(base, len);
     }
     return true;
 }
@@ -358,17 +400,29 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
         if (!carve_locked(base, len, place == WinVmPlace::Exact)) return nullptr;
     }
     // Views take a real page protection; NOACCESS is applied afterwards.
-    const DWORD view_prot = protect == PAGE_NOACCESS ? PAGE_READWRITE : protect;
+    const DWORD clean_prot = sanitize_prot(static_cast<DWORD>(protect));
+    DWORD view_prot = clean_prot == PAGE_NOACCESS ? PAGE_READWRITE : clean_prot;
     void* p = api().MapViewOfFile3(section, GetCurrentProcess(), reinterpret_cast<void*>(base), offset, len,
                                    MEM_REPLACE_PLACEHOLDER, view_prot, nullptr, 0);
+#if defined(BBX_UWP)
+    // Our UWP direct-memory and private sections are created with
+    // PAGE_READWRITE | SEC_RESERVE (non-executable under W^X), so an RX view
+    // request against a data section returns ERROR_ACCESS_DENIED; fall back to
+    // PAGE_READWRITE rather than failing the guest mapping.
+    if (!p && is_exec_prot(view_prot) && GetLastError() == ERROR_ACCESS_DENIED) {
+        view_prot = PAGE_READWRITE;
+        p = api().MapViewOfFile3(section, GetCurrentProcess(), reinterpret_cast<void*>(base), offset, len,
+                                 MEM_REPLACE_PLACEHOLDER, view_prot, nullptr, 0);
+    }
+#endif
     if (!p) {
         host_log("win-vm: MapViewOfFile3 at %p offset 0x%llx len 0x%llx prot 0x%lx: error %lu",
                  reinterpret_cast<void*>(base), static_cast<unsigned long long>(offset),
-                 static_cast<unsigned long long>(len), protect, GetLastError());
+                 static_cast<unsigned long long>(len), static_cast<unsigned long>(view_prot), GetLastError());
         if (place == WinVmPlace::Anywhere) VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
         return nullptr;
     }
-    if (protect == PAGE_NOACCESS) {
+    if (clean_prot == PAGE_NOACCESS) {
         DWORD old = 0;
         VmProtect(p, len, PAGE_NOACCESS, &old);
     }
@@ -377,8 +431,9 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
 }
 
 void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlace place, std::uint64_t limit) {
+    const DWORD clean_prot = sanitize_prot(static_cast<DWORD>(protect));
     if (!api().ok) {
-        return VmAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE | MEM_COMMIT, protect);
+        return VmAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE | MEM_COMMIT, clean_prot);
     }
 #if defined(BBX_UWP)
     // AppContainer: the FromApp call, and no RWX (a guest mapping that wants
@@ -395,7 +450,7 @@ void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlac
                  GetLastError());
         return nullptr;
     }
-    void* p = win_vm_map(s, at, len, 0, protect, place, limit);
+    void* p = win_vm_map(s, at, len, 0, clean_prot, place, limit);
     if (!p) {
         CloseHandle(s);
         return nullptr;
@@ -406,7 +461,8 @@ void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlac
 }
 
 void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uint64_t limit) {
-    if (!api().ok) return VmAlloc(at, len, MEM_RESERVE | MEM_COMMIT, protect);
+    const DWORD clean_prot = sanitize_prot(static_cast<DWORD>(protect));
+    if (!api().ok) return VmAlloc(at, len, MEM_RESERVE | MEM_COMMIT, clean_prot);
     std::lock_guard<std::mutex> lk(g_mu);
     if (at) {
         if (!carve_locked(reinterpret_cast<std::uintptr_t>(at), len, true)) return nullptr;
@@ -415,7 +471,7 @@ void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uin
         if (!at) return nullptr;
     }
     void* p = api().VirtualAlloc2(GetCurrentProcess(), at, len, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-                                  protect, nullptr, 0);
+                                  clean_prot, nullptr, 0);
     if (!p) host_log("win-vm: committing %p (0x%llx): error %lu", at, static_cast<unsigned long long>(len), GetLastError());
     return p;
 }

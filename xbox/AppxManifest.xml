@@ -4,27 +4,25 @@
   bbxbox, Xbox Series X|S Retail Developer Mode, Game mode.
 
   Capabilities are the minimum the port needs and nothing else, and every one of
-  them is named in the schema's own namespace: `codeGeneration` is a *restricted*
-  capability, so it is `<rescap:Capability>` and not `<Capability>`. Written the
-  other way it is not a capability the platform grants - makeappx accepts it (it
-  is a valid element in the default namespace) and the app then calls
-  `VirtualProtect` on code pages it was never given.
+  them is declared in its actual Windows 10 UWP schema namespace:
 
-    codeGeneration     the guest is emitted and patched at run time (bbhost is
-                       an HLE, not an interpreter), and the D3D12 swapchain
-                       requires it anyway;
-    expandedResources  the Game-mode memory grant: without it a title is held to
-                       the shared-memory limit and the guest's 5,120 MiB budget
-                       is not there at all;
-    removableStorage   the dump is on a USB drive, picked once and remembered in
-                       the FutureAccessList.
+    <Capability Name="codeGeneration" />
+        Foundation capability (default namespace): grants VirtualProtectFromApp
+        executable transitions (RX) for guest x86-64 code and patches under W^X.
+        Declaring it under rescap: causes Windows/Xbox to ignore it and deny RX.
+    <uap:Capability Name="removableStorage" />
+        UAP capability: paired with windows.fileTypeAssociation below, allows
+        reading Bloodborne dump files from USB storage via FromApp APIs and
+        KnownFolders::RemovableDevices(), in addition to FutureAccessList grants.
+    <rescap:Capability Name="expandedResources" />
+        Restricted capability: the Xbox Dev Mode Game-mode memory grant, needed
+        for the guest's 5,120 MiB budget (docs/memory-budget.md).
+    <DeviceCapability Name="gamepad" />
+        Controller input via Windows.Gaming.Input.
 
   Deliberately absent: runFullTrust (not available to a Store-style app and not
-  needed), broadFileSystemAccess (the dump is reached through the picker's
-  grant), internetClient, microphone, webcam (SDL3's WASAPI capture is unused),
-  and any background task. `TargetDeviceFamily` is Windows.Desktop because
-  Developer Mode on Xbox presents as that family with the Xbox device in
-  `System.DeviceModel`.
+  needed), broadFileSystemAccess, internetClient, microphone, webcam (SDL3's
+  WASAPI capture is unused), and any background task.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -85,23 +83,87 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\LargeTile.png" />
         <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0C0E12" />
       </uap:VisualElements>
-      <!-- No <Extensions>: windows.gameExplorer is a uap/3 category and this
-           manifest targets uap/1, so makeappx rejects it ("violates enumeration
-           constraint"). Game mode on the console comes from the title being
-           launched as a game, not from an extension. -->
+      <!-- UWP's removableStorage capability only exposes files on USB drives
+           whose extensions are registered in a windows.fileTypeAssociation
+           extension. Declaring Bloodborne's dump, patch, mod and baked-cache
+           extensions here enables direct FromApp and RemovableDevices reads. -->
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="bbxboxassets">
+            <uap:DisplayName>Bloodborne game dump</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.bin</uap:FileType>
+              <uap:FileType>.sfo</uap:FileType>
+              <uap:FileType>.prx</uap:FileType>
+              <uap:FileType>.sprx</uap:FileType>
+              <uap:FileType>.self</uap:FileType>
+              <uap:FileType>.elf</uap:FileType>
+              <uap:FileType>.dcx</uap:FileType>
+              <uap:FileType>.bnd</uap:FileType>
+              <uap:FileType>.bhd</uap:FileType>
+              <uap:FileType>.bhd5</uap:FileType>
+              <uap:FileType>.bdt</uap:FileType>
+              <uap:FileType>.tpf</uap:FileType>
+              <uap:FileType>.tpfbhd</uap:FileType>
+              <uap:FileType>.tpfbdt</uap:FileType>
+              <uap:FileType>.cache</uap:FileType>
+              <uap:FileType>.paths</uap:FileType>
+              <uap:FileType>.txt</uap:FileType>
+              <uap:FileType>.ini</uap:FileType>
+              <uap:FileType>.log</uap:FileType>
+              <uap:FileType>.mp4</uap:FileType>
+              <uap:FileType>.fsb</uap:FileType>
+              <uap:FileType>.fev</uap:FileType>
+              <uap:FileType>.bnk</uap:FileType>
+              <uap:FileType>.at9</uap:FileType>
+              <uap:FileType>.wem</uap:FileType>
+              <uap:FileType>.pck</uap:FileType>
+              <uap:FileType>.dat</uap:FileType>
+              <uap:FileType>.dds</uap:FileType>
+              <uap:FileType>.png</uap:FileType>
+              <uap:FileType>.trp</uap:FileType>
+              <uap:FileType>.json</uap:FileType>
+              <uap:FileType>.xml</uap:FileType>
+              <uap:FileType>.cfg</uap:FileType>
+              <uap:FileType>.lua</uap:FileType>
+              <uap:FileType>.sav</uap:FileType>
+              <uap:FileType>.sl2</uap:FileType>
+              <uap:FileType>.msb</uap:FileType>
+              <uap:FileType>.flver</uap:FileType>
+              <uap:FileType>.hkx</uap:FileType>
+              <uap:FileType>.fmg</uap:FileType>
+              <uap:FileType>.mtd</uap:FileType>
+              <uap:FileType>.evd</uap:FileType>
+              <uap:FileType>.emevd</uap:FileType>
+              <uap:FileType>.gparam</uap:FileType>
+              <uap:FileType>.btl</uap:FileType>
+              <uap:FileType>.tae</uap:FileType>
+              <uap:FileType>.drb</uap:FileType>
+              <uap:FileType>.ccm</uap:FileType>
+              <uap:FileType>.fnt</uap:FileType>
+              <uap:FileType>.tdf</uap:FileType>
+              <uap:FileType>.ver</uap:FileType>
+              <uap:FileType>.info</uap:FileType>
+              <uap:FileType>.sha</uap:FileType>
+              <uap:FileType>.sig</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
     </Application>
   </Applications>
 
   <Capabilities>
-    <!-- codeGeneration is rescap, not a plain capability: the schema lists it
-         among the restricted capabilities, and the plain element (which makeappx
-         accepts) grants nothing. -->
-    <rescap:Capability Name="codeGeneration" />
+    <!-- Foundation capability (default namespace): grants W^X RX transitions
+         via VirtualProtectFromApp on Xbox Series X|S Dev Mode. -->
+    <Capability Name="codeGeneration" />
+    <!-- UAP capability: grants removable USB storage access for the file types
+         declared in windows.fileTypeAssociation above. -->
+    <uap:Capability Name="removableStorage" />
     <!-- Game mode's memory grant. A title without it is capped at the
          shared-memory limit and the guest's budget cannot be met
          (docs/memory-budget.md). -->
     <rescap:Capability Name="expandedResources" />
-    <rescap:Capability Name="removableStorage" />
     <DeviceCapability Name="gamepad" />
   </Capabilities>
 

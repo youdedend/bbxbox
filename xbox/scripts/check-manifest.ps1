@@ -10,11 +10,13 @@
 
    * x64, Windows.Universal (the console's app model), one Application whose
      Executable and EntryPoint agree with the code;
-   * capabilities: codeGeneration, expandedResources and removableStorage, all
-     three in rescap - the schema's restricted namespace - and nothing else: no
-     runFullTrust, no broadFileSystemAccess, no internetClient. codeGeneration
-     written as a plain <Capability> is a *failure* here, because makeappx
-     accepts it and the platform then grants nothing;
+   * capabilities in their exact Windows 10 UWP schema namespaces:
+       - <Capability Name="codeGeneration" /> (foundation default namespace),
+       - <uap:Capability Name="removableStorage" /> (uap namespace, paired with
+         a windows.fileTypeAssociation extension),
+       - <rescap:Capability Name="expandedResources" /> (restricted namespace),
+       - <DeviceCapability Name="gamepad" />,
+     and nothing else: no runFullTrust, no broadFileSystemAccess, no internetClient;
    * every Assets\*.png the manifest names exists on disk.
 
    * the Microsoft.VCLibs framework package is a dependency, with Microsoft's
@@ -81,37 +83,56 @@ if ($applications.Count -ne 1) {
     if ($app.EntryPoint -ne "bbxbox.App") {
         $problems.Add("Application EntryPoint must be bbxbox.App, found '$($app.EntryPoint)'")
     }
+    $ftaNodes = @($app.SelectNodes(".//*[local-name()='Extension' and @Category='windows.fileTypeAssociation']"))
+    if ($ftaNodes.Count -eq 0) {
+        $problems.Add("uap:Extension Category='windows.fileTypeAssociation' is required for removableStorage USB file access")
+    }
 }
 
-# The capabilities are read from the element names and namespaces: <rescap:Capability>
-# is a Capability element in the restricted-capabilities namespace, not a separate
-# XML name, so asking PowerShell for "RestrictedCapability" finds nothing.
+# Capabilities must live in their exact schema namespaces:
+#   foundation default namespace -> codeGeneration
+#   uap namespace                -> removableStorage
+#   rescap namespace             -> expandedResources
+# Putting codeGeneration or removableStorage in rescap: causes Windows/Xbox to
+# ignore them, denying VirtualProtectFromApp RX and direct USB reads.
+$foundationNs = "http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+$uapNs = "http://schemas.microsoft.com/appx/manifest/uap/windows10"
 $capabilityElements = @($manifest.Package.Capabilities.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })
-$names = @($capabilityElements |
-        Where-Object { $_.LocalName -eq 'Capability' -and $_.NamespaceURI -notlike '*restrictedcapabilities*' } |
+$foundation = @($capabilityElements |
+        Where-Object { $_.LocalName -eq 'Capability' -and $_.NamespaceURI -eq $foundationNs } |
+        ForEach-Object { $_.Name })
+$uap = @($capabilityElements |
+        Where-Object { $_.LocalName -eq 'Capability' -and $_.NamespaceURI -eq $uapNs } |
         ForEach-Object { $_.Name })
 $restricted = @($capabilityElements |
         Where-Object { $_.LocalName -eq 'Capability' -and $_.NamespaceURI -like '*restrictedcapabilities*' } |
         ForEach-Object { $_.Name })
+$allCaps = @($capabilityElements |
+        Where-Object { $_.LocalName -eq 'Capability' } |
+        ForEach-Object { $_.Name })
 $device = @($capabilityElements | Where-Object { $_.LocalName -eq 'DeviceCapability' } | ForEach-Object { $_.Name })
 
-# codeGeneration and expandedResources are restricted capabilities in the appx
-# schema. In the wrong namespace they parse, package, install - and grant
-# nothing, which on a console is a JIT copy that faults and a title held to the
-# shared-memory limit.
-foreach ($required in @("codeGeneration", "expandedResources", "removableStorage")) {
-    if ($restricted -notcontains $required) {
-        $problems.Add("restricted capability '$required' is required as <rescap:Capability> (not a plain <Capability>, which grants nothing)")
-    }
+if ($foundation -notcontains "codeGeneration") {
+    $problems.Add("capability 'codeGeneration' is required as a foundation <Capability Name=`"codeGeneration`" /> (not rescap:)")
 }
-foreach ($misplaced in @("codeGeneration", "expandedResources", "removableStorage")) {
-    if ($names -contains $misplaced) {
-        $problems.Add("capability '$misplaced' is in the default namespace; the schema defines it in rescap")
-    }
+if ($uap -notcontains "removableStorage") {
+    $problems.Add("capability 'removableStorage' is required as <uap:Capability Name=`"removableStorage`" /> (not rescap:)")
+}
+if ($restricted -notcontains "expandedResources") {
+    $problems.Add("restricted capability 'expandedResources' is required as <rescap:Capability Name=`"expandedResources`" />")
+}
+if ($restricted -contains "codeGeneration" -or $uap -contains "codeGeneration") {
+    $problems.Add("capability 'codeGeneration' is in the wrong namespace; it must be a plain foundation <Capability>")
+}
+if ($restricted -contains "removableStorage" -or $foundation -contains "removableStorage") {
+    $problems.Add("capability 'removableStorage' is in the wrong namespace; it must be <uap:Capability>")
+}
+if ($foundation -contains "expandedResources" -or $uap -contains "expandedResources") {
+    $problems.Add("capability 'expandedResources' is in the wrong namespace; it must be <rescap:Capability>")
 }
 if ($device -notcontains "gamepad") { $problems.Add("device capability 'gamepad' is required") }
 foreach ($forbidden in @("runFullTrust", "broadFileSystemAccess", "internetClient", "internetClientServer", "privateNetworkClientServer", "microphone", "webcam", "documentsLibrary", "picturesLibrary", "videosLibrary", "enterpriseAuthentication", "sharedUserCertificates")) {
-    if (($names -contains $forbidden) -or ($restricted -contains $forbidden)) {
+    if ($allCaps -contains $forbidden) {
         $problems.Add("capability '$forbidden' must not appear; the port does not need it")
     }
 }

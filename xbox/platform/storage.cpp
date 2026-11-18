@@ -399,19 +399,79 @@ bool ReleaseGrant(const std::string& token) {
 
 std::vector<std::string> CandidateDumpRoots() {
     std::vector<std::string> roots;
-    // Removable drives: the manifest's `removableStorage` capability plus the
-    // FromApp find API is the only way to see them, and only the drives the
-    // console has handed to this app appear.
+    const auto add_unique = [&roots](std::string path) {
+        if (path.empty()) return;
+        for (char& ch : path) {
+            if (ch == '/') ch = '\\';
+        }
+        while (path.size() > 3 && path.back() == '\\') path.pop_back();
+        auto same = [&path](const std::string& existing) {
+            if (existing.size() != path.size()) return false;
+            for (std::size_t i = 0; i < existing.size(); ++i) {
+                if (std::towlower(static_cast<unsigned char>(existing[i])) !=
+                    std::towlower(static_cast<unsigned char>(path[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (std::none_of(roots.begin(), roots.end(), same)) {
+            roots.push_back(std::move(path));
+        }
+    };
+
+    // Xbox Dev Mode internal storage: D:\ root itself is denied to an
+    // AppContainer, but D:\DevelopmentFiles is readable without the picker and
+    // is where Device Portal / FTP dumps are usually placed.
+    {
+        WIN32_FIND_DATAW dev_data{};
+        HANDLE dev_find = ::FindFirstFileExFromAppW(L"D:\\DevelopmentFiles\\*", FindExInfoBasic,
+                                                    &dev_data, FindExSearchNameMatch, nullptr, 0);
+        if (dev_find != INVALID_HANDLE_VALUE) {
+            ::FindClose(dev_find);
+            add_unique("D:\\DevelopmentFiles");
+        }
+    }
+
+    // Removable USB drives via KnownFolders::RemovableDevices(), queried on an
+    // MTA worker thread so calling CandidateDumpRoots() from ui-main never
+    // blocks or throws on the CoreWindow dispatcher thread.
+    {
+        std::vector<std::string> winrt_drives;
+        std::thread worker([&winrt_drives]() {
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            } catch (...) {
+            }
+            try {
+                const auto drives =
+                    winrt::Windows::Storage::KnownFolders::RemovableDevices().GetFoldersAsync().get();
+                for (const auto& drive : drives) {
+                    const std::string p = winrt::to_string(drive.Path());
+                    if (!p.empty()) winrt_drives.push_back(p);
+                }
+            } catch (const winrt::hresult_error& err) {
+                LogMessage(Level::kWarn, "storage: RemovableDevices enumeration failed (0x%08x)",
+                           static_cast<unsigned>(err.code().value));
+            } catch (...) {
+            }
+        });
+        worker.join();
+        for (auto& drive : winrt_drives) add_unique(std::move(drive));
+    }
+
+    // Fallback drive-letter probe: catches E:\ and any other mapped volume
+    // reachable through FromApp even if RemovableDevices returned nothing.
     for (wchar_t letter = L'D'; letter <= L'Z'; ++letter) {
         const std::wstring root{letter, L':', L'\\'};
         WIN32_FIND_DATAW data{};
         HANDLE find = ::FindFirstFileExFromAppW((root + L"*").c_str(), FindExInfoBasic, &data,
-                                               FindExSearchNameMatch, nullptr, 0);
+                                                FindExSearchNameMatch, nullptr, 0);
         if (find == INVALID_HANDLE_VALUE) continue;
         ::FindClose(find);
-        roots.push_back(Narrow(root));
+        add_unique(Narrow(root));
     }
-    if (!g_storage.paths.local_state.empty()) roots.push_back(g_storage.paths.local_state);
+    if (!g_storage.paths.local_state.empty()) add_unique(g_storage.paths.local_state);
     return roots;
 }
 

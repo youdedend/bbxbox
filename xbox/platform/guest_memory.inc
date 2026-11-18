@@ -116,19 +116,10 @@ inline bool Alloc(Arena& arena, std::uint64_t slide, std::size_t size) {
     // FromApp: the desktop VirtualAlloc2 is not callable from an AppContainer.
     // The address is exact: anything else and every precomputed patch site is
     // off by the delta.
-    void* base = VirtualAlloc2FromApp(GetCurrentProcess(), wanted, size,
-                                      MEM_RESERVE | MEM_COMMIT | MEM_RESERVE_PLACEHOLDER,
+    void* base = VirtualAlloc2FromApp(GetCurrentProcess(), wanted, size, MEM_RESERVE | MEM_COMMIT,
                                       PAGE_READWRITE, nullptr, 0);
-    if (base == nullptr) {
-        base = VirtualAlloc2FromApp(GetCurrentProcess(), wanted, size, MEM_RESERVE | MEM_COMMIT,
-                                    PAGE_READWRITE, nullptr, 0);
-    }
-    if (base != nullptr && base != wanted) {
-        VirtualFree(base, 0, MEM_RELEASE);
-        base = nullptr;
-    }
     if (base == nullptr) return false;
-    if (reinterpret_cast<std::uintptr_t>(base) != static_cast<std::uintptr_t>(slide)) {
+    if (base != wanted) {
         VirtualFree(base, 0, MEM_RELEASE);  // never run a slid image
         return false;
     }
