@@ -23,6 +23,7 @@
 #include "xbox/platform/bbhost_bridge.h"
 #include "xbox/platform/guest_compute.h"
 #include "xbox/platform/guest_frames.h"
+#include "xbox/platform/guest_graphics.h"
 #include "xbox/platform/log.h"
 
 namespace bbx::platform {
@@ -81,6 +82,7 @@ struct D3d12Session::Impl {
     std::unique_ptr<d3d12::DescriptorRing> guest_sampler_arena;
     std::uint32_t guest_arena_base = 0, guest_sampler_base = 0;
     GuestCompute guest_compute;
+    GuestGraphics guest_graphics;
 
     [[nodiscard]] d3d12::DeviceDesc Desc(bool debug) const {
         d3d12::DeviceDesc desc{};
@@ -120,13 +122,19 @@ struct D3d12Session::Impl {
         Impl& impl = *static_cast<Impl*>(user);
         return impl.guest_memory.ReadGuest(impl.guest_plan.table, va, out, bytes) == d3d12::Status::kOk;
     }
-    // The pipeline half (guest_compute.cpp): the shader's bake-identical key, and
-    // the dispatch itself.
+    // The pipeline halves (guest_compute.cpp + guest_graphics.cpp): compute keys
+    // and dispatches, plus graphics shader creation notes and draw execution.
     static std::uint64_t DispatchKey(void* user, const GpuDispatch& d) {
         return static_cast<Impl*>(user)->guest_compute.KeyFor(d);
     }
     static bool Dispatch(void* user, std::uint64_t key, const GpuDispatch& d) {
         return static_cast<Impl*>(user)->guest_compute.Run(key, d);
+    }
+    static void NoteShaderCreated(void* user, int stage, const std::uint8_t* container, std::size_t size) {
+        static_cast<Impl*>(user)->guest_graphics.NoteShaderCreated(stage, container, size);
+    }
+    static bool Draw(void* user, const GpuDraw& d, const d3d12::DrawIdentity& identity) {
+        return static_cast<Impl*>(user)->guest_graphics.Draw(d, identity);
     }
 
     // Installs the binding the guest's HLE calls through (host_gpu_d3d12.h).
@@ -141,11 +149,13 @@ struct D3d12Session::Impl {
         guest_binding.mem_fill = &Impl::MemFill;
         guest_binding.mem_copy = &Impl::MemCopy;
         guest_binding.read_guest = &Impl::ReadGuest;
-        // The compute pipeline: Slice 5B-2a's half. A graphics draw is still
-        // host_gpu_draw's counted stub (5B-2b), and it does not go through here.
         if (guest_compute.Ready()) {
             guest_binding.dispatch_key = &Impl::DispatchKey;
             guest_binding.dispatch = &Impl::Dispatch;
+        }
+        if (guest_graphics.Ready()) {
+            guest_binding.note_shader_created = &Impl::NoteShaderCreated;
+            guest_binding.draw = &Impl::Draw;
         }
         guest_binding.ready = ready && guest_memory.Ready();
         d3d12::SetGuestGpuBinding(&guest_binding);
@@ -163,7 +173,7 @@ struct D3d12Session::Impl {
         }
         if (report.adapter.empty()) { report.adapter = "unknown adapter"; }
         report.memory = device.DescribeMemory();
-        report.guest = guest_memory_line + " | " + guest_compute.Report();
+        report.guest = guest_memory_line + " | " + guest_compute.Report() + " | " + guest_graphics.Report();
         char text[192];
         std::snprintf(text, sizeof(text), "%ux%u x%u%s%s", swapchain.Width(), swapchain.Height(),
                       swapchain.BufferCount(), plan.clamped ? ", clamped" : "",
@@ -313,6 +323,15 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
                 if (c == '\n') c = ' ';
             }
             LogMessage(Level::kInfo, "d3d12: %s", line.c_str());
+            const d3d12::Status graphics = impl.guest_graphics.Create(
+                impl.device, impl.pipelines, impl.guest_memory, impl.guest_compute,
+                impl.guest_arena_base, impl.guest_sampler_base);
+            if (graphics != d3d12::Status::kOk) {
+                LogMessage(Level::kWarn, "d3d12: guest graphics not created (%s): draws will be refused",
+                           d3d12::StatusName(graphics));
+            } else {
+                LogMessage(Level::kInfo, "d3d12: %s", impl.guest_graphics.Report().c_str());
+            }
         }
     }
     // The guest's HLE now sees the device's fence and the guest's slabs
@@ -463,7 +482,9 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     // waiting anyway), so the guest's compute PSOs whose eviction it proves are
     // released now: a pipeline object freed while a recorded list still names it
     // is the one lifetime mistake D3D12 does not report.
-    impl.guest_compute.OnFrame(impl.device.CompletedValue());
+    const std::uint64_t completed = impl.device.CompletedValue();
+    impl.guest_compute.OnFrame(completed);
+    impl.guest_graphics.OnFrame(completed);
     return presented;
 }
 
@@ -534,6 +555,7 @@ void D3d12Session::Destroy() {
     impl_->ready = false;
     // The guest's HLE must stop calling into this device before it is destroyed.
     d3d12::SetGuestGpuBinding(nullptr);
+    impl_->guest_graphics.Destroy();
     impl_->guest_compute.Destroy();
     impl_->guest_arena.reset();
     impl_->guest_sampler_arena.reset();

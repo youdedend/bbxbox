@@ -58,7 +58,6 @@ struct D3D12_CPU_DESCRIPTOR_HANDLE;
 struct D3D12_GPU_DESCRIPTOR_HANDLE;
 struct D3D12_VERTEX_BUFFER_VIEW;
 struct D3D12_INDEX_BUFFER_VIEW;
-struct D3D12_INDEX_BUFFER_VIEW;
 struct D3D12_VIEWPORT;
 struct D3D12_RECT;
 struct D3D12_RANGE;
@@ -227,6 +226,7 @@ constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_DEPTH_WRITE = 0x10;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_DEPTH_READ = 0x20;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE = 0x40;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE = 0x80;
+constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT = 0x200;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_COPY_DEST = 0x400;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_COPY_SOURCE = 0x800;
 constexpr D3D12_RESOURCE_STATES D3D12_RESOURCE_STATE_GENERIC_READ = 0xAC3;
@@ -254,13 +254,19 @@ enum D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS : UINT {
 enum D3D12_BLEND : UINT {
     D3D12_BLEND_ZERO = 1,
     D3D12_BLEND_ONE = 2,
-    D3D12_BLEND_SRC_ALPHA = 5,
-    D3D12_BLEND_INV_SRC_ALPHA = 6,
     D3D12_BLEND_SRC_COLOR = 3,
     D3D12_BLEND_INV_SRC_COLOR = 4,
+    D3D12_BLEND_SRC_ALPHA = 5,
+    D3D12_BLEND_INV_SRC_ALPHA = 6,
     D3D12_BLEND_DEST_ALPHA = 7,
     D3D12_BLEND_INV_DEST_ALPHA = 8,
     D3D12_BLEND_DEST_COLOR = 9,
+    D3D12_BLEND_INV_DEST_COLOR = 10,
+    D3D12_BLEND_SRC_ALPHA_SAT = 11,
+    D3D12_BLEND_SRC1_COLOR = 16,
+    D3D12_BLEND_INV_SRC1_COLOR = 17,
+    D3D12_BLEND_SRC1_ALPHA = 18,
+    D3D12_BLEND_INV_SRC1_ALPHA = 19,
 };
 
 enum D3D12_BLEND_OP : UINT {
@@ -291,6 +297,11 @@ enum D3D12_STENCIL_OP : UINT {
     D3D12_STENCIL_OP_KEEP = 1,
     D3D12_STENCIL_OP_ZERO = 2,
     D3D12_STENCIL_OP_REPLACE = 3,
+    D3D12_STENCIL_OP_INCR_SAT = 4,
+    D3D12_STENCIL_OP_DECR_SAT = 5,
+    D3D12_STENCIL_OP_INVERT = 6,
+    D3D12_STENCIL_OP_INCR = 7,
+    D3D12_STENCIL_OP_DECR = 8,
 };
 
 enum D3D12_PRIMITIVE_TOPOLOGY_TYPE : UINT {
@@ -305,6 +316,7 @@ enum D3D12_PRIMITIVE_TOPOLOGY : UINT {
     D3D_PRIMITIVE_TOPOLOGY_UNDEFINED = 0,
     D3D_PRIMITIVE_TOPOLOGY_POINTLIST = 1,
     D3D_PRIMITIVE_TOPOLOGY_LINELIST = 2,
+    D3D_PRIMITIVE_TOPOLOGY_LINESTRIP = 3,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST = 4,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP = 5,
 };
@@ -508,6 +520,51 @@ struct D3D12_RENDER_TARGET_VIEW_DESC {
     D3D12_TEX2D_RTV Texture2D;
 };
 
+enum D3D12_DSV_DIMENSION : UINT {
+    D3D12_DSV_DIMENSION_UNKNOWN = 0,
+    D3D12_DSV_DIMENSION_TEXTURE1D = 1,
+    D3D12_DSV_DIMENSION_TEXTURE1DARRAY = 2,
+    D3D12_DSV_DIMENSION_TEXTURE2D = 3,
+    D3D12_DSV_DIMENSION_TEXTURE2DARRAY = 4,
+    D3D12_DSV_DIMENSION_TEXTURE2DMS = 5,
+    D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY = 6,
+};
+
+enum D3D12_DSV_FLAGS : UINT {
+    D3D12_DSV_FLAG_NONE = 0,
+    D3D12_DSV_FLAG_READ_ONLY_DEPTH = 0x1,
+    D3D12_DSV_FLAG_READ_ONLY_STENCIL = 0x2,
+};
+
+struct D3D12_TEX2D_DSV {
+    UINT MipSlice = 0;
+};
+
+struct D3D12_DEPTH_STENCIL_VIEW_DESC {
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+    D3D12_DSV_DIMENSION ViewDimension = D3D12_DSV_DIMENSION_UNKNOWN;
+    D3D12_DSV_FLAGS Flags = D3D12_DSV_FLAG_NONE;
+    D3D12_TEX2D_DSV Texture2D;
+};
+
+enum D3D12_CLEAR_FLAGS : UINT {
+    D3D12_CLEAR_FLAG_DEPTH = 0x1,
+    D3D12_CLEAR_FLAG_STENCIL = 0x2,
+};
+
+struct D3D12_DEPTH_STENCIL_VALUE {
+    float Depth = 1.0f;
+    UINT8 Stencil = 0;
+};
+
+struct D3D12_CLEAR_VALUE {
+    DXGI_FORMAT Format = DXGI_FORMAT_UNKNOWN;
+    union {
+        float Color[4];
+        D3D12_DEPTH_STENCIL_VALUE DepthStencil;
+    };
+};
+
 // Raw (byte-address) buffers: the format is R32_TYPELESS and this flag says so.
 constexpr UINT D3D12_BUFFER_SRV_FLAG_NONE = 0;
 constexpr UINT D3D12_BUFFER_SRV_FLAG_RAW = 0x1;
@@ -653,6 +710,8 @@ struct DECLSPEC_UUID("189819f1-1db6-4b57-be54-1821339b85f7") ID3D12Device : ID3D
                                               D3D12_CPU_DESCRIPTOR_HANDLE destination) = 0;
     virtual HRESULT CreateRenderTargetView(void* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                            D3D12_CPU_DESCRIPTOR_HANDLE destination) = 0;
+    virtual void CreateDepthStencilView(void* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                                        D3D12_CPU_DESCRIPTOR_HANDLE destination) = 0;
     virtual HRESULT CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) = 0;
     virtual HRESULT CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
@@ -753,6 +812,7 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
                                  D3D12_GPU_VIRTUAL_ADDRESS args_offset, void* count, UINT64 count_offset) = 0;
     virtual void IASetVertexBuffers(UINT start_slot, UINT count,
                                     const D3D12_VERTEX_BUFFER_VIEW* views) = 0;
+    virtual void IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) = 0;
     virtual void IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) = 0;
     // The events the replay emits for the recorder's markers; a no-op without a
     // debug layer, which is exactly what they are on a retail console.
@@ -769,6 +829,9 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
                                   ID3D12Resource* destination, UINT64 offset) = 0;
     virtual void ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE rtv, const float color[4],
                                        UINT rect_count, const D3D12_RECT* rects) = 0;
+    virtual void ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,
+                                       float depth, UINT8 stencil, UINT rect_count,
+                                       const D3D12_RECT* rects) = 0;
     virtual void ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
                                               ID3D12Resource* resource, const UINT values[4],
                                               UINT rect_count, const D3D12_RECT* rects) = 0;
@@ -781,6 +844,7 @@ struct DECLSPEC_UUID("5b160d0f-ac1b-4185-8ba8-b3aec28e8000") ID3D12GraphicsComma
     virtual void OMSetStencilRef(UINT ref) = 0;
     virtual void SetGraphicsRootSignature(void* signature) = 0;
     virtual void SetComputeRootSignature(void* signature) = 0;
+    virtual void SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) = 0;
     virtual void SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) = 0;
     virtual void SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) = 0;
     virtual void SetGraphicsRoot32BitConstant(UINT index, UINT value, UINT offset) = 0;

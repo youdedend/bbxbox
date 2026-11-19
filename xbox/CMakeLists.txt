@@ -184,6 +184,7 @@ set(BBX_D3D12_SOURCES
     ../src/host/d3d12/bbx_guest_draw.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
     platform/guest_compute.cpp
+    platform/guest_graphics.cpp
 )
 
 set(BBX_APP_SOURCES

@@ -69,9 +69,10 @@ struct Counters {
     std::uint64_t no_device = 0;
     std::uint64_t bad_program = 0;
     std::uint64_t draws = 0;
-    std::uint64_t draws_identified = 0;   // a draw whose identity this port decoded
-    std::uint64_t draw_refusals = 0;      // ... and which it refused, by name
-    std::uint64_t draw_pipeline_missing = 0;  // identified, but the pipeline is not recorded yet
+    std::uint64_t draws_identified = 0;       // a draw whose identity this port decoded
+    std::uint64_t draws_executed = 0;         // ... and which the graphics pipeline submitted
+    std::uint64_t draw_refusals = 0;          // ... and which it refused, by name
+    std::uint64_t draw_pipeline_missing = 0;  // identified, but no graphics pipeline recorded it
     // Which draw identities have already put a line in the log (5B-2b): a level
     // makes the same draw thousands of times and the answer is one line.
     std::set<std::uint64_t> logged_draws;
@@ -110,6 +111,9 @@ void Publish() {
     c.published.no_device = c.no_device;
     c.published.bad_program = c.bad_program;
     c.published.draws = c.draws;
+    c.published.draws_executed = c.draws_executed;
+    c.published.draw_refusals = c.draw_refusals;
+    c.published.draw_pipeline_missing = c.draw_pipeline_missing;
     c.published.mem_writes = c.mem_writes;
     c.published.mem_fills = c.mem_fills;
     c.published.mem_copies = c.mem_copies;
@@ -163,11 +167,15 @@ std::string FormatGuestGpuReportLocked(const Counters& c) {
     char line[512];
     std::snprintf(line, sizeof(line),
                   "guest gpu: %llu dispatch(es) (%llu dispatched, %llu cache miss, %llu no pipeline, %llu no device, "
-                  "%llu bad program), %llu draw(s) refused, %llu upload(s) (%llu refused)",
+                  "%llu bad program), %llu draw(s) (%llu drawn, %llu refused, %llu no pipeline), "
+                  "%llu upload(s) (%llu refused)",
                   static_cast<unsigned long long>(c.dispatches), static_cast<unsigned long long>(c.dispatched),
                   static_cast<unsigned long long>(c.cache_misses), static_cast<unsigned long long>(c.no_pipeline),
                   static_cast<unsigned long long>(c.no_device), static_cast<unsigned long long>(c.bad_program),
-                  static_cast<unsigned long long>(c.draws), static_cast<unsigned long long>(c.mem_writes + c.mem_fills + c.mem_copies),
+                  static_cast<unsigned long long>(c.draws), static_cast<unsigned long long>(c.draws_executed),
+                  static_cast<unsigned long long>(c.draw_refusals),
+                  static_cast<unsigned long long>(c.draw_pipeline_missing),
+                  static_cast<unsigned long long>(c.mem_writes + c.mem_fills + c.mem_copies),
                   static_cast<unsigned long long>(c.mem_refused));
     return line;
 }
@@ -400,20 +408,31 @@ bool host_gpu_draw(const GpuDraw& d) {
         std::fprintf(stderr, "host_gpu: draw %llu: %s\n", static_cast<unsigned long long>(c.draws),
                      DrawIdentityLine(identity).c_str());
     }
-    // The rest of the graphics half - root signature and PSO from the wired
-    // bindings, the render-target views, the tile and blit paths - is what turns
-    // this into a draw. Until it is recorded, the answer is that step's name and
-    // not a silent success: a draw reported as drawn while nothing was submitted
-    // is the one kind of stub this port does not keep.
+    const GuestGpuBinding* gpu = g_bound;
+    if (gpu && gpu->draw) {
+        if (gpu->draw(gpu->user, d, identity)) {
+            ++c.draws_executed;
+            Publish();
+            return true;
+        }
+    }
     ++c.draw_pipeline_missing;
     if (c.logged_draws.size() <= 8 || c.draw_pipeline_missing == 1) {
         std::fprintf(stderr,
-                     "host_gpu: draw %llu identified but not recorded: the graphics pipeline (root signature, PSO, "
-                     "render-target views) is the next step of 5B-2b\n",
-                     static_cast<unsigned long long>(c.draws));
+                     "host_gpu: draw %llu identified but not recorded (%s)\n",
+                     static_cast<unsigned long long>(c.draws),
+                     (gpu && gpu->draw) ? "graphics pipeline refused or cache miss" : "no graphics hook installed");
     }
     Publish();
     return false;
+}
+
+void host_gpu_note_shader_created(int stage, const std::uint8_t* container, std::size_t size, std::uint64_t) {
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (gpu && gpu->note_shader_created && container != nullptr && size != 0) {
+        gpu->note_shader_created(gpu->user, stage, container, size);
+    }
 }
 
 int host_gpu_run_commit(const GpuDraw*, const std::uint64_t*, std::uint32_t, std::uint32_t& failed) {

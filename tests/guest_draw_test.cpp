@@ -14,6 +14,7 @@
 // silently skipped is a frame that is wrong in no log either.
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -294,3 +295,108 @@ TEST(GuestDraw_ADrawWithAnotherStageIsRefusedByNameNotDrawnAsAVsPsDraw) {
     CHECK_EQ(DrawFingerprint(tess),
              DrawFingerprint(DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data(), 0x1)));
 }
+
+TEST(GuestDraw_DecodesBlendStateAndClampsConstantAlphaForGuardG4) {
+    Registers r = OneDraw();
+    r.ctx[0x8e] = 0x0f;  // target 0 RGBA
+    r.ctx[0x8f] = 0x07;  // shader RGB only
+    // Target 0: enable (bit 30), separate alpha (bit 29),
+    // color: src=SRC_ALPHA (4), op=ADD (0), dst=INV_SRC_ALPHA (5),
+    // alpha: src=CONSTANT_ALPHA (19 -> Guard G4 kOne), op=SUBTRACT (1), dst=ONE_MINUS_CONSTANT_ALPHA (20 -> Guard G4 kZero).
+    r.ctx[0x1e0] = (1u << 30) | (1u << 29) | 4u | (0u << 5) | (5u << 8) | (19u << 16) | (1u << 21) | (20u << 24);
+    const DrawIdentity id = DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data());
+    CHECK(id.verdict == DrawVerdict::kOk);
+    CHECK(id.blend[0].enable);
+    CHECK(id.blend[0].src_color == DrawBlendFactor::kSrcAlpha);
+    CHECK(id.blend[0].dst_color == DrawBlendFactor::kInvSrcAlpha);
+    CHECK(id.blend[0].color_op == DrawBlendOp::kAdd);
+    CHECK(id.blend[0].src_alpha == DrawBlendFactor::kOne);
+    CHECK(id.blend[0].dst_alpha == DrawBlendFactor::kZero);
+    CHECK(id.blend[0].alpha_op == DrawBlendOp::kSubtract);
+    CHECK_EQ(id.blend[0].write_mask, 0x07u);
+    CHECK(id.blend[0].clamped_constant_factor);
+    CHECK(id.clamped_constant_blend);
+}
+
+TEST(GuestDraw_DecodesDepthStencilRasterizerViewportAndTopology) {
+    Registers r = OneDraw();
+    // Depth test (bit 1) + depth write (bit 2) + ZFUNC=GEQUAL (6<<4) + stencil (bit 0) + backface (bit 7)
+    // + front func EQUAL (2<<8) + back func NOTEQUAL (5<<20).
+    r.ctx[0x200] = 1u | 2u | 4u | (6u << 4) | (1u << 7) | (2u << 8) | (5u << 20);
+    // Front: fail=ZERO(1), pass=REPLACE(3), zfail=INCR_SAT(5); Back: fail=KEEP(0), pass=INVERT(7), zfail=DECR(9).
+    r.ctx[0x10b] = 1u | (3u << 4) | (5u << 8) | (0u << 12) | (7u << 16) | (9u << 20);
+    r.ctx[0x10c] = 0xabu | (0xcdu << 8) | (0xefu << 16);
+    r.ctx[0x12] = 0x0060'0000u;                    // depth_base = 0x60000000
+    r.ctx[0x16] = (159u) | (89u << 11);            // (159+1)*8 = 1280, (89+1)*8 = 720
+    r.ctx[0x205] = 2u | 4u | 0x10u | (1u << 5);    // cull_back, front_cw, wireframe
+    r.ctx[0x204] = (1u << 26);                     // ZCLIP_NEAR_DISABLE -> depth_clip = false
+    r.ctx[0x102] = static_cast<std::uint32_t>(-4); // base_vertex = -4
+    const auto fbits = [](float v) {
+        std::uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        return b;
+    };
+    r.ctx[0x10f + 0] = fbits(960.0f);   // xscale
+    r.ctx[0x10f + 1] = fbits(960.0f);   // xoffset
+    r.ctx[0x10f + 2] = fbits(-540.0f);  // yscale (Y-flipped)
+    r.ctx[0x10f + 3] = fbits(540.0f);   // yoffset
+    r.ctx[0x10f + 4] = fbits(1.0f);     // zscale
+    r.ctx[0x10f + 5] = fbits(0.0f);     // zoffset
+
+    const DrawIdentity id = DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data());
+    CHECK(id.verdict == DrawVerdict::kOk);
+    CHECK(id.depth_stencil.depth_test);
+    CHECK(id.depth_stencil.depth_write_enable);
+    CHECK(id.depth_stencil.depth_func == DrawCompareOp::kGreaterEqual);
+    CHECK(id.depth_stencil.stencil_enable);
+    CHECK(id.depth_stencil.backface_enable);
+    CHECK_EQ(id.depth_stencil.stencil_ref, 0xabu);
+    CHECK_EQ(id.depth_stencil.stencil_read_mask, 0xcdu);
+    CHECK_EQ(id.depth_stencil.stencil_write_mask, 0xefu);
+    CHECK(id.depth_stencil.front.fail_op == DrawStencilOp::kZero);
+    CHECK(id.depth_stencil.front.pass_op == DrawStencilOp::kReplace);
+    CHECK(id.depth_stencil.front.depth_fail_op == DrawStencilOp::kIncrSat);
+    CHECK(id.depth_stencil.front.func == DrawCompareOp::kEqual);
+    CHECK(id.depth_stencil.back.pass_op == DrawStencilOp::kInvert);
+    CHECK(id.depth_stencil.back.depth_fail_op == DrawStencilOp::kDecr);
+    CHECK(id.depth_stencil.back.func == DrawCompareOp::kNotEqual);
+    CHECK_EQ(id.depth_stencil.depth_base, 0x6000'0000ull);
+    CHECK_EQ(id.depth_stencil.depth_width, 1280u);
+    CHECK_EQ(id.depth_stencil.depth_height, 720u);
+    CHECK(!id.raster.cull_front);
+    CHECK(id.raster.cull_back);
+    CHECK(id.raster.front_cw);
+    CHECK(id.raster.wireframe);
+    CHECK(!id.raster.depth_clip);
+    CHECK_EQ(id.base_vertex, -4);
+    CHECK(id.viewport.valid);
+    CHECK_EQ(id.viewport.x, 0.0f);
+    CHECK_EQ(id.viewport.y, 0.0f);
+    CHECK_EQ(id.viewport.width, 1920.0f);
+    CHECK_EQ(id.viewport.height, 1080.0f);
+
+    CHECK(DecodeTopology(4).supported);
+    CHECK(DecodeTopology(4).topology == DrawTopology::kTriangleList);
+    CHECK(DecodeTopology(6).topology == DrawTopology::kTriangleStrip);
+    CHECK(DecodeTopology(17).rect_list);
+    CHECK(!DecodeTopology(0).supported);
+}
+
+TEST(GuestDraw_GraphicsPsoKeyTracksFixedStateAndIgnoresDynamicState) {
+    Registers a = OneDraw();
+    Registers same_pso = OneDraw();
+    // Moving the target VA or scissor changes dynamic state, not the PSO.
+    same_pso.Color(0, 0x5500'0000ull, 7680, 1080, 10, 0, 0);
+    same_pso.Scissor(640, 360);
+    const DrawIdentity id_a = DecodeDraw(a.sh.data(), a.ctx.data(), a.uconfig.data());
+    const DrawIdentity id_same = DecodeDraw(same_pso.sh.data(), same_pso.ctx.data(), same_pso.uconfig.data());
+    CHECK(GraphicsPsoKey(11, 22, id_a) == GraphicsPsoKey(11, 22, id_same));
+
+    // Changing cull mode, blend enable, or shader keys must produce a distinct PSO key.
+    Registers diff_cull = OneDraw();
+    diff_cull.ctx[0x205] = 2u;
+    const DrawIdentity id_cull = DecodeDraw(diff_cull.sh.data(), diff_cull.ctx.data(), diff_cull.uconfig.data());
+    CHECK(!(GraphicsPsoKey(11, 22, id_a) == GraphicsPsoKey(11, 22, id_cull)));
+    CHECK(!(GraphicsPsoKey(11, 22, id_a) == GraphicsPsoKey(11, 23, id_a)));
+}
+

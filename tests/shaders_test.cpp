@@ -342,3 +342,55 @@ TEST(ConsoleDialectPadsABlockToTheLiftsOffsets) {
     CHECK(!bad.errors.empty());
     CHECK(bad.errors.front().find("dxil 6.4:") != std::string::npos);
 }
+
+TEST(ConsoleDialectLowersVectorSignWithHlsl2021Select) {
+    // GLSL.std.450 FSign (opcode 6) and SSign (opcode 7) on float4/int4 must
+    // lower to HLSL 2021 select() rather than failing DXIL SM 6.4 bake.
+    std::vector<std::uint32_t> m = {0x07230203u, 0x00010600u, 0u, 200u, 0u};
+    const auto op = [&m](std::uint32_t code, const std::vector<std::uint32_t>& ops) {
+        m.push_back((static_cast<std::uint32_t>(ops.size() + 1) << 16) | code);
+        for (const std::uint32_t o : ops) m.push_back(o);
+    };
+    const std::uint32_t kVoid = 1, kFunc = 2, kFloat = 3, kVec4 = 4, kInt = 5, kIVec4 = 6;
+    const std::uint32_t kPtrIn = 7, kPtrOut = 8, kGlsl = 9;
+    const std::uint32_t vIn = 10, vOut = 11, fMain = 12, lbl = 13;
+    const std::uint32_t tIn = 20, tFSign = 21, tAsInt = 22, tSSign = 23, tAsFloat = 24, tAdd = 25;
+    op(17, {1});                                                    // OpCapability Shader
+    op(11, {kGlsl, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0u});     // OpExtInstImport "GLSL.std.450"
+    op(14, {0, 1});                                                 // OpMemoryModel Logical GLSL450
+    op(15, {4, fMain, 0x6e69616du, 0u, vIn, vOut});                 // OpEntryPoint Fragment "main"
+    op(16, {fMain, 7});                                             // OpExecutionMode OriginUpperLeft
+    op(71, {vIn, 30, 0});
+    op(71, {vOut, 30, 0});
+    op(19, {kVoid});
+    op(33, {kFunc, kVoid});
+    op(22, {kFloat, 32});
+    op(23, {kVec4, kFloat, 4});
+    op(21, {kInt, 32, 1});
+    op(23, {kIVec4, kInt, 4});
+    op(32, {kPtrIn, 1, kVec4});
+    op(32, {kPtrOut, 3, kVec4});
+    op(59, {kPtrIn, vIn, 1});
+    op(59, {kPtrOut, vOut, 3});
+    op(54, {kVoid, fMain, 0, kFunc});
+    op(248, {lbl});
+    op(61, {kVec4, tIn, vIn});
+    op(12, {kVec4, tFSign, kGlsl, 6, tIn});       // FSign(float4)
+    op(110, {kIVec4, tAsInt, tIn});               // OpConvertFToS
+    op(12, {kIVec4, tSSign, kGlsl, 7, tAsInt});   // SSign(int4)
+    op(111, {kVec4, tAsFloat, tSSign});           // OpConvertSToF
+    op(129, {kVec4, tAdd, tFSign, tAsFloat});
+    op(62, {vOut, tAdd});
+    op(253, {});
+    op(56, {});
+
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult r = gcn::emit_hlsl(m, options);
+    CHECK(r.ok());
+    CHECK(r.source.find("[[") == std::string::npos);
+    CHECK(r.source.find("spv_fsign(") != std::string::npos);
+    CHECK(r.source.find("spv_ssign(") != std::string::npos);
+    CHECK(r.source.find("select(") != std::string::npos);
+}
+

@@ -252,9 +252,16 @@ struct GuestCompute::Impl {
     // Which key's plans (and user_data SGPRs) are in the compute stage's slots
     // right now. The region is one per stage, not one per program, so a key or
     // user_data change has to wait for idle and rewrite the region.
+    struct SrvCopy {
+        std::uint32_t slab = 0;
+        std::uint64_t src_offset = 0;
+        std::uint64_t dst_offset = 0;
+        std::uint64_t bytes = 0;
+    };
     std::uint64_t bound_key = 0;
     std::array<std::uint32_t, 16> bound_user_data{};
     bool bound_valid = false;
+    std::vector<SrvCopy> bound_srv_copies;
 
     std::unordered_map<std::uint64_t, Program> programs;              // code VA -> program
     std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>,
@@ -262,11 +269,27 @@ struct GuestCompute::Impl {
     std::map<std::uint64_t, std::uint64_t> key_refusals;              // key -> how often it was asked for
 
     // The compute PSOs: the portable cache decides the budget and the eviction,
-    // the device owns the objects.
+    // the device owns the objects. Evicted PSOs stay alive until the GPU fence
+    // passes their retirement value.
+    struct RetiredPso {
+        ID3D12PipelineState* pso = nullptr;
+        std::uint64_t fence = 0;
+    };
     std::unique_ptr<d3d12::PsoCache> psos;
     std::unordered_map<std::uint64_t, ID3D12PipelineState*> pso_objects;
+    std::vector<RetiredPso> retired_psos;
     std::uint64_t clock = 0;
     std::uint64_t completed = 0;  // the fence's last completed value (OnFrame)
+
+    // Fence-tracked command allocator/list pool: never destroy a command
+    // allocator while its submitted command list is still executing on the GPU.
+    struct CommandSlot {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        std::uint64_t fence = 0;
+    };
+    std::vector<CommandSlot> free_lists;
+    std::vector<CommandSlot> in_flight;
 
     // The StageParams block: a ring of upload slots, one per dispatch, so a
     // dispatch recorded now never rewrites the constants of one still in flight.
@@ -275,11 +298,83 @@ struct GuestCompute::Impl {
     static constexpr std::uint32_t kParamSlots = 256;
     std::uint32_t params_next = 0;
 
-    // ExecuteIndirect's signature: one DISPATCH argument, read from the guest's
-    // own slab (the args are the guest's memory, not a copy).
+    // GPU-side SRV snapshot ring (DEFAULT heap, resting state COPY_DEST): space-1
+    // read-only t# buffer bindings copy their slice out of guest memory slabs into
+    // this ring before the shader runs, avoiding UAV/SRV state aliasing on slabs
+    // that are simultaneously bound as u0..u31 in space3.
+    static constexpr std::uint64_t kSrvRingBytes = 16ull * 1024ull * 1024ull;
+    ComPtr<ID3D12Resource> srv_ring;
+    std::uint64_t srv_ring_cursor = 0;
+    bool srv_ring_budgeted = false;
+
+    // Tiny DEFAULT-heap staging buffer (resting state COPY_DEST) for ExecuteIndirect
+    // dispatch arguments so indirect args never alias a slab's space3 UAV state.
+    static constexpr std::uint64_t kIndirectStagingBytes = 4096ull;
+    ComPtr<ID3D12Resource> indirect_staging;
+    std::uint64_t indirect_cursor = 0;
+
+    // ExecuteIndirect's signature: one DISPATCH argument.
     ComPtr<ID3D12CommandSignature> indirect;
 
     Counts counts;
+
+    void ReclaimCompleted(std::uint64_t done) {
+        for (std::size_t i = 0; i < in_flight.size();) {
+            if (in_flight[i].fence <= done) {
+                CommandSlot slot = std::move(in_flight[i]);
+                slot.fence = 0;
+                in_flight.erase(in_flight.begin() + static_cast<std::ptrdiff_t>(i));
+                free_lists.push_back(std::move(slot));
+            } else {
+                ++i;
+            }
+        }
+        for (std::size_t i = 0; i < retired_psos.size();) {
+            if (retired_psos[i].fence <= done) {
+                if (retired_psos[i].pso != nullptr) retired_psos[i].pso->Release();
+                retired_psos.erase(retired_psos.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    bool AcquireCommandList(CommandSlot* out) {
+        ReclaimCompleted(device->CompletedValue());
+        if (!free_lists.empty()) {
+            *out = std::move(free_lists.back());
+            free_lists.pop_back();
+            if (FAILED(out->allocator->Reset()) || FAILED(out->list->Reset(out->allocator.Get(), nullptr))) {
+                return false;
+            }
+            return true;
+        }
+        CommandSlot fresh;
+        if (FAILED(device->Get()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                         IID_PPV_ARGS(fresh.allocator.GetAddressOf())))) {
+            return false;
+        }
+        if (FAILED(device->Get()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, fresh.allocator.Get(), nullptr,
+                                                    IID_PPV_ARGS(fresh.list.GetAddressOf())))) {
+            return false;
+        }
+        *out = std::move(fresh);
+        return true;
+    }
+
+    bool ReserveSrvSlice(std::uint64_t bytes, std::uint64_t* out_offset) {
+        if (srv_ring == nullptr || bytes == 0 || bytes > kSrvRingBytes) return false;
+        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
+        if (srv_ring_cursor + aligned > kSrvRingBytes) {
+            // Wait for prior GPU consumers before wrapping the shared snapshot ring.
+            (void)device->WaitIdle();
+            ReclaimCompleted(device->CompletedValue());
+            srv_ring_cursor = 0;
+        }
+        *out_offset = srv_ring_cursor;
+        srv_ring_cursor += aligned;
+        return true;
+    }
 
     // --- the space-1 slots (5B-2b) ------------------------------------------------
     // The compute stage's 191 descriptors in the device's one shader-visible
@@ -349,6 +444,31 @@ struct GuestCompute::Impl {
         return true;
     }
 
+    // One read-only t# buffer view over the GPU-side SRV snapshot ring. The
+    // dispatch command list copies the guest slab slice into this offset right
+    // before Dispatch(), avoiding UAV/SRV state aliasing on space3 slabs.
+    bool WriteBufferSrv(std::uint32_t slot, const d3d12::BindingWrite& write, SrvCopy* out_copy) {
+        if (memory->EnsureSlab(write.slab) != d3d12::Status::kOk) return false;
+        if (memory->SlabBuffer(write.slab) == nullptr) return false;
+        const std::uint64_t bytes = static_cast<std::uint64_t>(write.dwords) * 4ull;
+        std::uint64_t ring_offset = 0;
+        if (!ReserveSrvSlice(bytes, &ring_offset)) return false;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_UINT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = static_cast<UINT>(ring_offset / 4ull);
+        srv.Buffer.NumElements = write.dwords;
+        srv.Buffer.StructureByteStride = 0;
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        device->Get()->CreateShaderResourceView(srv_ring.Get(), &srv, SlotHandle(slot));
+        out_copy->slab = write.slab;
+        out_copy->src_offset = write.offset;
+        out_copy->dst_offset = ring_offset;
+        out_copy->bytes = bytes;
+        return true;
+    }
+
     // The plans for `key`, written into this stage's slots. Called before the
     // command list that reads them, and - when another key's or user_data's
     // plans are in place - after the device is idle, because a submission still
@@ -360,10 +480,12 @@ struct GuestCompute::Impl {
         if (bound_valid && bound_key == key && same_user_data) return;
         if (bound_valid) {
             (void)device->WaitIdle();
+            ReclaimCompleted(device->CompletedValue());
             WriteNullRegion();
+            bound_srv_copies.clear();
             bound_valid = false;
         }
-        std::uint32_t written = 0, refused = 0, nulls = 0, planned = 0;
+        std::uint32_t written = 0, srvs = 0, refused = 0, nulls = 0, planned = 0;
         std::string line;
         for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
             const d3d12::BindingPlan* plan = paths.Find(key, binding);
@@ -384,23 +506,27 @@ struct GuestCompute::Impl {
                 ++nulls;  // the null descriptor is the right answer, and it is already there
                 break;
             case d3d12::BindingVerdict::kWrite:
-                if (write.kind != d3d12::BindingKind::kUav) {
-                    // A t# over guest memory is a read of a resource the same
-                    // program writes through the space-3 slabs; the state and the
-                    // transition for that are not recorded yet, so the slot stays
-                    // null rather than being read in a state nobody proved.
-                    ++refused;
-                    line += " " + d3d12::BindingWriteLine(write) +
-                            " refused (a read-only view over guest memory needs a state this pass does not record)";
-                    break;
+                if (write.kind == d3d12::BindingKind::kUav) {
+                    if (!WriteBufferUav(slot.index, write)) {
+                        ++refused;
+                        line += " " + d3d12::BindingWriteLine(write) + " refused (the slab is not resident)";
+                        break;
+                    }
+                    ++written;
+                    line += " " + d3d12::BindingWriteLine(write);
+                } else {
+                    SrvCopy copy{};
+                    if (!WriteBufferSrv(slot.index, write, &copy)) {
+                        ++refused;
+                        line += " " + d3d12::BindingWriteLine(write) +
+                                " refused (SRV snapshot ring full or slab not resident)";
+                        break;
+                    }
+                    bound_srv_copies.push_back(copy);
+                    ++written;
+                    ++srvs;
+                    line += " " + d3d12::BindingWriteLine(write);
                 }
-                if (!WriteBufferUav(slot.index, write)) {
-                    ++refused;
-                    line += " " + d3d12::BindingWriteLine(write) + " refused (the slab is not resident)";
-                    break;
-                }
-                ++written;
-                line += " " + d3d12::BindingWriteLine(write);
                 break;
             default:
                 ++refused;
@@ -409,6 +535,7 @@ struct GuestCompute::Impl {
             }
         }
         counts.bindings_written += written;
+        counts.bindings_srv += srvs;
         counts.bindings_refused += refused;
         counts.bindings_null += nulls;
         bound_key = key;
@@ -416,9 +543,9 @@ struct GuestCompute::Impl {
         bound_valid = planned != 0;
         if (planned != 0) {
             std::string text = "guest compute: key ";
-            char head[160];
-            std::snprintf(head, sizeof(head), "%016llx: %u plan(s), %u slot(s) written, %u null, %u refused",
-                          static_cast<unsigned long long>(key), planned, written, nulls, refused);
+            char head[192];
+            std::snprintf(head, sizeof(head), "%016llx: %u plan(s), %u slot(s) written (%u srv), %u null, %u refused",
+                          static_cast<unsigned long long>(key), planned, written, srvs, nulls, refused);
             text += head;
             text += line;
             LogMessage(refused != 0 ? Level::kWarn : Level::kInfo, "%s", text.c_str());
@@ -637,6 +764,42 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
     }
     if (FAILED(impl.params->Map(0, nullptr, &impl.params_mapped))) return d3d12::Status::kOutOfMemory;
 
+    // GPU-side SRV snapshot ring (DEFAULT heap, resting state COPY_DEST) for
+    // read-only space-1 t# buffer bindings without UAV/SRV state aliasing.
+    D3D12_HEAP_PROPERTIES default_heap{};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC srv_desc{};
+    srv_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    srv_desc.Width = Impl::kSrvRingBytes;
+    srv_desc.Height = 1;
+    srv_desc.DepthOrArraySize = 1;
+    srv_desc.MipLevels = 1;
+    srv_desc.SampleDesc.Count = 1;
+    srv_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (device.Memory().Allocate(d3d12::Owner::kHeaps, Impl::kSrvRingBytes).ok) {
+        if (SUCCEEDED(device.Get()->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &srv_desc,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(impl.srv_ring.GetAddressOf())))) {
+            impl.srv_ring_budgeted = true;
+        } else {
+            device.Memory().Free(d3d12::Owner::kHeaps, Impl::kSrvRingBytes);
+            LogMessage(Level::kWarn, "guest compute: SRV snapshot ring was not created; t# buffer plans will be refused");
+        }
+    } else {
+        LogMessage(Level::kWarn, "guest compute: heaps budget full for 16 MiB SRV snapshot ring");
+    }
+
+    // Tiny DEFAULT-heap staging buffer for ExecuteIndirect arguments so indirect
+    // reads never alias a space3 slab's UNORDERED_ACCESS state.
+    D3D12_RESOURCE_DESC ind_desc = srv_desc;
+    ind_desc.Width = Impl::kIndirectStagingBytes;
+    if (FAILED(device.Get()->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ind_desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(impl.indirect_staging.GetAddressOf())))) {
+        LogMessage(Level::kWarn, "guest compute: indirect staging buffer was not created; indirect dispatches refused");
+        impl.indirect_staging.Reset();
+    }
+
     // ExecuteIndirect's command signature: one DISPATCH argument (three
     // workgroup counts, 4-byte stride), so an indirect dispatch reads the guest's
     // own {x,y,z} where the title wrote it. D3D12 requires pRootSignature == nullptr
@@ -661,12 +824,29 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
 void GuestCompute::Destroy() {
     if (impl_ == nullptr) return;
     Impl& impl = *impl_;
+    if (impl.device != nullptr) {
+        (void)impl.device->WaitIdle();
+    }
+    for (Impl::RetiredPso& retired : impl.retired_psos) {
+        if (retired.pso != nullptr) retired.pso->Release();
+    }
+    impl.retired_psos.clear();
+    impl.in_flight.clear();
+    impl.free_lists.clear();
     for (auto& [key, pso] : impl.pso_objects) {
         (void)key;
         if (pso != nullptr) pso->Release();
     }
     impl.pso_objects.clear();
     impl.psos.reset();
+    if (impl.srv_ring_budgeted && impl.device != nullptr) {
+        impl.device->Memory().Free(d3d12::Owner::kHeaps, Impl::kSrvRingBytes);
+        impl.srv_ring_budgeted = false;
+    }
+    impl.srv_ring.Reset();
+    impl.srv_ring_cursor = 0;
+    impl.indirect_staging.Reset();
+    impl.indirect_cursor = 0;
     if (impl.params != nullptr && impl.params_mapped != nullptr) {
         impl.params->Unmap(0, nullptr);
     }
@@ -681,6 +861,7 @@ void GuestCompute::Destroy() {
     impl.cache_dir.clear();
     impl.bound_key = 0;
     impl.bound_user_data.fill(0);
+    impl.bound_srv_copies.clear();
     impl.bound_valid = false;
     impl.device = nullptr;
     impl.pipelines = nullptr;
@@ -813,9 +994,10 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
         pso = created.Get();
         impl.pso_objects.emplace(key, pso);
         (void)created.Detach();  // the map owns it; Destroy releases them all
+        const std::uint64_t retire_fence = impl.device->SubmittedValue();
         for (const PsoKey& evicted : impl.psos->Insert(PsoKey{key, 0}, key, dxil.size(), impl.clock)) {
             if (const auto it = impl.pso_objects.find(evicted.lo); it != impl.pso_objects.end()) {
-                it->second->Release();
+                impl.retired_psos.push_back({it->second, retire_fence});
                 impl.pso_objects.erase(it);
                 ++impl.counts.evicted;
             }
@@ -826,9 +1008,39 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     // Which workgroup counts: the packet's own, or the guest's memory through
     // ExecuteIndirect.
     const bool indirect = d.indirect_va != 0;
-    if (indirect && impl.indirect == nullptr) {
+    if (indirect && (impl.indirect == nullptr || impl.indirect_staging == nullptr)) {
         ++impl.counts.no_indirect;
         return false;
+    }
+
+    // Resolve indirect args before acquiring a command list so a refusal leaves
+    // no half-recorded command allocator.
+    ID3D12Resource* indirect_slab = nullptr;
+    std::uint64_t indirect_src_offset = 0;
+    std::uint64_t indirect_dst_offset = 0;
+    if (indirect) {
+        std::vector<d3d12::GuestRun> runs;
+        if (!d3d12::SlabRuns(impl.memory->Table(), d.indirect_va, 3 * sizeof(std::uint32_t), &runs) ||
+            runs.empty()) {
+            ++impl.counts.no_indirect;
+            return false;
+        }
+        const d3d12::GuestRun run = runs.front();
+        if (impl.memory->EnsureSlab(run.slab) != d3d12::Status::kOk) {
+            ++impl.counts.no_indirect;
+            return false;
+        }
+        indirect_slab = impl.memory->SlabBuffer(run.slab);
+        if (indirect_slab == nullptr) {
+            ++impl.counts.no_indirect;
+            return false;
+        }
+        indirect_src_offset = run.offset;
+        if (impl.indirect_cursor + 16ull > Impl::kIndirectStagingBytes) {
+            impl.indirect_cursor = 0;
+        }
+        indirect_dst_offset = impl.indirect_cursor;
+        impl.indirect_cursor += 16ull;
     }
 
     // StageParams: user_sgpr only (see this file's header for why that is the
@@ -851,19 +1063,78 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     // another key's descriptors are still in the region.
     impl.BindResources(key, d);
 
-    // Record it.
-    ComPtr<ID3D12CommandAllocator> allocator;
-    if (FAILED(impl.device->Get()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                          IID_PPV_ARGS(allocator.GetAddressOf())))) {
+    // Record it on a fence-tracked command allocator/list from the pool.
+    Impl::CommandSlot cmd;
+    if (!impl.AcquireCommandList(&cmd)) {
         ++impl.counts.record_failed;
         return false;
     }
-    ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(impl.device->Get()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                                     IID_PPV_ARGS(list.GetAddressOf())))) {
-        ++impl.counts.record_failed;
-        return false;
+    ID3D12GraphicsCommandList* list = cmd.list.Get();
+
+    const auto transition = [](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        return b;
+    };
+
+    // Snapshot any space-1 read-only t# slices from guest slabs into srv_ring,
+    // and stage indirect dispatch arguments into indirect_staging, keeping all
+    // guest slabs in UNORDERED_ACCESS during the dispatch itself.
+    std::vector<ID3D12Resource*> copy_slabs;
+    const auto add_copy_slab = [&copy_slabs](ID3D12Resource* res) {
+        if (res != nullptr && std::find(copy_slabs.begin(), copy_slabs.end(), res) == copy_slabs.end()) {
+            copy_slabs.push_back(res);
+        }
+    };
+    const bool has_srv_copies = !impl.bound_srv_copies.empty() && impl.srv_ring != nullptr;
+    if (has_srv_copies) {
+        for (const Impl::SrvCopy& copy : impl.bound_srv_copies) {
+            add_copy_slab(impl.memory->SlabBuffer(copy.slab));
+        }
     }
+    if (indirect) add_copy_slab(indirect_slab);
+
+    if (!copy_slabs.empty()) {
+        std::vector<D3D12_RESOURCE_BARRIER> pre;
+        pre.reserve(copy_slabs.size());
+        for (ID3D12Resource* slab : copy_slabs) {
+            pre.push_back(transition(slab, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        }
+        list->ResourceBarrier(static_cast<UINT>(pre.size()), pre.data());
+
+        if (has_srv_copies) {
+            for (const Impl::SrvCopy& copy : impl.bound_srv_copies) {
+                if (ID3D12Resource* slab = impl.memory->SlabBuffer(copy.slab)) {
+                    list->CopyBufferRegion(impl.srv_ring.Get(), copy.dst_offset, slab, copy.src_offset, copy.bytes);
+                }
+            }
+        }
+        if (indirect) {
+            list->CopyBufferRegion(impl.indirect_staging.Get(), indirect_dst_offset, indirect_slab, indirect_src_offset,
+                                   3 * sizeof(std::uint32_t));
+        }
+
+        std::vector<D3D12_RESOURCE_BARRIER> post;
+        post.reserve(copy_slabs.size() + 2);
+        for (ID3D12Resource* slab : copy_slabs) {
+            post.push_back(transition(slab, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        }
+        if (has_srv_copies) {
+            post.push_back(transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                      D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+        }
+        if (indirect) {
+            post.push_back(transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+        }
+        list->ResourceBarrier(static_cast<UINT>(post.size()), post.data());
+    }
+
     // One CBV/SRV/UAV heap and one sampler heap, set once: the guest arena's
     // descriptors for both are in these two (bbx_guest_root.h's rule 4).
     ID3D12DescriptorHeap* heaps[2] = {impl.device->CbvSrvUavHeap(), impl.device->SamplerHeap()};
@@ -886,52 +1157,63 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     list->SetComputeRootDescriptorTable(3, impl.memory->TableHandle());
 
     if (indirect) {
-        // The args are the guest's own three dwords, in the slab the page table
-        // puts them in: a D3D12 buffer is the slab, so the resource is the slab
-        // and the offset is the page offset - no copy, and no second address
-        // space for the title's memory.
-        std::vector<d3d12::GuestRun> runs;
-        if (!d3d12::SlabRuns(impl.memory->Table(), d.indirect_va, 3 * sizeof(std::uint32_t), &runs) ||
-            runs.empty()) {
-            ++impl.counts.no_indirect;
-            return false;
-        }
-        const d3d12::GuestRun run = runs.front();
-        if (impl.memory->EnsureSlab(run.slab) != d3d12::Status::kOk) {
-            ++impl.counts.no_indirect;
-            return false;
-        }
-        ID3D12Resource* slab = impl.memory->SlabBuffer(run.slab);
-        if (slab == nullptr) {
-            ++impl.counts.no_indirect;
-            return false;
-        }
-        list->ExecuteIndirect(impl.indirect.Get(), 1, slab, run.offset, nullptr, 0);
+        list->ExecuteIndirect(impl.indirect.Get(), 1, impl.indirect_staging.Get(), indirect_dst_offset, nullptr, 0);
         ++impl.counts.indirect;
     } else {
         list->Dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
-    // A UAV barrier: the next dispatch reads what this one wrote. Compute passes
-    // in a chain are the common case (GX's copy and clear passes), and a missing
-    // barrier there is a frame that is wrong on some GPUs and right on others.
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier.UAV.pResource = nullptr;  // every UAV
-    list->ResourceBarrier(1, &barrier);
+    // Restore staging buffers to COPY_DEST and issue a global UAV barrier so the
+    // next dispatch/draw sees everything this dispatch wrote.
+    std::vector<D3D12_RESOURCE_BARRIER> epilogue;
+    epilogue.reserve(3);
+    if (has_srv_copies) {
+        epilogue.push_back(transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                      D3D12_RESOURCE_STATE_COPY_DEST));
+    }
+    if (indirect) {
+        epilogue.push_back(transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                      D3D12_RESOURCE_STATE_COPY_DEST));
+    }
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    uav_barrier.UAV.pResource = nullptr;  // every UAV
+    epilogue.push_back(uav_barrier);
+    list->ResourceBarrier(static_cast<UINT>(epilogue.size()), epilogue.data());
     ++impl.counts.uav_barriers;
     if (FAILED(list->Close())) {
         ++impl.counts.record_failed;
         return false;
     }
-    ID3D12CommandList* lists[1] = {list.Get()};
+    ID3D12CommandList* lists[1] = {list};
     impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    // No wait: the fence is the submission's, and gnm_exec's EOP/label waits and
-    // the flip's are what ask about it (host_gpu_d3d12.cpp). The allocator and
-    // the list are released when the last reference goes, which is after the
-    // driver has taken the recording.
+    cmd.fence = impl.device->Signal();
+    impl.in_flight.push_back(std::move(cmd));
     ++impl.counts.ran;
     return true;
+}
+
+void GuestCompute::EnsureCacheLoaded() {
+    if (impl_ == nullptr) return;
+    impl_->LoadCache();
+    impl_->LoadPaths();
+}
+
+const d3d12::ShaderCache& GuestCompute::Cache() const { return impl_->cache; }
+
+const d3d12::PathTable& GuestCompute::Paths() const { return impl_->paths; }
+
+bool GuestCompute::CacheReady() const {
+    return impl_ != nullptr && impl_->cache.status() == d3d12::CacheStatus::kOk;
+}
+
+ID3D12Resource* GuestCompute::SrvSnapshotRing() const {
+    return impl_ != nullptr ? impl_->srv_ring.Get() : nullptr;
+}
+
+bool GuestCompute::ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset) {
+    if (impl_ == nullptr || out_offset == nullptr) return false;
+    return impl_->ReserveSrvSlice(bytes, out_offset);
 }
 
 std::string GuestCompute::Report() const {
@@ -941,7 +1223,7 @@ std::string GuestCompute::Report() const {
     std::snprintf(line, sizeof(line),
                   "guest compute: %llu dispatch(es) run, %llu indirect, %llu cache miss, %llu no cache, "
                   "%llu bad program, %llu bad blob, %llu bad PSO, %llu evicted, %llu record failure(s), "
-                  "%llu space-1 slot(s) written, %llu refused, %llu null, %llu key(s) without plans",
+                  "%llu space-1 slot(s) written (%llu srv), %llu refused, %llu null, %llu key(s) without plans",
                   static_cast<unsigned long long>(impl.counts.ran),
                   static_cast<unsigned long long>(impl.counts.indirect),
                   static_cast<unsigned long long>(impl.counts.miss),
@@ -952,6 +1234,7 @@ std::string GuestCompute::Report() const {
                   static_cast<unsigned long long>(impl.counts.evicted),
                   static_cast<unsigned long long>(impl.counts.record_failed),
                   static_cast<unsigned long long>(impl.counts.bindings_written),
+                  static_cast<unsigned long long>(impl.counts.bindings_srv),
                   static_cast<unsigned long long>(impl.counts.bindings_refused),
                   static_cast<unsigned long long>(impl.counts.bindings_null),
                   static_cast<unsigned long long>(impl.counts.keys_without_plans));
@@ -959,13 +1242,17 @@ std::string GuestCompute::Report() const {
 }
 
 void GuestCompute::OnFrame(std::uint64_t completed) {
-    if (impl_ == nullptr || impl_->psos == nullptr) return;
-    // The cache hands back the keys it evicted; their objects are this side's to
-    // release (PsoCache stores ids, not COM pointers - bbx_psocache.h).
-    for (const PsoKey& evicted : impl_->psos->Trim(0)) {
-        if (const auto it = impl_->pso_objects.find(evicted.lo); it != impl_->pso_objects.end()) {
-            it->second->Release();
-            impl_->pso_objects.erase(it);
+    if (impl_ == nullptr) return;
+    impl_->ReclaimCompleted(completed);
+    if (impl_->psos != nullptr) {
+        const std::uint64_t retire_fence = impl_->device != nullptr ? impl_->device->SubmittedValue() : completed;
+        // The cache hands back the keys it evicted; their objects stay alive
+        // until the GPU fence passes `retire_fence`.
+        for (const PsoKey& evicted : impl_->psos->Trim(0)) {
+            if (const auto it = impl_->pso_objects.find(evicted.lo); it != impl_->pso_objects.end()) {
+                impl_->retired_psos.push_back({it->second, retire_fence});
+                impl_->pso_objects.erase(it);
+            }
         }
     }
     impl_->completed = completed;

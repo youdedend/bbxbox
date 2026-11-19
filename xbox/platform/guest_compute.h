@@ -20,7 +20,9 @@
 
 namespace bbx::d3d12 {
 class Device;
+class PathTable;
 class PipelineSet;
+class ShaderCache;
 }  // namespace bbx::d3d12
 
 namespace bbx::platform {
@@ -42,6 +44,7 @@ public:
         std::uint64_t record_failed = 0;  // a command list that would not record
         std::uint64_t uav_barriers = 0;   // one after every dispatch
         std::uint64_t bindings_written = 0;   // space-1 slots written from the bake's plans
+        std::uint64_t bindings_srv = 0;       // read-only t# slots bound via SRV snapshot ring
         std::uint64_t bindings_refused = 0;   // plans this pass would not bind (the slot stays null)
         std::uint64_t bindings_null = 0;      // plans that named a null V#: the null descriptor is right
         std::uint64_t keys_without_plans = 0; // keys that read a table the bake assigned nothing to
@@ -71,9 +74,19 @@ public:
     // bind the root CBV and the tables, and submit it.
     bool Run(std::uint64_t key, const GpuDispatch& d);
 
+    // Shared baked cache, binding table, and GPU-side SRV snapshot ring used by
+    // GuestGraphics so the console loads bbx_shaders.cache and bbx_shaders.paths
+    // once instead of twice.
+    void EnsureCacheLoaded();
+    [[nodiscard]] const bbx::d3d12::ShaderCache& Cache() const;
+    [[nodiscard]] const bbx::d3d12::PathTable& Paths() const;
+    [[nodiscard]] bool CacheReady() const;
+    [[nodiscard]] ID3D12Resource* SrvSnapshotRing() const;
+    bool ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset);
+
     // The cache's one line and the counts, for the boot/exit report.
     [[nodiscard]] std::string Report() const;
-    // Retires PSOs whose eviction the fence has passed.
+    // Retires PSOs and in-flight command allocators whose fence has completed.
     void OnFrame(std::uint64_t completed);
 
 private:

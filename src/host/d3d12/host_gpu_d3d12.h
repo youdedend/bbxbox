@@ -28,6 +28,8 @@
 
 namespace bbx::d3d12 {
 
+struct DrawIdentity;
+
 // Why a dispatch did not run. One per key, in the log, and counted.
 enum class GuestDispatchRefusal : std::uint8_t {
     kNone = 0,
@@ -45,6 +47,9 @@ struct GuestGpuCounts {
     std::uint64_t no_device = 0;
     std::uint64_t bad_program = 0;
     std::uint64_t draws = 0;
+    std::uint64_t draws_executed = 0;
+    std::uint64_t draw_refusals = 0;
+    std::uint64_t draw_pipeline_missing = 0;
     std::uint64_t mem_writes = 0, mem_fills = 0, mem_copies = 0, mem_reads = 0, mem_refused = 0;
     std::uint64_t refused_keys = 0;
 };
@@ -79,6 +84,15 @@ struct GuestGpuBinding {
     // CBV and the space-3 tables, and issue the dispatch (Direct or Indirect).
     // False: counted as `no-pipeline` and refused.
     bool (*dispatch)(void* user, std::uint64_t key, const GpuDispatch& d) = nullptr;
+
+    // Called when the guest creates a shader from a Sony Shdr container (stage 0
+    // = VS, 1 = PS), allowing the graphics pipeline to compute and cache the
+    // exact bake-identical ConsoleStageKeyOf hash before the first draw.
+    void (*note_shader_created)(void* user, int stage, const std::uint8_t* container, std::size_t size) = nullptr;
+    // Slice 5B-2b: resolve cached vs_6_4/ps_6_4 DXIL blobs, create or look up the
+    // graphics PSO for (vs_key, ps_key, fixed state), bind StageParams/space-1/
+    // space-3 tables and render/depth targets, and record the draw.
+    bool (*draw)(void* user, const GpuDraw& d, const DrawIdentity& identity) = nullptr;
 };
 
 // Installed by the session: `binding` must outlive the boot (the session's own

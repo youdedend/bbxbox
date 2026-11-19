@@ -149,8 +149,6 @@ void* host_gpu_present_timeline() { return nullptr; }
 
 void host_gpu_present_reads_locked(std::uint64_t) {}
 
-void host_gpu_note_shader_created(int, const std::uint8_t*, std::size_t, std::uint64_t) {}
-
 void host_gpu_shadow_cp_write(std::uint64_t, std::size_t) {}
 
 std::string host_gpu_shadow_report() { return {}; }

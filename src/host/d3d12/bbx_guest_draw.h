@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <string>
 
+#include "src/host/d3d12/bbx_cache.h"
 #include "src/host/d3d12/bbx_format.h"
 
 namespace bbx::d3d12 {
@@ -55,6 +56,135 @@ struct DrawTarget {
     std::uint32_t set_mask = 0;  // the nibble of CB_TARGET_MASK that named it
 };
 
+// Portable fixed-function enums decoded from GCN context registers. Kept
+// Windows-free so every mapping rule (including Xbox Guard G4 constant-alpha
+// blend clamping) is pinned by host unit tests.
+enum class DrawBlendFactor : std::uint8_t {
+    kZero = 0,
+    kOne,
+    kSrcColor,
+    kInvSrcColor,
+    kSrcAlpha,
+    kInvSrcAlpha,
+    kDestAlpha,
+    kInvDestAlpha,
+    kDestColor,
+    kInvDestColor,
+    kSrcAlphaSat,
+    kSrc1Color,
+    kInvSrc1Color,
+    kSrc1Alpha,
+    kInvSrc1Alpha,
+};
+
+enum class DrawBlendOp : std::uint8_t {
+    kAdd = 0,
+    kSubtract,
+    kRevSubtract,
+    kMin,
+    kMax,
+};
+
+enum class DrawCompareOp : std::uint8_t {
+    kNever = 0,
+    kLess,
+    kEqual,
+    kLessEqual,
+    kGreater,
+    kNotEqual,
+    kGreaterEqual,
+    kAlways,
+};
+
+enum class DrawStencilOp : std::uint8_t {
+    kKeep = 0,
+    kZero,
+    kReplace,
+    kIncrSat,
+    kDecrSat,
+    kInvert,
+    kIncr,
+    kDecr,
+};
+
+enum class DrawTopologyType : std::uint8_t {
+    kUndefined = 0,
+    kPoint,
+    kLine,
+    kTriangle,
+};
+
+enum class DrawTopology : std::uint8_t {
+    kUndefined = 0,
+    kPointList,
+    kLineList,
+    kLineStrip,
+    kTriangleList,
+    kTriangleStrip,
+};
+
+struct DrawTopologyInfo {
+    DrawTopologyType type = DrawTopologyType::kUndefined;
+    DrawTopology topology = DrawTopology::kUndefined;
+    bool rect_list = false;
+    bool supported = false;
+};
+
+struct DrawBlendTarget {
+    bool enable = false;
+    DrawBlendFactor src_color = DrawBlendFactor::kOne;
+    DrawBlendFactor dst_color = DrawBlendFactor::kZero;
+    DrawBlendOp color_op = DrawBlendOp::kAdd;
+    DrawBlendFactor src_alpha = DrawBlendFactor::kOne;
+    DrawBlendFactor dst_alpha = DrawBlendFactor::kZero;
+    DrawBlendOp alpha_op = DrawBlendOp::kAdd;
+    std::uint8_t write_mask = 0x0f;
+    // Guard G4: Xbox consoles reject constant-alpha / blend-factor PSOs, so
+    // GCN factors 13/14/19/20 clamp safely to kOne/kZero and raise this flag.
+    bool clamped_constant_factor = false;
+};
+
+struct DrawStencilFace {
+    DrawStencilOp fail_op = DrawStencilOp::kKeep;
+    DrawStencilOp depth_fail_op = DrawStencilOp::kKeep;
+    DrawStencilOp pass_op = DrawStencilOp::kKeep;
+    DrawCompareOp func = DrawCompareOp::kAlways;
+};
+
+struct DrawDepthStencil {
+    bool depth_test = false;          // DB_DEPTH_CONTROL bit 1 (Z_ENABLE)
+    bool depth_write_enable = false;  // DB_DEPTH_CONTROL bit 2 (Z_WRITE_ENABLE)
+    DrawCompareOp depth_func = DrawCompareOp::kLess;
+    bool stencil_enable = false;      // DB_DEPTH_CONTROL bit 0
+    bool backface_enable = false;     // DB_DEPTH_CONTROL bit 7
+    std::uint8_t stencil_ref = 0;
+    std::uint8_t stencil_read_mask = 0xff;
+    std::uint8_t stencil_write_mask = 0xff;
+    DrawStencilFace front;
+    DrawStencilFace back;
+    std::uint64_t depth_base = 0;     // DB_Z_READ_BASE << 8
+    std::uint32_t depth_width = 0;    // decoded from DB_DEPTH_SIZE when set
+    std::uint32_t depth_height = 0;
+};
+
+struct DrawRasterizer {
+    bool cull_front = false;
+    bool cull_back = false;
+    bool front_cw = false;
+    bool wireframe = false;
+    bool depth_clip = true;
+};
+
+struct DrawViewport {
+    float x = 0.0f;
+    float y = 0.0f;
+    float width = 0.0f;
+    float height = 0.0f;
+    float min_depth = 0.0f;
+    float max_depth = 1.0f;
+    bool valid = false;
+};
+
 enum class DrawVerdict : std::uint8_t {
     kOk = 0,
     kNoVertexProgram,    // SPI_SHADER_PGM_LO/HI_VS are zero
@@ -83,9 +213,17 @@ struct DrawIdentity {
     std::uint32_t col_format = 0;     // SPI_SHADER_COL_FORMAT
     std::uint32_t z_info = 0;         // DB_Z_INFO
     std::uint32_t depth_format = 0;   // DxgiFormat, 0 when there is no depth target
-    bool depth_write = false;         // DB_DEPTH_CONTROL's Z_WRITE
+    bool depth_write = false;         // DB_DEPTH_CONTROL Z enable/write flag
     std::uint32_t target_count = 0;
     DrawTarget targets[8] = {};
+    // Full fixed-function state decoded from the same context file for D3D12 PSO creation.
+    DrawBlendTarget blend[8] = {};
+    float blend_const[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool clamped_constant_blend = false;
+    DrawDepthStencil depth_stencil;
+    DrawRasterizer raster;
+    DrawViewport viewport;
+    std::int32_t base_vertex = 0;     // VGT_INDX_OFFSET (ctx[0x102])
     // The rectangle the draw writes: the generic scissor intersected with the
     // screen scissor (zero bottom-right on one leaves the other), and the viewport
     // scissor when PA_SC_MODE_CNTL_0 enables it. `x1`/`y1` are exclusive.
@@ -106,6 +244,14 @@ struct DrawIdentity {
 // session's answer and guessing it here would be a silent fallthrough.
 [[nodiscard]] DrawIdentity DecodeDraw(const std::uint32_t* sh, const std::uint32_t* ctx,
                                      const std::uint32_t* uconfig, std::uint32_t stages = 0);
+
+// Maps VGT_PRIMITIVE_TYPE into D3D12-compatible topology class and primitive topology.
+[[nodiscard]] DrawTopologyInfo DecodeTopology(std::uint32_t prim);
+
+// Builds the canonical 128-bit PSO LRU key for a VS/PS draw + fixed-function state.
+// Always uses pso_library = 0 (console has no ID3D12PipelineLibrary).
+[[nodiscard]] PsoKey GraphicsPsoKey(std::uint64_t vs_key, std::uint64_t ps_key,
+                                    const DrawIdentity& identity);
 
 // A stable fingerprint of the identity, for "log this once": two draws that would
 // build the same pipeline share it, and a draw whose target moved does not.

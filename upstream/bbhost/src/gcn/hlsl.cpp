@@ -2950,15 +2950,15 @@ std::string dxil_helper_body(const std::string& name, const std::string& ret, co
     if (name == "spv_fmix" && n == 3) return "    return a0 + a2 * (a1 - a0);";  // x*(1-a) + y*a, as D3D's lerp
     if (name == "spv_fsign" && n == 1) {
         if (dxil_vector_name(r)) {
-            why = "a vector FSign";
-            return {};
+            return "    return select(a0 > (" + r + ")0, (" + r + ")1, select(a0 < (" + r + ")0, (" + r +
+                   ")-1, a0));  // +-0 and NaN keep their operand";
         }
         return "    if (a0 > 0) return " + r + "(1);\n    if (a0 < 0) return " + r + "(-1);\n    return a0;  // +-0 and NaN keep their operand";
     }
     if (name == "spv_ssign" && n == 1) {
         if (dxil_vector_name(r)) {
-            why = "a vector SSign";
-            return {};
+            return "    return select(a0 > (" + r + ")0, (" + r + ")1, select(a0 < (" + r + ")0, (" + r + ") -1, (" + r +
+                   ")0));";
         }
         return "    if (a0 > 0) return 1;\n    if (a0 < 0) return -1;\n    return 0;";
     }
