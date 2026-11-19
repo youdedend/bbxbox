@@ -6,7 +6,9 @@
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -505,6 +507,21 @@ void InstallLastChanceLogger() {
         return EXCEPTION_EXECUTE_HANDLER;
     });
     std::set_terminate(&OnTerminate);
+    std::signal(SIGABRT, [](int) {
+        std::snprintf(g_report, sizeof(g_report),
+                      "=== bbxbox abort (SIGABRT) ===\ncrumb: %s\nlast_line: %s\n",
+                      g_crumb, g_last_line);
+        WriteRaw(g_report, true, /*to_debugger=*/false);
+        if (g_crash >= 0) {
+            std::unique_lock<std::mutex> lock(g_mirror_mu, std::try_to_lock_t());
+            if (lock.owns_lock()) {
+                MirrorWrite(g_crash, g_report);
+                (void)hostfs::Flush(g_crash);
+            }
+        }
+        std::_Exit(134);
+    });
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 }
 
 const char* LastLine() { return g_last_line; }

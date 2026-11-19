@@ -1168,18 +1168,41 @@ void OnAction(PadAction action) {
     }
 }
 
-std::vector<std::string> WrapLines(const std::string& text) {
+std::vector<std::string> WrapLines(const std::string& text, std::size_t max_chars) {
     std::vector<std::string> lines;
     std::string current;
+    auto flush_wrapped = [&](const std::string& line) {
+        if (max_chars == 0 || line.size() <= max_chars) {
+            lines.push_back(line);
+            return;
+        }
+        std::size_t pos = 0;
+        while (pos < line.size()) {
+            const std::size_t remaining = line.size() - pos;
+            if (remaining <= max_chars) {
+                lines.push_back(line.substr(pos));
+                break;
+            }
+            std::size_t split = line.rfind(' ', pos + max_chars);
+            if (split == std::string::npos || split <= pos) {
+                split = pos + max_chars;
+                lines.push_back(line.substr(pos, split - pos));
+                pos = split;
+            } else {
+                lines.push_back(line.substr(pos, split - pos));
+                pos = split + 1;
+            }
+        }
+    };
     for (const char c : text) {
         if (c == '\n') {
-            lines.push_back(current);
+            flush_wrapped(current);
             current.clear();
         } else {
             current.push_back(c);
         }
     }
-    lines.push_back(current);
+    flush_wrapped(current);
     return lines;
 }
 
@@ -1197,8 +1220,11 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     const std::uint32_t small_scale = scale > 2u ? (scale - 1u) : scale;
     const float margin = static_cast<float>(scale) * 7.0f;
     const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 2.5f;
+    const float inner_w = width - margin * 3.2f;
+    const std::size_t max_footer_chars = std::max<std::size_t>(
+        32u, static_cast<std::size_t>(inner_w / static_cast<float>(bbx::platform::HudFont::kColumns * scale)));
 
-    const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer());
+    const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer(), max_footer_chars);
     const float max_panel_h = std::max(line * 10.0f, height - margin * 1.4f);
     const float fixed_h = line * static_cast<float>(3.5 + static_cast<double>(footer_lines.size())) +
                           margin * 1.4f;

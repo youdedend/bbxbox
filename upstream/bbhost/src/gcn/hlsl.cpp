@@ -241,6 +241,7 @@ private:
         std::map<std::uint32_t, Block> blocks;
         std::uint32_t first_block = 0;
         std::vector<std::uint32_t> locals;           // function-local variables (a GS's GSVS ring), declared at its top
+        std::map<std::uint32_t, std::uint32_t> local_inits;  // local variable -> initializer constant id
         std::map<std::uint32_t, std::size_t> preds;  // block -> branches into it
         std::string name, text;                      // its HLSL name; the printed body with its declarations
     };
@@ -498,11 +499,12 @@ private:
                 break;
             case kOpLine: case kOpNoLine: break;
             case spv::OpVariable:
-                // A function-local array (a GS's GSVS ring, gcn/lift.h GsLift), declared at the top of its function.
+                // A function-local variable (e.g. a GS's GSVS ring or a zero-initialized local), declared at the top of its function.
                 if (cur->label != f.first_block) fail("a function-local variable outside the first block");
-                if (in.a.size() != 1 || in.a[0] != spv::ScFunction) fail("a function-local variable with an initializer");
+                if (in.a.empty() || in.a.size() > 2 || in.a[0] != spv::ScFunction) fail("a function-local variable with an unsupported storage class");
                 var_type[in.id] = in.type;
                 f.locals.push_back(in.id);
+                if (in.a.size() == 2) f.local_inits[in.id] = in.a[1];
                 break;
             default: cur->body.push_back(&in); break;
             }
@@ -1181,7 +1183,56 @@ private:
             return s + ")";
         }
         if (t.k == TK::Bool || t.k == TK::Int || t.k == TK::Float) return scalar_literal(const_bits(c), kind_of(c.type));
+        if (t.k == TK::Array) {
+            if (!c.null && !c.undef && !c.composite) fail("a constant of an aggregate type");
+            const std::uint32_t count = c.composite ? static_cast<std::uint32_t>(c.parts.size()) : t.count;
+            std::string s = "{";
+            for (std::uint32_t k = 0; k < count; ++k) {
+                if (k) s += ", ";
+                s += (c.null || c.undef) ? null_expr(t.elem) : const_expr(c.parts.at(k));
+            }
+            return s + "}";
+        }
+        if (t.k == TK::Struct) {
+            if (!c.null && !c.undef && !c.composite) fail("a constant of an aggregate type");
+            const std::size_t count = c.composite ? c.parts.size() : t.members.size();
+            std::string s = "{";
+            for (std::size_t k = 0; k < count; ++k) {
+                if (k) s += ", ";
+                s += (c.null || c.undef) ? null_expr(t.members.at(k)) : const_expr(c.parts.at(k));
+            }
+            return s + "}";
+        }
         fail("a constant of an aggregate type");
+    }
+    std::string null_expr(std::uint32_t type_id) {
+        const Type& t = type(type_id);
+        if (t.k == TK::Bool || t.k == TK::Int || t.k == TK::Float) return scalar_literal(0, kind_of(type_id));
+        if (t.k == TK::Vector) {
+            std::string s = type_name(type_id) + "(";
+            for (std::uint32_t k = 0; k < t.count; ++k) {
+                if (k) s += ", ";
+                s += scalar_literal(0, kind_of(t.elem));
+            }
+            return s + ")";
+        }
+        if (t.k == TK::Array) {
+            std::string s = "{";
+            for (std::uint32_t k = 0; k < t.count; ++k) {
+                if (k) s += ", ";
+                s += null_expr(t.elem);
+            }
+            return s + "}";
+        }
+        if (t.k == TK::Struct) {
+            std::string s = "{";
+            for (std::size_t k = 0; k < t.members.size(); ++k) {
+                if (k) s += ", ";
+                s += null_expr(t.members.at(k));
+            }
+            return s + "}";
+        }
+        fail("a null constant of an unsupported type");
     }
     // `v` reinterpreted as kind `k` (same width): asuint / asint / asfloat.
     std::string as(std::uint32_t v, char k) {
@@ -2453,7 +2504,14 @@ private:
     // A function's phis and the values a use outside their scope reaches, declared at its top.
     std::string declarations(const Function& f) {
         std::string top;
-        for (const std::uint32_t v : f.locals) top += "    " + declare(type(var_type.at(v)).elem, global_names.at(v)) + ";\n";
+        for (const std::uint32_t v : f.locals) {
+            top += "    " + declare(type(var_type.at(v)).elem, global_names.at(v));
+            if (const auto init_it = f.local_inits.find(v); init_it != f.local_inits.end()) {
+                if (!consts.count(init_it->second)) fail("a function-local variable with a non-constant initializer");
+                top += " = " + const_expr(init_it->second);
+            }
+            top += ";\n";
+        }
         for (const Ins& in : f.ins) {
             if (!in.id || !in.type || in.op == spv::OpFunctionParameter) continue;
             const bool phi = in.op == spv::OpPhi;
