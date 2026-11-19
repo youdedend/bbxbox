@@ -962,33 +962,6 @@ void PollDumpPick() {
     }
 }
 
-void OnAction(PadAction action) {
-    if (g_session.keyboard_open) {
-        switch (action) {
-        case PadAction::kNavigateUp: g_session.keyboard.Move(0, -1); return;
-        case PadAction::kNavigateDown: g_session.keyboard.Move(0, 1); return;
-        case PadAction::kNavigateLeft: g_session.keyboard.Move(-1, 0); return;
-        case PadAction::kNavigateRight: g_session.keyboard.Move(1, 0); return;
-        case PadAction::kConfirm:
-            if (!g_session.keyboard.Accept()) {
-                std::string name = g_session.keyboard.Text();
-                if (name.size() > 16u) name.resize(16u);
-                g_session.model.hunter_name = name;
-                bbx::platform::LogF("hunter name: \"%s\"", name.c_str());
-                if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"), name)) {
-                    bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write hunter-name.txt");
-                }
-                g_session.keyboard_open = false;
-                RefreshLauncher();
-            }
-            return;
-        case PadAction::kCancel:
-            g_session.keyboard.Backspace();
-            return;
-        default: return;
-        }
-    }
-
 int LauncherTabForAction(bbx::platform::Action action) {
     using bbx::platform::Action;
     switch (action) {
@@ -1054,6 +1027,33 @@ void SwitchTab(int delta) {
         }
     }
 }
+
+void OnAction(PadAction action) {
+    if (g_session.keyboard_open) {
+        switch (action) {
+        case PadAction::kNavigateUp: g_session.keyboard.Move(0, -1); return;
+        case PadAction::kNavigateDown: g_session.keyboard.Move(0, 1); return;
+        case PadAction::kNavigateLeft: g_session.keyboard.Move(-1, 0); return;
+        case PadAction::kNavigateRight: g_session.keyboard.Move(1, 0); return;
+        case PadAction::kConfirm:
+            if (!g_session.keyboard.Accept()) {
+                std::string name = g_session.keyboard.Text();
+                if (name.size() > 16u) name.resize(16u);
+                g_session.model.hunter_name = name;
+                bbx::platform::LogF("hunter name: \"%s\"", name.c_str());
+                if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"), name)) {
+                    bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write hunter-name.txt");
+                }
+                g_session.keyboard_open = false;
+                RefreshLauncher();
+            }
+            return;
+        case PadAction::kCancel:
+            g_session.keyboard.Backspace();
+            return;
+        default: return;
+        }
+    }
 
     // No rumble call here: the pad belongs to WinRT on this target and a launcher
     // menu does not need haptics badly enough to initialise a second input stack.
