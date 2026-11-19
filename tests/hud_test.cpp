@@ -141,3 +141,22 @@ TEST(HudResizeKeepsItsQuadsAndItsFrame) {
     // frame per present.
     CHECK_EQ(hud.Quads().size(), 1u);
 }
+
+TEST(HudGothicFrameDividerAndHuntersMark) {
+    CHECK(HudFont::Has('|'));
+    CHECK(HudFont::Has('\''));
+    CHECK(HudFont::Has('"'));
+
+    Hud hud(1920.0f, 1080.0f);
+    hud.GothicPanel(40.0f, 40.0f, 800.0f, 400.0f);
+    const std::size_t after_panel = hud.Quads().size();
+    // 1 fill + 4 outer border + 4 inner border + 4 corner finials = 13 quads
+    CHECK_EQ(after_panel, 13u);
+
+    hud.GothicDivider(60.0f, 120.0f, 760.0f, 3u);
+    const std::size_t after_divider = hud.Quads().size();
+    CHECK(after_divider > after_panel);
+
+    hud.HuntersMark(100.0f, 80.0f, 3u);
+    CHECK(hud.Quads().size() > after_divider + 10u);
+}

@@ -569,7 +569,13 @@ Status Replay::DrawPresent(float red, float green, float blue, float sharpness) 
     const float texel_x = frame_image_width_ > 0 ? (1.0f / static_cast<float>(frame_image_width_)) : 0.0f;
     const float texel_y = frame_image_height_ > 0 ? (1.0f / static_cast<float>(frame_image_height_)) : 0.0f;
     const float clamped_sharp = sharpness < 0.0f ? 0.0f : (sharpness > 1.0f ? 1.0f : sharpness);
-    const float present_constants[8] = {red, green, blue, 1.0f, texel_x, texel_y, clamped_sharp, 0.0f};
+    const float backdrop_aspect =
+        (red < 0.5f)
+            ? (frame_height_ > 0 ? (static_cast<float>(frame_width_) / static_cast<float>(frame_height_))
+                                 : (16.0f / 9.0f))
+            : 0.0f;
+    const float present_constants[8] = {red,     green,   blue,          1.0f,
+                                        texel_x, texel_y, clamped_sharp, backdrop_aspect};
     command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kPresent));
     command_list_->SetPipelineState(pso);
     command_list_->SetGraphicsRoot32BitConstants(0, 8, present_constants, 0);

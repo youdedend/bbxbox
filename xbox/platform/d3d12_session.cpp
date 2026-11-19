@@ -418,48 +418,48 @@ Hud D3d12Session::BuildReportHud() const {
     const Impl& impl = *impl_;
     Hud hud = impl.hud;
     hud.Clear();
+    if (bridge::Flips() != 0) {
+        return hud;
+    }
     const float width = hud.Width();
     const float height = hud.Height();
-    // A panel across the bottom third, scaled off the swapchain so the same layout
-    // works at 1080p and at 2160p.
-    const float scale = width >= 3000.0f ? 8.0f : 4.0f;
-    const float margin = static_cast<float>(scale) * 6.0f;
+    // A compact gothic hardware telemetry panel across the lower edge, scaled off
+    // the swapchain so the same layout works at 1080p and at 2160p.
+    const float scale = width >= 3000.0f ? 6.0f : 3.0f;
+    const float margin = static_cast<float>(scale) * 7.0f;
     const float line = Hud::TextHeight(static_cast<std::uint32_t>(scale)) +
-                       static_cast<float>(scale) * 3.0f;
+                       static_cast<float>(scale) * 2.5f;
 
-    const std::uint32_t lines = 9;
+    const std::uint32_t lines = 8;
     const float panel_height = line * static_cast<float>(lines) + margin;
-    const float panel_y = height - panel_height - margin;
-    hud.Panel(margin, panel_y, width - margin * 2.0f, panel_height, HudColor::Panel());
+    const float panel_y = height - panel_height - margin * 0.7f;
+    hud.GothicPanel(margin, panel_y, width - margin * 2.0f, panel_height);
 
-    float y = panel_y + margin * 0.5f;
-    const float x = margin * 2.0f;
-    const float row_width = width - margin * 4.0f;
+    float y = panel_y + margin * 0.45f;
+    const float x = margin * 1.6f;
+    const float row_width = width - margin * 3.2f;
     const auto s = static_cast<std::uint32_t>(scale);
-    hud.Text(x, y, s, "BBXBOX", HudColor::White());
-    hud.Text(x + Hud::TextWidth("BBXBOX  ", s), y, s, "BLOODBORNE ON XBOX SERIES",
-             HudColor::Green());
+    hud.Text(x, y, s, "YHARNAM CHALICE ALTAR", HudColor::TarnishedGold());
+    hud.Text(x + Hud::TextWidth("YHARNAM CHALICE ALTAR   ", s), y, s,
+             "DIRECT3D 12  |  SHADER MODEL 6.4", HudColor::BloodCrimson());
+    y += line * 1.05f;
+    hud.GothicDivider(x, y - line * 0.22f, row_width, s);
+    hud.Row(x, y, row_width, s, "ADAPTER", impl.report.adapter, HudColor::BoneIvory());
     y += line;
-    hud.Row(x, y, row_width, s, "ADAPTER", impl.report.adapter, HudColor::White());
+    hud.Row(x, y, row_width, s, "FEATURE LEVEL", impl.report.feature_level, HudColor::BoneIvory());
     y += line;
-    hud.Row(x, y, row_width, s, "FEATURE LEVEL", impl.report.feature_level, HudColor::White());
+    hud.Row(x, y, row_width, s, "MEMORY", impl.report.memory, HudColor::BoneIvory());
     y += line;
-    hud.Row(x, y, row_width, s, "MEMORY", impl.report.memory, HudColor::White());
-    y += line;
-    hud.Row(x, y, row_width, s, "SWAPCHAIN", impl.report.swapchain, HudColor::White());
+    hud.Row(x, y, row_width, s, "SWAPCHAIN", impl.report.swapchain, HudColor::BoneIvory());
     y += line;
     hud.Status(x, y, s, impl.report.selftest_ok, impl.report.selftest);
     y += line;
-    // The baked console shaders, and how many frames the guest has offered: the
-    // two facts a live test reads off the television (StartGuest loads the cache
-    // and logs the same line; host_present counts the flips).
-    hud.Row(x, y, row_width, s, "SHADER CACHE", bridge::ShaderCacheLine(), HudColor::White());
+    hud.Row(x, y, row_width, s, "CARYLL SHADER CACHE", bridge::ShaderCacheLine(),
+            HudColor::TarnishedGold());
     y += line;
-    hud.Row(x, y, row_width, s, "GUEST FLIPS",
-            std::to_string(static_cast<unsigned long long>(bridge::Flips())), HudColor::White());
-    y += line;
-    hud.Text(x, y, s, "LAUNCHER UI AND GUEST BOOT ARE P1B: THIS IS THE 4K GPU PATH",
-             HudColor::Grey());
+    hud.Text(x, y, s,
+             "FEAR THE OLD BLOOD  |  L3+R3 IN-GAME OPENS HUNTER'S DREAM QUICK MENU",
+             HudColor::AshSilver());
     return hud;
 }
 

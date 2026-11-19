@@ -897,31 +897,51 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
         g_session.baking
             ? 7u
             : (g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size());
+    const float panel_w = width - margin * 2.0f;
     const float panel_height =
-        line * static_cast<float>(2 + footer_lines.size() + body_rows) + margin;
-    hud.Panel(margin, margin, width - margin * 2.0f, panel_height, bbx::platform::HudColor::Panel());
+        line * static_cast<float>(3 + footer_lines.size() + body_rows) + margin * 1.2f;
+    hud.GothicPanel(margin, margin * 0.7f, panel_w, panel_height);
 
-    float y = margin + static_cast<float>(scale) * 3.5f;
-    const float x = margin * 1.5f;
-    hud.Text(x, y, scale, g_session.model.Title(), bbx::platform::HudColor::White());
-    y += line * 1.2f;
+    float y = margin * 0.7f + static_cast<float>(scale) * 3.8f;
+    const float x = margin * 1.6f;
+    const float inner_w = width - margin * 3.2f;
+
+    // Header: Hunter's Mark Caryll Rune + Title + Paleblood motto
+    const float rune_cx = x + static_cast<float>(scale) * 4.0f;
+    const float rune_cy = y + line * 0.55f;
+    hud.HuntersMark(rune_cx, rune_cy, scale, bbx::platform::HudColor::TarnishedGold(),
+                    bbx::platform::HudColor::BloodCrimson());
+    const float title_x = x + static_cast<float>(scale) * 11.0f;
+    hud.Text(title_x, y, scale, g_session.model.Title(), bbx::platform::HudColor::TarnishedGold());
+    y += line * 0.95f;
+    hud.Text(title_x, y, scale > 2u ? (scale - 1u) : scale,
+             "SEEK PALEBLOOD TO TRANSCEND THE HUNT  |  XBOX SERIES X|S EDITION",
+             bbx::platform::HudColor::BloodCrimson());
+    y += line * 0.85f;
+    hud.GothicDivider(x, y, inner_w, scale);
+    y += line * 0.45f;
 
     for (const std::string& info : footer_lines) {
-        hud.Text(x, y, scale, info, bbx::platform::HudColor::Grey());
+        hud.Text(x, y, scale, info, bbx::platform::HudColor::AshSilver());
         y += line;
     }
-    y += line * 0.4f;
+    y += line * 0.25f;
+    hud.GothicDivider(x, y, inner_w, scale);
+    y += line * 0.45f;
 
     if (g_session.baking) {
         const bbx::d3d12::BakeProgressSnapshot snap = g_session.bake_progress.Snapshot();
         const std::string headline = bbx::d3d12::FormatBakeHudLine(snap);
-        hud.Text(x, y, scale, headline, bbx::platform::HudColor::Green());
+        hud.Text(x, y, scale, headline, bbx::platform::HudColor::TarnishedGold());
         y += line * 1.15f;
 
-        // Progress bar: background trough + filled green bar.
-        const float bar_w = width - margin * 3.0f;
-        const float bar_h = static_cast<float>(scale) * 5.0f;
-        hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.12f, 0.14f, 0.18f, 0.95f});
+        // Blood Transfusion Shader Baker Bar: tarnished-brass frame + blood-crimson fill.
+        const float bar_w = inner_w;
+        const float bar_h = static_cast<float>(scale) * 5.2f;
+        const float border_t = std::max(1.5f, static_cast<float>(scale) * 0.5f);
+        hud.Panel(x - border_t, y - border_t, bar_w + border_t * 2.0f, bar_h + border_t * 2.0f,
+                  bbx::platform::HudColor::GothicBorder());
+        hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.08f, 0.04f, 0.06f, 0.96f});
         float frac = 0.0f;
         if (snap.total > 0) {
             frac = static_cast<float>(snap.done) / static_cast<float>(snap.total);
@@ -930,9 +950,13 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
             frac = 1.0f;
         }
         if (frac > 0.0f) {
-            hud.Panel(x, y, bar_w * frac, bar_h, bbx::platform::HudColor::Green());
+            const float fill_w = bar_w * frac;
+            hud.Panel(x, y, fill_w, bar_h, bbx::platform::HudColor::BloodCrimson());
+            const float tip_w = std::min(fill_w, static_cast<float>(scale) * 3.0f);
+            hud.Panel(x + fill_w - tip_w, y, tip_w, bar_h,
+                      bbx::platform::HudColor::PalebloodEmber());
         } else {
-            hud.Panel(x, y, bar_w * 0.08f, bar_h, bbx::platform::HudColor::Amber());
+            hud.Panel(x, y, bar_w * 0.08f, bar_h, bbx::platform::HudColor::TarnishedGold());
         }
         y += bar_h + line * 0.7f;
 
@@ -943,27 +967,27 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
                       static_cast<unsigned>(snap.resumed_count),
                       static_cast<unsigned>(snap.refused_count),
                       static_cast<unsigned>(snap.quarantined_count));
-        hud.Text(x, y, scale, stats, bbx::platform::HudColor::White());
+        hud.Text(x, y, scale, stats, bbx::platform::HudColor::BoneIvory());
         y += line;
 
         if (!snap.current_name.empty()) {
-            hud.Text(x, y, scale, "SHADER: " + TruncateLabel(snap.current_name, 56),
-                     bbx::platform::HudColor::Grey());
+            hud.Text(x, y, scale, "CARYLL RUNE: " + TruncateLabel(snap.current_name, 54),
+                     bbx::platform::HudColor::AshSilver());
         } else {
-            hud.Text(x, y, scale, "COMPILING PS4 GCN SHADERS TO NATIVE XBOX DXIL 6.4...",
-                     bbx::platform::HudColor::Grey());
+            hud.Text(x, y, scale, "ETCHING PS4 GCN SHADERS TO NATIVE XBOX DXIL 6.4...",
+                     bbx::platform::HudColor::AshSilver());
         }
         y += line * 1.2f;
 
         const bool cancelling = g_session.bake_progress.CancelRequested();
         hud.Text(x, y, scale,
-                 cancelling ? "CANCELLING... SAVING CHECKPOINT FOR RESUME"
-                            : "PRESS B TO CANCEL (PROGRESS IS SAVED FOR RESUME)",
-                 bbx::platform::HudColor::Amber());
+                 cancelling ? "HALTING RITUAL... SAVING CHECKPOINT FOR RESUME"
+                            : "PRESS B TO HALT RITUAL (CHECKPOINT IS SAVED FOR RESUME)",
+                 bbx::platform::HudColor::TarnishedGold());
         y += line;
     } else if (g_session.keyboard_open) {
-        hud.Text(x, y, scale, "HUNTER NAME: " + g_session.keyboard.Text(),
-                 bbx::platform::HudColor::Amber());
+        hud.Text(x, y, scale, "HUNTER CONTRACT NAME: " + g_session.keyboard.Text(),
+                 bbx::platform::HudColor::TarnishedGold());
         y += line;
         for (std::size_t row = 0; row < g_session.keyboard.RowCount(); ++row) {
             std::string label = g_session.keyboard.Row(row);
@@ -971,25 +995,32 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
                 const std::size_t column = g_session.keyboard.CursorColumn() * 2;
                 if (column < label.size()) label[column] = '>';
             }
-            hud.Text(x + margin * 0.5f, y, scale, label, bbx::platform::HudColor::White());
+            hud.Text(x + margin * 0.5f, y, scale, label, bbx::platform::HudColor::BoneIvory());
             y += line;
         }
     } else {
         for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
             const bbx::platform::Item& item = g_session.model.items[i];
             const bool selected = (i == g_session.model.selected);
-            bbx::platform::HudColor colour = bbx::platform::HudColor::Grey();
+            if (selected) {
+                const float sel_pad = static_cast<float>(scale) * 1.2f;
+                hud.Panel(x - sel_pad, y - sel_pad * 0.6f, inner_w + sel_pad * 2.0f,
+                          line - sel_pad * 0.3f, bbx::platform::HudColor::CrimsonSelection());
+                hud.Panel(x - sel_pad, y - sel_pad * 0.6f, static_cast<float>(scale) * 1.4f,
+                          line - sel_pad * 0.3f, bbx::platform::HudColor::TarnishedGold());
+            }
+            bbx::platform::HudColor colour = bbx::platform::HudColor::AshSilver();
             if (item.enabled) {
                 if (item.dangerous) {
-                    colour = bbx::platform::HudColor::Amber();
+                    colour = bbx::platform::HudColor::PalebloodEmber();
                 } else if (selected) {
-                    colour = bbx::platform::HudColor::Green();
+                    colour = bbx::platform::HudColor::TarnishedGold();
                 } else {
-                    colour = bbx::platform::HudColor::White();
+                    colour = bbx::platform::HudColor::BoneIvory();
                 }
             }
-            const std::string label = std::string(selected ? "> " : "  ") + item.label;
-            hud.Text(x, y, scale, label, colour);
+            const std::string label = std::string(selected ? "<> " : "   ") + item.label;
+            hud.Text(x + static_cast<float>(scale) * 1.5f, y, scale, label, colour);
             y += line;
         }
     }
@@ -1017,7 +1048,7 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
                       bbx::bridge::VsyncEnabled() ? "ON" : "OFF",
                       g_session.model.sharp_upscale ? "ON" : "OFF");
         char line2[128];
-        std::snprintf(line2, sizeof(line2), "RAM %llu/%llu MIB | FLIPS %llu | L3+R3 MENU",
+        std::snprintf(line2, sizeof(line2), "RAM %llu/%llu MIB | FLIPS %llu | L3+R3 DREAM MENU",
                       static_cast<unsigned long long>(mem.used_mib),
                       static_cast<unsigned long long>(mem.limit_mib),
                       static_cast<unsigned long long>(perf.flips));
@@ -1026,11 +1057,11 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
                      bbx::platform::Hud::TextWidth(line2, small_scale)) +
             margin;
         const float box_h = line * 2.0f + static_cast<float>(small_scale) * 5.0f;
-        hud.Panel(margin * 0.5f, margin * 0.5f, box_w, box_h, bbx::platform::HudColor::Panel());
-        const float tx = margin * 0.5f + static_cast<float>(small_scale) * 3.0f;
-        const float ty = margin * 0.5f + static_cast<float>(small_scale) * 2.5f;
-        hud.Text(tx, ty, small_scale, line1, bbx::platform::HudColor::Green());
-        hud.Text(tx, ty + line, small_scale, line2, bbx::platform::HudColor::White());
+        hud.GothicPanel(margin * 0.5f, margin * 0.5f, box_w, box_h);
+        const float tx = margin * 0.5f + static_cast<float>(small_scale) * 3.2f;
+        const float ty = margin * 0.5f + static_cast<float>(small_scale) * 2.6f;
+        hud.Text(tx, ty, small_scale, line1, bbx::platform::HudColor::TarnishedGold());
+        hud.Text(tx, ty + line, small_scale, line2, bbx::platform::HudColor::BoneIvory());
     }
 
     // 2. Toast banner from host_message_show / host_text_show.
@@ -1042,27 +1073,32 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
         const float pad = static_cast<float>(scale) * 4.0f;
         const float bx = (width - (tw + pad * 2.0f)) * 0.5f;
         const float by = margin;
-        hud.Panel(bx, by, tw + pad * 2.0f, th + pad * 2.0f, bbx::platform::HudColor::Panel());
-        hud.Text(bx + pad, by + pad, scale, clipped, bbx::platform::HudColor::Amber());
+        hud.GothicPanel(bx, by, tw + pad * 2.0f, th + pad * 2.0f);
+        hud.Text(bx + pad, by + pad, scale, clipped, bbx::platform::HudColor::TarnishedGold());
     }
 
     // 3. In-game Virtual Keyboard IME overlay (when guest calls host_text_entry_begin).
     if (g_session.ime_open) {
         const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
         const float panel_w = width * 0.72f;
-        const float panel_h = line * static_cast<float>(4 + g_session.ime_keyboard.RowCount()) + margin;
+        const float panel_h = line * static_cast<float>(5 + g_session.ime_keyboard.RowCount()) + margin;
         const float px = (width - panel_w) * 0.5f;
         const float py = (height - panel_h) * 0.5f;
-        hud.Panel(px, py, panel_w, panel_h, bbx::platform::HudColor{0.03f, 0.04f, 0.07f, 0.90f});
+        hud.GothicPanel(px, py, panel_w, panel_h);
 
-        float y = py + margin * 0.6f;
-        const float tx = px + margin * 0.8f;
-        hud.Text(tx, y, scale, TruncateLabel(g_session.ime_label, 48), bbx::platform::HudColor::White());
-        y += line * 1.1f;
+        float y = py + margin * 0.65f;
+        const float tx = px + margin * 0.9f;
+        const float inner_w = panel_w - margin * 1.8f;
+        hud.Text(tx, y, scale, "HUNTER'S CONTRACT  |  " + TruncateLabel(g_session.ime_label, 38),
+                 bbx::platform::HudColor::TarnishedGold());
+        y += line * 1.0f;
+        hud.GothicDivider(tx, y, inner_w, scale);
+        y += line * 0.45f;
 
         std::string shown = g_session.ime_keyboard.Text();
         if (g_session.ime_hidden) shown.assign(shown.size(), '*');
-        hud.Text(tx, y, scale, "TEXT: " + shown + "_", bbx::platform::HudColor::Amber());
+        hud.Text(tx, y, scale, "INSCRIPTION: " + shown + "_",
+                 bbx::platform::HudColor::BoneIvory());
         y += line * 1.2f;
 
         for (std::size_t row = 0; row < g_session.ime_keyboard.RowCount(); ++row) {
@@ -1071,50 +1107,68 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
                 const std::size_t column = g_session.ime_keyboard.CursorColumn() * 2;
                 if (column < label.size()) label[column] = '>';
             }
-            hud.Text(tx + margin * 0.4f, y, scale, label, bbx::platform::HudColor::White());
+            hud.Text(tx + margin * 0.4f, y, scale, label, bbx::platform::HudColor::BoneIvory());
             y += line;
         }
         y += line * 0.3f;
-        hud.Text(tx, y, small_scale, "A: TYPE  B: BACKSPACE  MENU: ACCEPT  VIEW: CANCEL",
-                 bbx::platform::HudColor::Grey());
+        hud.Text(tx, y, small_scale, "A: INSCRIBE  B: ERASE  MENU: SEAL CONTRACT  VIEW: CANCEL",
+                 bbx::platform::HudColor::AshSilver());
         return;
     }
 
-    // 4. In-game L3+R3 Quick Menu overlay.
+    // 4. In-game L3+R3 Hunter's Dream Quick Menu overlay.
     if (g_session.quick_menu_open) {
         const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
         const std::vector<std::string> rows = {
-            "RESUME GAME",
+            "RETURN TO THE HUNT (RESUME)",
             std::string("FRAME RATE CAP: ") + (g_session.model.fps_cap >= 60 ? "60 FPS" : "30 FPS"),
             std::string("VSYNC: ") + (bbx::bridge::VsyncEnabled() ? "ON" : "OFF"),
             std::string("SHARP UPSCALE (FSR RCAS): ") +
                 (g_session.model.sharp_upscale ? "ON" : "OFF"),
             std::string("PERFORMANCE HUD: ") + (g_session.model.perf_hud ? "ON" : "OFF"),
-            "EXIT GAME",
+            "AWAKEN FROM THE DREAM (EXIT GAME)",
         };
-        const float panel_w = width * 0.64f;
-        const float panel_h = line * static_cast<float>(rows.size() + 3) + margin;
+        const float panel_w = width * 0.66f;
+        const float panel_h = line * static_cast<float>(rows.size() + 4) + margin;
         const float px = (width - panel_w) * 0.5f;
         const float py = (height - panel_h) * 0.5f;
-        hud.Panel(px, py, panel_w, panel_h, bbx::platform::HudColor{0.03f, 0.04f, 0.07f, 0.90f});
+        hud.GothicPanel(px, py, panel_w, panel_h);
 
-        float y = py + margin * 0.6f;
-        const float tx = px + margin * 0.8f;
-        hud.Text(tx, y, scale, "BBXBOX QUICK MENU", bbx::platform::HudColor::White());
-        y += line * 1.3f;
+        float y = py + margin * 0.65f;
+        const float tx = px + margin * 0.9f;
+        const float inner_w = panel_w - margin * 1.8f;
+        hud.HuntersMark(tx + static_cast<float>(scale) * 3.5f, y + line * 0.35f, scale,
+                        bbx::platform::HudColor::TarnishedGold(),
+                        bbx::platform::HudColor::BloodCrimson());
+        hud.Text(tx + static_cast<float>(scale) * 10.0f, y, scale,
+                 "HUNTER'S DREAM  |  MESSENGER QUICK MENU",
+                 bbx::platform::HudColor::TarnishedGold());
+        y += line * 1.15f;
+        hud.GothicDivider(tx, y, inner_w, scale);
+        y += line * 0.55f;
 
         for (std::size_t i = 0; i < rows.size(); ++i) {
             const bool sel = (i == g_session.quick_menu_selected);
+            if (sel) {
+                const float sel_pad = static_cast<float>(scale) * 1.2f;
+                hud.Panel(tx - sel_pad, y - sel_pad * 0.5f, inner_w + sel_pad * 2.0f,
+                          line - sel_pad * 0.3f, bbx::platform::HudColor::CrimsonSelection());
+                hud.Panel(tx - sel_pad, y - sel_pad * 0.5f, static_cast<float>(scale) * 1.4f,
+                          line - sel_pad * 0.3f, bbx::platform::HudColor::TarnishedGold());
+            }
             const bbx::platform::HudColor col =
-                sel ? (i == rows.size() - 1 ? bbx::platform::HudColor::Amber()
-                                            : bbx::platform::HudColor::Green())
-                    : bbx::platform::HudColor::White();
-            hud.Text(tx, y, scale, std::string(sel ? "> " : "  ") + rows[i], col);
+                sel ? (i == rows.size() - 1 ? bbx::platform::HudColor::PalebloodEmber()
+                                            : bbx::platform::HudColor::TarnishedGold())
+                    : bbx::platform::HudColor::BoneIvory();
+            hud.Text(tx + static_cast<float>(scale) * 1.5f, y, scale,
+                     std::string(sel ? "<> " : "   ") + rows[i], col);
             y += line;
         }
-        y += line * 0.3f;
-        hud.Text(tx, y, small_scale, "A: TOGGLE/SELECT   B OR L3+R3: RESUME",
-                 bbx::platform::HudColor::Grey());
+        y += line * 0.35f;
+        hud.GothicDivider(tx, y, inner_w, scale);
+        y += line * 0.4f;
+        hud.Text(tx, y, small_scale, "A: COMMUNE / TOGGLE   B OR L3+R3: RETURN TO THE HUNT",
+                 bbx::platform::HudColor::AshSilver());
     }
 }
 

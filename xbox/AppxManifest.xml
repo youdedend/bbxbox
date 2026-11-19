@@ -43,10 +43,10 @@
                     PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 
   <Properties>
-    <DisplayName>bbxbox</DisplayName>
-    <PublisherDisplayName>bbxbox</PublisherDisplayName>
+    <DisplayName>Bloodborne</DisplayName>
+    <PublisherDisplayName>Yharnam Workshop</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
-    <Description>Bloodborne v1.09 native x86-64 compatibility layer with a Direct3D 12 renderer.</Description>
+    <Description>Bloodborne v1.09 native x86-64 compatibility layer with a Direct3D 12 renderer for Xbox Series X|S.</Description>
   </Properties>
 
   <Dependencies>
@@ -74,14 +74,14 @@
          main.cpp), which returns bbxbox.App as the IFrameworkViewSource. -->
     <Application Id="App" Executable="bbxbox.exe" EntryPoint="bbxbox.App">
       <uap:VisualElements
-        DisplayName="bbxbox"
-        Description="Bloodborne compatibility layer"
-        BackgroundColor="#0C0E12"
+        DisplayName="Bloodborne"
+        Description="Bloodborne — Seek Paleblood to transcend the hunt"
+        BackgroundColor="#09060A"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png"
         AppListEntry="default">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\LargeTile.png" />
-        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0C0E12" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#09060A" />
       </uap:VisualElements>
       <!-- UWP's removableStorage capability only exposes files on USB drives
            whose extensions are registered in a windows.fileTypeAssociation

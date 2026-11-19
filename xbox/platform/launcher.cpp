@@ -38,11 +38,11 @@ void LauncherModel::Rebuild() {
     const bool supported = ready && VersionSupported(layout.EffectiveVersion());
 
     if (ready && supported) {
-        items.push_back(Item{Action::kStartGame, "Start game",
-                             "bbhost starts; the title's own menu follows", !precompiling, false});
+        items.push_back(Item{Action::kStartGame, "Awaken Above Ground (Start Game)",
+                             "Enter Yharnam; Bloodborne v1.09 awakens on Xbox Series X|S", !precompiling, false});
         items.push_back(Item{Action::kPrecompile,
-                             precompiling ? "Precompiling..." : (cache_current ? "Rebuild shader cache" : "Precompile shaders"),
-                             "Compile Bloodborne shaders natively to DXIL SM 6.4 and unload DXC",
+                             precompiling ? "Communing with Caryll Runes..." : (cache_current ? "Rebuild shader cache" : "Precompile shaders"),
+                             "Etch PS4 GCN shaders natively to Xbox DXIL SM 6.4 and unload DXC",
                              !precompiling, false});
     }
     if (ready && !supported) {
@@ -107,7 +107,7 @@ void LauncherModel::Rebuild() {
     items.push_back(Item{Action::kMemorySelfTest, "Run memory self-test",
                          "Walks the guest memory contract; writes LocalState\\memory-selftest.txt",
                          !precompiling, false});
-    items.push_back(Item{Action::kQuit, "Quit", "Close bbxbox", true, false});
+    items.push_back(Item{Action::kQuit, "Return to Waking World (Quit)", "Close Bloodborne", true, false});
 
     selected = 0;
     if (previous != Action::kNone) {
@@ -145,7 +145,7 @@ Action LauncherModel::Activate() const {
 }
 
 std::string LauncherModel::Title() const {
-    return "bbxbox - Bloodborne on Xbox Series X|S";
+    return "BLOODBORNE  |  THE HUNTER'S DREAM";
 }
 
 std::string LauncherModel::Footer() const {
