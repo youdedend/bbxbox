@@ -452,6 +452,49 @@ bbx::platform::ButtonMask MaskFromPad() {
     return mask;
 }
 
+int ParseIntClamped(const std::string& s, int fallback, int lo, int hi) {
+    if (s.empty()) return fallback;
+    char* end = nullptr;
+    const long val = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || (end != nullptr && *end != '\0')) return fallback;
+    if (val < static_cast<long>(lo)) return lo;
+    if (val > static_cast<long>(hi)) return hi;
+    return static_cast<int>(val);
+}
+
+void SyncBridgeSettings() {
+    bbx::bridge::ConsoleSettings cfg;
+    cfg.fps_cap = g_session.model.fps_cap >= 60 ? 60 : 30;
+    cfg.vsync = g_session.model.vsync;
+    cfg.skip_logos = g_session.model.skip_logos;
+    cfg.enhancements = g_session.model.enhancements;
+    cfg.chromatic_aberration = g_session.model.chromatic_aberration;
+    cfg.motion_blur = g_session.model.motion_blur;
+    cfg.depth_of_field = g_session.model.depth_of_field;
+    cfg.vignette = g_session.model.vignette;
+    cfg.fov_scale = static_cast<float>(g_session.model.fov_percent) / 100.0f;
+    cfg.camera_distance_scale = static_cast<float>(g_session.model.camera_distance_percent) / 100.0f;
+    cfg.stick_deadzone = static_cast<float>(g_session.model.stick_deadzone_percent) / 100.0f;
+    bbx::bridge::ApplyConsoleSettings(cfg);
+}
+
+void LoadHunterName() {
+    std::string raw;
+    if (!bbx::platform::ReadText(bbx::platform::Local("hunter-name.txt"), raw)) {
+        g_session.model.hunter_name.clear();
+        return;
+    }
+    while (!raw.empty() &&
+           (raw.back() == '\r' || raw.back() == '\n' || raw.back() == ' ' || raw.back() == '\t')) {
+        raw.pop_back();
+    }
+    std::size_t first = 0;
+    while (first < raw.size() && (raw[first] == ' ' || raw[first] == '\t')) ++first;
+    std::string trimmed = raw.substr(first);
+    if (trimmed.size() > 16u) trimmed.resize(16u);
+    g_session.model.hunter_name = std::move(trimmed);
+}
+
 void SaveLayoutSettings() {
     const std::string path = bbx::platform::Local("bbxbox.ini");
     // IniSet returns false when a key's value is unchanged; never short-circuit
@@ -471,6 +514,26 @@ void SaveLayoutSettings() {
                                 g_session.model.sharp_upscale ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "perf_hud",
                                 g_session.model.perf_hud ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "gameplay", "skip_logos",
+                                g_session.model.skip_logos ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "gameplay", "enhancements",
+                                g_session.model.enhancements ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "gameplay", "auto_backup_saves",
+                                g_session.model.auto_backup_saves ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "chromatic_aberration",
+                                g_session.model.chromatic_aberration ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "motion_blur",
+                                g_session.model.motion_blur ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "depth_of_field",
+                                g_session.model.depth_of_field ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "vignette",
+                                g_session.model.vignette ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "fov_percent",
+                                std::to_string(g_session.model.fov_percent));
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "camera_distance_percent",
+                                std::to_string(g_session.model.camera_distance_percent));
+    (void)bbx::platform::IniSet(g_session.ini_text, "controls", "stick_deadzone_percent",
+                                std::to_string(g_session.model.stick_deadzone_percent));
     g_session.ini = bbx::platform::ParseIni(g_session.ini_text);
     if (!bbx::platform::WriteText(path, g_session.ini_text)) {
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
@@ -735,12 +798,15 @@ void OnAction(PadAction action) {
         case PadAction::kNavigateRight: g_session.keyboard.Move(1, 0); return;
         case PadAction::kConfirm:
             if (!g_session.keyboard.Accept()) {
-                bbx::platform::LogF("hunter name: \"%s\"", g_session.keyboard.Text().c_str());
-                if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"),
-                                              g_session.keyboard.Text())) {
+                std::string name = g_session.keyboard.Text();
+                if (name.size() > 16u) name.resize(16u);
+                g_session.model.hunter_name = name;
+                bbx::platform::LogF("hunter name: \"%s\"", name.c_str());
+                if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"), name)) {
                     bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write hunter-name.txt");
                 }
                 g_session.keyboard_open = false;
+                RefreshLauncher();
             }
             return;
         case PadAction::kCancel:
@@ -761,7 +827,7 @@ void OnAction(PadAction action) {
         return;
     case PadAction::kMenu:
         g_session.keyboard_open = true;
-        g_session.keyboard.Reset();
+        g_session.keyboard.Reset(g_session.model.hunter_name);
         return;
     case PadAction::kOpenPcSettings:
         bbx::platform::LogF("PC settings menu requested (L3+R3)");
@@ -803,14 +869,14 @@ void OnAction(PadAction action) {
             return;
         case bbx::platform::Action::kToggleFpsCap:
             g_session.model.fps_cap = (g_session.model.fps_cap >= 60) ? 30 : 60;
-            bbx::bridge::SetTargetFps(g_session.model.fps_cap);
+            SyncBridgeSettings();
             bbx::platform::LogF("video: fps_cap=%d", g_session.model.fps_cap);
             SaveLayoutSettings();
             RefreshLauncher();
             return;
         case bbx::platform::Action::kToggleVsync:
             g_session.model.vsync = !g_session.model.vsync;
-            bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
+            SyncBridgeSettings();
             bbx::platform::LogF("video: vsync=%s", g_session.model.vsync ? "on" : "off");
             SaveLayoutSettings();
             RefreshLauncher();
@@ -824,6 +890,38 @@ void OnAction(PadAction action) {
         case bbx::platform::Action::kTogglePerfHud:
             g_session.model.perf_hud = !g_session.model.perf_hud;
             bbx::platform::LogF("video: perf_hud=%s", g_session.model.perf_hud ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleSkipLogos:
+            g_session.model.skip_logos = !g_session.model.skip_logos;
+            SyncBridgeSettings();
+            bbx::platform::LogF("gameplay: skip_logos=%s", g_session.model.skip_logos ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleEnhancements:
+            g_session.model.enhancements = !g_session.model.enhancements;
+            SyncBridgeSettings();
+            bbx::platform::LogF("gameplay: enhancements=%s",
+                                g_session.model.enhancements ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kCycleDeadzone: {
+            const int next = ((g_session.model.stick_deadzone_percent / 5) + 1) % 5;
+            g_session.model.stick_deadzone_percent = next * 5;
+            SyncBridgeSettings();
+            bbx::platform::LogF("controls: stick_deadzone_percent=%d",
+                                g_session.model.stick_deadzone_percent);
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        }
+        case bbx::platform::Action::kToggleAutoBackup:
+            g_session.model.auto_backup_saves = !g_session.model.auto_backup_saves;
+            bbx::platform::LogF("gameplay: auto_backup_saves=%s",
+                                g_session.model.auto_backup_saves ? "on" : "off");
             SaveLayoutSettings();
             RefreshLauncher();
             return;
@@ -888,18 +986,45 @@ std::string TruncateLabel(const std::string& s, std::size_t max_chars) {
 void AppendLauncherToHud(bbx::platform::Hud& hud) {
     if (bbx::bridge::Flips() != 0) return;
     const float width = hud.Width();
-    const std::uint32_t scale = width >= 3000.0f ? 5u : 3u;
+    const float height = hud.Height();
+    const std::uint32_t scale = width >= 3000.0f ? 5u : (height >= 950.0f ? 3u : 2u);
+    const std::uint32_t small_scale = scale > 2u ? (scale - 1u) : scale;
     const float margin = static_cast<float>(scale) * 7.0f;
     const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 2.5f;
 
     const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer());
+    const float max_panel_h = std::max(line * 10.0f, height - margin * 1.4f);
+    const float fixed_h = line * static_cast<float>(3.5 + static_cast<double>(footer_lines.size())) +
+                          margin * 1.4f;
+    const std::size_t max_visible_rows = std::max<std::size_t>(
+        5u, static_cast<std::size_t>(std::max(0.0f, (max_panel_h - fixed_h) / line)));
+
+    const std::size_t total_items = g_session.model.items.size();
+    const bool list_mode = !g_session.baking && !g_session.keyboard_open;
+    const bool scrolling = list_mode && total_items > max_visible_rows;
+    const std::size_t visible_items =
+        scrolling ? (max_visible_rows > 1u ? max_visible_rows - 1u : 1u) : total_items;
+    std::size_t first_row = 0;
+    if (scrolling) {
+        const std::size_t half = visible_items / 2u;
+        if (g_session.model.selected > half) {
+            first_row = g_session.model.selected - half;
+        }
+        if (first_row + visible_items > total_items) {
+            first_row = total_items - visible_items;
+        }
+    }
+
     const std::size_t body_rows =
         g_session.baking
             ? 7u
-            : (g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size());
+            : (g_session.keyboard_open
+                   ? (1u + g_session.keyboard.RowCount())
+                   : (scrolling ? (visible_items + 1u) : total_items));
     const float panel_w = width - margin * 2.0f;
-    const float panel_height =
-        line * static_cast<float>(3 + footer_lines.size() + body_rows) + margin * 1.2f;
+    const float panel_height = std::min(
+        max_panel_h,
+        line * static_cast<float>(3u + footer_lines.size() + body_rows) + margin * 1.2f);
     hud.GothicPanel(margin, margin * 0.7f, panel_w, panel_height);
 
     float y = margin * 0.7f + static_cast<float>(scale) * 3.8f;
@@ -914,7 +1039,7 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     const float title_x = x + static_cast<float>(scale) * 11.0f;
     hud.Text(title_x, y, scale, g_session.model.Title(), bbx::platform::HudColor::TarnishedGold());
     y += line * 0.95f;
-    hud.Text(title_x, y, scale > 2u ? (scale - 1u) : scale,
+    hud.Text(title_x, y, small_scale,
              "SEEK PALEBLOOD TO TRANSCEND THE HUNT  |  XBOX SERIES X|S EDITION",
              bbx::platform::HudColor::BloodCrimson());
     y += line * 0.85f;
@@ -999,7 +1124,8 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
             y += line;
         }
     } else {
-        for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
+        const std::size_t end_row = std::min(total_items, first_row + visible_items);
+        for (std::size_t i = first_row; i < end_row; ++i) {
             const bbx::platform::Item& item = g_session.model.items[i];
             const bool selected = (i == g_session.model.selected);
             if (selected) {
@@ -1022,6 +1148,15 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
             const std::string label = std::string(selected ? "<> " : "   ") + item.label;
             hud.Text(x + static_cast<float>(scale) * 1.5f, y, scale, label, colour);
             y += line;
+        }
+        if (scrolling) {
+            char scroll_hint[96];
+            std::snprintf(scroll_hint, sizeof(scroll_hint),
+                          "%s ITEMS %zu-%zu OF %zu  |  D-PAD UP/DOWN TO SCROLL %s",
+                          first_row > 0u ? "[^]" : "   ", first_row + 1u, end_row, total_items,
+                          end_row < total_items ? "[v]" : "   ");
+            hud.Text(x + static_cast<float>(scale) * 1.5f, y, small_scale, scroll_hint,
+                     bbx::platform::HudColor::AshSilver());
         }
     }
 }
@@ -1116,58 +1251,72 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
         return;
     }
 
-    // 4. In-game L3+R3 Hunter's Dream Quick Menu overlay.
+    // 4. In-game L3+R3 Hunter's Dream Quick Menu overlay (live engine/graphics/camera/controls).
     if (g_session.quick_menu_open) {
-        const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
+        const std::uint32_t menu_scale = width >= 3000.0f ? 5u : (height >= 950.0f ? 3u : 2u);
+        const std::uint32_t hint_scale = menu_scale > 2u ? (menu_scale - 1u) : menu_scale;
+        const float menu_margin = static_cast<float>(menu_scale) * 6.0f;
+        const float line =
+            bbx::platform::Hud::TextHeight(menu_scale) + static_cast<float>(menu_scale) * 2.6f;
         const std::vector<std::string> rows = {
             "RETURN TO THE HUNT (RESUME)",
-            std::string("FRAME RATE CAP: ") + (g_session.model.fps_cap >= 60 ? "60 FPS" : "30 FPS"),
+            std::string("FRAME RATE CAP: ") +
+                (g_session.model.fps_cap >= 60 ? "60 FPS++" : "30 FPS"),
             std::string("VSYNC: ") + (bbx::bridge::VsyncEnabled() ? "ON" : "OFF"),
             std::string("SHARP UPSCALE (FSR RCAS): ") +
                 (g_session.model.sharp_upscale ? "ON" : "OFF"),
+            std::string("CHROMATIC ABERRATION: ") +
+                (g_session.model.chromatic_aberration ? "ON" : "OFF"),
+            std::string("MOTION BLUR: ") + (g_session.model.motion_blur ? "ON" : "OFF"),
+            std::string("DEPTH OF FIELD: ") + (g_session.model.depth_of_field ? "ON" : "OFF"),
+            std::string("VIGNETTE: ") + (g_session.model.vignette ? "ON" : "OFF"),
+            "CAMERA FOV: " + std::to_string(g_session.model.fov_percent) + "%",
+            "CAMERA DISTANCE: " + std::to_string(g_session.model.camera_distance_percent) + "%",
+            "STICK DEADZONE: " + std::to_string(g_session.model.stick_deadzone_percent) + "%",
             std::string("PERFORMANCE HUD: ") + (g_session.model.perf_hud ? "ON" : "OFF"),
-            "AWAKEN FROM THE DREAM (EXIT GAME)",
+            g_session.model.auto_backup_saves ? "AWAKEN FROM THE DREAM (EXIT & SYNC SAVES)"
+                                              : "AWAKEN FROM THE DREAM (EXIT GAME)",
         };
-        const float panel_w = width * 0.66f;
-        const float panel_h = line * static_cast<float>(rows.size() + 4) + margin;
+        const float panel_w = width * 0.70f;
+        const float panel_h = line * static_cast<float>(rows.size() + 4u) + menu_margin;
         const float px = (width - panel_w) * 0.5f;
         const float py = (height - panel_h) * 0.5f;
         hud.GothicPanel(px, py, panel_w, panel_h);
 
-        float y = py + margin * 0.65f;
-        const float tx = px + margin * 0.9f;
-        const float inner_w = panel_w - margin * 1.8f;
-        hud.HuntersMark(tx + static_cast<float>(scale) * 3.5f, y + line * 0.35f, scale,
+        float y = py + menu_margin * 0.65f;
+        const float tx = px + menu_margin * 0.9f;
+        const float inner_w = panel_w - menu_margin * 1.8f;
+        hud.HuntersMark(tx + static_cast<float>(menu_scale) * 3.5f, y + line * 0.35f, menu_scale,
                         bbx::platform::HudColor::TarnishedGold(),
                         bbx::platform::HudColor::BloodCrimson());
-        hud.Text(tx + static_cast<float>(scale) * 10.0f, y, scale,
+        hud.Text(tx + static_cast<float>(menu_scale) * 10.0f, y, menu_scale,
                  "HUNTER'S DREAM  |  MESSENGER QUICK MENU",
                  bbx::platform::HudColor::TarnishedGold());
         y += line * 1.15f;
-        hud.GothicDivider(tx, y, inner_w, scale);
-        y += line * 0.55f;
+        hud.GothicDivider(tx, y, inner_w, menu_scale);
+        y += line * 0.5f;
 
         for (std::size_t i = 0; i < rows.size(); ++i) {
             const bool sel = (i == g_session.quick_menu_selected);
             if (sel) {
-                const float sel_pad = static_cast<float>(scale) * 1.2f;
+                const float sel_pad = static_cast<float>(menu_scale) * 1.1f;
                 hud.Panel(tx - sel_pad, y - sel_pad * 0.5f, inner_w + sel_pad * 2.0f,
                           line - sel_pad * 0.3f, bbx::platform::HudColor::CrimsonSelection());
-                hud.Panel(tx - sel_pad, y - sel_pad * 0.5f, static_cast<float>(scale) * 1.4f,
+                hud.Panel(tx - sel_pad, y - sel_pad * 0.5f, static_cast<float>(menu_scale) * 1.4f,
                           line - sel_pad * 0.3f, bbx::platform::HudColor::TarnishedGold());
             }
             const bbx::platform::HudColor col =
                 sel ? (i == rows.size() - 1 ? bbx::platform::HudColor::PalebloodEmber()
                                             : bbx::platform::HudColor::TarnishedGold())
                     : bbx::platform::HudColor::BoneIvory();
-            hud.Text(tx + static_cast<float>(scale) * 1.5f, y, scale,
+            hud.Text(tx + static_cast<float>(menu_scale) * 1.5f, y, menu_scale,
                      std::string(sel ? "<> " : "   ") + rows[i], col);
             y += line;
         }
         y += line * 0.35f;
-        hud.GothicDivider(tx, y, inner_w, scale);
+        hud.GothicDivider(tx, y, inner_w, menu_scale);
         y += line * 0.4f;
-        hud.Text(tx, y, small_scale, "A: COMMUNE / TOGGLE   B OR L3+R3: RETURN TO THE HUNT",
+        hud.Text(tx, y, hint_scale, "A / LEFT-RIGHT: ADJUST   B OR L3+R3: RETURN TO THE HUNT",
                  bbx::platform::HudColor::AshSilver());
     }
 }
@@ -1335,14 +1484,40 @@ void LoadSettings() {
     g_session.model.modded_eboot_ok = bbx::platform::IniFlag(g_session.ini, "dump.modded_eboot", false);
 
     // Video & overlay settings persisted across launches.
-    const std::string fps_str = bbx::platform::IniGet(g_session.ini, "video.fps_cap", "30");
-    g_session.model.fps_cap = (fps_str == "60") ? 60 : 30;
+    const std::string fps_str = bbx::platform::IniGet(g_session.ini, "video.fps_cap", "60");
+    g_session.model.fps_cap = (fps_str == "30") ? 30 : 60;
     g_session.model.vsync = bbx::platform::IniFlag(g_session.ini, "video.vsync", true);
     g_session.model.sharp_upscale =
         bbx::platform::IniFlag(g_session.ini, "video.sharp_upscale", true);
     g_session.model.perf_hud = bbx::platform::IniFlag(g_session.ini, "video.perf_hud", false);
-    bbx::bridge::SetTargetFps(g_session.model.fps_cap);
-    bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
+
+    // Gameplay, post-processing, camera, and controller deadzone settings.
+    g_session.model.skip_logos =
+        bbx::platform::IniFlag(g_session.ini, "gameplay.skip_logos", true);
+    g_session.model.enhancements =
+        bbx::platform::IniFlag(g_session.ini, "gameplay.enhancements", true);
+    g_session.model.auto_backup_saves =
+        bbx::platform::IniFlag(g_session.ini, "gameplay.auto_backup_saves", true);
+    g_session.model.chromatic_aberration =
+        bbx::platform::IniFlag(g_session.ini, "graphics.chromatic_aberration", true);
+    g_session.model.motion_blur =
+        bbx::platform::IniFlag(g_session.ini, "graphics.motion_blur", true);
+    g_session.model.depth_of_field =
+        bbx::platform::IniFlag(g_session.ini, "graphics.depth_of_field", true);
+    g_session.model.vignette =
+        bbx::platform::IniFlag(g_session.ini, "graphics.vignette", true);
+    g_session.model.fov_percent =
+        ParseIntClamped(bbx::platform::IniGet(g_session.ini, "graphics.fov_percent", "100"),
+                        100, 100, 125);
+    g_session.model.camera_distance_percent = ParseIntClamped(
+        bbx::platform::IniGet(g_session.ini, "graphics.camera_distance_percent", "100"),
+        100, 90, 130);
+    g_session.model.stick_deadzone_percent = ParseIntClamped(
+        bbx::platform::IniGet(g_session.ini, "controls.stick_deadzone_percent", "10"),
+        10, 0, 20);
+
+    LoadHunterName();
+    SyncBridgeSettings();
 }
 
 std::string NormalizeScanPath(std::string path) {
@@ -1733,7 +1908,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             bbx::platform::Bit(Pad::kView) | bbx::platform::Bit(Pad::kMenu);
         const bbx::platform::ButtonMask kQuickMenuMask =
             bbx::platform::Bit(Pad::kLeftStick) | bbx::platform::Bit(Pad::kRightStick);
-        constexpr std::size_t kQuickMenuCount = 6;
+        constexpr std::size_t kQuickMenuCount = 13;
 
         while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
             if (stored_window) {
@@ -1819,6 +1994,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         g_session.quick_menu_open = !g_session.quick_menu_open;
                         bbx::bridge::SetGuestInputSuppressed(g_session.quick_menu_open);
                     } else if (g_session.quick_menu_open) {
+                        const bool confirm = (pressed & bbx::platform::Bit(Pad::kSouth)) != 0;
+                        const bool step_left = (pressed & bbx::platform::Bit(Pad::kDpadLeft)) != 0;
+                        const bool step_right = (pressed & bbx::platform::Bit(Pad::kDpadRight)) != 0;
                         if (pressed & bbx::platform::Bit(Pad::kDpadUp)) {
                             g_session.quick_menu_selected =
                                 (g_session.quick_menu_selected + kQuickMenuCount - 1) % kQuickMenuCount;
@@ -1828,36 +2006,105 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         } else if (pressed & bbx::platform::Bit(Pad::kEast)) {
                             g_session.quick_menu_open = false;
                             bbx::bridge::SetGuestInputSuppressed(false);
-                        } else if (pressed & bbx::platform::Bit(Pad::kSouth)) {
+                        } else if (confirm || step_left || step_right) {
+                            bool settings_changed = false;
                             switch (g_session.quick_menu_selected) {
                             case 0:
-                                g_session.quick_menu_open = false;
-                                bbx::bridge::SetGuestInputSuppressed(false);
+                                if (confirm) {
+                                    g_session.quick_menu_open = false;
+                                    bbx::bridge::SetGuestInputSuppressed(false);
+                                }
                                 break;
                             case 1:
                                 g_session.model.fps_cap = (g_session.model.fps_cap >= 60) ? 30 : 60;
-                                bbx::bridge::SetTargetFps(g_session.model.fps_cap);
-                                SaveLayoutSettings();
+                                settings_changed = true;
                                 break;
                             case 2:
                                 g_session.model.vsync = !bbx::bridge::VsyncEnabled();
-                                bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
-                                SaveLayoutSettings();
+                                settings_changed = true;
                                 break;
                             case 3:
                                 g_session.model.sharp_upscale = !g_session.model.sharp_upscale;
                                 SaveLayoutSettings();
                                 break;
                             case 4:
+                                g_session.model.chromatic_aberration =
+                                    !g_session.model.chromatic_aberration;
+                                settings_changed = true;
+                                break;
+                            case 5:
+                                g_session.model.motion_blur = !g_session.model.motion_blur;
+                                settings_changed = true;
+                                break;
+                            case 6:
+                                g_session.model.depth_of_field = !g_session.model.depth_of_field;
+                                settings_changed = true;
+                                break;
+                            case 7:
+                                g_session.model.vignette = !g_session.model.vignette;
+                                settings_changed = true;
+                                break;
+                            case 8:
+                                if (confirm) {
+                                    g_session.model.fov_percent =
+                                        (g_session.model.fov_percent >= 125)
+                                            ? 100
+                                            : (g_session.model.fov_percent + 5);
+                                } else if (step_left) {
+                                    g_session.model.fov_percent =
+                                        std::max(100, g_session.model.fov_percent - 5);
+                                } else if (step_right) {
+                                    g_session.model.fov_percent =
+                                        std::min(125, g_session.model.fov_percent + 5);
+                                }
+                                settings_changed = true;
+                                break;
+                            case 9:
+                                if (confirm) {
+                                    g_session.model.camera_distance_percent =
+                                        (g_session.model.camera_distance_percent >= 130)
+                                            ? 90
+                                            : (g_session.model.camera_distance_percent + 10);
+                                } else if (step_left) {
+                                    g_session.model.camera_distance_percent =
+                                        std::max(90, g_session.model.camera_distance_percent - 10);
+                                } else if (step_right) {
+                                    g_session.model.camera_distance_percent =
+                                        std::min(130, g_session.model.camera_distance_percent + 10);
+                                }
+                                settings_changed = true;
+                                break;
+                            case 10:
+                                if (confirm) {
+                                    g_session.model.stick_deadzone_percent =
+                                        (g_session.model.stick_deadzone_percent >= 20)
+                                            ? 0
+                                            : (g_session.model.stick_deadzone_percent + 5);
+                                } else if (step_left) {
+                                    g_session.model.stick_deadzone_percent =
+                                        std::max(0, g_session.model.stick_deadzone_percent - 5);
+                                } else if (step_right) {
+                                    g_session.model.stick_deadzone_percent =
+                                        std::min(20, g_session.model.stick_deadzone_percent + 5);
+                                }
+                                settings_changed = true;
+                                break;
+                            case 11:
                                 g_session.model.perf_hud = !g_session.model.perf_hud;
                                 SaveLayoutSettings();
                                 break;
-                            case 5:
-                                g_session.quick_menu_open = false;
-                                bbx::bridge::SetGuestInputSuppressed(false);
-                                g_session.quit = true;
+                            case 12:
+                                if (confirm) {
+                                    g_session.quick_menu_open = false;
+                                    bbx::bridge::SetGuestInputSuppressed(false);
+                                    g_session.quit = true;
+                                }
                                 break;
                             default: break;
+                            }
+                            if (settings_changed) {
+                                SyncBridgeSettings();
+                                SaveLayoutSettings();
                             }
                         }
                     }
@@ -1884,6 +2131,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         g_session.bake_result.summary.c_str());
                     RefreshLauncher();
                     if (g_session.start_after_bake && !g_session.bake_result.cancelled) {
+                        SyncBridgeSettings();
                         if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
                             guest_ever_started = true;
                         } else {
@@ -1926,7 +2174,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 if (g_session.model.mods_enabled && g_session.model.mods_present) {
                     req.mods = g_session.layout.base_path + "\\mods";
                 }
+                req.hunter_name = g_session.model.hunter_name;
                 req.modded_eboot_ok = g_session.model.modded_eboot_ok;
+                SyncBridgeSettings();
 
                 std::string found_cache_dir;
                 std::string found_cache_report;
@@ -1959,6 +2209,15 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         }
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         if (guest_ever_started || bbx::bridge::Running()) {
+            if (g_session.model.auto_backup_saves && !g_session.layout.base_path.empty()) {
+                std::string detail;
+                const bool synced = bbx::platform::BackupSavesAndLogsToUsb(
+                    bbx::platform::Paths().local_state, bbx::platform::Local("data"),
+                    g_session.layout.base_path, &detail);
+                bbx::platform::LogMirroredMessage(
+                    synced ? bbx::platform::Level::kInfo : bbx::platform::Level::kWarn,
+                    "usb: exit auto-backup %s (%s)", synced ? "ok" : "skipped", detail.c_str());
+            }
             // Normal UWP exit runs static destructors and DLL teardown while
             // detached guest threads are still running, hanging the console on
             // the last frame for minutes. Flush logs and terminate cleanly.

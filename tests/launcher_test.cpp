@@ -230,3 +230,41 @@ TEST(VideoTogglesUsbSaveActionsAndStatusBanner) {
     const std::string footer = model.Footer();
     CHECK(footer.find("Backed up 2 save file(s)") != std::string::npos);
 }
+
+TEST(GameplayEnhancementsDeadzoneAutoBackupAndHunterName) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.has_usb = true;
+    model.skip_logos = true;
+    model.enhancements = false;
+    model.stick_deadzone_percent = 15;
+    model.auto_backup_saves = true;
+    model.hunter_name = "Gehrman";
+    model.Rebuild();
+
+    CHECK(Has(model, Action::kToggleSkipLogos));
+    CHECK(Has(model, Action::kToggleEnhancements));
+    CHECK(Has(model, Action::kCycleDeadzone));
+    CHECK(Has(model, Action::kToggleAutoBackup));
+
+    CHECK_EQ(std::string(ActionName(Action::kToggleSkipLogos)), std::string("toggle-skip-logos"));
+    CHECK_EQ(std::string(ActionName(Action::kToggleEnhancements)), std::string("toggle-enhancements"));
+    CHECK_EQ(std::string(ActionName(Action::kCycleDeadzone)), std::string("cycle-deadzone"));
+    CHECK_EQ(std::string(ActionName(Action::kToggleAutoBackup)), std::string("toggle-auto-backup"));
+
+    bool found_dz = false;
+    bool found_enh_off = false;
+    for (const Item& item : model.items) {
+        if (item.action == Action::kCycleDeadzone) {
+            found_dz = item.label.find("15%") != std::string::npos;
+        }
+        if (item.action == Action::kToggleEnhancements) {
+            found_enh_off = item.label.find("off") != std::string::npos;
+        }
+    }
+    CHECK(found_dz);
+    CHECK(found_enh_off);
+
+    const std::string footer = model.Footer();
+    CHECK(footer.find("Hunter: Gehrman") != std::string::npos);
+}

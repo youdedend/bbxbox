@@ -25,6 +25,7 @@
 //     The description is read here, on the guest's thread, and it is arithmetic:
 //     nothing in it waits for the GPU.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -43,13 +44,16 @@
 #include <winrt/Windows.Gaming.Input.h>
 #include <winrt/Windows.Foundation.Collections.h>
 
+#include "core/config.h"
 #include "engine/graphics_patch.h"
 #include "engine/frame_rate.h"
+#include "host/framegen.h"
 #include "host/translation_cache.h"
 #include "host/options.h"
 #include "host/window.h"
 #include "host/gpu.h"
 #include "host/ingame_menu.h"
+#include "host/upscaler.h"
 #include "engine/menu_pointer.h"
 #include "engine/option_menu.h"
 #include "engine/patch_manifest.h"
@@ -62,6 +66,7 @@
 #include "xbox/platform/host_fs.h"
 #include "xbox/platform/hostfs_extra.h"
 #include "xbox/platform/storage.h"
+#include "xbox/platform/ux.h"
 #include "src/host/d3d12/bbx_scanout.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
 #include "xbox/platform/guest_frames.h"
@@ -85,6 +90,7 @@
 #include "host/gxvk_lists.h"
 #include "host/perf_meter.h"
 #include "host/settings.h"
+#include "host/settings_store.h"
 
 
 namespace {
@@ -96,13 +102,46 @@ namespace {
 std::atomic<std::uint64_t> g_flips{0};
 std::atomic<std::uint64_t> g_game_frames{0};
 std::atomic<bool> g_input_suppressed{false};
-std::atomic<int> g_target_fps{30};
+std::atomic<int> g_target_fps{60};
 std::atomic<bool> g_vsync_enabled{true};
 std::atomic<int> g_display_w{1920};
 std::atomic<int> g_display_h{1080};
 std::atomic<float> g_display_hz{60.0f};
 std::atomic<bool> g_quit_requested{false};
 std::atomic<std::uint64_t> g_last_present_ns{0};
+
+HostSettingsStore g_settings_store;
+std::mutex g_console_settings_mu;
+bbx::bridge::ConsoleSettings g_console_settings{};
+
+HostSettings BuildHostSettings(const bbx::bridge::ConsoleSettings& cfg) {
+    HostSettings hs;
+    hs.fullscreen = true;
+    hs.vsync = cfg.vsync;
+    hs.frame_cap = cfg.fps_cap >= 60 ? 60 : 30;
+    hs.res_width = 1920;
+    hs.res_height = 1080;
+    hs.fov_scale = std::clamp(cfg.fov_scale, 1.0f, 1.25f);
+    hs.camera_distance_scale = std::clamp(cfg.camera_distance_scale, 0.9f, 1.3f);
+    hs.button_prompts = 2;  // Always display controller prompts on Xbox.
+    const float dz = std::clamp(cfg.stick_deadzone, 0.0f, 0.25f);
+    hs.stick_inner[0] = dz;
+    hs.stick_inner[1] = dz;
+    hs.stick_outer[0] = 1.0f;
+    hs.stick_outer[1] = 1.0f;
+    hs.chromatic_aberration = cfg.chromatic_aberration;
+    hs.motion_blur = cfg.motion_blur;
+    hs.depth_of_field = cfg.depth_of_field;
+    hs.vignette = cfg.vignette;
+    hs.skip_logos = cfg.skip_logos;
+    hs.change_appearance = cfg.enhancements;
+    hs.rebirth = cfg.enhancements;
+    hs.five_players = false;
+    hs.skill_issue = false;
+    hs.full_phantom_hp = true;
+    hs.auto_replenish = cfg.enhancements;
+    return hs;
+}
 
 std::mutex g_perf_mu;
 std::chrono::steady_clock::time_point g_last_frame_tp{};
@@ -184,13 +223,45 @@ void CompleteTextEntry(const std::string& utf8_text, bool accepted) {
     g_text_entry_prompt.active = false;
 }
 
+ConsoleSettings GetConsoleSettings() {
+    std::lock_guard<std::mutex> lock(g_console_settings_mu);
+    return g_console_settings;
+}
+
+void ApplyConsoleSettings(const ConsoleSettings& settings) {
+    ConsoleSettings clean = settings;
+    clean.fps_cap = clean.fps_cap >= 60 ? 60 : 30;
+    clean.fov_scale = std::clamp(clean.fov_scale, 1.0f, 1.25f);
+    clean.camera_distance_scale = std::clamp(clean.camera_distance_scale, 0.9f, 1.3f);
+    clean.stick_deadzone = std::clamp(clean.stick_deadzone, 0.0f, 0.25f);
+    {
+        std::lock_guard<std::mutex> lock(g_console_settings_mu);
+        g_console_settings = clean;
+    }
+    g_target_fps.store(clean.fps_cap, std::memory_order_relaxed);
+    g_vsync_enabled.store(clean.vsync, std::memory_order_relaxed);
+    g_settings_store.publish(BuildHostSettings(clean));
+#if defined(BBX_GUEST_BOOT)
+    hle_video_set_fps_cap(clean.fps_cap);
+    if (Running()) {
+        (void)frame_rate_request(clean.fps_cap);
+    }
+#endif
+}
+
 void SetTargetFps(int fps) {
-    g_target_fps.store(fps >= 60 ? 60 : 30, std::memory_order_relaxed);
+    ConsoleSettings cfg = GetConsoleSettings();
+    cfg.fps_cap = fps >= 60 ? 60 : 30;
+    ApplyConsoleSettings(cfg);
 }
 
 int TargetFps() { return g_target_fps.load(std::memory_order_relaxed); }
 
-void SetVsyncEnabled(bool on) { g_vsync_enabled.store(on, std::memory_order_relaxed); }
+void SetVsyncEnabled(bool on) {
+    ConsoleSettings cfg = GetConsoleSettings();
+    cfg.vsync = on;
+    ApplyConsoleSettings(cfg);
+}
 
 bool VsyncEnabled() { return g_vsync_enabled.load(std::memory_order_relaxed); }
 
@@ -246,15 +317,6 @@ constexpr std::uint32_t kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10,
 constexpr std::uint16_t kPadTouchLeftX = 480;
 constexpr std::uint16_t kPadTouchRightX = 1440;
 constexpr std::uint16_t kPadTouchMidY = 471;
-
-// 0..255 with 127 at rest, from the pad's -1.0..1.0. Matches upstream's
-// axis_to_u8 so 0.0 lands on kStickRest (127) and not 128.
-std::uint8_t StickFromFloat(double value) {
-    if (value > 1.0) value = 1.0;
-    if (value < -1.0) value = -1.0;
-    const int scaled = (static_cast<int>(value * 32767.0) + 32768) / 257;
-    return static_cast<std::uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
-}
 
 // A trigger is 0..1 on the pad and 0..255 here; `host/window.cpp` divides by 128
 // and treats 8000 as held, so the same scale is kept.
@@ -318,11 +380,15 @@ PadState host_pad_state() {
             }
 
             // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
-            // 0 for up and 255 for down; negate both Y axes to match PS4 convention.
-            s.lx = StickFromFloat(reading.LeftThumbstickX);
-            s.ly = StickFromFloat(-reading.LeftThumbstickY);
-            s.rx = StickFromFloat(reading.RightThumbstickX);
-            s.ry = StickFromFloat(-reading.RightThumbstickY);
+            // 0 for up and 255 for down; negate both Y axes to match PS4 convention
+            // and apply the player's configurable radial deadzone curve.
+            const HostSettings& hs = host_settings_ref();
+            bbx::platform::ApplyRadialStickDeadzone(
+                reading.LeftThumbstickX, -reading.LeftThumbstickY,
+                hs.stick_inner[0], hs.stick_outer[0], &s.lx, &s.ly);
+            bbx::platform::ApplyRadialStickDeadzone(
+                reading.RightThumbstickX, -reading.RightThumbstickY,
+                hs.stick_inner[1], hs.stick_outer[1], &s.rx, &s.ry);
             s.l2 = TriggerFromFloat(reading.LeftTrigger);
             s.r2 = TriggerFromFloat(reading.RightTrigger);
             if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
@@ -470,32 +536,14 @@ bool host_window_active() { return true; }
 // from bbhost's headers and the bodies are the quiet answer; when a slice of the
 // port needs one of them for real, it is implemented here and the entry is gone.
 
-// engine/frame_rate.h
-void frame_rate_atk_params_loaded() {  }
-bool frame_rate_converted() { return g_target_fps.load(std::memory_order_relaxed) > 30; }
-int frame_rate_game_fps() { return g_target_fps.load(std::memory_order_relaxed); }
-void frame_rate_install(ElfImage* image) { (void)image; }
-void frame_rate_install_late(ElfImage* image) { (void)image; }
-float frame_rate_limit_fps() { return static_cast<float>(g_target_fps.load(std::memory_order_relaxed)); }
-std::string frame_rate_limiter_window() { return {}; }
-bool frame_rate_live(int fps) { return fps == 30 || fps == 60; }
-bool frame_rate_request(int fps) {
-    bbx::bridge::SetTargetFps(fps);
-    return true;
-}
-void frame_rate_retime() {  }
-void frame_rate_set_time_scale(float scale) { (void)scale; }
+// engine/frame_rate.h, engine/graphics_patch.h, and engine/patch_manifest.h
+// are compiled directly into bbhost_engine so 60 FPS++, post-processing live
+// hooks, intro skip, and gameplay enhancements run natively on Xbox.
 
-// engine/graphics_patch.h
-bool engine_prologue_hook_variadic(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
-std::uint64_t engine_scene_view_flip() { return {}; }
-bool engine_site_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* bytes, std::size_t n, void* host, std::uint64_t id) { return {}; }
-std::string graphics_glare_report() { return {}; }
-std::uint32_t graphics_look_available() { return {}; }
-void graphics_look_set(const GraphicsLook& look) {  }
-void graphics_patch_install(ElfImage* image) {  }
-void graphics_scene_context_made(std::uint64_t ctx) {  }
-void graphics_ssr_live_in() {  }
+// host/framegen.h & host/upscaler.h (Vulkan temporal upscaling/framegen are off
+// on the D3D12 console path; D3D12 FSR RCAS handles crisp TV upscaling).
+float framegen_shown_per_frame() { return 1.0f; }
+int upscaler_method() { return 0; }
 
 // engine/menu_pointer.h
 void menu_pointer_click() {  }
@@ -513,21 +561,6 @@ void option_menu_confirm_close() {  }
 void option_menu_install(ElfImage* image) {  }
 void option_menu_list_update(void* comp, bool focused) {  }
 void option_menu_poll() {  }
-
-// engine/patch_manifest.h
-PatchLiveState patch_manifest_live_state(const std::string& name) { return {}; }
-bool patch_manifest_off(const std::string& name) { return {}; }
-bool patch_manifest_on(const std::string& name, bool enabled) { return {}; }
-bool patch_manifest_option_known(const std::string& option) { return {}; }
-const char* patch_manifest_owner(std::uint64_t address, std::size_t n) { return {}; }
-bool patch_manifest_set_live(const std::string& name, bool on, std::string* why) { return {}; }
-void patch_manifests_apply(ElfImage* image) {  }
-bool patch_manifests_done() { return {}; }
-std::vector<std::string> patch_manifests_gameplay() { return {}; }
-std::vector<PatchListing> patch_manifests_list(const std::string& mods) { return {}; }
-bool shadow_resolution_known(bool* applied) { return {}; }
-std::uint64_t shadow_resolution_more_mib(int tier) { return {}; }
-ShadowMapSizes shadow_resolution_sizes(int tier) { return {}; }
 
 // engine/render_scale.h
 bool render_scale_applied() { return {}; }
@@ -643,7 +676,7 @@ bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, floa
 bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps) { return {}; }
 int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps) { return {}; }
 void host_opt_choose_effect_timing(int index) {  }
-int host_opt_default_frame_cap() { return 30; }
+int host_opt_default_frame_cap() { return 60; }
 bool host_opt_default_get(const char* key) { (void)key; return {}; }
 int host_opt_default_index(const char* key) { (void)key; return {}; }
 int host_opt_default_resolution_index() { return {}; }
@@ -657,22 +690,25 @@ void host_opt_menu_colour(float* hue_degrees, float* vibrance) { (void)hue_degre
 float host_opt_menu_text_scale() { return {}; }
 int host_opt_motion_rebuilt_bits() { return {}; }
 bool host_opt_motion_wanted() { return {}; }
+// Pin the guest render resolution to 1920x1080 even on 4K TVs so Bloodborne's
+// render-target heap stays inside the 5,120 MiB Xbox Dev Mode memory cap; the
+// D3D12 presentation pass upscales crisply to the TV via FSR RCAS.
 bool host_opt_output_size(int* w, int* h) {
-    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
-    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    if (w != nullptr) *w = 1920;
+    if (h != nullptr) *h = 1080;
     return true;
 }
 void host_opt_republish() {  }
 bool host_opt_resolution(int* w, int* h) {
-    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
-    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    if (w != nullptr) *w = 1920;
+    if (h != nullptr) *h = 1080;
     return true;
 }
 int host_opt_resolution_index() { return {}; }
 const char* const* host_opt_resolution_labels(int* n) { (void)n; return {}; }
 const char* host_opt_resolution_note() { return {}; }
 bool host_opt_saved(const char* key) { (void)key; return {}; }
-std::uint64_t host_opt_serial() { return {}; }
+std::uint64_t host_opt_serial() { return g_settings_store.now().serial; }
 void host_opt_set(const char* key, bool on) { (void)key; (void)on; }
 void host_opt_set_frame_cap(int fps) { bbx::bridge::SetTargetFps(fps); }
 void host_opt_set_frame_cap_custom(bool on, int fps) {  }
@@ -914,9 +950,8 @@ void decomp_event_interpreter_add() {}
 // What the census found next: the hooks, the option rows' drawing, the list
 // pool, the settings listener and the two arm calls. Same quiet answer.
 
-bool engine_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
-bool engine_prologue_hook_exec(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, const std::uint8_t* exec, std::size_t m, void* host, std::uint64_t id) { return {}; }
-bool engine_call_site_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, void* host) { return {}; }
+// engine_prologue_hook, engine_prologue_hook_exec, and engine_call_site_hook
+// are defined in engine/graphics_patch.cpp.
 bool menu_pointer_in_menu() { return {}; }
 void hle_watch_arm(std::uint64_t lo, std::uint64_t hi) {  }
 void hle_bp_arm(std::uint64_t va) {  }
@@ -928,7 +963,7 @@ bool plugin_panel_native_set(int row, int value) { return {}; }
 bool plugin_panel_native_turn(int dir) { return {}; }
 bool plugin_panel_native_back() { return {}; }
 bool plugins_active(const std::string& name) { return {}; }
-void host_settings_listen(HostSettingsListener fn) {  }
+void host_settings_listen(HostSettingsListener fn) { (void)g_settings_store.listen(fn); }
 
 namespace option_rows {
 void* fn(std::uint64_t bn) { return {}; }
@@ -962,7 +997,8 @@ bool host_gpu_splice(std::uint64_t id) { return {}; }
 bool ingame_menu_open() { return {}; }
 bool host_options_open() { return {}; }
 bool plugin_panel_native_corner_wanted() { return {}; }
-const HostSettings& host_settings_ref() { static const HostSettings none{}; return none; }
+HostSettings host_settings() { return g_settings_store.now(); }
+const HostSettings& host_settings_ref() { return g_settings_store.now(); }
 bool host_mouse_relative() { return {}; }
 bool host_plugin_taken_motion() { return {}; }
 bool host_text_entry_open() {
@@ -1126,6 +1162,28 @@ bool StartGuest(const GuestRequest& req) {
         return true;
     }
     g_eboot_path = req.eboot;
+
+    // Publish the console settings snapshot, Hunter identity, intro-skip flag,
+    // and Bloodborne gameplay enhancements before HLE patching installs
+    // frame_rate, graphics_patch, camera, and patch_manifest hooks.
+    const ConsoleSettings cfg = GetConsoleSettings();
+    g_settings_store.publish(BuildHostSettings(cfg));
+    const char* hunter = req.hunter_name.empty() ? "Hunter" : req.hunter_name.c_str();
+    hle_dialog_set_default_name(hunter, true);
+    hle_np_set_online_id(hunter);
+    hle_video_set_fps_cap(cfg.fps_cap);
+    config_set_skip_intro(cfg.skip_logos);
+    config_set_enhancements(cfg.enhancements, cfg.enhancements, false, false, true,
+                            cfg.enhancements);
+    bbx::platform::LogF(
+        "boot: settings fps=%d vsync=%u skip_logos=%u enhancements=%u ca=%u blur=%u dof=%u "
+        "vignette=%u fov=%.2f cam_dist=%.2f deadzone=%.2f hunter=\"%s\"",
+        cfg.fps_cap, static_cast<unsigned>(cfg.vsync), static_cast<unsigned>(cfg.skip_logos),
+        static_cast<unsigned>(cfg.enhancements), static_cast<unsigned>(cfg.chromatic_aberration),
+        static_cast<unsigned>(cfg.motion_blur), static_cast<unsigned>(cfg.depth_of_field),
+        static_cast<unsigned>(cfg.vignette), static_cast<double>(cfg.fov_scale),
+        static_cast<double>(cfg.camera_distance_scale), static_cast<double>(cfg.stick_deadzone),
+        hunter);
 
     // The HLE's file system: which folder is app0, which overlay is the update,
     // where saves and temporaries go, and where the player's loose files are.

@@ -7,6 +7,7 @@
 #include "core/legacy_cpu_code.h"
 #include "decomp/insn.h"
 #include "core/memory.h"
+#include "core/portable.h"
 #include "core/thunk.h"
 #include "engine/addr.h"
 #include "engine/camera.h"
@@ -435,8 +436,8 @@ void set_chromatic_aberration(bool on) {
     if (g_ca_mask->exchange(want) != want) host_log("graphics: chromatic aberration %s", on ? "on" : "off");
 }
 
-void* alloc_exec_near(std::uint64_t at);
-void free_exec_page(void* page);
+void* alloc_exec_near(std::uint64_t at, std::size_t size = 0x1000);
+void free_exec_page(void* page, std::size_t size = 0x1000);
 
 // The copy, through the mask. The stub has to be within a rel32 of the code,
 // so its page comes from near it (alloc_exec_near). On Windows there was no
@@ -444,7 +445,17 @@ void free_exec_page(void* page);
 // "it stays on", and the setting did nothing (Kyo: "chromatic aberration
 // disable actually doesn't even currently work").
 bool install_ca_stub(ElfImage* image, std::uint64_t at) {
-    void* page = alloc_exec_near(at);
+#if defined(BBX_UWP)
+    // Local change, marked BBX_UWP: AppContainer enforces strict W^X, so the
+    // stub code on page 0 flips to PAGE_EXECUTE_READ while the live-mutated
+    // mask sits on page 1 (+0x1000) which stays PAGE_READWRITE.
+    constexpr std::size_t kAllocBytes = 0x2000;
+    constexpr std::size_t kMaskAt = 0x1000;
+#else
+    constexpr std::size_t kAllocBytes = 0x1000;
+    constexpr std::size_t kMaskAt = 0x40;
+#endif
+    void* page = alloc_exec_near(at, kAllocBytes);
     if (!page) return false;
     auto* c = static_cast<std::uint8_t*>(page);
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(c);
@@ -456,7 +467,6 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
         return true;
     };
     std::int32_t to_stub = 0, to_back = 0, to_mask = 0;
-    constexpr std::size_t kMaskAt = 0x40;
     // mov eax, [rbp-0xa70]
     std::memcpy(c, kCaCopyBytes, 6);
     // and eax, [rip+mask]
@@ -468,18 +478,25 @@ bool install_ca_stub(ElfImage* image, std::uint64_t at) {
     c[18] = 0xe9;
     if (!rel32(stub + 12, stub + kMaskAt, &to_mask) || !rel32(stub + 23, back, &to_back) ||
         !rel32(at + 5, stub, &to_stub)) {
-        free_exec_page(page);
+        free_exec_page(page, kAllocBytes);
         return false;
     }
     std::memcpy(c + 8, &to_mask, 4);
     std::memcpy(c + 19, &to_back, 4);
     g_ca_mask = reinterpret_cast<std::atomic<std::uint32_t>*>(c + kMaskAt);
     g_ca_mask->store(0xffffffffu);
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(page, 0x1000)) {
+        g_ca_mask = nullptr;
+        free_exec_page(page, kAllocBytes);
+        return false;
+    }
+#endif
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     const std::uint64_t lo = at & ~0xfffull, hi = (at + sizeof(kCaCopyBytes) + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) {
         g_ca_mask = nullptr;
-        free_exec_page(page);
+        free_exec_page(page, kAllocBytes);
         return false;
     }
     p[0] = 0xe9;  // jmp stub
@@ -1581,32 +1598,54 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     return 0;
 }
 
-void free_exec_page(void* page) {
+void free_exec_page(void* page, std::size_t size) {
 #if defined(_WIN32)
+    (void)size;
     VirtualFree(page, 0, MEM_RELEASE);
 #else
-    munmap(page, 0x1000);
+    munmap(page, size);
 #endif
 }
 
 // An executable page within a rel32 of `at`, for a stub a jump or call there
 // can reach. Null when none is free.
-void* alloc_exec_near(std::uint64_t at) {
-#if defined(_WIN32)
+void* alloc_exec_near(std::uint64_t at, std::size_t size) {
+#if defined(BBX_UWP)
+    // Local change, marked BBX_UWP: VirtualAllocFromApp takes no fixed address
+    // and PAGE_EXECUTE_READWRITE is refused outright. Allocate PAGE_READWRITE
+    // via VirtualAlloc2FromApp and flip the code page to PAGE_EXECUTE_READ via
+    // host_page_make_executable once emitted.
+    const std::uint64_t reach = 0x7ff00000ull, base = at & ~0xffffull;
+    const auto try_at = [&](std::uint64_t a) -> void* {
+        void* p = VirtualAlloc2FromApp(GetCurrentProcess(), reinterpret_cast<void*>(a), size,
+                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, nullptr, 0);
+        if (!p) return nullptr;
+        if (reinterpret_cast<std::uint64_t>(p) != a) {
+            VirtualFree(p, 0, MEM_RELEASE);
+            return nullptr;
+        }
+        return p;
+    };
+    for (std::uint64_t a = base - 0x10000; a > 0x10000 && base - a < reach; a -= 0x10000)
+        if (void* p = try_at(a)) return p;
+    for (std::uint64_t a = base + 0x10000; a - base < reach; a += 0x10000)
+        if (void* p = try_at(a)) return p;
+    return nullptr;
+#elif defined(_WIN32)
     // Downwards from `at` and then upwards, a 64 KiB allocation granule at a
     // time, inside the reach of a rel32.
     const std::uint64_t reach = 0x7ff00000ull, base = at & ~0xffffull;
     for (std::uint64_t a = base - 0x10000; a > 0x10000 && base - a < reach; a -= 0x10000)
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
     for (std::uint64_t a = base + 0x10000; a - base < reach; a += 0x10000)
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
+        if (void* p = VirtualAlloc(reinterpret_cast<void*>(a), size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return p;
     return nullptr;
 #else
-    void* page = mmap(nullptr, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    void* page = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (page == MAP_FAILED) return nullptr;
     const std::int64_t d = static_cast<std::int64_t>(reinterpret_cast<std::uint64_t>(page)) - static_cast<std::int64_t>(at);
     if (d < INT32_MIN + 0x1000ll || d > INT32_MAX - 0x1000ll) {
-        munmap(page, 0x1000);
+        munmap(page, size);
         return nullptr;
     }
     return page;
@@ -1629,6 +1668,12 @@ bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, 
     const std::uint64_t stub = reinterpret_cast<std::uint64_t>(page);
     const std::int64_t d = static_cast<std::int64_t>(stub) - static_cast<std::int64_t>(at + 5);
     thunk_emit_prologue_stub(static_cast<std::uint8_t*>(page), 0, thunk_wrap(host), target, nullptr, 0);
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(page, 0x1000)) {
+        free_exec_page(page);
+        return false;
+    }
+#endif
     const std::uint64_t lo = at & ~0xfffull, hi = (at + 5 + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) return false;  // the page stays; it is one
     const std::int32_t to_stub = static_cast<std::int32_t>(d);
@@ -2116,7 +2161,10 @@ bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t
         exec = expanded;
         m = k;
     }
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    void* page = host_page_alloc(0x1000, true);
+    const bool placed = page != nullptr;
+#elif defined(_WIN32)
     void* page = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     const bool placed = page != nullptr;
 #else
@@ -2124,9 +2172,21 @@ bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t
     const bool placed = page != MAP_FAILED;
 #endif
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
-    if (!placed || !guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
+    if (!placed || !guest_protect_rwx(&image->mem, lo, hi - lo)) {
+#if defined(BBX_UWP)
+        if (placed) host_page_free(page, 0x1000);
+#endif
+        return false;
+    }
     auto* stub = static_cast<std::uint8_t*>(page);
     thunk_emit_prologue_stub(stub, id, thunk_wrap(host), at + n, exec, m, keep_rax, site);
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(page, 0x1000)) {
+        guest_protect_rx(&image->mem, lo, hi - lo);
+        host_page_free(page, 0x1000);
+        return false;
+    }
+#endif
     legacy_cpu_release(at, n, "a hook");
     const std::uint64_t dest = reinterpret_cast<std::uint64_t>(stub);
     p[0] = 0xff;

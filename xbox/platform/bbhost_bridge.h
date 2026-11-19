@@ -26,6 +26,9 @@ struct GuestRequest {
     // The launcher's "Allow modded v1.09 eboot" switch: without it an eboot whose
     // sha256 is not 1.09's is refused before anything is patched.
     bool modded_eboot_ok = false;
+    // Preferred Hunter name from LocalState\hunter-name.txt; pre-fills the
+    // character creation IME and offline online-ID when non-empty.
+    std::string hunter_name;
 };
 
 // Loads, patches and starts the guest on its own thread. True when the thread
@@ -56,6 +59,25 @@ struct TextEntryPrompt {
 };
 [[nodiscard]] TextEntryPrompt PollTextEntryPrompt();
 void CompleteTextEntry(const std::string& utf8_text, bool accepted);
+
+// Console gameplay, graphics, camera, and controller settings pushed to the
+// live HostSettingsStore (`engine/frame_rate.cpp`, `engine/graphics_patch.cpp`,
+// `engine/camera.cpp`, `host/shader_patch.cpp`, `engine/patch_manifest.cpp`).
+struct ConsoleSettings {
+    int fps_cap = 60;
+    bool vsync = true;
+    bool skip_logos = true;
+    bool enhancements = true;
+    bool chromatic_aberration = true;
+    bool motion_blur = true;
+    bool depth_of_field = true;
+    bool vignette = true;
+    float fov_scale = 1.0f;
+    float camera_distance_scale = 1.0f;
+    float stick_deadzone = 0.10f;
+};
+void ApplyConsoleSettings(const ConsoleSettings& settings);
+[[nodiscard]] ConsoleSettings GetConsoleSettings();
 
 // Frame pacing & display settings shared between launcher, L3+R3 quick menu,
 // and guest HLE (`frame_rate_*`, `host_window_*`).

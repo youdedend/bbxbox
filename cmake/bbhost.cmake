@@ -266,6 +266,7 @@ add_library(bbhost_host STATIC
     "${BBX_BBHOST_ROOT}/src/host/pixel_cutaway.cpp"
     # (render_hooks.cpp is out: it includes `bbhost_plugin.h`, which is the
     # public plugin SDK header and not part of the vendored source.)
+    "${BBX_BBHOST_ROOT}/src/host/scene_look.cpp"
     "${BBX_BBHOST_ROOT}/src/host/shader_bundles.cpp"
     # (shader_liveness.cpp is out: it includes host/gpu_internal.h, which is the
     # Vulkan device's own header.)
@@ -376,7 +377,9 @@ add_library(bbhost_engine STATIC
     "${BBX_BBHOST_ROOT}/src/engine/fmod_ring.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/font_handle_set.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/frame_pool.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/frame_rate.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/frame_tick.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/graphics_patch.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/guest.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/gx_resources.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/gx_state.cpp"
@@ -395,6 +398,7 @@ add_library(bbhost_engine STATIC
     "${BBX_BBHOST_ROOT}/src/engine/np_test.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/paramdef.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/params.cpp"
+    "${BBX_BBHOST_ROOT}/src/engine/patch_manifest.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/patch_manifest_file.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/phantom_hp.cpp"
     "${BBX_BBHOST_ROOT}/src/engine/player_data.cpp"

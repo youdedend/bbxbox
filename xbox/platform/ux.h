@@ -116,4 +116,10 @@ private:
     bool done_ = false;
 };
 
+// Maps normalized analog stick coordinates [-1.0, 1.0] through a radial
+// inner/outer deadzone curve into ScePadData byte coordinates (0..255 with 127
+// at rest), preserving diagonal direction.
+void ApplyRadialStickDeadzone(double x, double y, float inner, float outer,
+                              std::uint8_t* out_x, std::uint8_t* out_y);
+
 }  // namespace bbx::platform

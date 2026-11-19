@@ -49,3 +49,20 @@ TEST(IniIgnoresCommentsAndCase) {
     const IniMap ini = ParseIni("; comment\n# another\n[Video]\nVSync = 1\n");
     CHECK(IniFlag(ini, "video.vsync", false));
 }
+
+TEST(DefaultIniIncludesGameplayGraphicsAndControlKeys) {
+    const IniMap ini = ParseIni(DefaultIni());
+    CHECK(IniGet(ini, "video.fps_cap") == "60");
+    CHECK(IniFlag(ini, "video.sharp_upscale", false));
+    CHECK(!IniFlag(ini, "video.perf_hud", true));
+    CHECK(IniFlag(ini, "gameplay.skip_logos", false));
+    CHECK(IniFlag(ini, "gameplay.enhancements", false));
+    CHECK(IniFlag(ini, "gameplay.auto_backup_saves", false));
+    CHECK(IniFlag(ini, "graphics.chromatic_aberration", false));
+    CHECK(IniFlag(ini, "graphics.motion_blur", false));
+    CHECK(IniFlag(ini, "graphics.depth_of_field", false));
+    CHECK(IniFlag(ini, "graphics.vignette", false));
+    CHECK(IniGet(ini, "graphics.fov_percent") == "100");
+    CHECK(IniGet(ini, "graphics.camera_distance_percent") == "100");
+    CHECK(IniGet(ini, "controls.stick_deadzone_percent") == "10");
+}

@@ -31,6 +31,10 @@ enum class Action : std::uint8_t {
     kToggleVsync,
     kToggleSharpUpscale,
     kTogglePerfHud,
+    kToggleSkipLogos,
+    kToggleEnhancements,
+    kCycleDeadzone,
+    kToggleAutoBackup,
     kSyncCacheToUsb,
     kSyncCacheFromUsb,
     kBackupSavesToUsb,
@@ -59,13 +63,24 @@ struct LauncherModel {
     std::size_t pipelines = 0;
     std::string cache_stamp;
     std::string status_banner;
+    std::string hunter_name;
 
-    // Video & overlay preferences (persisted in LocalState\bbxbox.ini and also
-    // toggleable in-game via the L3+R3 quick menu).
-    int fps_cap = 30;            // 30 (native PS4 pacing) or 60 (unlocked)
-    bool vsync = true;           // DXGI sync interval 1 vs 0
-    bool sharp_upscale = true;   // HLSL SM 6.4 RCAS sharpening vs plain bilinear
-    bool perf_hud = false;       // compact corner FPS / RAM / GPU stats overlay
+    // Video, gameplay, post-processing, camera & control preferences
+    // (persisted in LocalState\bbxbox.ini and editable live in L3+R3 menu).
+    int fps_cap = 60;                  // 30 (native PS4 pacing) or 60 (60 FPS++)
+    bool vsync = true;                 // DXGI sync interval 1 vs 0
+    bool sharp_upscale = true;         // HLSL SM 6.4 RCAS sharpening vs plain bilinear
+    bool perf_hud = false;             // compact corner FPS / RAM / GPU stats overlay
+    bool skip_logos = true;            // skip intro company logos at boot
+    bool enhancements = true;          // Hunter's Dream mirror, Rebirth Altar, Auto-Replenish
+    bool chromatic_aberration = true;  // live graphics_patch CA mask
+    bool motion_blur = true;           // live graphics_patch + shader_patch blur toggle
+    bool depth_of_field = true;        // live YEBIS depth-of-field toggle
+    bool vignette = true;              // live YEBIS vignette toggle
+    int fov_percent = 100;             // 100..125% in 5% steps (live LockCamParam)
+    int camera_distance_percent = 100; // 90..130% in 10% steps (live LockCamParam)
+    int stick_deadzone_percent = 10;   // 0..20% in 5% steps (radial stick deadzone)
+    bool auto_backup_saves = true;     // auto-mirror savedata to USB on exit
 
     // The `<dump>\mods` overlay: a directory the player drops loose files into
     // (`msg/`, `font/`, `menu/` - the Arabic localisation patch for CUSA03173

@@ -20,6 +20,10 @@ const char* ActionName(Action action) {
     case Action::kToggleVsync: return "toggle-vsync";
     case Action::kToggleSharpUpscale: return "toggle-sharp-upscale";
     case Action::kTogglePerfHud: return "toggle-perf-hud";
+    case Action::kToggleSkipLogos: return "toggle-skip-logos";
+    case Action::kToggleEnhancements: return "toggle-enhancements";
+    case Action::kCycleDeadzone: return "cycle-deadzone";
+    case Action::kToggleAutoBackup: return "toggle-auto-backup";
     case Action::kSyncCacheToUsb: return "sync-cache-to-usb";
     case Action::kSyncCacheFromUsb: return "sync-cache-from-usb";
     case Action::kBackupSavesToUsb: return "backup-saves-to-usb";
@@ -75,8 +79,8 @@ void LauncherModel::Rebuild() {
         }
     }
     items.push_back(Item{Action::kToggleFpsCap,
-                         fps_cap >= 60 ? "Frame rate cap: 60 FPS" : "Frame rate cap: 30 FPS",
-                         "Toggle between native 30 FPS pacing and unlocked 60 FPS (also in L3+R3 menu)",
+                         fps_cap >= 60 ? "Frame rate cap: 60 FPS++" : "Frame rate cap: 30 FPS",
+                         "Toggle native 30 FPS or true 60 FPS++ timestep patching (live in L3+R3 menu)",
                          !precompiling, false});
     items.push_back(Item{Action::kToggleVsync,
                          vsync ? "VSync: on" : "VSync: off",
@@ -86,11 +90,28 @@ void LauncherModel::Rebuild() {
                          sharp_upscale ? "Upscaling: FSR RCAS" : "Upscaling: Bilinear",
                          "HLSL SM 6.4 contrast-adaptive sharpening for 1440p/4K TVs",
                          !precompiling, false});
+    items.push_back(Item{Action::kToggleSkipLogos,
+                         skip_logos ? "Skip intro logos: on" : "Skip intro logos: off",
+                         "Jump straight to the title screen without PlayStation/FromSoft intro logos",
+                         !precompiling, false});
+    items.push_back(Item{Action::kToggleEnhancements,
+                         enhancements ? "QoL enhancements: on" : "QoL enhancements: off",
+                         "Hunter's Dream appearance mirror, Altar of Despair respec & auto-replenish",
+                         !precompiling, false});
+    items.push_back(Item{Action::kCycleDeadzone,
+                         "Stick deadzone: " + std::to_string(stick_deadzone_percent) + "%",
+                         "Radial inner deadzone for both analog sticks (0% to 20%; live in L3+R3 menu)",
+                         !precompiling, false});
     items.push_back(Item{Action::kTogglePerfHud,
                          perf_hud ? "Performance HUD: on" : "Performance HUD: off",
                          "Show live FPS, frame time, RAM usage and flips in-game (L3+R3 toggles)",
                          !precompiling, false});
     if (has_usb && !syncing) {
+        items.push_back(Item{Action::kToggleAutoBackup,
+                             auto_backup_saves ? "Auto-backup saves on exit: on"
+                                               : "Auto-backup saves on exit: off",
+                             "Automatically mirror LocalState savedata to USB when exiting Bloodborne",
+                             !precompiling, false});
         items.push_back(Item{Action::kSyncCacheToUsb, "Copy shader cache to USB",
                              "Export LocalState DXIL cache to your dump folder for instant reuse",
                              !precompiling, false});
@@ -153,6 +174,11 @@ std::string LauncherModel::Footer() const {
     const std::string banner = BbPanel::BaseOnlyBanner(layout);
     if (!banner.empty()) text += "\n\n" + banner;
     text += "\n" + BbPanel::CacheLine(stages, pipelines, cache_stamp, cache_current);
+    if (!hunter_name.empty()) {
+        text += "\nHunter: " + hunter_name + " (press Menu to rename)";
+    } else {
+        text += "\nHunter: default (press Menu to set default name)";
+    }
     if (!status_banner.empty()) text += "\nStatus: " + status_banner;
     const Item* item = Current();
     if (item && !item->hint.empty()) text += "\n\n" + item->label + ": " + item->hint;

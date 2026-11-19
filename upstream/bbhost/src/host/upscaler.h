@@ -22,9 +22,45 @@
 //
 // BBHOST_UPSCALER=0: the bridge is not loaded at all.
 
-#include <vulkan/vulkan.h>
-
+// Local change, marked BBX_UWP: the console upscales via D3D12 FSR RCAS
+// without Vulkan, so Vulkan handle types are opaque here.
+#if defined(BBX_UWP)
+#include <cstddef>
 #include <cstdint>
+#ifndef BBX_UWP_VK_STUBS
+#define BBX_UWP_VK_STUBS 1
+#define BBX_VK_HANDLE(name) struct name
+struct VkInstance_T; struct VkPhysicalDevice_T; struct VkDevice_T; struct VkQueue_T;
+struct VkCommandBuffer_T; struct VkImage_T; struct VkImageView_T;
+struct VkSwapchainKHR_T; struct VkSemaphore_T; struct VkFence_T;
+using VkInstance = VkInstance_T*;
+using VkPhysicalDevice = VkPhysicalDevice_T*;
+using VkDevice = VkDevice_T*;
+using VkQueue = VkQueue_T*;
+using VkCommandBuffer = VkCommandBuffer_T*;
+using VkImage = VkImage_T*;
+using VkImageView = VkImageView_T*;
+using VkSwapchainKHR = VkSwapchainKHR_T*;
+using VkSemaphore = VkSemaphore_T*;
+using VkFence = VkFence_T*;
+using VkFormat = int;
+using VkImageLayout = int;
+using VkResult = int;
+struct VkExtent2D { std::uint32_t width, height; };
+struct VkOffset2D { std::int32_t x, y; };
+struct VkSwapchainCreateInfoKHR;
+struct VkPresentInfoKHR;
+struct VkInstanceCreateInfo;
+struct VkDeviceCreateInfo;
+constexpr std::nullptr_t VK_NULL_HANDLE = nullptr;
+constexpr int VK_FORMAT_UNDEFINED = 0;
+constexpr int VK_IMAGE_LAYOUT_GENERAL = 1;
+#endif
+#else
+#include <vulkan/vulkan.h>
+#include <cstdint>
+#endif
+
 #include <string>
 
 // Loads the bridge and opens its context; false (and nothing else happens)

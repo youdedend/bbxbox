@@ -2,6 +2,7 @@
 #include "xbox/platform/ux.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace bbx::platform {
 
@@ -158,6 +159,34 @@ void VirtualKeyboard::Backspace() {
 void VirtualKeyboard::Append(char c) {
     if (c < 0x20 || c > 0x7e || text_.size() >= kMaxName) return;
     text_.push_back(c);
+}
+
+namespace {
+
+std::uint8_t StickAxisToU8(double value) {
+    const double clamped = std::clamp(value, -1.0, 1.0);
+    const int scaled = (static_cast<int>(clamped * 32767.0) + 32768) / 257;
+    return static_cast<std::uint8_t>(std::clamp(scaled, 0, 255));
+}
+
+}  // namespace
+
+void ApplyRadialStickDeadzone(double x, double y, float inner, float outer,
+                              std::uint8_t* out_x, std::uint8_t* out_y) {
+    const double dz_in = static_cast<double>(std::clamp(inner, 0.0f, 0.90f));
+    const double dz_out = static_cast<double>(std::clamp(outer, static_cast<float>(dz_in) + 0.05f, 1.0f));
+    const double mag = std::hypot(x, y);
+    double sx = 0.0;
+    double sy = 0.0;
+    if (mag > dz_in && dz_out > dz_in) {
+        double t = (mag - dz_in) / (dz_out - dz_in);
+        if (t > 1.0) t = 1.0;
+        const double scale = t / mag;
+        sx = std::clamp(x * scale, -1.0, 1.0);
+        sy = std::clamp(y * scale, -1.0, 1.0);
+    }
+    if (out_x != nullptr) *out_x = StickAxisToU8(sx);
+    if (out_y != nullptr) *out_y = StickAxisToU8(sy);
 }
 
 }  // namespace bbx::platform

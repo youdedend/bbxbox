@@ -110,3 +110,38 @@ TEST(KeyboardAcceptsAPhysicalKeyboardToo) {
     keyboard.Append('\n');  // control characters are ignored
     CHECK(keyboard.Text() == "Hi");
 }
+
+TEST(RadialDeadzoneKeepsRestAndSuppressesDrift) {
+    std::uint8_t x = 0;
+    std::uint8_t y = 0;
+    ApplyRadialStickDeadzone(0.0, 0.0, 0.10f, 1.0f, &x, &y);
+    CHECK_EQ(static_cast<int>(x), 127);
+    CHECK_EQ(static_cast<int>(y), 127);
+
+    // Slight stick drift inside the 10% inner deadzone snaps cleanly to rest (127).
+    ApplyRadialStickDeadzone(0.06, -0.07, 0.10f, 1.0f, &x, &y);
+    CHECK_EQ(static_cast<int>(x), 127);
+    CHECK_EQ(static_cast<int>(y), 127);
+
+    // Zero deadzone passes slight deflection through without swallowing it.
+    ApplyRadialStickDeadzone(0.08, 0.0, 0.0f, 1.0f, &x, &y);
+    CHECK(x > 127);
+    CHECK_EQ(static_cast<int>(y), 127);
+}
+
+TEST(RadialDeadzoneReachesFullDeflectionAndPreservesDiagonals) {
+    std::uint8_t x = 0;
+    std::uint8_t y = 0;
+    ApplyRadialStickDeadzone(1.0, 0.0, 0.15f, 1.0f, &x, &y);
+    CHECK_EQ(static_cast<int>(x), 255);
+    CHECK_EQ(static_cast<int>(y), 127);
+
+    ApplyRadialStickDeadzone(-1.0, 0.0, 0.15f, 1.0f, &x, &y);
+    CHECK_EQ(static_cast<int>(x), 0);
+    CHECK_EQ(static_cast<int>(y), 127);
+
+    // 45-degree diagonal stays symmetric after radial rescaling.
+    ApplyRadialStickDeadzone(0.5, 0.5, 0.10f, 1.0f, &x, &y);
+    CHECK(x > 127);
+    CHECK_EQ(static_cast<int>(x), static_cast<int>(y));
+}

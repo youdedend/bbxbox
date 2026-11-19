@@ -23,18 +23,37 @@
 // `host/options.h` include this header for the event/pump/open calls, and those
 // are unchanged; nothing else here is compiled for the console.
 #if defined(BBX_UWP)
+#include <cstddef>
 #include <cstdint>
+#ifndef BBX_UWP_VK_STUBS
+#define BBX_UWP_VK_STUBS 1
 #define BBX_VK_HANDLE(name) struct name
 struct VkInstance_T; struct VkPhysicalDevice_T; struct VkDevice_T; struct VkQueue_T;
-struct VkCommandBuffer_T; struct VkImageView_T;
+struct VkCommandBuffer_T; struct VkImage_T; struct VkImageView_T;
+struct VkSwapchainKHR_T; struct VkSemaphore_T; struct VkFence_T;
 using VkInstance = VkInstance_T*;
 using VkPhysicalDevice = VkPhysicalDevice_T*;
 using VkDevice = VkDevice_T*;
 using VkQueue = VkQueue_T*;
 using VkCommandBuffer = VkCommandBuffer_T*;
+using VkImage = VkImage_T*;
 using VkImageView = VkImageView_T*;
+using VkSwapchainKHR = VkSwapchainKHR_T*;
+using VkSemaphore = VkSemaphore_T*;
+using VkFence = VkFence_T*;
 using VkFormat = int;
+using VkImageLayout = int;
+using VkResult = int;
 struct VkExtent2D { std::uint32_t width, height; };
+struct VkOffset2D { std::int32_t x, y; };
+struct VkSwapchainCreateInfoKHR;
+struct VkPresentInfoKHR;
+struct VkInstanceCreateInfo;
+struct VkDeviceCreateInfo;
+constexpr std::nullptr_t VK_NULL_HANDLE = nullptr;
+constexpr int VK_FORMAT_UNDEFINED = 0;
+constexpr int VK_IMAGE_LAYOUT_GENERAL = 1;
+#endif
 #else
 #include <vulkan/vulkan.h>
 #endif

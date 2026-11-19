@@ -19,8 +19,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#if defined(BBX_UWP)
+#include "xbox/platform/host_fs.h"
+#include "xbox/platform/hostfs_extra.h"
+#else
 #include <filesystem>
 #include <fstream>
+#endif
 #include <iterator>
 #include <atomic>
 #include <map>
@@ -214,15 +219,26 @@ bool tpf_names(const std::vector<std::uint8_t>& tpf, const std::string& name) {
 // update folder and mods included.
 std::string old_hunters_missing() {
     const std::string pack = hle_fs_map_path("/app0/dvdroot_ps4/menu/title.tpf.dcx");
+#if defined(BBX_UWP)
+    std::vector<std::uint8_t> raw;
+    if (!bbx::hostfs::ReadFileAll(pack, &raw) || raw.empty()) return "menu/title.tpf.dcx";
+#else
     std::ifstream in(pack, std::ios::binary);
     if (!in) return "menu/title.tpf.dcx";
     const std::vector<std::uint8_t> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+#endif
     const std::vector<std::uint8_t> tpf = gcn::dcx_decompress(raw);
     if (!tpf_names(tpf.empty() ? raw : tpf, "MENU_Title_00004")) return "Old Hunters title art (MENU_Title_00004 in menu/title.tpf.dcx)";
     for (const char* map : {"m34_00_00_00", "m35_00_00_00", "m36_00_00_00"}) {
-        std::error_code ec;
-        if (!std::filesystem::is_directory(hle_fs_map_path(("/app0/dvdroot_ps4/map/" + std::string(map)).c_str()), ec))
+        const std::string map_path = hle_fs_map_path(("/app0/dvdroot_ps4/map/" + std::string(map)).c_str());
+#if defined(BBX_UWP)
+        if (!bbx::hostfs::IsDir(map_path))
             return std::string("map/") + map + " (an Old Hunters area)";
+#else
+        std::error_code ec;
+        if (!std::filesystem::is_directory(map_path, ec))
+            return std::string("map/") + map + " (an Old Hunters area)";
+#endif
     }
     return {};
 }
