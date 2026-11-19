@@ -64,3 +64,5 @@ shipped.
   hardware decode, built with clang-cl.
 * [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v1.1.4 (MIT): FSR 1 and
   FSR 3.1, compiled into the app; AMD's licence ships beside the binaries.
+* [XStation-UWP](https://github.com/BBCPrince/XStation-UWP) (GPL-2.0-or-later): reference for the
+  Xbox Series X|S 540p (960x540) Bloodborne performance profile.

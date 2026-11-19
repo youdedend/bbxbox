@@ -71,7 +71,7 @@ struct LauncherModel {
     // Video, gameplay, post-processing, camera & control preferences
     // (persisted in LocalState\bbxbox.ini and editable live in L3+R3 menu).
     int fps_cap = 60;                  // 30 (native PS4 pacing) or 60 (60 FPS++)
-    int render_res_mode = 0;           // 0 = 1920x1080, 1 = 1600x900, 2 = 1280x720
+    int render_res_mode = 0;           // 0 = 1920x1080, 1 = 1600x900, 2 = 1280x720, 3 = 960x540
     bool vsync = true;                 // DXGI sync interval 1 vs 0 (VRR/FreeSync when off)
     bool sharp_upscale = true;         // HLSL SM 6.4 RCAS sharpening vs plain bilinear
     bool performance_mode = false;     // disables heavy YEBIS post passes (full effect on boot)

@@ -22,7 +22,7 @@ struct ProtocolLaunchArgs {
     std::string dump_path;
     std::string launch_on_exit;
     int fps_cap = 0;           // 0 = unchanged, 30 or 60
-    int render_res_mode = -1;  // -1 = unchanged, 0=1080p, 1=900p, 2=720p
+    int render_res_mode = -1;  // -1 = unchanged, 0=1080p, 1=900p, 2=720p, 3=540p
 };
 
 // Decodes a URI query component (`%XX` hex escapes and `+` -> space).

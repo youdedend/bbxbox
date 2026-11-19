@@ -88,6 +88,10 @@ void ApplyCmdToken(const std::string& token, ProtocolLaunchArgs& out) {
         out.render_res_mode = 2;
         return;
     }
+    if (lower == "--res=540p" || lower == "--540p") {
+        out.render_res_mode = 3;
+        return;
+    }
     if (!token.empty() && token[0] == '-') {
         return;
     }
@@ -204,6 +208,9 @@ ProtocolLaunchArgs ParseProtocolUri(std::string_view raw_uri) {
                     out.valid = true;
                 } else if (r == "720p" || r == "2") {
                     out.render_res_mode = 2;
+                    out.valid = true;
+                } else if (r == "540p" || r == "3") {
+                    out.render_res_mode = 3;
                     out.valid = true;
                 }
             } else if (key == "cmd") {

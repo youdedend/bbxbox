@@ -580,18 +580,21 @@ int ParseIntClamped(const std::string& s, int fallback, int lo, int hi) {
 int RenderWidthForMode(int mode) {
     if (mode == 1) return 1600;
     if (mode == 2) return 1280;
+    if (mode >= 3) return 960;
     return 1920;
 }
 
 int RenderHeightForMode(int mode) {
     if (mode == 1) return 900;
     if (mode == 2) return 720;
+    if (mode >= 3) return 540;
     return 1080;
 }
 
 const char* RenderResShortLabel(int mode) {
     if (mode == 1) return "900P";
     if (mode == 2) return "720P";
+    if (mode >= 3) return "540P";
     return "1080P";
 }
 
@@ -666,7 +669,7 @@ void SaveLayoutSettings() {
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "fps_cap",
                                 g_session.model.fps_cap >= 60 ? "60" : "30");
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "render_res_mode",
-                                std::to_string(std::clamp(g_session.model.render_res_mode, 0, 2)));
+                                std::to_string(std::clamp(g_session.model.render_res_mode, 0, 3)));
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "vsync", g_session.model.vsync ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "sharp_upscale",
                                 g_session.model.sharp_upscale ? "1" : "0");
@@ -1123,7 +1126,7 @@ void OnAction(PadAction action) {
             RefreshLauncher();
             return;
         case bbx::platform::Action::kCycleResolution:
-            g_session.model.render_res_mode = (g_session.model.render_res_mode + 1) % 3;
+            g_session.model.render_res_mode = (g_session.model.render_res_mode + 1) % 4;
             SyncBridgeSettings();
             bbx::platform::LogF("video: render_res=%dx%d",
                                 RenderWidthForMode(g_session.model.render_res_mode),
@@ -1954,7 +1957,7 @@ void LoadSettings() {
     const std::string fps_str = bbx::platform::IniGet(g_session.ini, "video.fps_cap", "60");
     g_session.model.fps_cap = (fps_str == "30") ? 30 : 60;
     g_session.model.render_res_mode = ParseIntClamped(
-        bbx::platform::IniGet(g_session.ini, "video.render_res_mode", "0"), 0, 0, 2);
+        bbx::platform::IniGet(g_session.ini, "video.render_res_mode", "0"), 0, 0, 3);
     g_session.model.vsync = bbx::platform::IniFlag(g_session.ini, "video.vsync", true);
     g_session.model.sharp_upscale =
         bbx::platform::IniFlag(g_session.ini, "video.sharp_upscale", true);
@@ -2002,7 +2005,7 @@ void LoadSettings() {
         if (g_protocol_args.fps_cap == 30 || g_protocol_args.fps_cap == 60) {
             g_session.model.fps_cap = g_protocol_args.fps_cap;
         }
-        if (g_protocol_args.render_res_mode >= 0 && g_protocol_args.render_res_mode <= 2) {
+        if (g_protocol_args.render_res_mode >= 0 && g_protocol_args.render_res_mode <= 3) {
             g_session.model.render_res_mode = g_protocol_args.render_res_mode;
         }
     }
@@ -2761,13 +2764,13 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                             case 2:
                                 if (confirm) {
                                     g_session.model.render_res_mode =
-                                        (g_session.model.render_res_mode + 1) % 3;
+                                        (g_session.model.render_res_mode + 1) % 4;
                                 } else if (step_left) {
                                     g_session.model.render_res_mode =
                                         std::max(0, g_session.model.render_res_mode - 1);
                                 } else if (step_right) {
                                     g_session.model.render_res_mode =
-                                        std::min(2, g_session.model.render_res_mode + 1);
+                                        std::min(3, g_session.model.render_res_mode + 1);
                                 }
                                 settings_changed = true;
                                 break;

@@ -303,4 +303,14 @@ TEST(PerformanceResolutionAndShadowControls) {
     CHECK(found_720p);
     CHECK(found_perf_on);
     CHECK(found_lowest);
+
+    model.render_res_mode = 3;       // 540p
+    model.Rebuild();
+    bool found_540p = false;
+    for (const Item& item : model.items) {
+        if (item.action == Action::kCycleResolution) {
+            found_540p = item.label.find("540p") != std::string::npos;
+        }
+    }
+    CHECK(found_540p);
 }

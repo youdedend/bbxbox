@@ -88,6 +88,8 @@ void LauncherModel::Rebuild() {
         res_label = "Render resolution: 900p (1600x900)";
     } else if (render_res_mode == 2) {
         res_label = "Render resolution: 720p (1280x720)";
+    } else if (render_res_mode >= 3) {
+        res_label = "Render resolution: 540p (960x540)";
     }
     items.push_back(Item{Action::kCycleResolution, res_label,
                          "Internal guest render size upscaled by FSR RCAS (live in L3+R3 menu)",
