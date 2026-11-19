@@ -39,6 +39,46 @@ bool Running();
 // Frames the guest has asked to present (host_present), for the launcher's HUD.
 std::uint64_t Flips();
 
+// Suppresses guest pad reads while an overlay (L3+R3 Quick Menu or Virtual
+// Keyboard) owns the controller, so menu presses never leak into Bloodborne.
+void SetGuestInputSuppressed(bool suppressed);
+
+// Immediately zeroes Xbox controller vibration motors (on overlay/suspend/exit).
+void StopPadRumble();
+
+// In-game IME text entry bridge (`host_text_entry_begin` / `poll` / `end`).
+struct TextEntryPrompt {
+    bool active = false;
+    std::string label;
+    std::string initial;
+    unsigned max_chars = 16;
+    bool hidden = false;
+};
+[[nodiscard]] TextEntryPrompt PollTextEntryPrompt();
+void CompleteTextEntry(const std::string& utf8_text, bool accepted);
+
+// Frame pacing & display settings shared between launcher, L3+R3 quick menu,
+// and guest HLE (`frame_rate_*`, `host_window_*`).
+void SetTargetFps(int fps);
+[[nodiscard]] int TargetFps();
+void SetVsyncEnabled(bool on);
+[[nodiscard]] bool VsyncEnabled();
+void SetDisplayMetrics(int width, int height, float refresh_hz);
+[[nodiscard]] bool QuitRequested();
+
+// Live rolling FPS / frame-time snapshot for the toggleable Performance HUD.
+struct PerfSnapshot {
+    float fps = 0.0f;
+    float frame_ms = 0.0f;
+    std::uint64_t flips = 0;
+    std::uint64_t game_frames = 0;
+};
+[[nodiscard]] PerfSnapshot SnapshotPerf();
+
+// Active toast notification set by `host_message_show` / `host_text_show`, or
+// empty when expired.
+[[nodiscard]] std::string ActiveToastMessage();
+
 // The baked console shaders (<dump>/bbx_shaders.cache), once StartGuest has
 // loaded them: one line for the HUD, and a look-up by interface hash for the
 // pipeline that needs the program. False when the cache did not validate, with

@@ -27,8 +27,14 @@ enum class Action : std::uint8_t {
     kToggleMods,
     kToggleModdedEboot,
     kContinueUnpatched,
+    kToggleFpsCap,
+    kToggleVsync,
+    kToggleSharpUpscale,
+    kTogglePerfHud,
     kSyncCacheToUsb,
     kSyncCacheFromUsb,
+    kBackupSavesToUsb,
+    kRestoreSavesFromUsb,
     kMemorySelfTest,
     kQuit,
 };
@@ -52,6 +58,14 @@ struct LauncherModel {
     std::size_t stages = 0;
     std::size_t pipelines = 0;
     std::string cache_stamp;
+    std::string status_banner;
+
+    // Video & overlay preferences (persisted in LocalState\bbxbox.ini and also
+    // toggleable in-game via the L3+R3 quick menu).
+    int fps_cap = 30;            // 30 (native PS4 pacing) or 60 (unlocked)
+    bool vsync = true;           // DXGI sync interval 1 vs 0
+    bool sharp_upscale = true;   // HLSL SM 6.4 RCAS sharpening vs plain bilinear
+    bool perf_hud = false;       // compact corner FPS / RAM / GPU stats overlay
 
     // The `<dump>\mods` overlay: a directory the player drops loose files into
     // (`msg/`, `font/`, `menu/` - the Arabic localisation patch for CUSA03173

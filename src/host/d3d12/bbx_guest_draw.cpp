@@ -528,4 +528,90 @@ std::string DrawIdentityLine(const DrawIdentity& identity) {
     return line;
 }
 
+DecodedClearView DecodeClearView(const ClearViewInput& in) {
+    DecodedClearView out{};
+    out.depth = in.depth;
+    if (!in.depth) {
+        if (in.color[0] == 0) {
+            out.why = "no color base address";
+            return out;
+        }
+        out.base = static_cast<std::uint64_t>(in.color[0]) << 8;
+        const std::uint32_t info = in.color[4];
+        const std::uint32_t number_type = (info >> 8) & 7u;
+        const std::uint32_t nfmt = number_type == 6u ? 9u : number_type;
+        const FormatInfo fmt = FromGcnFormat((info >> 2) & 0x1fu, nfmt, (info >> 11) & 3u);
+        if (!fmt.valid()) {
+            out.why = "unsupported color target format";
+            return out;
+        }
+        out.format = static_cast<std::uint32_t>(fmt.format);
+        out.srgb = fmt.srgb;
+
+        if (in.extent != 0) {
+            out.width = in.extent >> 16;
+            out.height = in.extent & 0xffffu;
+        }
+        if (out.width == 0 || out.height == 0) {
+            const std::uint32_t pitch = ((in.color[1] & 0x7ffu) + 1u) * 8u;
+            const std::uint32_t slice_px = ((in.color[2] & 0x3fffffu) + 1u) * 64u;
+            const std::uint32_t padded_h = slice_px / pitch;
+            const std::uint32_t bpp = fmt.bytes_per_block != 0 ? fmt.bytes_per_block : 4u;
+            out.width = pitch / bpp;
+            out.height = padded_h;
+        }
+        if (out.width == 0 || out.height == 0 || out.width > 8192 || out.height > 8192) {
+            out.why = "invalid color target extent";
+            return out;
+        }
+        for (int i = 0; i < 4; ++i) out.rgba[i] = in.rgba[i];
+        out.ok = true;
+        out.why = "";
+        return out;
+    }
+
+    if (in.z_read_base == 0) {
+        out.why = "no depth base address";
+        return out;
+    }
+    out.base = static_cast<std::uint64_t>(in.z_read_base) << 8;
+    const std::uint32_t z_format = in.z_info & 3u;
+    const bool has_stencil = (in.stencil_info & 1u) != 0;
+    if (z_format == 0 && !has_stencil) {
+        out.why = "no depth or stencil plane";
+        return out;
+    }
+    const FormatInfo fmt = FromDepthFormat(z_format, has_stencil);
+    if (!fmt.valid()) {
+        out.why = "unsupported depth format";
+        return out;
+    }
+    out.format = static_cast<std::uint32_t>(fmt.format);
+
+    if (in.extent != 0) {
+        out.width = in.extent >> 16;
+        out.height = in.extent & 0xffffu;
+    }
+    if ((out.width == 0 || out.height == 0) && in.depth_size != 0) {
+        out.width = ((in.depth_size & 0x7ffu) + 1u) * 8u;
+        out.height = (((in.depth_size >> 11) & 0x7ffu) + 1u) * 8u;
+    }
+    if (out.width == 0 || out.height == 0 || out.width > 8192 || out.height > 8192) {
+        out.why = "invalid depth target extent";
+        return out;
+    }
+    const std::uint32_t flags = in.flags != 0 ? in.flags : 3u;
+    out.clear_depth = ((flags & 1u) != 0) && (z_format != 0);
+    out.clear_stencil = ((flags & 2u) != 0) && has_stencil;
+    if (!out.clear_depth && !out.clear_stencil) {
+        out.why = "clear flags select neither depth nor stencil";
+        return out;
+    }
+    out.depth_value = std::clamp(in.depth_value, 0.0f, 1.0f);
+    out.stencil_value = static_cast<std::uint8_t>(in.stencil & 0xffu);
+    out.ok = true;
+    out.why = "";
+    return out;
+}
+
 }  // namespace bbx::d3d12

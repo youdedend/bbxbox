@@ -16,8 +16,14 @@ const char* ActionName(Action action) {
     case Action::kToggleMods: return "toggle-mods";
     case Action::kToggleModdedEboot: return "toggle-modded-eboot";
     case Action::kContinueUnpatched: return "continue-unpatched";
+    case Action::kToggleFpsCap: return "toggle-fps-cap";
+    case Action::kToggleVsync: return "toggle-vsync";
+    case Action::kToggleSharpUpscale: return "toggle-sharp-upscale";
+    case Action::kTogglePerfHud: return "toggle-perf-hud";
     case Action::kSyncCacheToUsb: return "sync-cache-to-usb";
     case Action::kSyncCacheFromUsb: return "sync-cache-from-usb";
+    case Action::kBackupSavesToUsb: return "backup-saves-to-usb";
+    case Action::kRestoreSavesFromUsb: return "restore-saves-from-usb";
     case Action::kMemorySelfTest: return "memory-self-test";
     case Action::kQuit: return "quit";
     }
@@ -34,8 +40,9 @@ void LauncherModel::Rebuild() {
     if (ready && supported) {
         items.push_back(Item{Action::kStartGame, "Start game",
                              "bbhost starts; the title's own menu follows", !precompiling, false});
-        items.push_back(Item{Action::kPrecompile, precompiling ? "Precompiling…" : "Precompile shaders",
-                             "Build the DXIL and pipeline caches on the title screen",
+        items.push_back(Item{Action::kPrecompile,
+                             precompiling ? "Precompiling..." : (cache_current ? "Rebuild shader cache" : "Precompile shaders"),
+                             "Compile Bloodborne shaders natively to DXIL SM 6.4 and unload DXC",
                              !precompiling, false});
     }
     if (ready && !supported) {
@@ -67,13 +74,35 @@ void LauncherModel::Rebuild() {
                                  true, true});
         }
     }
+    items.push_back(Item{Action::kToggleFpsCap,
+                         fps_cap >= 60 ? "Frame rate cap: 60 FPS" : "Frame rate cap: 30 FPS",
+                         "Toggle between native 30 FPS pacing and unlocked 60 FPS (also in L3+R3 menu)",
+                         !precompiling, false});
+    items.push_back(Item{Action::kToggleVsync,
+                         vsync ? "VSync: on" : "VSync: off",
+                         "Lock presentation to display refresh to eliminate tearing",
+                         !precompiling, false});
+    items.push_back(Item{Action::kToggleSharpUpscale,
+                         sharp_upscale ? "Upscaling: FSR RCAS" : "Upscaling: Bilinear",
+                         "HLSL SM 6.4 contrast-adaptive sharpening for 1440p/4K TVs",
+                         !precompiling, false});
+    items.push_back(Item{Action::kTogglePerfHud,
+                         perf_hud ? "Performance HUD: on" : "Performance HUD: off",
+                         "Show live FPS, frame time, RAM usage and flips in-game (L3+R3 toggles)",
+                         !precompiling, false});
     if (has_usb && !syncing) {
         items.push_back(Item{Action::kSyncCacheToUsb, "Copy shader cache to USB",
-                             "Take this console's precompiled cache to another one", !precompiling,
-                             false});
+                             "Export LocalState DXIL cache to your dump folder for instant reuse",
+                             !precompiling, false});
         items.push_back(Item{Action::kSyncCacheFromUsb, "Copy shader cache from USB",
-                             "Import a cache built by the same build and device", !precompiling,
-                             false});
+                             "Import a verified DXIL cache from your dump folder into LocalState",
+                             !precompiling, false});
+        items.push_back(Item{Action::kBackupSavesToUsb, "Backup saves & logs to USB",
+                             "Copy LocalState savedata, bbxbox.ini and logs to bbxbox_backups",
+                             !precompiling, false});
+        items.push_back(Item{Action::kRestoreSavesFromUsb, "Restore saves from USB",
+                             "Restore bbxbox_backups\\savedata into LocalState\\data\\savedata",
+                             !precompiling, false});
     }
     items.push_back(Item{Action::kMemorySelfTest, "Run memory self-test",
                          "Walks the guest memory contract; writes LocalState\\memory-selftest.txt",
@@ -124,6 +153,7 @@ std::string LauncherModel::Footer() const {
     const std::string banner = BbPanel::BaseOnlyBanner(layout);
     if (!banner.empty()) text += "\n\n" + banner;
     text += "\n" + BbPanel::CacheLine(stages, pipelines, cache_stamp, cache_current);
+    if (!status_banner.empty()) text += "\nStatus: " + status_banner;
     const Item* item = Current();
     if (item && !item->hint.empty()) text += "\n\n" + item->label + ": " + item->hint;
     return text;

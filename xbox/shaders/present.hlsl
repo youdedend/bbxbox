@@ -17,7 +17,7 @@
 
 cbuffer PresentParams : register(b0) {
     float4 tint;          // rgb multiplier, a = transfer selector (1 = passthrough)
-    float4 source_size;   // xy = texel size of the sampled image
+    float4 source_size;   // xy = texel size (1/w, 1/h), z = RCAS sharpness (0 = off), w = reserved
 };
 
 struct PresentOut {
@@ -40,7 +40,25 @@ PresentOut PresentVs(uint vertex_id : SV_VertexID) {
 Texture2D<float4> source : register(t0);
 SamplerState source_sampler : register(s0);
 
+float3 ApplyRcas(float2 uv, float3 center, float2 texel, float sharpness) {
+    const float3 n = source.Sample(source_sampler, uv + float2(0.0, -texel.y)).rgb;
+    const float3 s = source.Sample(source_sampler, uv + float2(0.0, texel.y)).rgb;
+    const float3 w = source.Sample(source_sampler, uv + float2(-texel.x, 0.0)).rgb;
+    const float3 e = source.Sample(source_sampler, uv + float2(texel.x, 0.0)).rgb;
+
+    const float3 mn = min(center, min(min(n, s), min(w, e)));
+    const float3 mx = max(center, max(max(n, s), max(w, e)));
+    const float3 amp = saturate(min(mn, 1.0 - mx) / max(mx, 1e-5));
+    const float3 weight = -sqrt(amp) * (saturate(sharpness) * 0.22);
+    const float3 denom = max(1.0 + 4.0 * weight, 0.12);
+    return saturate((center + weight * (n + s + w + e)) / denom);
+}
+
 float4 PresentPs(PresentOut input) : SV_Target {
     const float4 sampled = source.Sample(source_sampler, input.uv);
-    return float4(sampled.rgb * tint.rgb, sampled.a * tint.a);
+    float3 rgb = sampled.rgb;
+    if (source_size.z > 0.001) {
+        rgb = ApplyRcas(input.uv, rgb, source_size.xy, source_size.z);
+    }
+    return float4(rgb * tint.rgb, sampled.a * tint.a);
 }

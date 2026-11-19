@@ -76,11 +76,29 @@ struct Session {
     bool quit = false;
     bool start_requested = false;
     bool baking = false;
+    bool start_after_bake = false;
     std::atomic<bool> bake_finished{false};
     bbx::platform::BakeProgressState bake_progress;
     bbx::platform::BakeResult bake_result;
     std::thread bake_thread;
     bbx::bridge::GuestRequest pending_guest_req;
+
+    // Background USB sync / save backup-restore worker so UI never stalls.
+    bool usb_sync_running = false;
+    std::atomic<bool> usb_sync_finished{false};
+    bool usb_sync_ok = false;
+    std::string usb_sync_message;
+    std::thread usb_sync_thread;
+
+    // In-game L3+R3 Quick Menu & guest IME text-entry overlay state.
+    bool quick_menu_open = false;
+    std::size_t quick_menu_selected = 0;
+    bool ime_open = false;
+    std::string ime_label;
+    bool ime_hidden = false;
+    std::size_t ime_max_chars = 16;
+    bbx::platform::VirtualKeyboard ime_keyboard;
+
     std::string usb_token;
     std::string patch_token;
     // The only renderer: device, 4K swapchain, pipelines, replay and the HUD. A
@@ -446,6 +464,13 @@ void SaveLayoutSettings() {
     (void)bbx::platform::IniSet(g_session.ini_text, "dump", "mods", g_session.model.mods_enabled ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "dump", "modded_eboot",
                                 g_session.model.modded_eboot_ok ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "video", "fps_cap",
+                                g_session.model.fps_cap >= 60 ? "60" : "30");
+    (void)bbx::platform::IniSet(g_session.ini_text, "video", "vsync", g_session.model.vsync ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "video", "sharp_upscale",
+                                g_session.model.sharp_upscale ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "video", "perf_hud",
+                                g_session.model.perf_hud ? "1" : "0");
     g_session.ini = bbx::platform::ParseIni(g_session.ini_text);
     if (!bbx::platform::WriteText(path, g_session.ini_text)) {
         bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
@@ -473,11 +498,162 @@ void RefreshModsOverlay() {
     g_session.model.mods_present = present;
 }
 
+std::vector<std::string> CacheSearchDirs() {
+    std::vector<std::string> dirs;
+    if (!g_session.layout.base_path.empty()) {
+        const std::string& eboot_dir = g_session.layout.CanRunPatched() ? g_session.layout.patch_path
+                                                                        : g_session.layout.base_path;
+        if (!eboot_dir.empty()) dirs.push_back(eboot_dir);
+        if (g_session.layout.base_path != eboot_dir) dirs.push_back(g_session.layout.base_path);
+    }
+    dirs.push_back(bbx::platform::Local("data"));
+    dirs.push_back(bbx::platform::Paths().local_state);
+    return dirs;
+}
+
 void RefreshLauncher() {
     g_session.model.layout = g_session.layout;
-    g_session.model.has_usb = !g_session.usb_token.empty();
+    g_session.model.has_usb = !g_session.usb_token.empty() || !g_session.layout.base_path.empty();
+    g_session.model.precompiling = g_session.baking;
+    g_session.model.syncing = g_session.usb_sync_running;
     RefreshModsOverlay();
+
+    // Probe console DXIL 6.4 shader cache status whenever the baker is idle so
+    // the launcher shows accurate stage counts and offers Rebuild vs Precompile.
+    if (!g_session.baking) {
+        std::size_t stages = 0;
+        std::string stamp;
+        if (bbx::platform::HasValidConsoleCache(CacheSearchDirs(), nullptr, nullptr, &stages, &stamp)) {
+            g_session.model.cache_current = true;
+            g_session.model.stages = stages;
+            g_session.model.cache_stamp = stamp;
+        } else {
+            g_session.model.cache_current = false;
+            g_session.model.stages = 0;
+            g_session.model.cache_stamp.clear();
+        }
+    }
     g_session.model.Rebuild();
+}
+
+void StartShaderBake(bool start_after, bool force_rebuild) {
+    if (g_session.baking || g_session.usb_sync_running) return;
+    if (!g_session.layout.layout_ok() || g_session.layout.base_path.empty()) {
+        g_session.model.status_banner = "Select a valid Bloodborne dump folder before baking shaders.";
+        RefreshLauncher();
+        return;
+    }
+
+    const std::string data_dir = bbx::platform::Local("data");
+    (void)bbx::hostfs::MkDir(data_dir, true);
+    const std::string& eboot_dir = g_session.layout.CanRunPatched() ? g_session.layout.patch_path
+                                                                    : g_session.layout.base_path;
+
+    bbx::platform::BakeRequest bake_req;
+    bake_req.app0 = g_session.layout.base_path;
+    if (g_session.layout.CanRunPatched()) {
+        bake_req.update_dir = g_session.layout.patch_path;
+    }
+    bake_req.eboot = eboot_dir + "\\eboot.bin";
+    bake_req.out_dir = data_dir;
+    bake_req.max_workers = 0;  // auto (up to 4 DXC worker threads)
+    bake_req.force_rebuild = force_rebuild;
+
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "launcher: starting native Xbox shader bake into %s (start_after=%u, force_rebuild=%u)",
+        data_dir.c_str(), static_cast<unsigned>(start_after), static_cast<unsigned>(force_rebuild));
+
+    g_session.start_after_bake = start_after;
+    g_session.bake_progress.Reset();
+    g_session.bake_result = bbx::platform::BakeResult{};
+    g_session.bake_finished.store(false, std::memory_order_relaxed);
+    g_session.baking = true;
+    g_session.model.status_banner.clear();
+    RefreshLauncher();
+
+    g_session.bake_thread = std::thread([bake_req]() {
+        const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        (void)pthread_setname_np(pthread_self(), "shader-baker");
+        Steps().RegisterThread(tid, "shader-baker");
+        g_session.bake_result = bbx::platform::BakeConsoleShaders(bake_req, g_session.bake_progress);
+        Steps().UnregisterThread(tid);
+        g_session.bake_finished.store(true, std::memory_order_release);
+    });
+}
+
+enum class UsbTaskKind {
+    kSyncCacheToUsb,
+    kSyncCacheFromUsb,
+    kBackupSavesToUsb,
+    kRestoreSavesFromUsb,
+};
+
+void StartUsbTask(UsbTaskKind kind) {
+    if (g_session.usb_sync_running || g_session.baking) return;
+    if (g_session.layout.base_path.empty()) {
+        g_session.model.status_banner = "Pick a USB dump folder first to enable USB sync/backup.";
+        RefreshLauncher();
+        return;
+    }
+
+    const std::string local_state = bbx::platform::Paths().local_state;
+    const std::string data_dir = bbx::platform::Local("data");
+    const std::string usb_root = g_session.layout.base_path;
+
+    const char* label = "Working on USB...";
+    switch (kind) {
+    case UsbTaskKind::kSyncCacheToUsb: label = "Copying shader cache to USB..."; break;
+    case UsbTaskKind::kSyncCacheFromUsb: label = "Importing shader cache from USB..."; break;
+    case UsbTaskKind::kBackupSavesToUsb: label = "Backing up saves and logs to USB..."; break;
+    case UsbTaskKind::kRestoreSavesFromUsb: label = "Restoring saves from USB backup..."; break;
+    }
+
+    g_session.usb_sync_running = true;
+    g_session.usb_sync_finished.store(false, std::memory_order_relaxed);
+    g_session.usb_sync_ok = false;
+    g_session.usb_sync_message.clear();
+    g_session.model.status_banner = label;
+    RefreshLauncher();
+
+    g_session.usb_sync_thread = std::thread([kind, local_state, data_dir, usb_root]() {
+        const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+        (void)pthread_setname_np(pthread_self(), "usb-sync");
+        Steps().RegisterThread(tid, "usb-sync");
+        std::string detail;
+        bool ok = false;
+        switch (kind) {
+        case UsbTaskKind::kSyncCacheToUsb:
+            ok = bbx::platform::SyncShaderCacheFiles(data_dir, usb_root, &detail);
+            break;
+        case UsbTaskKind::kSyncCacheFromUsb:
+            ok = bbx::platform::SyncShaderCacheFiles(usb_root, data_dir, &detail);
+            break;
+        case UsbTaskKind::kBackupSavesToUsb:
+            ok = bbx::platform::BackupSavesAndLogsToUsb(local_state, data_dir, usb_root, &detail);
+            break;
+        case UsbTaskKind::kRestoreSavesFromUsb:
+            ok = bbx::platform::RestoreSavesFromUsb(usb_root, data_dir, &detail);
+            break;
+        }
+        g_session.usb_sync_ok = ok;
+        g_session.usb_sync_message = detail;
+        Steps().UnregisterThread(tid);
+        g_session.usb_sync_finished.store(true, std::memory_order_release);
+    });
+}
+
+void PollUsbSync() {
+    if (!g_session.usb_sync_running) return;
+    if (!g_session.usb_sync_finished.load(std::memory_order_acquire)) return;
+    if (g_session.usb_sync_thread.joinable()) g_session.usb_sync_thread.join();
+    g_session.usb_sync_running = false;
+    g_session.usb_sync_finished.store(false, std::memory_order_relaxed);
+    g_session.model.status_banner = g_session.usb_sync_message;
+    bbx::platform::LogMirroredMessage(
+        g_session.usb_sync_ok ? bbx::platform::Level::kInfo : bbx::platform::Level::kWarn,
+        "usb: %s", g_session.usb_sync_message.c_str());
+    RefreshLauncher();
 }
 
 // The launcher loop is the thread that pumps the CoreWindow dispatcher, and the
@@ -625,10 +801,54 @@ void OnAction(PadAction action) {
             SaveLayoutSettings();
             RefreshLauncher();
             return;
+        case bbx::platform::Action::kToggleFpsCap:
+            g_session.model.fps_cap = (g_session.model.fps_cap >= 60) ? 30 : 60;
+            bbx::bridge::SetTargetFps(g_session.model.fps_cap);
+            bbx::platform::LogF("video: fps_cap=%d", g_session.model.fps_cap);
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleVsync:
+            g_session.model.vsync = !g_session.model.vsync;
+            bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
+            bbx::platform::LogF("video: vsync=%s", g_session.model.vsync ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kToggleSharpUpscale:
+            g_session.model.sharp_upscale = !g_session.model.sharp_upscale;
+            bbx::platform::LogF("video: sharp_upscale=%s", g_session.model.sharp_upscale ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kTogglePerfHud:
+            g_session.model.perf_hud = !g_session.model.perf_hud;
+            bbx::platform::LogF("video: perf_hud=%s", g_session.model.perf_hud ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kPrecompile:
+            StartShaderBake(/*start_after=*/false, /*force_rebuild=*/g_session.model.cache_current);
+            return;
+        case bbx::platform::Action::kSyncCacheToUsb:
+            StartUsbTask(UsbTaskKind::kSyncCacheToUsb);
+            return;
+        case bbx::platform::Action::kSyncCacheFromUsb:
+            StartUsbTask(UsbTaskKind::kSyncCacheFromUsb);
+            return;
+        case bbx::platform::Action::kBackupSavesToUsb:
+            StartUsbTask(UsbTaskKind::kBackupSavesToUsb);
+            return;
+        case bbx::platform::Action::kRestoreSavesFromUsb:
+            StartUsbTask(UsbTaskKind::kRestoreSavesFromUsb);
+            return;
         case bbx::platform::Action::kMemorySelfTest: {
             const bbx::platform::SelfTestResult result =
                 bbx::platform::RunMemorySelfTest(false);
             bbx::platform::LogF("self-test %s", result.Passed() ? "PASS" : "FAIL");
+            g_session.model.status_banner =
+                result.Passed() ? "Memory self-test PASSED." : "Memory self-test FAILED (see loader.log).";
+            RefreshLauncher();
             return;
         }
         case bbx::platform::Action::kStartGame:
@@ -659,23 +879,29 @@ std::vector<std::string> WrapLines(const std::string& text) {
     return lines;
 }
 
+std::string TruncateLabel(const std::string& s, std::size_t max_chars) {
+    if (s.size() <= max_chars) return s;
+    if (max_chars <= 3) return s.substr(0, max_chars);
+    return s.substr(0, max_chars - 3) + "...";
+}
+
 void AppendLauncherToHud(bbx::platform::Hud& hud) {
     if (bbx::bridge::Flips() != 0) return;
     const float width = hud.Width();
-    const std::uint32_t scale = width >= 3000.0f ? 6u : 3u;
-    const float margin = static_cast<float>(scale) * 8.0f;
-    const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
+    const std::uint32_t scale = width >= 3000.0f ? 5u : 3u;
+    const float margin = static_cast<float>(scale) * 7.0f;
+    const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 2.5f;
 
     const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer());
     const std::size_t body_rows =
         g_session.baking
-            ? 6u
+            ? 7u
             : (g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size());
     const float panel_height =
         line * static_cast<float>(2 + footer_lines.size() + body_rows) + margin;
     hud.Panel(margin, margin, width - margin * 2.0f, panel_height, bbx::platform::HudColor::Panel());
 
-    float y = margin + static_cast<float>(scale) * 4.0f;
+    float y = margin + static_cast<float>(scale) * 3.5f;
     const float x = margin * 1.5f;
     hud.Text(x, y, scale, g_session.model.Title(), bbx::platform::HudColor::White());
     y += line * 1.2f;
@@ -686,7 +912,56 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     }
     y += line * 0.4f;
 
-    if (g_session.keyboard_open) {
+    if (g_session.baking) {
+        const bbx::d3d12::BakeProgressSnapshot snap = g_session.bake_progress.Snapshot();
+        const std::string headline = bbx::d3d12::FormatBakeHudLine(snap);
+        hud.Text(x, y, scale, headline, bbx::platform::HudColor::Green());
+        y += line * 1.15f;
+
+        // Progress bar: background trough + filled green bar.
+        const float bar_w = width - margin * 3.0f;
+        const float bar_h = static_cast<float>(scale) * 5.0f;
+        hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.12f, 0.14f, 0.18f, 0.95f});
+        float frac = 0.0f;
+        if (snap.total > 0) {
+            frac = static_cast<float>(snap.completed) / static_cast<float>(snap.total);
+            if (frac > 1.0f) frac = 1.0f;
+        } else if (snap.phase == bbx::d3d12::BakePhase::kDone) {
+            frac = 1.0f;
+        }
+        if (frac > 0.0f) {
+            hud.Panel(x, y, bar_w * frac, bar_h, bbx::platform::HudColor::Green());
+        } else {
+            hud.Panel(x, y, bar_w * 0.08f, bar_h, bbx::platform::HudColor::Amber());
+        }
+        y += bar_h + line * 0.7f;
+
+        char stats[160];
+        std::snprintf(stats, sizeof(stats),
+                      "WORKERS: %u  |  RESUMED: %u  |  REFUSED: %u  |  QUARANTINED: %u",
+                      static_cast<unsigned>(snap.workers),
+                      static_cast<unsigned>(snap.resumed_count),
+                      static_cast<unsigned>(snap.refused),
+                      static_cast<unsigned>(snap.quarantined));
+        hud.Text(x, y, scale, stats, bbx::platform::HudColor::White());
+        y += line;
+
+        if (!snap.current_name.empty()) {
+            hud.Text(x, y, scale, "SHADER: " + TruncateLabel(snap.current_name, 56),
+                     bbx::platform::HudColor::Grey());
+        } else {
+            hud.Text(x, y, scale, "COMPILING PS4 GCN SHADERS TO NATIVE XBOX DXIL 6.4...",
+                     bbx::platform::HudColor::Grey());
+        }
+        y += line * 1.2f;
+
+        const bool cancelling = g_session.bake_progress.CancelRequested();
+        hud.Text(x, y, scale,
+                 cancelling ? "CANCELLING... SAVING CHECKPOINT FOR RESUME"
+                            : "PRESS B TO CANCEL (PROGRESS IS SAVED FOR RESUME)",
+                 bbx::platform::HudColor::Amber());
+        y += line;
+    } else if (g_session.keyboard_open) {
         hud.Text(x, y, scale, "HUNTER NAME: " + g_session.keyboard.Text(),
                  bbx::platform::HudColor::Amber());
         y += line;
@@ -720,6 +995,129 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     }
 }
 
+void AppendInGameOverlays(bbx::platform::Hud& hud) {
+    if (!bbx::bridge::Running() && bbx::bridge::Flips() == 0) return;
+
+    const float width = hud.Width();
+    const float height = hud.Height();
+    const std::uint32_t scale = width >= 3000.0f ? 5u : 3u;
+    const std::uint32_t small_scale = width >= 3000.0f ? 4u : 2u;
+    const float margin = static_cast<float>(scale) * 6.0f;
+
+    // 1. Compact corner Performance HUD (toggleable via launcher or L3+R3 Quick Menu).
+    if (g_session.model.perf_hud) {
+        const bbx::bridge::PerfSnapshot perf = bbx::bridge::SnapshotPerf();
+        const bbx::platform::TelemetrySample mem = QueryTelemetrySample();
+        const float line =
+            bbx::platform::Hud::TextHeight(small_scale) + static_cast<float>(small_scale) * 2.5f;
+        char line1[128];
+        std::snprintf(line1, sizeof(line1), "FPS %4.1f (%4.1f MS) | CAP %d | VSYNC %s | RCAS %s",
+                      static_cast<double>(perf.fps), static_cast<double>(perf.frame_ms),
+                      g_session.model.fps_cap,
+                      bbx::bridge::VsyncEnabled() ? "ON" : "OFF",
+                      g_session.model.sharp_upscale ? "ON" : "OFF");
+        char line2[128];
+        std::snprintf(line2, sizeof(line2), "RAM %llu/%llu MIB | FLIPS %llu | L3+R3 MENU",
+                      static_cast<unsigned long long>(mem.used_mib),
+                      static_cast<unsigned long long>(mem.limit_mib),
+                      static_cast<unsigned long long>(perf.flips));
+        const float box_w =
+            std::max(bbx::platform::Hud::TextWidth(line1, small_scale),
+                     bbx::platform::Hud::TextWidth(line2, small_scale)) +
+            margin;
+        const float box_h = line * 2.0f + static_cast<float>(small_scale) * 5.0f;
+        hud.Panel(margin * 0.5f, margin * 0.5f, box_w, box_h, bbx::platform::HudColor::Panel());
+        const float tx = margin * 0.5f + static_cast<float>(small_scale) * 3.0f;
+        const float ty = margin * 0.5f + static_cast<float>(small_scale) * 2.5f;
+        hud.Text(tx, ty, small_scale, line1, bbx::platform::HudColor::Green());
+        hud.Text(tx, ty + line, small_scale, line2, bbx::platform::HudColor::White());
+    }
+
+    // 2. Toast banner from host_message_show / host_text_show.
+    const std::string toast = bbx::bridge::ActiveToastMessage();
+    if (!toast.empty()) {
+        const std::string clipped = TruncateLabel(toast, 64);
+        const float tw = bbx::platform::Hud::TextWidth(clipped, scale);
+        const float th = bbx::platform::Hud::TextHeight(scale);
+        const float pad = static_cast<float>(scale) * 4.0f;
+        const float bx = (width - (tw + pad * 2.0f)) * 0.5f;
+        const float by = margin;
+        hud.Panel(bx, by, tw + pad * 2.0f, th + pad * 2.0f, bbx::platform::HudColor::Panel());
+        hud.Text(bx + pad, by + pad, scale, clipped, bbx::platform::HudColor::Amber());
+    }
+
+    // 3. In-game Virtual Keyboard IME overlay (when guest calls host_text_entry_begin).
+    if (g_session.ime_open) {
+        const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
+        const float panel_w = width * 0.72f;
+        const float panel_h = line * static_cast<float>(4 + g_session.ime_keyboard.RowCount()) + margin;
+        const float px = (width - panel_w) * 0.5f;
+        const float py = (height - panel_h) * 0.5f;
+        hud.Panel(px, py, panel_w, panel_h, bbx::platform::HudColor{0.03f, 0.04f, 0.07f, 0.90f});
+
+        float y = py + margin * 0.6f;
+        const float tx = px + margin * 0.8f;
+        hud.Text(tx, y, scale, TruncateLabel(g_session.ime_label, 48), bbx::platform::HudColor::White());
+        y += line * 1.1f;
+
+        std::string shown = g_session.ime_keyboard.Text();
+        if (g_session.ime_hidden) shown.assign(shown.size(), '*');
+        hud.Text(tx, y, scale, "TEXT: " + shown + "_", bbx::platform::HudColor::Amber());
+        y += line * 1.2f;
+
+        for (std::size_t row = 0; row < g_session.ime_keyboard.RowCount(); ++row) {
+            std::string label = g_session.ime_keyboard.Row(row);
+            if (row == g_session.ime_keyboard.CursorRow()) {
+                const std::size_t column = g_session.ime_keyboard.CursorColumn() * 2;
+                if (column < label.size()) label[column] = '>';
+            }
+            hud.Text(tx + margin * 0.4f, y, scale, label, bbx::platform::HudColor::White());
+            y += line;
+        }
+        y += line * 0.3f;
+        hud.Text(tx, y, small_scale, "A: TYPE  B: BACKSPACE  MENU: ACCEPT  VIEW: CANCEL",
+                 bbx::platform::HudColor::Grey());
+        return;
+    }
+
+    // 4. In-game L3+R3 Quick Menu overlay.
+    if (g_session.quick_menu_open) {
+        const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 3.0f;
+        const std::vector<std::string> rows = {
+            "RESUME GAME",
+            std::string("FRAME RATE CAP: ") + (g_session.model.fps_cap >= 60 ? "60 FPS" : "30 FPS"),
+            std::string("VSYNC: ") + (bbx::bridge::VsyncEnabled() ? "ON" : "OFF"),
+            std::string("SHARP UPSCALE (FSR RCAS): ") +
+                (g_session.model.sharp_upscale ? "ON" : "OFF"),
+            std::string("PERFORMANCE HUD: ") + (g_session.model.perf_hud ? "ON" : "OFF"),
+            "EXIT GAME",
+        };
+        const float panel_w = width * 0.64f;
+        const float panel_h = line * static_cast<float>(rows.size() + 3) + margin;
+        const float px = (width - panel_w) * 0.5f;
+        const float py = (height - panel_h) * 0.5f;
+        hud.Panel(px, py, panel_w, panel_h, bbx::platform::HudColor{0.03f, 0.04f, 0.07f, 0.90f});
+
+        float y = py + margin * 0.6f;
+        const float tx = px + margin * 0.8f;
+        hud.Text(tx, y, scale, "BBXBOX QUICK MENU", bbx::platform::HudColor::White());
+        y += line * 1.3f;
+
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const bool sel = (i == g_session.quick_menu_selected);
+            const bbx::platform::HudColor col =
+                sel ? (i == rows.size() - 1 ? bbx::platform::HudColor::Amber()
+                                            : bbx::platform::HudColor::Green())
+                    : bbx::platform::HudColor::White();
+            hud.Text(tx, y, scale, std::string(sel ? "> " : "  ") + rows[i], col);
+            y += line;
+        }
+        y += line * 0.3f;
+        hud.Text(tx, y, small_scale, "A: TOGGLE/SELECT   B OR L3+R3: RESUME",
+                 bbx::platform::HudColor::Grey());
+    }
+}
+
 // One frame, drawn by the only renderer this target has. When the device is not
 // up - or a present fails because it went away - the loop keeps running and the
 // 1 Hz gate line keeps printing why; there is no second renderer to fall back to
@@ -728,7 +1126,10 @@ void DrawFrame() {
     if (g_session.gpu) {
         bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
         AppendLauncherToHud(hud);
-        const bbx::d3d12::Status status = g_session.gpu->Present(hud);
+        AppendInGameOverlays(hud);
+        const bool vsync = bbx::bridge::VsyncEnabled();
+        const bbx::d3d12::Status status =
+            g_session.gpu->Present(hud, vsync, g_session.model.sharp_upscale);
         if (status == bbx::d3d12::Status::kOk) {
             g_present_count.fetch_add(1, std::memory_order_relaxed);
             (void)Steps().FirstFramePresented();
@@ -785,6 +1186,8 @@ bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
     const bbx::d3d12::Status status =
         g_session.gpu->Create(window_abi, window_width, window_height, false);
     if (status == bbx::d3d12::Status::kOk) {
+        bbx::bridge::SetDisplayMetrics(static_cast<int>(g_session.gpu->OutputWidth()),
+                                       static_cast<int>(g_session.gpu->OutputHeight()), 60.0f);
         const bbx::platform::GpuReport& report = g_session.gpu->Report();
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kInfo, "d3d12: %s, %s, self-test %s",
@@ -876,6 +1279,16 @@ void LoadSettings() {
     // to off, because it is the one that steps outside the verified digests.
     g_session.model.mods_enabled = bbx::platform::IniFlag(g_session.ini, "dump.mods", true);
     g_session.model.modded_eboot_ok = bbx::platform::IniFlag(g_session.ini, "dump.modded_eboot", false);
+
+    // Video & overlay settings persisted across launches.
+    const std::string fps_str = bbx::platform::IniGet(g_session.ini, "video.fps_cap", "30");
+    g_session.model.fps_cap = (fps_str == "60") ? 60 : 30;
+    g_session.model.vsync = bbx::platform::IniFlag(g_session.ini, "video.vsync", true);
+    g_session.model.sharp_upscale =
+        bbx::platform::IniFlag(g_session.ini, "video.sharp_upscale", true);
+    g_session.model.perf_hud = bbx::platform::IniFlag(g_session.ini, "video.perf_hud", false);
+    bbx::bridge::SetTargetFps(g_session.model.fps_cap);
+    bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
 }
 
 std::string NormalizeScanPath(std::string path) {
@@ -1048,6 +1461,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     static_cast<unsigned long long>(mem.used_mib),
                     static_cast<unsigned long long>(mem.limit_mib),
                     static_cast<unsigned long long>(mem.presents));
+                bbx::bridge::StopPadRumble();
                 Steps().Shutdown("suspend event");
                 bbx::platform::LogFlush();
                 if (deferral) {
@@ -1263,6 +1677,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         std::chrono::steady_clock::time_point emergency_hold_start{};
         const bbx::platform::ButtonMask kEmergencyQuitMask =
             bbx::platform::Bit(Pad::kView) | bbx::platform::Bit(Pad::kMenu);
+        const bbx::platform::ButtonMask kQuickMenuMask =
+            bbx::platform::Bit(Pad::kLeftStick) | bbx::platform::Bit(Pad::kRightStick);
+        constexpr std::size_t kQuickMenuCount = 6;
 
         while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
             if (stored_window) {
@@ -1270,14 +1687,19 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     winrt::Windows::UI::Core::CoreProcessEventsOption::ProcessAllIfPresent);
             }
             if (g_window_closed.load(std::memory_order_relaxed)) break;
+            if (bbx::bridge::QuitRequested()) {
+                g_session.quit = true;
+                break;
+            }
 
             // The pad is WinRT's; there is no SDL event queue on this target.
             const bbx::platform::ButtonMask held = MaskFromPad();
+            const bbx::platform::ButtonMask pressed = held & ~previous;
+            const bbx::platform::ButtonMask released = previous & ~held;
+            previous = held;
+
             if (bbx::bridge::Running()) {
-                // Once the guest is running, do not feed gameplay buttons into
-                // the launcher menu (pressing Menu/D-pad/A in-game would open
-                // the virtual keyboard or activate hidden launcher items).
-                // Keep only a 3-second View+Menu emergency exit chord.
+                // Keep the 3-second View+Menu emergency exit chord active at all times.
                 if ((held & kEmergencyQuitMask) == kEmergencyQuitMask) {
                     const auto now = std::chrono::steady_clock::now();
                     if (!emergency_holding) {
@@ -1292,21 +1714,122 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 } else {
                     emergency_holding = false;
                 }
-                previous = held;
+
+                // Poll guest IME text-entry requests (Hunter Name, Chalice Glyph, Password).
+                const bbx::bridge::TextEntryPrompt prompt = bbx::bridge::PollTextEntryPrompt();
+                if (prompt.active && !g_session.ime_open) {
+                    g_session.ime_open = true;
+                    g_session.ime_label = prompt.label;
+                    g_session.ime_hidden = prompt.hidden;
+                    g_session.ime_max_chars = prompt.max_chars == 0 ? 16u : prompt.max_chars;
+                    g_session.ime_keyboard.Reset(prompt.initial);
+                    g_session.quick_menu_open = false;
+                    bbx::bridge::SetGuestInputSuppressed(true);
+                } else if (!prompt.active && g_session.ime_open) {
+                    g_session.ime_open = false;
+                    bbx::bridge::SetGuestInputSuppressed(g_session.quick_menu_open);
+                }
+
+                if (g_session.ime_open) {
+                    if (pressed & bbx::platform::Bit(Pad::kDpadUp)) g_session.ime_keyboard.Move(0, -1);
+                    if (pressed & bbx::platform::Bit(Pad::kDpadDown)) g_session.ime_keyboard.Move(0, 1);
+                    if (pressed & bbx::platform::Bit(Pad::kDpadLeft)) g_session.ime_keyboard.Move(-1, 0);
+                    if (pressed & bbx::platform::Bit(Pad::kDpadRight)) g_session.ime_keyboard.Move(1, 0);
+                    if (pressed & bbx::platform::Bit(Pad::kEast)) g_session.ime_keyboard.Backspace();
+                    if (pressed & bbx::platform::Bit(Pad::kMenu)) {
+                        std::string result = g_session.ime_keyboard.Text();
+                        if (result.size() > g_session.ime_max_chars) {
+                            result.resize(g_session.ime_max_chars);
+                        }
+                        bbx::bridge::CompleteTextEntry(result, true);
+                        g_session.ime_open = false;
+                        bbx::bridge::SetGuestInputSuppressed(false);
+                    } else if (pressed & bbx::platform::Bit(Pad::kView)) {
+                        bbx::bridge::CompleteTextEntry({}, false);
+                        g_session.ime_open = false;
+                        bbx::bridge::SetGuestInputSuppressed(false);
+                    } else if (pressed & bbx::platform::Bit(Pad::kSouth)) {
+                        if (!g_session.ime_keyboard.Accept()) {
+                            std::string result = g_session.ime_keyboard.Text();
+                            if (result.size() > g_session.ime_max_chars) {
+                                result.resize(g_session.ime_max_chars);
+                            }
+                            bbx::bridge::CompleteTextEntry(result, true);
+                            g_session.ime_open = false;
+                            bbx::bridge::SetGuestInputSuppressed(false);
+                        }
+                    }
+                } else {
+                    // Toggle the in-game L3+R3 Quick Menu when both sticks are clicked together.
+                    if ((held & kQuickMenuMask) == kQuickMenuMask && (pressed & kQuickMenuMask) != 0) {
+                        g_session.quick_menu_open = !g_session.quick_menu_open;
+                        bbx::bridge::SetGuestInputSuppressed(g_session.quick_menu_open);
+                    } else if (g_session.quick_menu_open) {
+                        if (pressed & bbx::platform::Bit(Pad::kDpadUp)) {
+                            g_session.quick_menu_selected =
+                                (g_session.quick_menu_selected + kQuickMenuCount - 1) % kQuickMenuCount;
+                        } else if (pressed & bbx::platform::Bit(Pad::kDpadDown)) {
+                            g_session.quick_menu_selected =
+                                (g_session.quick_menu_selected + 1) % kQuickMenuCount;
+                        } else if (pressed & bbx::platform::Bit(Pad::kEast)) {
+                            g_session.quick_menu_open = false;
+                            bbx::bridge::SetGuestInputSuppressed(false);
+                        } else if (pressed & bbx::platform::Bit(Pad::kSouth)) {
+                            switch (g_session.quick_menu_selected) {
+                            case 0:
+                                g_session.quick_menu_open = false;
+                                bbx::bridge::SetGuestInputSuppressed(false);
+                                break;
+                            case 1:
+                                g_session.model.fps_cap = (g_session.model.fps_cap >= 60) ? 30 : 60;
+                                bbx::bridge::SetTargetFps(g_session.model.fps_cap);
+                                SaveLayoutSettings();
+                                break;
+                            case 2:
+                                g_session.model.vsync = !bbx::bridge::VsyncEnabled();
+                                bbx::bridge::SetVsyncEnabled(g_session.model.vsync);
+                                SaveLayoutSettings();
+                                break;
+                            case 3:
+                                g_session.model.sharp_upscale = !g_session.model.sharp_upscale;
+                                SaveLayoutSettings();
+                                break;
+                            case 4:
+                                g_session.model.perf_hud = !g_session.model.perf_hud;
+                                SaveLayoutSettings();
+                                break;
+                            case 5:
+                                g_session.quick_menu_open = false;
+                                bbx::bridge::SetGuestInputSuppressed(false);
+                                g_session.quit = true;
+                                break;
+                            default: break;
+                            }
+                        }
+                    }
+                }
             } else if (g_session.baking) {
                 emergency_holding = false;
-                previous = held;
+                if ((pressed & bbx::platform::Bit(Pad::kEast)) != 0 &&
+                    !g_session.bake_progress.CancelRequested()) {
+                    bbx::platform::LogMirroredMessage(
+                        bbx::platform::Level::kInfo,
+                        "launcher: B pressed during shader bake; cancelling and saving checkpoint");
+                    g_session.bake_progress.RequestCancel();
+                }
                 if (g_session.bake_finished.load(std::memory_order_acquire)) {
                     if (g_session.bake_thread.joinable()) g_session.bake_thread.join();
                     g_session.baking = false;
                     g_session.bake_finished.store(false, std::memory_order_relaxed);
+                    g_session.model.status_banner = g_session.bake_result.summary;
                     bbx::platform::LogMirroredMessage(
                         g_session.bake_result.ok ? bbx::platform::Level::kInfo
                                                  : bbx::platform::Level::kWarn,
-                        "launcher: first-boot shader bake finished (%s): %s",
+                        "launcher: shader bake finished (%s): %s",
                         g_session.bake_result.ok ? "ok" : "incomplete",
                         g_session.bake_result.summary.c_str());
-                    if (!g_session.bake_result.cancelled) {
+                    RefreshLauncher();
+                    if (g_session.start_after_bake && !g_session.bake_result.cancelled) {
                         if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
                             guest_ever_started = true;
                         } else {
@@ -1320,17 +1843,17 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 emergency_holding = false;
                 bbx::platform::PadEdges edges;
                 edges.held = held;
-                edges.pressed = held & ~previous;
-                edges.released = previous & ~held;
-                previous = held;
+                edges.pressed = pressed;
+                edges.released = released;
                 const PadAction action = g_session.chords.Update(edges);
                 if (action != PadAction::kNone) OnAction(action);
                 PollDumpPick();
+                PollUsbSync();
             }
 
             DrawFrame();
 
-            if (g_session.start_requested && !g_session.baking) {
+            if (g_session.start_requested && !g_session.baking && !g_session.usb_sync_running) {
                 bbx::platform::LogF("launcher: start requested (version %s)",
                                     g_session.layout.EffectiveVersion().c_str());
                 g_session.start_requested = false;
@@ -1351,14 +1874,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 }
                 req.modded_eboot_ok = g_session.model.modded_eboot_ok;
 
-                std::vector<std::string> cache_dirs;
-                cache_dirs.push_back(eboot_dir);
-                if (req.app0 != eboot_dir) cache_dirs.push_back(req.app0);
-                cache_dirs.push_back(req.data);
-                cache_dirs.push_back(bbx::platform::Paths().local_state);
                 std::string found_cache_dir;
                 std::string found_cache_report;
-                if (bbx::platform::HasValidConsoleCache(cache_dirs, &found_cache_dir,
+                if (bbx::platform::HasValidConsoleCache(CacheSearchDirs(), &found_cache_dir,
                                                         &found_cache_report)) {
                     bbx::platform::LogF(
                         "launcher: valid DXIL 6.4 cache found in %s (%s); skipping DXC load",
@@ -1371,40 +1889,19 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                             "launcher: the guest did not start; staying in the launcher");
                     }
                 } else {
-                    bbx::platform::LogMirroredMessage(
-                        bbx::platform::Level::kInfo,
-                        "launcher: no valid DXIL 6.4 cache found; starting one-time native Xbox shader bake into %s",
-                        req.data.c_str());
                     g_session.pending_guest_req = req;
-                    g_session.bake_progress.Reset();
-                    g_session.bake_result = bbx::platform::BakeResult{};
-                    g_session.bake_finished.store(false, std::memory_order_relaxed);
-                    g_session.baking = true;
-
-                    bbx::platform::BakeRequest bake_req;
-                    bake_req.app0 = req.app0;
-                    if (g_session.layout.CanRunPatched()) {
-                        bake_req.update_dir = g_session.layout.patch_path;
-                    }
-                    bake_req.eboot = req.eboot;
-                    bake_req.out_dir = req.data;
-
-                    g_session.bake_thread = std::thread([bake_req]() {
-                        const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
-                        (void)pthread_setname_np(pthread_self(), "shader-baker");
-                        Steps().RegisterThread(tid, "shader-baker");
-                        g_session.bake_result =
-                            bbx::platform::BakeConsoleShaders(bake_req, g_session.bake_progress);
-                        Steps().UnregisterThread(tid);
-                        g_session.bake_finished.store(true, std::memory_order_release);
-                    });
+                    StartShaderBake(/*start_after=*/true, /*force_rebuild=*/false);
                 }
             }
-            ::Sleep(8);
+            ::Sleep(bbx::bridge::Running() ? 1 : 8);
         }
+        bbx::bridge::StopPadRumble();
         if (g_session.bake_thread.joinable()) {
             g_session.bake_progress.RequestCancel();
             g_session.bake_thread.join();
+        }
+        if (g_session.usb_sync_thread.joinable()) {
+            g_session.usb_sync_thread.join();
         }
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         if (guest_ever_started || bbx::bridge::Running()) {

@@ -28,6 +28,7 @@
 
 namespace bbx::d3d12 {
 
+struct DecodedClearView;
 struct DrawIdentity;
 
 // Why a dispatch did not run. One per key, in the log, and counted.
@@ -50,6 +51,9 @@ struct GuestGpuCounts {
     std::uint64_t draws_executed = 0;
     std::uint64_t draw_refusals = 0;
     std::uint64_t draw_pipeline_missing = 0;
+    std::uint64_t clears = 0;
+    std::uint64_t target_copies = 0;
+    std::uint64_t texture_writes = 0;
     std::uint64_t mem_writes = 0, mem_fills = 0, mem_copies = 0, mem_reads = 0, mem_refused = 0;
     std::uint64_t refused_keys = 0;
 };
@@ -93,6 +97,18 @@ struct GuestGpuBinding {
     // graphics PSO for (vs_key, ps_key, fixed state), bind StageParams/space-1/
     // space-3 tables and render/depth targets, and record the draw.
     bool (*draw)(void* user, const GpuDraw& d, const DrawIdentity& identity) = nullptr;
+
+    // Render/depth target clear, target-to-target copy, and memory invalidation hooks.
+    bool (*clear_view)(void* user, const DecodedClearView& view, bool apply, bool* out_created) = nullptr;
+    bool (*clear_target)(void* user, std::uint64_t va, std::uint32_t value, std::size_t bytes) = nullptr;
+    bool (*copy_target)(void* user, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) = nullptr;
+    void (*forget_region)(void* user, std::uint64_t lo, std::uint64_t hi) = nullptr;
+    void (*texture_written)(void* user, std::uint64_t va, std::size_t bytes) = nullptr;
+
+    // Device memory & identity reporting hooks.
+    bool (*memory_glance)(void* user, GpuMemoryGlance* out) = nullptr;
+    std::string (*memory_budget_report)(void* user) = nullptr;
+    std::string (*device_identity)(void* user) = nullptr;
 };
 
 // Installed by the session: `binding` must outlive the boot (the session's own

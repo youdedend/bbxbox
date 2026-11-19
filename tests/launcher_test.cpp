@@ -204,3 +204,29 @@ TEST(ModdedEbootSwitchSaysAllowedWhenOn) {
         if (item.action == Action::kToggleModdedEboot) CHECK(item.dangerous);
     }
 }
+
+TEST(VideoTogglesUsbSaveActionsAndStatusBanner) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.has_usb = true;
+    model.fps_cap = 60;
+    model.vsync = false;
+    model.sharp_upscale = true;
+    model.perf_hud = true;
+    model.status_banner = "Backed up 2 save file(s) and 3 log(s) to USB";
+    model.Rebuild();
+
+    CHECK(Has(model, Action::kToggleFpsCap));
+    CHECK(Has(model, Action::kToggleVsync));
+    CHECK(Has(model, Action::kToggleSharpUpscale));
+    CHECK(Has(model, Action::kTogglePerfHud));
+    CHECK(Has(model, Action::kBackupSavesToUsb));
+    CHECK(Has(model, Action::kRestoreSavesFromUsb));
+
+    CHECK_EQ(std::string(ActionName(Action::kToggleFpsCap)), std::string("toggle-fps-cap"));
+    CHECK_EQ(std::string(ActionName(Action::kBackupSavesToUsb)), std::string("backup-saves-to-usb"));
+    CHECK_EQ(std::string(ActionName(Action::kRestoreSavesFromUsb)), std::string("restore-saves-from-usb"));
+
+    const std::string footer = model.Footer();
+    CHECK(footer.find("Backed up 2 save file(s)") != std::string::npos);
+}

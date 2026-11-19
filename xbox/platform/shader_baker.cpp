@@ -23,7 +23,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -607,7 +609,20 @@ CacheStamp MakeConsoleBakeStamp(const std::string& dxc_version) {
     return bbx::d3d12::ExpectedConsoleStamp(recorded);
 }
 
-bool ValidateCacheDir(const std::string& dir, std::string* report) {
+std::string FormatStampHex(const bbx::d3d12::StampDigest& digest) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(digest.size() * 2);
+    for (const std::uint8_t b : digest) {
+        out.push_back(kHex[(b >> 4) & 0xfu]);
+        out.push_back(kHex[b & 0xfu]);
+    }
+    return out;
+}
+
+bool ValidateCacheDir(const std::string& dir, std::string* report,
+                      std::size_t* out_stages = nullptr,
+                      std::string* out_stamp = nullptr) {
     if (dir.empty()) return false;
     const std::string cache_path = bbx::hostfs::JoinPath(dir, "bbx_shaders.cache");
     if (!bbx::hostfs::Exists(cache_path)) return false;
@@ -633,18 +648,155 @@ bool ValidateCacheDir(const std::string& dir, std::string* report) {
     if (report != nullptr) {
         *report = cache.Report() + "; " + table.Report();
     }
+    if (out_stages != nullptr) *out_stages = cache.entries();
+    if (out_stamp != nullptr) *out_stamp = FormatStampHex(cache.stamp_digest());
     return true;
+}
+
+struct CompiledProgramOutput {
+    bool ok = false;
+    CacheEntry entry;
+    std::vector<std::uint8_t> packed_blob;
+    std::string bindings_fragment;
+    std::size_t raw_dxil_bytes = 0;
+    std::size_t binding_count = 0;
+};
+
+CompiledProgramOutput CompileOneProgram(const PackagedDxcCompiler& compiler,
+                                        const AnalysedProgram& program) {
+    CompiledProgramOutput out;
+    const gcn::Program decoded = gcn::decode(program.words.data(), program.words.size());
+    if (!decoded.errors.empty()) return out;
+
+    const gcn::TranslateOptions tr_opts = MakeTranslateOptions(program);
+    const gcn::TranslateResult translated = gcn::translate(decoded, tr_opts);
+    if (!translated.errors.empty()) return out;
+
+    std::vector<BindingPlan> bindings;
+    std::uint32_t pointer_bindings = 0;
+    for (const gcn::BufferBinding& buffer : translated.buffers) {
+        if (buffer.pointer) {
+            ++pointer_bindings;
+            continue;
+        }
+        BindingPlan plan;
+        plan.binding = buffer.binding;
+        plan.kind = buffer.written ? BindingKind::kUav : BindingKind::kSrv;
+        plan.path.user_sgpr = buffer.path.user_sgpr;
+        plan.path.final_offset_dw = buffer.path.final_offset_dw;
+        plan.path.final_vsharp = buffer.path.final_vsharp;
+        plan.path.immediate = buffer.path.immediate;
+        for (const gcn::ResourceStep& step : buffer.path.loads) {
+            plan.path.loads.push_back(PathStep{step.offset_dw, step.vsharp});
+        }
+        bindings.push_back(std::move(plan));
+    }
+
+    gcn::LiftResult lifted;
+    switch (program.stage) {
+        case Stage::kVertex:
+            lifted = gcn::lift_vertex_shader(decoded, tr_opts, translated);
+            break;
+        case Stage::kPixel:
+            lifted = gcn::lift_pixel_shader(decoded, tr_opts, translated);
+            break;
+        default:
+            lifted = gcn::lift_compute_shader(decoded, tr_opts, translated);
+            break;
+    }
+    const std::vector<std::uint32_t>& spv = lifted.ok() ? lifted.spirv : translated.spirv;
+
+    gcn::HlslOptions hlsl_opts;
+    hlsl_opts.title = program.name;
+    hlsl_opts.dxil_sm64 = true;
+    const gcn::HlslResult hlsl = gcn::emit_hlsl(spv, hlsl_opts);
+    if (!hlsl.ok() || !hlsl.arguments.empty()) return out;
+
+    std::string why;
+    if (bbx::d3d12::Has64BitInteger(hlsl.source, why)) return out;
+
+    std::vector<std::uint8_t> dxil_obj;
+    if (!compiler.Compile(program.stage, hlsl.source, dxil_obj, why)) return out;
+    if (!bbx::d3d12::IsSignedDxbc(dxil_obj, why)) return out;
+    const DxilFeatures features = bbx::d3d12::DxilFeatureFlags(dxil_obj);
+    if (bbx::d3d12::HasForbiddenConsoleFeature(features)) return out;
+
+    std::vector<std::uint8_t> packed;
+    if (!DeflateBlob(dxil_obj, packed)) return out;
+
+    out.entry.key = program.key;
+    out.entry.program_hash = program.program_hash;
+    out.entry.bytecode_hash =
+        bbx::Fnv1a64(std::span<const std::uint8_t>(dxil_obj.data(), dxil_obj.size()));
+    out.entry.stage = program.stage;
+    out.entry.fallback = false;
+    out.entry.offset = 0;
+    out.entry.size = static_cast<std::uint32_t>(packed.size());
+    out.entry.raw_size = static_cast<std::uint32_t>(dxil_obj.size());
+    out.packed_blob = std::move(packed);
+    out.raw_dxil_bytes = dxil_obj.size();
+    out.binding_count = bindings.size();
+
+    char note[224] = {};
+    std::snprintf(
+        note, sizeof(note),
+        "# key %016llx stage %u: %zu buffer binding(s) recorded, %u not (an address, not a V#), "
+        "%zu image(s), %zu sampler(s)\n",
+        static_cast<unsigned long long>(program.key), static_cast<unsigned>(program.stage),
+        bindings.size(), pointer_bindings, translated.images.size(),
+        translated.samplers.size());
+    out.bindings_fragment = note;
+    for (const BindingPlan& plan : bindings) {
+        out.bindings_fragment += PathTable::FormatBinding(
+            program.key, static_cast<std::uint32_t>(program.stage), plan);
+        out.bindings_fragment += '\n';
+    }
+    out.ok = true;
+    return out;
+}
+
+bool CopyFileAtomic(const std::string& src_path, const std::string& dst_path) {
+    std::vector<std::uint8_t> bytes;
+    if (!bbx::hostfs::ReadFileAll(src_path, &bytes)) return false;
+    return WriteBytesAtomic(dst_path, bytes);
+}
+
+bool CopyTreeRecursive(const std::string& src_dir, const std::string& dst_dir,
+                       std::size_t& copied_files, std::size_t& failed_files, int depth = 0) {
+    if (depth > 8 || !bbx::hostfs::Exists(src_dir)) return false;
+    (void)bbx::hostfs::MkDir(dst_dir, true);
+    std::vector<bbx::hostfs::DirEntry> entries;
+    if (!bbx::hostfs::ListDir(src_dir, &entries)) return false;
+    for (const bbx::hostfs::DirEntry& e : entries) {
+        if (e.name.empty() || e.name == "." || e.name == "..") continue;
+        const std::string src_child = bbx::hostfs::JoinPath(src_dir, e.name);
+        const std::string dst_child = bbx::hostfs::JoinPath(dst_dir, e.name);
+        if (e.is_dir) {
+            (void)CopyTreeRecursive(src_child, dst_child, copied_files, failed_files, depth + 1);
+        } else {
+            if (CopyFileAtomic(src_child, dst_child)) {
+                ++copied_files;
+            } else {
+                ++failed_files;
+            }
+        }
+    }
+    return failed_files == 0;
 }
 
 }  // namespace
 
 bool HasValidConsoleCache(const std::vector<std::string>& search_dirs, std::string* found_dir,
-                          std::string* report) {
+                          std::string* report, std::size_t* out_stages, std::string* out_stamp) {
     for (const std::string& dir : search_dirs) {
         std::string local_report;
-        if (ValidateCacheDir(dir, &local_report)) {
+        std::size_t local_stages = 0;
+        std::string local_stamp;
+        if (ValidateCacheDir(dir, &local_report, &local_stages, &local_stamp)) {
             if (found_dir != nullptr) *found_dir = dir;
             if (report != nullptr) *report = local_report;
+            if (out_stages != nullptr) *out_stages = local_stages;
+            if (out_stamp != nullptr) *out_stamp = local_stamp;
             return true;
         }
     }
@@ -679,18 +831,25 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     const std::string inflight_path = bbx::hostfs::JoinPath(req.out_dir, "precompile_inflight.txt");
     const std::string quarantine_path =
         bbx::hostfs::JoinPath(req.out_dir, "precompile_quarantine.txt");
+    const std::string checkpoint_path =
+        bbx::hostfs::JoinPath(req.out_dir, "bbx_shaders.checkpoint");
     Quarantine quarantine = Quarantine::Parse(ReadTextFile(quarantine_path));
+    bool recovered_crash = false;
     if (bbx::hostfs::Exists(inflight_path)) {
         const std::string inflight_text = ReadTextFile(inflight_path);
         const bbx::d3d12::CrashRecovery recovery =
             bbx::d3d12::RecoverFromInflight(inflight_text, quarantine);
         if (recovery.found) {
+            recovered_crash = true;
             LogMessage(Level::kWarn, "shader_baker: %s", recovery.message.c_str());
             if (recovery.promoted) {
                 (void)WriteTextAtomic(quarantine_path, quarantine.Serialize());
             }
         }
         (void)bbx::hostfs::Unlink(inflight_path);
+    }
+    if (req.force_rebuild && bbx::hostfs::Exists(checkpoint_path)) {
+        (void)bbx::hostfs::Unlink(checkpoint_path);
     }
 
     // --- 2. Load packaged dxil.dll + dxcompiler.dll --------------------------
@@ -705,8 +864,15 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
         progress.Update(snap);
         return result;
     }
-    LogMessage(Level::kInfo, "shader_baker: loaded packaged dxil.dll + dxcompiler.dll (v%s)",
-               compiler.version().c_str());
+    const std::string dxc_version = compiler.version();
+    const CacheStamp bake_stamp = MakeConsoleBakeStamp(dxc_version);
+    const std::uint32_t workers = bbx::d3d12::ChooseBakeWorkerCount(
+        std::thread::hardware_concurrency(), req.max_workers, recovered_crash);
+    snap.workers = workers;
+    LogMessage(Level::kInfo,
+               "shader_baker: loaded packaged dxil.dll + dxcompiler.dll (v%s, %u worker%s%s)",
+               dxc_version.c_str(), workers, workers == 1u ? "" : "s",
+               recovered_crash ? ", single-thread isolation after crash" : "");
 
     // --- 3. Discover shader bundles + eboot containers via hostfs ------------
     std::vector<std::string> bundle_paths;
@@ -720,6 +886,7 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     for (std::size_t i = 0; i < bundle_paths.size(); ++i) {
         if (progress.CancelRequested()) {
             result.cancelled = true;
+            result.summary = "shader_baker: cancelled while scanning";
             compiler.Unload();
             return result;
         }
@@ -756,6 +923,7 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     for (std::size_t i = 0; i < items.size(); ++i) {
         if (progress.CancelRequested()) {
             result.cancelled = true;
+            result.summary = "shader_baker: cancelled while analysing";
             compiler.Unload();
             return result;
         }
@@ -784,170 +952,184 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     LogMessage(Level::kInfo, "shader_baker: %zu unique shader key(s) to compile (%u skipped in analysis)",
                unique_programs.size(), analyse_refused);
 
-    // --- 5. Compile to signed DXIL SM 6.4 (single-threaded for low RAM & exact crash quarantine) ---
+    // --- 4b. Resume prior checkpoint if present and matching this stamp ------
     std::vector<CacheEntry> entries;
     std::vector<std::uint8_t> blobs;
     std::string bindings_text;
+    std::unordered_set<std::uint64_t> resumed_keys;
     entries.reserve(unique_programs.size());
 
     std::uint32_t signed_count = 0;
+    std::uint32_t resumed_count = 0;
     std::uint32_t compile_refused = analyse_refused;
     std::uint32_t quarantined_count = 0;
     std::size_t raw_dxil_bytes = 0;
     std::size_t planned_bindings = 0;
 
-    for (std::size_t i = 0; i < unique_programs.size(); ++i) {
-        if (progress.CancelRequested()) {
-            (void)bbx::hostfs::Unlink(inflight_path);
-            result.cancelled = true;
-            compiler.Unload();
-            return result;
+    if (!req.force_rebuild && bbx::hostfs::Exists(checkpoint_path)) {
+        std::vector<std::uint8_t> cp_bytes;
+        bbx::d3d12::BakeCheckpoint cp;
+        if (bbx::hostfs::ReadFileAll(checkpoint_path, &cp_bytes) &&
+            bbx::d3d12::ParseBakeCheckpoint(cp_bytes, bake_stamp, &cp) && !cp.entries.empty()) {
+            entries = std::move(cp.entries);
+            blobs = std::move(cp.blobs);
+            bindings_text = std::move(cp.bindings_text);
+            resumed_keys.reserve(entries.size());
+            for (const CacheEntry& e : entries) {
+                resumed_keys.insert(e.key);
+                raw_dxil_bytes += e.raw_size;
+            }
+            signed_count = static_cast<std::uint32_t>(entries.size());
+            resumed_count = signed_count;
+            LogMessage(Level::kInfo,
+                       "shader_baker: resumed %u compiled shader(s) from checkpoint",
+                       resumed_count);
+        } else {
+            LogMessage(Level::kInfo,
+                       "shader_baker: discarding stale or unreadable checkpoint");
+            (void)bbx::hostfs::Unlink(checkpoint_path);
         }
-        const AnalysedProgram& program = unique_programs[i];
+    }
+
+    // Build worklist of remaining un-compiled, non-quarantined shaders.
+    std::vector<std::size_t> pending_indices;
+    pending_indices.reserve(unique_programs.size());
+    std::uint32_t completed_total = 0;
+    for (std::size_t i = 0; i < unique_programs.size(); ++i) {
+        const std::uint64_t key = unique_programs[i].key;
+        if (resumed_keys.find(key) != resumed_keys.end()) {
+            ++completed_total;
+            continue;
+        }
+        if (quarantine.Contains(key)) {
+            ++quarantined_count;
+            ++completed_total;
+            continue;
+        }
+        pending_indices.push_back(i);
+    }
+
+    // --- 5. Compile to signed DXIL SM 6.4 (multi-threaded with checkpoints) --
+    constexpr std::uint32_t kCheckpointInterval = 250u;
+    std::mutex merge_mu;
+    std::atomic<std::size_t> next_work{0};
+    std::uint32_t newly_signed_since_checkpoint = 0;
+
+    const auto save_checkpoint_locked = [&]() {
+        if (entries.empty()) return;
+        const std::vector<std::uint8_t> cp_bytes = bbx::d3d12::SerializeBakeCheckpoint(
+            bake_stamp, entries, blobs, bindings_text);
+        if (WriteBytesAtomic(checkpoint_path, cp_bytes)) {
+            LogMessage(Level::kInfo,
+                       "shader_baker: checkpoint saved (%zu shaders, %.1f MiB)",
+                       entries.size(), static_cast<double>(cp_bytes.size()) / 1048576.0);
+        }
+    };
+
+    const auto publish_progress_locked = [&](const std::string& current_name) {
         snap.phase = BakePhase::kCompiling;
-        snap.done = static_cast<std::uint32_t>(i);
+        snap.done = completed_total;
         snap.total = static_cast<std::uint32_t>(unique_programs.size());
         snap.signed_count = signed_count;
         snap.refused_count = compile_refused;
         snap.quarantined_count = quarantined_count;
+        snap.resumed_count = resumed_count;
+        snap.workers = workers;
         snap.elapsed_seconds = elapsed_sec();
-        snap.current_name = program.name;
+        snap.current_name = current_name;
         progress.Update(snap);
+    };
 
-        if (quarantine.Contains(program.key)) {
-            ++quarantined_count;
-            continue;
-        }
+    {
+        std::lock_guard<std::mutex> lock(merge_mu);
+        publish_progress_locked(pending_indices.empty()
+                                    ? std::string("RESUMED")
+                                    : unique_programs[pending_indices.front()].name);
+    }
 
-        // Write crash breadcrumb before lifting + invoking DXC.
-        Unit unit;
-        unit.hash = program.key;
-        unit.kind = ShaderKindOfStage(program.stage);
-        unit.bundle = program.bundle;
-        unit.entry = program.entry;
-        (void)WriteTextFile(
-            inflight_path,
-            bbx::d3d12::SerializeInflight(unit, static_cast<std::uint32_t>(i + 1),
-                                          static_cast<std::uint32_t>(unique_programs.size())));
+    auto worker_fn = [&]() {
+        for (;;) {
+            if (progress.CancelRequested()) break;
+            const std::size_t slot = next_work.fetch_add(1, std::memory_order_relaxed);
+            if (slot >= pending_indices.size()) break;
+            const std::size_t prog_idx = pending_indices[slot];
+            const AnalysedProgram& program = unique_programs[prog_idx];
 
-        const gcn::Program decoded = gcn::decode(program.words.data(), program.words.size());
-        if (!decoded.errors.empty()) {
-            ++compile_refused;
-            continue;
-        }
-        const gcn::TranslateOptions tr_opts = MakeTranslateOptions(program);
-        const gcn::TranslateResult translated = gcn::translate(decoded, tr_opts);
-        if (!translated.errors.empty()) {
-            ++compile_refused;
-            continue;
-        }
-
-        std::vector<BindingPlan> bindings;
-        std::uint32_t pointer_bindings = 0;
-        for (const gcn::BufferBinding& buffer : translated.buffers) {
-            if (buffer.pointer) {
-                ++pointer_bindings;
-                continue;
+            // Record crash breadcrumb (deterministic when single-threaded; best-effort
+            // poison tracking when multi-threaded).
+            if (workers == 1u || (slot & 7u) == 0u) {
+                Unit unit;
+                unit.hash = program.key;
+                unit.kind = ShaderKindOfStage(program.stage);
+                unit.bundle = program.bundle;
+                unit.entry = program.entry;
+                std::lock_guard<std::mutex> lock(merge_mu);
+                (void)WriteTextFile(
+                    inflight_path,
+                    bbx::d3d12::SerializeInflight(unit, static_cast<std::uint32_t>(prog_idx + 1),
+                                                  static_cast<std::uint32_t>(unique_programs.size())));
             }
-            BindingPlan plan;
-            plan.binding = buffer.binding;
-            plan.kind = buffer.written ? BindingKind::kUav : BindingKind::kSrv;
-            plan.path.user_sgpr = buffer.path.user_sgpr;
-            plan.path.final_offset_dw = buffer.path.final_offset_dw;
-            plan.path.final_vsharp = buffer.path.final_vsharp;
-            plan.path.immediate = buffer.path.immediate;
-            for (const gcn::ResourceStep& step : buffer.path.loads) {
-                plan.path.loads.push_back(PathStep{step.offset_dw, step.vsharp});
+
+            CompiledProgramOutput compiled = CompileOneProgram(compiler, program);
+
+            std::lock_guard<std::mutex> lock(merge_mu);
+            ++completed_total;
+            if (compiled.ok) {
+                compiled.entry.offset = static_cast<std::uint32_t>(blobs.size());
+                entries.push_back(compiled.entry);
+                blobs.insert(blobs.end(), compiled.packed_blob.begin(), compiled.packed_blob.end());
+                bindings_text += compiled.bindings_fragment;
+                raw_dxil_bytes += compiled.raw_dxil_bytes;
+                planned_bindings += compiled.binding_count;
+                ++signed_count;
+                ++newly_signed_since_checkpoint;
+                if (newly_signed_since_checkpoint >= kCheckpointInterval) {
+                    newly_signed_since_checkpoint = 0;
+                    save_checkpoint_locked();
+                }
+            } else {
+                ++compile_refused;
             }
-            bindings.push_back(std::move(plan));
+            if ((completed_total & 3u) == 0u || completed_total == unique_programs.size()) {
+                publish_progress_locked(program.name);
+            }
         }
+    };
 
-        gcn::LiftResult lifted;
-        switch (program.stage) {
-            case Stage::kVertex:
-                lifted = gcn::lift_vertex_shader(decoded, tr_opts, translated);
-                break;
-            case Stage::kPixel:
-                lifted = gcn::lift_pixel_shader(decoded, tr_opts, translated);
-                break;
-            default:
-                lifted = gcn::lift_compute_shader(decoded, tr_opts, translated);
-                break;
+    if (workers <= 1u || pending_indices.size() < 4u) {
+        worker_fn();
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (std::uint32_t t = 0; t < workers; ++t) {
+            pool.emplace_back(worker_fn);
         }
-        const std::vector<std::uint32_t>& spv = lifted.ok() ? lifted.spirv : translated.spirv;
-
-        gcn::HlslOptions hlsl_opts;
-        hlsl_opts.title = program.name;
-        hlsl_opts.dxil_sm64 = true;
-        const gcn::HlslResult hlsl = gcn::emit_hlsl(spv, hlsl_opts);
-        if (!hlsl.ok() || !hlsl.arguments.empty()) {
-            ++compile_refused;
-            continue;
+        for (std::thread& th : pool) {
+            if (th.joinable()) th.join();
         }
-
-        std::string why;
-        if (bbx::d3d12::Has64BitInteger(hlsl.source, why)) {
-            ++compile_refused;
-            continue;
-        }
-
-        std::vector<std::uint8_t> dxil_obj;
-        if (!compiler.Compile(program.stage, hlsl.source, dxil_obj, why)) {
-            ++compile_refused;
-            continue;
-        }
-        if (!bbx::d3d12::IsSignedDxbc(dxil_obj, why)) {
-            ++compile_refused;
-            continue;
-        }
-        const DxilFeatures features = bbx::d3d12::DxilFeatureFlags(dxil_obj);
-        if (bbx::d3d12::HasForbiddenConsoleFeature(features)) {
-            ++compile_refused;
-            continue;
-        }
-
-        std::vector<std::uint8_t> packed;
-        if (!DeflateBlob(dxil_obj, packed)) {
-            ++compile_refused;
-            continue;
-        }
-
-        CacheEntry entry;
-        entry.key = program.key;
-        entry.program_hash = program.program_hash;
-        entry.bytecode_hash =
-            bbx::Fnv1a64(std::span<const std::uint8_t>(dxil_obj.data(), dxil_obj.size()));
-        entry.stage = program.stage;
-        entry.fallback = false;
-        entry.offset = static_cast<std::uint32_t>(blobs.size());
-        entry.size = static_cast<std::uint32_t>(packed.size());
-        entry.raw_size = static_cast<std::uint32_t>(dxil_obj.size());
-        entries.push_back(entry);
-        blobs.insert(blobs.end(), packed.begin(), packed.end());
-        raw_dxil_bytes += dxil_obj.size();
-
-        char note[224] = {};
-        std::snprintf(
-            note, sizeof(note),
-            "# key %016llx stage %u: %zu buffer binding(s) recorded, %u not (an address, not a V#), "
-            "%zu image(s), %zu sampler(s)\n",
-            static_cast<unsigned long long>(program.key), static_cast<unsigned>(program.stage),
-            bindings.size(), pointer_bindings, translated.images.size(),
-            translated.samplers.size());
-        bindings_text += note;
-        for (const BindingPlan& plan : bindings) {
-            bindings_text += PathTable::FormatBinding(
-                program.key, static_cast<std::uint32_t>(program.stage), plan);
-            bindings_text += '\n';
-        }
-        planned_bindings += bindings.size();
-        ++signed_count;
     }
 
     (void)bbx::hostfs::Unlink(inflight_path);
 
+    if (progress.CancelRequested()) {
+        if (!entries.empty()) {
+            std::lock_guard<std::mutex> lock(merge_mu);
+            save_checkpoint_locked();
+        }
+        compiler.Unload();
+        result.cancelled = true;
+        result.entries_written = signed_count;
+        result.resumed_count = resumed_count;
+        result.refused_count = compile_refused;
+        result.quarantined_count = quarantined_count;
+        result.elapsed_seconds = elapsed_sec();
+        result.summary = "shader_baker: cancelled (" + std::to_string(signed_count) +
+                         " shaders saved in checkpoint for resume)";
+        LogMessage(Level::kInfo, "%s", result.summary.c_str());
+        return result;
+    }
+
     // --- 6. Unload dxcompiler.dll + dxil.dll BEFORE writing & booting game ---
-    const std::string dxc_version = compiler.version();
     compiler.Unload();
     LogMessage(Level::kInfo,
                "shader_baker: unloaded dxcompiler.dll and dxil.dll (0 MiB compiler RAM for gameplay)");
@@ -976,17 +1158,17 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     snap.signed_count = signed_count;
     snap.refused_count = compile_refused;
     snap.quarantined_count = quarantined_count;
+    snap.resumed_count = resumed_count;
     snap.elapsed_seconds = elapsed_sec();
     snap.current_name = "bbx_shaders.cache";
     progress.Update(snap);
 
     std::sort(entries.begin(), entries.end(),
               [](const CacheEntry& a, const CacheEntry& b) { return a.key < b.key; });
-    const CacheStamp stamp = MakeConsoleBakeStamp(dxc_version);
-    const std::vector<std::uint8_t> cache_file = bbx::d3d12::SerializeCache(stamp, entries, blobs);
-    const std::string stamp_text = stamp.Serialize();
+    const std::vector<std::uint8_t> cache_file = bbx::d3d12::SerializeCache(bake_stamp, entries, blobs);
+    const std::string stamp_text = bake_stamp.Serialize();
     const std::string paths_text = std::string(PathTable::HeaderLine()) + "\n" +
-                                   PathTable::FormatStamp(stamp.Digest()) + "\n" + bindings_text;
+                                   PathTable::FormatStamp(bake_stamp.Digest()) + "\n" + bindings_text;
 
     const std::string cache_path = bbx::hostfs::JoinPath(req.out_dir, "bbx_shaders.cache");
     const std::string stamp_path = cache_path + ".stamp.txt";
@@ -1017,17 +1199,22 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
         return result;
     }
 
+    // Final cache verified: remove temporary checkpoint file.
+    (void)bbx::hostfs::Unlink(checkpoint_path);
+
     result.ok = true;
     result.entries_written = signed_count;
+    result.resumed_count = resumed_count;
     result.refused_count = compile_refused;
     result.quarantined_count = quarantined_count;
     result.elapsed_seconds = elapsed_sec();
     char summary_buf[256] = {};
     std::snprintf(summary_buf, sizeof(summary_buf),
-                  "baked %u DXIL 6.4 shaders (%.1f MiB -> %.1f MiB, %zu plans) in %us (%u skipped)",
-                  signed_count, static_cast<double>(raw_dxil_bytes) / 1048576.0,
+                  "baked %u DXIL 6.4 shaders (%uT, %u resumed, %.1f -> %.1f MiB, %zu plans) in %us",
+                  signed_count, workers, resumed_count,
+                  static_cast<double>(raw_dxil_bytes) / 1048576.0,
                   static_cast<double>(cache_file.size()) / 1048576.0, planned_bindings,
-                  result.elapsed_seconds, compile_refused + quarantined_count);
+                  result.elapsed_seconds);
     result.summary = summary_buf;
     LogMessage(Level::kInfo, "shader_baker: %s (%s)", result.summary.c_str(), verify_report.c_str());
 
@@ -1036,6 +1223,123 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     snap.detail = result.summary;
     progress.Update(snap);
     return result;
+}
+
+bool SyncShaderCacheFiles(const std::string& src_dir, const std::string& dst_dir,
+                          std::string* detail) {
+    if (src_dir.empty() || dst_dir.empty()) {
+        if (detail) *detail = "missing source or destination directory";
+        return false;
+    }
+    std::string report;
+    if (!ValidateCacheDir(src_dir, &report)) {
+        if (detail) *detail = "no valid shader cache found in " + src_dir;
+        return false;
+    }
+    (void)bbx::hostfs::MkDir(dst_dir, true);
+
+    const std::string src_cache = bbx::hostfs::JoinPath(src_dir, "bbx_shaders.cache");
+    std::string src_stamp = src_cache + ".stamp.txt";
+    if (!bbx::hostfs::Exists(src_stamp)) {
+        src_stamp = bbx::hostfs::JoinPath(src_dir, "bbx_shaders.stamp");
+    }
+    const std::string src_paths = bbx::hostfs::JoinPath(src_dir, "bbx_shaders.paths");
+
+    const std::string dst_cache = bbx::hostfs::JoinPath(dst_dir, "bbx_shaders.cache");
+    const std::string dst_stamp = dst_cache + ".stamp.txt";
+    const std::string dst_paths = bbx::hostfs::JoinPath(dst_dir, "bbx_shaders.paths");
+
+    if (!CopyFileAtomic(src_cache, dst_cache) || !CopyFileAtomic(src_stamp, dst_stamp) ||
+        !CopyFileAtomic(src_paths, dst_paths)) {
+        if (detail) *detail = "failed writing shader cache files to " + dst_dir;
+        return false;
+    }
+    if (!ValidateCacheDir(dst_dir, &report)) {
+        if (detail) *detail = "copied cache failed verification in " + dst_dir;
+        return false;
+    }
+    if (detail) *detail = "synced shader cache (" + report + ")";
+    return true;
+}
+
+bool BackupSavesAndLogsToUsb(const std::string& local_state_dir, const std::string& data_dir,
+                             const std::string& usb_root, std::string* detail) {
+    if (usb_root.empty()) {
+        if (detail) *detail = "no USB / dump folder selected";
+        return false;
+    }
+    const std::string backup_root = bbx::hostfs::JoinPath(usb_root, "bbxbox_backups");
+    (void)bbx::hostfs::MkDir(backup_root, true);
+
+    std::size_t save_files = 0;
+    std::size_t failed_files = 0;
+    if (!data_dir.empty()) {
+        const std::string save_src = bbx::hostfs::JoinPath(data_dir, "savedata");
+        if (bbx::hostfs::Exists(save_src)) {
+            const std::string save_dst = bbx::hostfs::JoinPath(backup_root, "savedata");
+            (void)CopyTreeRecursive(save_src, save_dst, save_files, failed_files);
+        }
+    }
+
+    std::size_t aux_files = 0;
+    if (!local_state_dir.empty()) {
+        const std::string logs_dst = bbx::hostfs::JoinPath(backup_root, "logs");
+        (void)bbx::hostfs::MkDir(logs_dst, true);
+        for (const char* name : {"loader.log", "errors.log", "crash.log", "memory-selftest.txt"}) {
+            const std::string src = bbx::hostfs::JoinPath(local_state_dir, name);
+            if (bbx::hostfs::Exists(src)) {
+                if (CopyFileAtomic(src, bbx::hostfs::JoinPath(logs_dst, name))) {
+                    ++aux_files;
+                } else {
+                    ++failed_files;
+                }
+            }
+        }
+        const std::string ini_src = bbx::hostfs::JoinPath(local_state_dir, "bbxbox.ini");
+        if (bbx::hostfs::Exists(ini_src)) {
+            if (CopyFileAtomic(ini_src, bbx::hostfs::JoinPath(backup_root, "bbxbox.ini"))) {
+                ++aux_files;
+            }
+        }
+    }
+
+    if (save_files == 0 && aux_files == 0) {
+        if (detail) *detail = "no save data or logs found to back up";
+        return false;
+    }
+    char buf[192] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "backed up %zu save file(s) and %zu log/config file(s) to bbxbox_backups",
+                  save_files, aux_files);
+    if (detail) *detail = buf;
+    return failed_files == 0;
+}
+
+bool RestoreSavesFromUsb(const std::string& usb_root, const std::string& data_dir,
+                         std::string* detail) {
+    if (usb_root.empty() || data_dir.empty()) {
+        if (detail) *detail = "missing USB or LocalState data folder";
+        return false;
+    }
+    const std::string save_src =
+        bbx::hostfs::JoinPath(bbx::hostfs::JoinPath(usb_root, "bbxbox_backups"), "savedata");
+    if (!bbx::hostfs::Exists(save_src)) {
+        if (detail) *detail = "no bbxbox_backups\\savedata folder found on USB";
+        return false;
+    }
+    const std::string save_dst = bbx::hostfs::JoinPath(data_dir, "savedata");
+    std::size_t copied = 0;
+    std::size_t failed = 0;
+    const bool ok = CopyTreeRecursive(save_src, save_dst, copied, failed);
+    if (copied == 0) {
+        if (detail) *detail = "backup savedata folder was empty";
+        return false;
+    }
+    char buf[160] = {};
+    std::snprintf(buf, sizeof(buf), "restored %zu save file(s) into LocalState\\data\\savedata",
+                  copied);
+    if (detail) *detail = buf;
+    return ok;
 }
 
 }  // namespace bbx::platform

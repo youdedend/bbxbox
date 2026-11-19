@@ -547,7 +547,7 @@ Status Replay::ExecuteStreamBlock(std::span<const std::uint8_t> block) {
     return Status::kOk;
 }
 
-Status Replay::DrawPresent(float red, float green, float blue) {
+Status Replay::DrawPresent(float red, float green, float blue, float sharpness) {
     if (!in_frame_) { return Status::kInvalidArgument; }
     ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kPresent);
     if (pso == nullptr) { return Status::kUnavailable; }
@@ -566,7 +566,10 @@ Status Replay::DrawPresent(float red, float green, float blue) {
     command_list_->ClearRenderTargetView(rtv, clear, 0, nullptr);
     command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
-    const float present_constants[8] = {red, green, blue, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f};
+    const float texel_x = frame_image_width_ > 0 ? (1.0f / static_cast<float>(frame_image_width_)) : 0.0f;
+    const float texel_y = frame_image_height_ > 0 ? (1.0f / static_cast<float>(frame_image_height_)) : 0.0f;
+    const float clamped_sharp = sharpness < 0.0f ? 0.0f : (sharpness > 1.0f ? 1.0f : sharpness);
+    const float present_constants[8] = {red, green, blue, 1.0f, texel_x, texel_y, clamped_sharp, 0.0f};
     command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kPresent));
     command_list_->SetPipelineState(pso);
     command_list_->SetGraphicsRoot32BitConstants(0, 8, present_constants, 0);

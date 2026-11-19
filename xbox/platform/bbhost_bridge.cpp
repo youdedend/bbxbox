@@ -26,9 +26,11 @@
 //     nothing in it waits for the GPU.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -91,13 +93,138 @@ namespace {
 // launcher and the game the same Gamepads vector, so the pad the launcher draws
 // its menus with and the pad the guest reads can never be two different
 // controllers. There is no SetPad on this target and no SDL handle to keep.
-std::uint64_t g_flips = 0;
+std::atomic<std::uint64_t> g_flips{0};
+std::atomic<std::uint64_t> g_game_frames{0};
+std::atomic<bool> g_input_suppressed{false};
+std::atomic<int> g_target_fps{30};
+std::atomic<bool> g_vsync_enabled{true};
+std::atomic<int> g_display_w{1920};
+std::atomic<int> g_display_h{1080};
+std::atomic<float> g_display_hz{60.0f};
+std::atomic<bool> g_quit_requested{false};
+std::atomic<std::uint64_t> g_last_present_ns{0};
+
+std::mutex g_perf_mu;
+std::chrono::steady_clock::time_point g_last_frame_tp{};
+bool g_has_frame_tp = false;
+float g_ema_frame_ms = 33.33f;
+
+void RecordFrameSample() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_perf_mu);
+    if (g_has_frame_tp) {
+        const float dt_ms = std::chrono::duration<float, std::milli>(now - g_last_frame_tp).count();
+        if (dt_ms > 0.25f && dt_ms < 2000.0f) {
+            g_ema_frame_ms = g_ema_frame_ms * 0.85f + dt_ms * 0.15f;
+        }
+    }
+    g_last_frame_tp = now;
+    g_has_frame_tp = true;
+}
+
+std::mutex g_text_entry_mu;
+bool g_text_entry_open = false;
+int g_text_entry_state = 0;  // 0 editing, 1 accepted, 2 cancelled
+bbx::bridge::TextEntryPrompt g_text_entry_prompt;
+std::string g_text_entry_result;
+
+std::mutex g_toast_mu;
+std::string g_toast_text;
+std::chrono::steady_clock::time_point g_toast_until{};
+
+void SetToastMessage(const char* text, float seconds) {
+    if (text == nullptr || text[0] == '\0' || seconds <= 0.0f) return;
+    const float clamped = seconds > 15.0f ? 15.0f : seconds;
+    std::lock_guard<std::mutex> lock(g_toast_mu);
+    g_toast_text = text;
+    g_toast_until = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(static_cast<long long>(clamped * 1000.0f));
+}
+
+void ApplyWinrtRumble(std::uint8_t small_mag, std::uint8_t large_mag) {
+    try {
+        const auto pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads();
+        if (pads.Size() == 0) return;
+        const winrt::Windows::Gaming::Input::Gamepad pad = pads.GetAt(0);
+        if (!pad) return;
+        winrt::Windows::Gaming::Input::GamepadVibration vib{};
+        vib.LeftMotor = static_cast<double>(large_mag) / 255.0;
+        vib.RightMotor = static_cast<double>(small_mag) / 255.0;
+        vib.LeftTrigger = 0.0;
+        vib.RightTrigger = 0.0;
+        pad.Vibration(vib);
+    } catch (...) {
+    }
+}
 
 }  // namespace
 
 namespace bbx::bridge {
 
-std::uint64_t Flips() { return g_flips; }
+std::uint64_t Flips() { return g_flips.load(std::memory_order_relaxed); }
+
+void SetGuestInputSuppressed(bool suppressed) {
+    g_input_suppressed.store(suppressed, std::memory_order_relaxed);
+    if (suppressed) ApplyWinrtRumble(0, 0);
+}
+
+void StopPadRumble() { ApplyWinrtRumble(0, 0); }
+
+TextEntryPrompt PollTextEntryPrompt() {
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    if (!g_text_entry_open || g_text_entry_state != 0) return TextEntryPrompt{};
+    return g_text_entry_prompt;
+}
+
+void CompleteTextEntry(const std::string& utf8_text, bool accepted) {
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    if (!g_text_entry_open) return;
+    g_text_entry_result = utf8_text;
+    g_text_entry_state = accepted ? 1 : 2;
+    g_text_entry_prompt.active = false;
+}
+
+void SetTargetFps(int fps) {
+    g_target_fps.store(fps >= 60 ? 60 : 30, std::memory_order_relaxed);
+}
+
+int TargetFps() { return g_target_fps.load(std::memory_order_relaxed); }
+
+void SetVsyncEnabled(bool on) { g_vsync_enabled.store(on, std::memory_order_relaxed); }
+
+bool VsyncEnabled() { return g_vsync_enabled.load(std::memory_order_relaxed); }
+
+void SetDisplayMetrics(int width, int height, float refresh_hz) {
+    if (width > 0) g_display_w.store(width, std::memory_order_relaxed);
+    if (height > 0) g_display_h.store(height, std::memory_order_relaxed);
+    if (refresh_hz >= 24.0f && refresh_hz <= 240.0f) {
+        g_display_hz.store(refresh_hz, std::memory_order_relaxed);
+    }
+}
+
+bool QuitRequested() { return g_quit_requested.load(std::memory_order_relaxed); }
+
+PerfSnapshot SnapshotPerf() {
+    PerfSnapshot snap;
+    snap.flips = g_flips.load(std::memory_order_relaxed);
+    snap.game_frames = g_game_frames.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_perf_mu);
+    if (g_has_frame_tp && g_ema_frame_ms > 0.1f) {
+        snap.frame_ms = g_ema_frame_ms;
+        snap.fps = 1000.0f / g_ema_frame_ms;
+    }
+    return snap;
+}
+
+std::string ActiveToastMessage() {
+    std::lock_guard<std::mutex> lock(g_toast_mu);
+    if (g_toast_text.empty()) return {};
+    if (std::chrono::steady_clock::now() >= g_toast_until) {
+        g_toast_text.clear();
+        return {};
+    }
+    return g_toast_text;
+}
 
 }  // namespace bbx::bridge
 
@@ -107,13 +234,18 @@ std::uint64_t Flips() { return g_flips; }
 // button at the bottom of the diamond, which is Windows.Gaming.Input's `A` on an
 // Xbox pad, so A goes to Cross.
 namespace {
-constexpr std::uint32_t kShare = 0x1, kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10,
+constexpr std::uint32_t kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10,
                         kRight = 0x20, kDown = 0x40, kLeft = 0x80, kL2 = 0x100, kR2 = 0x200,
                         kL1 = 0x400, kR1 = 0x800, kTriangle = 0x1000, kCircle = 0x2000,
-                        kCross = 0x4000, kSquare = 0x8000;
-// kTouchPad (0x100000) has no source here: a GamepadReading carries buttons,
-// sticks and triggers, and no touchpad surface, so the touch bit is never set and
-// the constant is left out rather than defined and unused.
+                        kCross = 0x4000, kSquare = 0x8000, kTouchPad = 0x100000;
+// DS4 touchpad coordinate space (1920x942): Bloodborne opens Gestures when
+// clicking the left half (x = 480) and Personal Effects on the right half
+// (x = 1440). On an Xbox controller:
+//   * View alone           -> TouchPad Right (Personal Effects)
+//   * View + D-pad Left    -> TouchPad Left  (Gestures, suppressing D-pad Left)
+constexpr std::uint16_t kPadTouchLeftX = 480;
+constexpr std::uint16_t kPadTouchRightX = 1440;
+constexpr std::uint16_t kPadTouchMidY = 471;
 
 // 0..255 with 127 at rest, from the pad's -1.0..1.0. Matches upstream's
 // axis_to_u8 so 0.0 lands on kStickRest (127) and not 128.
@@ -141,41 +273,61 @@ PadState host_pad_state() {
         if (pads.Size() == 0) return s;
         const winrt::Windows::Gaming::Input::Gamepad pad = pads.GetAt(0);
         if (!pad) return s;
-        const winrt::Windows::Gaming::Input::GamepadReading reading = pad.GetCurrentReading();
-        const auto buttons = reading.Buttons;
-        const auto held = [buttons](winrt::Windows::Gaming::Input::GamepadButtons flag) {
-            return (buttons & flag) == flag;
-        };
-        using winrt::Windows::Gaming::Input::GamepadButtons;
         s.connected = true;
-        const auto bit = [&s](bool down, std::uint32_t value) {
-            if (down) s.buttons |= value;
-        };
-        bit(held(GamepadButtons::A), kCross);
-        bit(held(GamepadButtons::B), kCircle);
-        bit(held(GamepadButtons::X), kSquare);
-        bit(held(GamepadButtons::Y), kTriangle);
-        bit(held(GamepadButtons::LeftShoulder), kL1);
-        bit(held(GamepadButtons::RightShoulder), kR1);
-        bit(held(GamepadButtons::View), kShare);
-        bit(held(GamepadButtons::Menu), kOptions);
-        bit(held(GamepadButtons::LeftThumbstick), kL3);
-        bit(held(GamepadButtons::RightThumbstick), kR3);
-        bit(held(GamepadButtons::DPadUp), kUp);
-        bit(held(GamepadButtons::DPadDown), kDown);
-        bit(held(GamepadButtons::DPadLeft), kLeft);
-        bit(held(GamepadButtons::DPadRight), kRight);
 
-        // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
-        // 0 for up and 255 for down; negate both Y axes to match PS4 convention.
-        s.lx = StickFromFloat(reading.LeftThumbstickX);
-        s.ly = StickFromFloat(-reading.LeftThumbstickY);
-        s.rx = StickFromFloat(reading.RightThumbstickX);
-        s.ry = StickFromFloat(-reading.RightThumbstickY);
-        s.l2 = TriggerFromFloat(reading.LeftTrigger);
-        s.r2 = TriggerFromFloat(reading.RightTrigger);
-        if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
-        if (s.r2 > 62) s.buttons |= kR2;
+        // While the in-game L3+R3 Quick Menu or Virtual Keyboard IME owns the
+        // controller, report a connected idle pad so overlay navigation never
+        // leaks into Bloodborne (matches PS4 system keyboard behavior).
+        const bool suppressed = g_input_suppressed.load(std::memory_order_relaxed) ||
+                                host_text_entry_open();
+        if (!suppressed) {
+            const winrt::Windows::Gaming::Input::GamepadReading reading = pad.GetCurrentReading();
+            const auto buttons = reading.Buttons;
+            const auto held = [buttons](winrt::Windows::Gaming::Input::GamepadButtons flag) {
+                return (buttons & flag) == flag;
+            };
+            using winrt::Windows::Gaming::Input::GamepadButtons;
+            const auto bit = [&s](bool down, std::uint32_t value) {
+                if (down) s.buttons |= value;
+            };
+            const bool view_down = held(GamepadButtons::View);
+            const bool dpad_left = held(GamepadButtons::DPadLeft);
+            const bool gestures_chord = view_down && dpad_left;
+
+            bit(held(GamepadButtons::A), kCross);
+            bit(held(GamepadButtons::B), kCircle);
+            bit(held(GamepadButtons::X), kSquare);
+            bit(held(GamepadButtons::Y), kTriangle);
+            bit(held(GamepadButtons::LeftShoulder), kL1);
+            bit(held(GamepadButtons::RightShoulder), kR1);
+            bit(held(GamepadButtons::Menu), kOptions);
+            bit(held(GamepadButtons::LeftThumbstick), kL3);
+            bit(held(GamepadButtons::RightThumbstick), kR3);
+            bit(held(GamepadButtons::DPadUp), kUp);
+            bit(held(GamepadButtons::DPadDown), kDown);
+            bit(dpad_left && !gestures_chord, kLeft);
+            bit(held(GamepadButtons::DPadRight), kRight);
+
+            if (view_down) {
+                s.buttons |= kTouchPad;
+                s.touch_count = 1;
+                s.touch[0].x = gestures_chord ? kPadTouchLeftX : kPadTouchRightX;
+                s.touch[0].y = kPadTouchMidY;
+                s.touch[0].id = gestures_chord ? 201 : 202;
+                s.touch[0].down = true;
+            }
+
+            // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
+            // 0 for up and 255 for down; negate both Y axes to match PS4 convention.
+            s.lx = StickFromFloat(reading.LeftThumbstickX);
+            s.ly = StickFromFloat(-reading.LeftThumbstickY);
+            s.rx = StickFromFloat(reading.RightThumbstickX);
+            s.ry = StickFromFloat(-reading.RightThumbstickY);
+            s.l2 = TriggerFromFloat(reading.LeftTrigger);
+            s.r2 = TriggerFromFloat(reading.RightTrigger);
+            if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
+            if (s.r2 > 62) s.buttons |= kR2;
+        }
 
         // A GamepadReading carries no timestamp of its own; the pad reports
         // microseconds and the guest only compares successive reads, so the
@@ -231,8 +383,14 @@ bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_
 void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h,
                   const PresentFlip& flip) {
     (void)buffer_index; (void)flip;
-    ++g_flips;
-    if ((g_flips % 60) == 1) {
+    const std::uint64_t flips = g_flips.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    g_last_present_ns.store(static_cast<std::uint64_t>(now_ns > 0 ? now_ns : 0),
+                            std::memory_order_relaxed);
+    RecordFrameSample();
+    if ((flips % 60) == 1) {
         bbx::platform::LogCrumb("gpu:flip");
     }
     if (display_va == 0 || display_w == 0 || display_h == 0) { return; }
@@ -314,16 +472,19 @@ bool host_window_active() { return true; }
 
 // engine/frame_rate.h
 void frame_rate_atk_params_loaded() {  }
-bool frame_rate_converted() { return {}; }
-int frame_rate_game_fps() { return {}; }
-void frame_rate_install(ElfImage* image) {  }
-void frame_rate_install_late(ElfImage* image) {  }
-float frame_rate_limit_fps() { return {}; }
+bool frame_rate_converted() { return g_target_fps.load(std::memory_order_relaxed) > 30; }
+int frame_rate_game_fps() { return g_target_fps.load(std::memory_order_relaxed); }
+void frame_rate_install(ElfImage* image) { (void)image; }
+void frame_rate_install_late(ElfImage* image) { (void)image; }
+float frame_rate_limit_fps() { return static_cast<float>(g_target_fps.load(std::memory_order_relaxed)); }
 std::string frame_rate_limiter_window() { return {}; }
-bool frame_rate_live(int fps) { return {}; }
-bool frame_rate_request(int fps) { return {}; }
+bool frame_rate_live(int fps) { return fps == 30 || fps == 60; }
+bool frame_rate_request(int fps) {
+    bbx::bridge::SetTargetFps(fps);
+    return true;
+}
 void frame_rate_retime() {  }
-void frame_rate_set_time_scale(float scale) {  }
+void frame_rate_set_time_scale(float scale) { (void)scale; }
 
 // engine/graphics_patch.h
 bool engine_prologue_hook_variadic(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n, void* host, std::uint64_t id) { return {}; }
@@ -389,14 +550,33 @@ void render_scale_size(int quality, std::uint32_t output_w, std::uint32_t output
 // bridge landed: host_gpu_read_guest, host_gpu_mem_write_serial/_ordered and
 // host_gpu_dispatch_user_reads.
 void host_gpu_compare_cs_user_data(const GxStageRecords& st, const std::uint32_t* reg, std::uint32_t read_mask, CsUserCompare& out) {  }
-std::uint64_t host_gpu_completed_submits() { return {}; }
-std::uint64_t host_gpu_completed_submits_seen() { return {}; }
-std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at, std::uint32_t piece, std::size_t n) { return {}; }
+std::uint64_t host_gpu_completed_submits() { return host_gpu_submissions_completed(); }
+std::uint64_t host_gpu_completed_submits_seen() { return host_gpu_submissions_completed(); }
+std::size_t host_gpu_copy_backs_captured(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes, const std::uint32_t* at, std::uint32_t piece, std::size_t n) {
+    (void)at; (void)piece;
+    return host_gpu_copy_backs(dst, src, bytes, n);
+}
 bool host_gpu_copy_image_region(const GpuImageCopy& c) { return {}; }
-void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {  }
+void host_gpu_depth_clear(std::uint64_t base, std::uint32_t word, std::uint32_t stencil) {
+    (void)stencil;
+    (void)host_gpu_clear_target(base, word, 4);
+}
 bool host_gpu_device_lost() { return {}; }
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value) {  }
-bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) { return {}; }
+bool host_gpu_fill(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear, std::uint32_t stencil_clear) {
+    (void)depth_clear; (void)stencil_clear;
+    std::uint32_t packed = 0;
+    if (rgba != nullptr) {
+        const auto to_u8 = [](float v) -> std::uint32_t {
+            const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            return static_cast<std::uint32_t>(c * 255.0f + 0.5f) & 0xFFu;
+        };
+        packed = to_u8(rgba[0]) | (to_u8(rgba[1]) << 8) | (to_u8(rgba[2]) << 16) | (to_u8(rgba[3]) << 24);
+    }
+    const bool cleared = host_gpu_clear_target(va, packed, bytes);
+    const bool filled = host_gpu_mem_fill(va, packed, bytes);
+    return cleared || filled;
+}
 std::string host_gpu_fill_stats() { return {}; }
 void host_gpu_hang_report() {  }
 void host_gpu_lists_arrival(std::uint64_t id) {  }
@@ -421,13 +601,22 @@ void host_gpu_stall_test(unsigned ms) {  }
 std::uint64_t host_gpu_surface_replacements() { return {}; }
 std::uint64_t host_gpu_texture_hash_us() { return {}; }
 std::uint64_t host_gpu_texture_hashes() { return {}; }
-void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {  }
+void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
+    (void)after_submitted; (void)gen;
+    if (base != 0 && bytes != 0) host_gpu_forget_region(base, base + bytes);
+}
 void host_gpu_texture_time_us(std::uint64_t out[5]) {  }
 std::uint64_t host_gpu_texture_uploads() { return {}; }
-bool host_gpu_upload_region(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) { return {}; }
+bool host_gpu_upload_region(std::uint64_t base, const std::uint32_t* tsharp, std::uint32_t mip, std::uint32_t layer, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) {
+    (void)tsharp; (void)layer;
+    if (mip == 0 && x == 0 && y == 0 && w != 0 && h != 0 && base != 0 && data != nullptr && bytes != 0 && row_bytes != 0) {
+        return host_gpu_mem_write(base, data, bytes);
+    }
+    return false;
+}
 std::uint32_t host_gpu_vendor_id() { return {}; }
 const char* host_gpu_vs_why_name(int why) { return {}; }
-void host_gpu_wait_work_submitted(std::uint64_t need) {  }
+void host_gpu_wait_work_submitted(std::uint64_t need) { (void)host_gpu_wait_completed(need, 1000); }
 void host_gpu_watch_display(std::uint64_t display_va) {  }
 const char* host_present_step(double& seconds) { return {}; }
 
@@ -454,30 +643,38 @@ bool host_frame_rate_control(int* cap_index, bool* custom, int* custom_fps, floa
 bool host_frame_rate_fit(int* cap_index, bool* custom, int* custom_fps) { return {}; }
 int host_frame_rate_warning_count(int cap_index, bool custom, int custom_fps) { return {}; }
 void host_opt_choose_effect_timing(int index) {  }
-int host_opt_default_frame_cap() { return {}; }
-bool host_opt_default_get(const char* key) { return {}; }
-int host_opt_default_index(const char* key) { return {}; }
+int host_opt_default_frame_cap() { return 30; }
+bool host_opt_default_get(const char* key) { (void)key; return {}; }
+int host_opt_default_index(const char* key) { (void)key; return {}; }
 int host_opt_default_resolution_index() { return {}; }
-int host_opt_frame_cap() { return {}; }
+int host_opt_frame_cap() { return g_target_fps.load(std::memory_order_relaxed); }
 bool host_opt_frame_cap_custom() { return {}; }
 int host_opt_frame_cap_custom_fps() { return {}; }
-int host_opt_frame_rate() { return {}; }
-bool host_opt_get(const char* key) { return {}; }
-int host_opt_index(const char* key) { return {}; }
-void host_opt_menu_colour(float* hue_degrees, float* vibrance) {  }
+int host_opt_frame_rate() { return g_target_fps.load(std::memory_order_relaxed); }
+bool host_opt_get(const char* key) { (void)key; return {}; }
+int host_opt_index(const char* key) { (void)key; return {}; }
+void host_opt_menu_colour(float* hue_degrees, float* vibrance) { (void)hue_degrees; (void)vibrance; }
 float host_opt_menu_text_scale() { return {}; }
 int host_opt_motion_rebuilt_bits() { return {}; }
 bool host_opt_motion_wanted() { return {}; }
-bool host_opt_output_size(int* w, int* h) { return {}; }
+bool host_opt_output_size(int* w, int* h) {
+    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    return true;
+}
 void host_opt_republish() {  }
-bool host_opt_resolution(int* w, int* h) { return {}; }
+bool host_opt_resolution(int* w, int* h) {
+    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    return true;
+}
 int host_opt_resolution_index() { return {}; }
-const char* const* host_opt_resolution_labels(int* n) { return {}; }
+const char* const* host_opt_resolution_labels(int* n) { (void)n; return {}; }
 const char* host_opt_resolution_note() { return {}; }
-bool host_opt_saved(const char* key) { return {}; }
+bool host_opt_saved(const char* key) { (void)key; return {}; }
 std::uint64_t host_opt_serial() { return {}; }
-void host_opt_set(const char* key, bool on) {  }
-void host_opt_set_frame_cap(int fps) {  }
+void host_opt_set(const char* key, bool on) { (void)key; (void)on; }
+void host_opt_set_frame_cap(int fps) { bbx::bridge::SetTargetFps(fps); }
 void host_opt_set_frame_cap_custom(bool on, int fps) {  }
 void host_opt_set_index(const char* key, int index) {  }
 void host_opt_set_resolution_index(int i) {  }
@@ -598,47 +795,108 @@ bool velo_cloth_vs(const std::string& name) { return {}; }
 }  // namespace gpu
 
 // host/window.h
-float host_display_refresh_hz() { return {}; }
-void host_fps_frame_start() {  }
-InputDevice host_input_device() { return {}; }
-std::uint64_t host_input_serial() { return {}; }
+float host_display_refresh_hz() { return g_display_hz.load(std::memory_order_relaxed); }
+void host_fps_frame_start() { g_game_frames.fetch_add(1, std::memory_order_relaxed); }
+InputDevice host_input_device() { return InputDevice::Pad; }
+std::uint64_t host_input_serial() { return 1; }
 bool host_key_strong() { return {}; }
-void host_message_show(const char* text, float seconds) {  }
-void host_mouse_describe(char* out, std::size_t n) {  }
-bool host_mouse_position(float& x, float& y) { return {}; }
-void host_mouse_set_relative(bool on) {  }
-void host_mouse_set_visible(bool visible) {  }
-bool host_mouse_stage_position(float& x, float& y) { return {}; }
+void host_message_show(const char* text, float seconds) { SetToastMessage(text, seconds); }
+void host_mouse_describe(char* out, std::size_t n) { (void)out; (void)n; }
+bool host_mouse_position(float& x, float& y) { (void)x; (void)y; return {}; }
+void host_mouse_set_relative(bool on) { (void)on; }
+void host_mouse_set_visible(bool visible) { (void)visible; }
+bool host_mouse_stage_position(float& x, float& y) { (void)x; (void)y; return {}; }
 MouseState host_mouse_state() { return {}; }
-void host_pad_rumble(std::uint8_t small, std::uint8_t large) {  }
-bool host_plugin_input(const char* reader, PluginInput& out) { return {}; }
-void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {  }
-void host_plugin_pad(PluginPad& out) {  }
+void host_pad_rumble(std::uint8_t small_mag, std::uint8_t large_mag) {
+    ApplyWinrtRumble(small_mag, large_mag);
+}
+bool host_plugin_input(const char* reader, PluginInput& out) { (void)reader; (void)out; return {}; }
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {
+    (void)owner; (void)scancodes; (void)n; (void)buttons; (void)wheel; (void)motion;
+}
+void host_plugin_pad(PluginPad& out) { (void)out; }
 void host_plugin_pad_frame() {  }
-void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {  }
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {
+    (void)owner; (void)buttons; (void)axes;
+}
 std::uint32_t host_plugin_pad_taken_axes() { return {}; }
 std::uint32_t host_plugin_pad_taken_buttons() { return {}; }
-void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {  }
-void host_plugin_take_drop(const char* owner) {  }
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {
+    (void)buttons; (void)lx; (void)ly; (void)rx; (void)ry;
+}
+void host_plugin_take_drop(const char* owner) { (void)owner; }
 std::uint32_t host_plugin_taken_buttons() { return {}; }
 bool host_plugin_taken_wheel() { return {}; }
-std::uint64_t host_present_last_ns(std::uint64_t* serial) { return {}; }
-bool host_test_keys_play(const char* path) { return {}; }
-void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label, TextCharset charset, bool select_initial) {  }
-void host_text_entry_end() {  }
-int host_text_entry_poll(std::string& text_utf8) { return {}; }
-void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {  }
-bool host_window_desktop_size(int* w, int* h) { return {}; }
-void host_window_error_box(const char* title, const char* text) {  }
-void host_window_on_pixels(void (*fn)(int, int)) {  }
-bool host_window_pixels(int* w, int* h) { return {}; }
+std::uint64_t host_present_last_ns(std::uint64_t* serial) {
+    if (serial != nullptr) *serial = g_flips.load(std::memory_order_relaxed);
+    return g_last_present_ns.load(std::memory_order_relaxed);
+}
+bool host_test_keys_play(const char* path) { (void)path; return {}; }
+void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label,
+                           TextCharset charset, bool select_initial) {
+    (void)charset;
+    (void)select_initial;
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    g_text_entry_open = true;
+    g_text_entry_state = 0;
+    g_text_entry_result = initial_utf8 != nullptr ? std::string(initial_utf8) : std::string();
+    g_text_entry_prompt.active = true;
+    g_text_entry_prompt.label =
+        (label != nullptr && label[0] != '\0') ? std::string(label) : std::string("Enter name");
+    g_text_entry_prompt.initial = g_text_entry_result;
+    g_text_entry_prompt.max_chars = max_chars == 0 ? 16u : max_chars;
+    g_text_entry_prompt.hidden = hidden;
+    ApplyWinrtRumble(0, 0);
+}
+void host_text_entry_end() {
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    g_text_entry_open = false;
+    g_text_entry_state = 0;
+    g_text_entry_prompt.active = false;
+}
+int host_text_entry_poll(std::string& text_utf8) {
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    if (!g_text_entry_open) return 2;
+    if (g_text_entry_state == 1) {
+        text_utf8 = g_text_entry_result;
+        return 1;
+    }
+    if (g_text_entry_state == 2) {
+        text_utf8.clear();
+        return 2;
+    }
+    return 0;
+}
+void host_text_show(const char* text, float seconds, float x, float y, float scale, std::uint32_t align) {
+    (void)x; (void)y; (void)scale; (void)align;
+    SetToastMessage(text, seconds);
+}
+bool host_window_desktop_size(int* w, int* h) {
+    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    return true;
+}
+void host_window_error_box(const char* title, const char* text) {
+    bbx::platform::LogMessage(bbx::platform::Level::kError, "%s: %s",
+                              title != nullptr ? title : "error",
+                              text != nullptr ? text : "");
+}
+void host_window_on_pixels(void (*fn)(int, int)) { (void)fn; }
+bool host_window_pixels(int* w, int* h) {
+    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    return true;
+}
 void host_window_recreate_swapchain() {  }
-float host_window_refresh_hz() { return {}; }
-void host_window_request_quit() {  }
-void host_window_set_mode(int mode, int width, int height) {  }
-void host_window_set_stay_borderless(bool on) {  }
-void host_window_set_vsync(bool on) {  }
-bool host_window_start(int width, int height, const char* title) { return {}; }
+float host_window_refresh_hz() { return g_display_hz.load(std::memory_order_relaxed); }
+void host_window_request_quit() { g_quit_requested.store(true, std::memory_order_relaxed); }
+void host_window_set_mode(int mode, int width, int height) { (void)mode; (void)width; (void)height; }
+void host_window_set_stay_borderless(bool on) { (void)on; }
+void host_window_set_vsync(bool on) { g_vsync_enabled.store(on, std::memory_order_relaxed); }
+bool host_window_start(int width, int height, const char* title) {
+    (void)width; (void)height; (void)title;
+    return true;
+}
 
 
 // The list pool's resting flag (`gxvk_lists_pool.cpp` is not compiled, and the GX
@@ -664,7 +922,6 @@ void hle_watch_arm(std::uint64_t lo, std::uint64_t hi) {  }
 void hle_bp_arm(std::uint64_t va) {  }
 bool host_gpu_list_committed(std::uint64_t id) { return {}; }
 bool host_gpu_writes_pending(std::uint64_t va, std::size_t bytes) { return {}; }
-bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t src_gen, std::uint64_t dst_gen, std::uint32_t cap_at, std::uint32_t cap_piece) { return {}; }
 bool host_gpu_texture_create_ahead(const std::uint32_t tsharp[8], std::uint64_t gen) { return {}; }
 bool plugin_panel_native_step(int row, int dir) { return {}; }
 bool plugin_panel_native_set(int row, int value) { return {}; }
@@ -708,7 +965,10 @@ bool plugin_panel_native_corner_wanted() { return {}; }
 const HostSettings& host_settings_ref() { static const HostSettings none{}; return none; }
 bool host_mouse_relative() { return {}; }
 bool host_plugin_taken_motion() { return {}; }
-bool host_text_entry_open() { return {}; }
+bool host_text_entry_open() {
+    std::lock_guard<std::mutex> lock(g_text_entry_mu);
+    return g_text_entry_open;
+}
 
 namespace gxvk_lists {
 std::string run_duty_report() { return {}; }

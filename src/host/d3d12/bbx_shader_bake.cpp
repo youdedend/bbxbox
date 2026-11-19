@@ -6,7 +6,41 @@
 #include <cstdio>
 #include <cstring>
 
+#include "host/d3d12/bbx_common.h"
+
 namespace bbx::d3d12 {
+
+namespace {
+
+constexpr char kCheckpointMagic[4] = {'B', 'B', 'X', 'C'};
+constexpr std::uint32_t kCheckpointVersion = 1u;
+constexpr std::size_t kCheckpointHeaderBytes = 24u;  // magic(4) + ver(4) + cache_len(4) + paths_len(4) + hash(8)
+
+void AppendU32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+    out.push_back(static_cast<std::uint8_t>(v & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xffu));
+}
+
+void AppendU64(std::vector<std::uint8_t>& out, std::uint64_t v) {
+    AppendU32(out, static_cast<std::uint32_t>(v & 0xffffffffu));
+    AppendU32(out, static_cast<std::uint32_t>(v >> 32));
+}
+
+std::uint32_t ReadU32(std::span<const std::uint8_t> data, std::size_t offset) {
+    return static_cast<std::uint32_t>(data[offset]) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 3]) << 24);
+}
+
+std::uint64_t ReadU64(std::span<const std::uint8_t> data, std::size_t offset) {
+    return static_cast<std::uint64_t>(ReadU32(data, offset)) |
+           (static_cast<std::uint64_t>(ReadU32(data, offset + 4)) << 32);
+}
+
+}  // namespace
 
 bool IsSignedDxbc(std::span<const std::uint8_t> object, std::string& why) {
     if (object.size() < 20) {
@@ -137,6 +171,84 @@ std::vector<EmbeddedContainerSpan> ScanEbootForContainers(std::span<const std::u
     return out;
 }
 
+std::uint32_t ChooseBakeWorkerCount(std::uint32_t hardware_threads,
+                                    std::uint32_t requested_max,
+                                    bool force_single_thread) noexcept {
+    if (force_single_thread) return 1u;
+    std::uint32_t cap = requested_max > 0 ? std::min<std::uint32_t>(requested_max, 4u) : 4u;
+    if (hardware_threads <= 1u) return 1u;
+    // Use half the logical cores (clamped to [2, cap]) so Xbox Series X|S (8
+    // threads) runs 4 DXC workers while keeping the UI thread and OS smooth.
+    std::uint32_t chosen = hardware_threads / 2u;
+    if (chosen < 2u) chosen = 2u;
+    if (chosen > cap) chosen = cap;
+    return chosen;
+}
+
+std::vector<std::uint8_t> SerializeBakeCheckpoint(
+    const CacheStamp& stamp,
+    const std::vector<CacheEntry>& entries,
+    const std::vector<std::uint8_t>& blobs,
+    std::string_view bindings_text) {
+    // Sort a copy of entries by key so ParseCache's sorted-index invariant holds.
+    std::vector<CacheEntry> sorted = entries;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const CacheEntry& a, const CacheEntry& b) { return a.key < b.key; });
+    const std::vector<std::uint8_t> cache_bytes = SerializeCache(stamp, sorted, blobs);
+
+    std::vector<std::uint8_t> payload(cache_bytes.size() + bindings_text.size());
+    if (!cache_bytes.empty()) {
+        std::memcpy(payload.data(), cache_bytes.data(), cache_bytes.size());
+    }
+    if (!bindings_text.empty()) {
+        std::memcpy(payload.data() + cache_bytes.size(), bindings_text.data(), bindings_text.size());
+    }
+    const std::uint64_t hash = bbx::Fnv1a64(std::span<const std::uint8_t>(payload));
+
+    std::vector<std::uint8_t> out;
+    out.reserve(kCheckpointHeaderBytes + payload.size());
+    for (char c : kCheckpointMagic) {
+        out.push_back(static_cast<std::uint8_t>(c));
+    }
+    AppendU32(out, kCheckpointVersion);
+    AppendU32(out, static_cast<std::uint32_t>(cache_bytes.size()));
+    AppendU32(out, static_cast<std::uint32_t>(bindings_text.size()));
+    AppendU64(out, hash);
+    out.resize(kCheckpointHeaderBytes + payload.size());
+    if (!payload.empty()) {
+        std::memcpy(out.data() + kCheckpointHeaderBytes, payload.data(), payload.size());
+    }
+    return out;
+}
+
+bool ParseBakeCheckpoint(std::span<const std::uint8_t> bytes,
+                         const CacheStamp& expected_stamp,
+                         BakeCheckpoint* out) {
+    if (out == nullptr || bytes.size() < kCheckpointHeaderBytes) return false;
+    if (std::memcmp(bytes.data(), kCheckpointMagic, sizeof(kCheckpointMagic)) != 0) return false;
+    if (ReadU32(bytes, 4u) != kCheckpointVersion) return false;
+    const std::size_t cache_len = ReadU32(bytes, 8u);
+    const std::size_t paths_len = ReadU32(bytes, 12u);
+    const std::uint64_t expected_hash = ReadU64(bytes, 16u);
+    if (cache_len == 0 || kCheckpointHeaderBytes + cache_len + paths_len != bytes.size()) {
+        return false;
+    }
+    const std::span<const std::uint8_t> payload = bytes.subspan(kCheckpointHeaderBytes);
+    if (bbx::Fnv1a64(payload) != expected_hash) return false;
+
+    const std::span<const std::uint8_t> cache_span = payload.subspan(0, cache_len);
+    ParseResult parsed = ParseCache(cache_span, expected_stamp);
+    if (parsed.status != CacheStatus::kOk) return false;
+
+    BakeCheckpoint cp;
+    cp.entries = std::move(parsed.entries);
+    cp.blobs = std::move(parsed.blobs);
+    const std::span<const std::uint8_t> paths_span = payload.subspan(cache_len, paths_len);
+    cp.bindings_text.assign(reinterpret_cast<const char*>(paths_span.data()), paths_span.size());
+    *out = std::move(cp);
+    return true;
+}
+
 const char* BakePhaseName(BakePhase phase) noexcept {
     switch (phase) {
         case BakePhase::kIdle: return "IDLE";
@@ -155,10 +267,17 @@ std::string FormatBakeHudLine(const BakeProgressSnapshot& snap) {
     if (snap.total > 0) {
         const std::uint32_t pct =
             snap.done >= snap.total ? 100u : static_cast<std::uint32_t>((static_cast<std::uint64_t>(snap.done) * 100ull) / snap.total);
-        std::snprintf(buf, sizeof(buf), "%s: %u / %u (%u%%)  OK %u  SKIP %u  [%us]",
-                      BakePhaseName(snap.phase), snap.done, snap.total, pct,
-                      snap.signed_count, snap.refused_count + snap.quarantined_count,
-                      snap.elapsed_seconds);
+        if (snap.workers > 1u && snap.phase == BakePhase::kCompiling) {
+            std::snprintf(buf, sizeof(buf), "%s (%uT): %u / %u (%u%%)  OK %u  SKIP %u  [%us]",
+                          BakePhaseName(snap.phase), snap.workers, snap.done, snap.total, pct,
+                          snap.signed_count, snap.refused_count + snap.quarantined_count,
+                          snap.elapsed_seconds);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s: %u / %u (%u%%)  OK %u  SKIP %u  [%us]",
+                          BakePhaseName(snap.phase), snap.done, snap.total, pct,
+                          snap.signed_count, snap.refused_count + snap.quarantined_count,
+                          snap.elapsed_seconds);
+        }
     } else {
         std::snprintf(buf, sizeof(buf), "%s...  [%us]",
                       BakePhaseName(snap.phase), snap.elapsed_seconds);

@@ -13,6 +13,8 @@
 #include <string_view>
 #include <vector>
 
+#include "host/d3d12/bbx_cache.h"
+
 namespace bbx::d3d12 {
 
 // DXIL container feature flags (SFI0 chunk, first dword).
@@ -67,6 +69,34 @@ struct EmbeddedContainerSpan {
 [[nodiscard]] std::vector<EmbeddedContainerSpan> ScanEbootForContainers(
     std::span<const std::uint8_t> elf_bytes);
 
+// Chooses a safe worker thread count for on-console DXC baking: caps at 4
+// threads (half of Xbox Series X|S's 8 Zen 2 cores) to keep peak DXC memory
+// well below the 5120 MiB UWP budget while accelerating first-boot baking ~3-4x.
+// Falls back to 1 when `force_single_thread` is true (e.g. right after a crash
+// quarantine recovery so any poison shader is isolated deterministically).
+[[nodiscard]] std::uint32_t ChooseBakeWorkerCount(std::uint32_t hardware_threads,
+                                                  std::uint32_t requested_max,
+                                                  bool force_single_thread) noexcept;
+
+// Self-contained incremental checkpoint written periodically during baking so
+// cancelling or suspending on Xbox resumes from the last saved batch instead of
+// restarting at 0%.
+struct BakeCheckpoint {
+    std::vector<CacheEntry> entries;
+    std::vector<std::uint8_t> blobs;
+    std::string bindings_text;
+};
+
+[[nodiscard]] std::vector<std::uint8_t> SerializeBakeCheckpoint(
+    const CacheStamp& stamp,
+    const std::vector<CacheEntry>& entries,
+    const std::vector<std::uint8_t>& blobs,
+    std::string_view bindings_text);
+
+[[nodiscard]] bool ParseBakeCheckpoint(std::span<const std::uint8_t> bytes,
+                                       const CacheStamp& expected_stamp,
+                                       BakeCheckpoint* out);
+
 enum class BakePhase : std::uint8_t {
     kIdle = 0,
     kScanning,
@@ -86,6 +116,8 @@ struct BakeProgressSnapshot {
     std::uint32_t signed_count = 0;
     std::uint32_t refused_count = 0;
     std::uint32_t quarantined_count = 0;
+    std::uint32_t resumed_count = 0;
+    std::uint32_t workers = 1;
     std::uint32_t elapsed_seconds = 0;
     std::string current_name;
     std::string detail;

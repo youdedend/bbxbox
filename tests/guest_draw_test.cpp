@@ -400,3 +400,51 @@ TEST(GuestDraw_GraphicsPsoKeyTracksFixedStateAndIgnoresDynamicState) {
     CHECK(!(GraphicsPsoKey(11, 22, id_a) == GraphicsPsoKey(11, 23, id_a)));
 }
 
+TEST(GuestDraw_DecodeClearViewColorAndDepthStencil) {
+    // 1. Color RTV clear decoded from pitch/slice and sRGB number type.
+    Registers r = OneDraw();
+    r.Color(0, 0x4000'0000ull, 7680, 1080, /*format=*/10, /*number_type=*/6, /*swap=*/0);
+    ClearViewInput color_in{};
+    color_in.depth = false;
+    for (int i = 0; i < 5; ++i) color_in.color[i] = r.ctx[0x318 + i];
+    color_in.rgba[0] = 0.25f;
+    color_in.rgba[1] = 0.50f;
+    color_in.rgba[2] = 0.75f;
+    color_in.rgba[3] = 1.00f;
+    const DecodedClearView color_view = DecodeClearView(color_in);
+    CHECK(color_view.ok);
+    CHECK(!color_view.depth);
+    CHECK_EQ(color_view.base, 0x4000'0000ull);
+    CHECK_EQ(color_view.width, 1920u);
+    CHECK_EQ(color_view.height, 1080u);
+    CHECK(color_view.srgb);
+    CHECK_EQ(color_view.rgba[0], 0.25f);
+    CHECK_EQ(color_view.rgba[3], 1.00f);
+
+    // 2. Depth + stencil DSV clear with explicit extent and stencil-only flag.
+    ClearViewInput depth_in{};
+    depth_in.depth = true;
+    depth_in.extent = (1920u << 16) | 1080u;
+    depth_in.z_info = 3u;       // Z_32
+    depth_in.stencil_info = 1u; // stencil plane present -> D32_FLOAT_S8X24_UINT
+    depth_in.z_read_base = static_cast<std::uint32_t>(0x6000'0000ull >> 8);
+    depth_in.flags = 2u;        // stencil only
+    depth_in.depth_value = 0.0f;
+    depth_in.stencil = 0x7Fu;
+    const DecodedClearView depth_view = DecodeClearView(depth_in);
+    CHECK(depth_view.ok);
+    CHECK(depth_view.depth);
+    CHECK_EQ(depth_view.base, 0x6000'0000ull);
+    CHECK_EQ(depth_view.format, static_cast<std::uint32_t>(DxgiFormat::kD32FloatS8X24Uint));
+    CHECK_EQ(depth_view.width, 1920u);
+    CHECK_EQ(depth_view.height, 1080u);
+    CHECK(!depth_view.clear_depth);
+    CHECK(depth_view.clear_stencil);
+    CHECK_EQ(depth_view.stencil_value, 0x7Fu);
+
+    // 3. Zero base address is rejected cleanly.
+    ClearViewInput bad_in = color_in;
+    bad_in.color[0] = 0;
+    CHECK(!DecodeClearView(bad_in).ok);
+}
+

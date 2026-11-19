@@ -59,8 +59,6 @@ bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return f
 
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}
 
-bool host_gpu_memory_glance(GpuMemoryGlance&) { return false; }
-
 bool host_gpu_memory_census_refresh() { return false; }
 
 void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
@@ -79,25 +77,6 @@ void host_gpu_home_made(std::uint64_t, std::uint64_t, std::uint32_t, std::uint8_
 void host_gpu_home_end(std::uint64_t, int) {}
 
 void host_gpu_home_covered(std::uint64_t, std::uint64_t, int) {}
-
-bool host_gpu_copy_guest(std::uint64_t, std::uint64_t, std::size_t, std::uint64_t, std::uint64_t) { return false; }
-
-bool host_gpu_copy_back(std::uint64_t, std::uint64_t, std::size_t) { return false; }
-
-std::size_t host_gpu_copy_backs(const std::uint64_t*, const std::uint64_t*, const std::uint64_t*, std::size_t) { return 0; }
-
-bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return false; }
-
-std::uint64_t host_gpu_guest_copy_targets() { return 0; }
-
-bool host_gpu_clear_target(std::uint64_t, std::uint32_t, std::size_t) { return false; }
-
-bool host_gpu_clear_view(const GpuClearView&, bool, GpuClearViewResult*) { return false; }
-
-bool host_gpu_clear_view_resolvable(const GpuClearView&, const char** why) {
-    *why = "no GPU";
-    return false;
-}
 
 void host_gpu_clear_view_check_begin(const GpuClearView&, const GpuClearViewResult&) {}
 
@@ -118,10 +97,6 @@ void host_gpu_unlock() {}
 bool host_gpu_blit_display(void*, std::uint64_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint32_t,
 
                            std::uint32_t, std::uint32_t, std::uint32_t, void*, bool*) { return false; }
-
-bool host_gpu_fsr_upscale(void*, void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-
-                          std::uint32_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t) { return false; }
 
 bool host_gpu_dump_display(std::uint64_t, const char*, bool) { return false; }
 
@@ -165,16 +140,6 @@ std::string host_gpu_image_heap_report() { return {}; }
 
 void host_gpu_resources_report() {}
 
-void host_gpu_texture_written(std::uint64_t, std::size_t) {}
-
-bool host_gpu_yebis_texture_update(std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-
-                                   std::uint32_t, const void*, std::uint32_t, std::uint64_t) {
-    return false;
-}
-
-void host_gpu_targets_rebuild(bool) {}
-
 void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
 
 void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}
@@ -189,10 +154,6 @@ std::string host_gpu_target_copy_report() { return {}; }
 
 std::string host_gpu_ps_wave_report() { return {}; }
 
-std::string host_gpu_memory_budget_report() { return {}; }
-
-std::string host_gpu_video_memory_report(bool) { return {}; }
-
 void host_gpu_log_video_memory(bool) {}
 
 void host_gpu_set_loading(bool) {}
@@ -206,8 +167,6 @@ void host_gpu_set_compile_session(bool) {}
 HostShaderCompileProgress host_gpu_compile_progress() { return {}; }
 
 void host_gpu_compile_cancel() {}
-
-std::string host_gpu_device_identity() { return {}; }
 
 std::string host_gpu_lock_holder() { return "none"; }
 

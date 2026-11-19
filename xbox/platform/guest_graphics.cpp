@@ -1557,17 +1557,329 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     return true;
 }
 
+bool GuestGraphics::ClearView(const bbx::d3d12::DecodedClearView& view, bool apply, bool* out_created) {
+    if (impl_ == nullptr || !Ready() || !view.ok) return false;
+    Impl& impl = *impl_;
+
+    if (!view.depth) {
+        const Impl::TargetKey key{view.base, view.format, view.width, view.height};
+        const bool existed = impl.rtv_pool.find(key) != impl.rtv_pool.end();
+        DrawTarget t{};
+        t.index = 0;
+        t.base = view.base;
+        t.width = view.width;
+        t.height = view.height;
+        t.format = view.format;
+        t.srgb = view.srgb;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{};
+        if (!impl.EnsureRenderTarget(t, &rtv_handle)) {
+            ++impl.counts.bad_target;
+            return false;
+        }
+        if (out_created != nullptr) *out_created = !existed;
+        if (!apply) return true;
+
+        Impl::CommandSlot cmd;
+        if (!impl.AcquireCommandList(&cmd)) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        cmd.list->ClearRenderTargetView(rtv_handle, view.rgba, 0, nullptr);
+        if (FAILED(cmd.list->Close())) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        ID3D12CommandList* lists[1] = {cmd.list.Get()};
+        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
+        cmd.fence = impl.device->Signal();
+        impl.last_draw_fence = cmd.fence;
+        impl.in_flight.push_back(std::move(cmd));
+        ++impl.counts.target_clears;
+        return true;
+    }
+
+    const Impl::TargetKey key{view.base, view.format, view.width, view.height};
+    const bool existed = impl.dsv_pool.find(key) != impl.dsv_pool.end();
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle{};
+    if (!impl.EnsureDepthTarget(view.base, view.format, view.width, view.height, &dsv_handle)) {
+        ++impl.counts.bad_target;
+        return false;
+    }
+    if (out_created != nullptr) *out_created = !existed;
+    if (!apply) return true;
+
+    D3D12_CLEAR_FLAGS flags = static_cast<D3D12_CLEAR_FLAGS>(0);
+    if (view.clear_depth) flags = static_cast<D3D12_CLEAR_FLAGS>(flags | D3D12_CLEAR_FLAG_DEPTH);
+    if (view.clear_stencil) flags = static_cast<D3D12_CLEAR_FLAGS>(flags | D3D12_CLEAR_FLAG_STENCIL);
+    if (flags == 0) return true;
+
+    Impl::CommandSlot cmd;
+    if (!impl.AcquireCommandList(&cmd)) {
+        ++impl.counts.record_failed;
+        return false;
+    }
+    cmd.list->ClearDepthStencilView(dsv_handle, flags, view.depth_value, view.stencil_value, 0, nullptr);
+    if (FAILED(cmd.list->Close())) {
+        ++impl.counts.record_failed;
+        return false;
+    }
+    ID3D12CommandList* lists[1] = {cmd.list.Get()};
+    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
+    cmd.fence = impl.device->Signal();
+    impl.last_draw_fence = cmd.fence;
+    impl.in_flight.push_back(std::move(cmd));
+    ++impl.counts.target_clears;
+    return true;
+}
+
+bool GuestGraphics::ClearTargetAt(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
+    if (impl_ == nullptr || !Ready() || va == 0 || bytes == 0) return false;
+    Impl& impl = *impl_;
+    const std::uint64_t hi = va + bytes;
+
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+    struct DsvClearItem {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+        std::uint32_t format = 0;
+    };
+    std::vector<DsvClearItem> dsvs;
+
+    for (auto& [key, entry] : impl.rtv_pool) {
+        const std::uint64_t entry_hi = key.va + (entry.bytes != 0 ? entry.bytes : 4ull);
+        if (key.va < hi && entry_hi > va) {
+            entry.last_used_seq = ++impl.target_use_seq;
+            rtvs.push_back(impl.RtvCpu(entry.slot));
+        }
+    }
+    for (auto& [key, entry] : impl.dsv_pool) {
+        const std::uint64_t entry_hi = key.va + (entry.bytes != 0 ? entry.bytes : 4ull);
+        if (key.va < hi && entry_hi > va) {
+            entry.last_used_seq = ++impl.target_use_seq;
+            dsvs.push_back({impl.DsvCpu(entry.slot), key.format});
+        }
+    }
+    if (rtvs.empty() && dsvs.empty()) return false;
+
+    Impl::CommandSlot cmd;
+    if (!impl.AcquireCommandList(&cmd)) {
+        ++impl.counts.record_failed;
+        return false;
+    }
+    const float rgba[4] = {
+        static_cast<float>(value & 0xFFu) / 255.0f,
+        static_cast<float>((value >> 8) & 0xFFu) / 255.0f,
+        static_cast<float>((value >> 16) & 0xFFu) / 255.0f,
+        static_cast<float>((value >> 24) & 0xFFu) / 255.0f,
+    };
+    for (const D3D12_CPU_DESCRIPTOR_HANDLE& rtv : rtvs) {
+        cmd.list->ClearRenderTargetView(rtv, rgba, 0, nullptr);
+    }
+    const float depth_val = (value == 0u) ? 0.0f : 1.0f;
+    const UINT8 stencil_val = static_cast<UINT8>(value & 0xFFu);
+    for (const DsvClearItem& dsv : dsvs) {
+        D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH;
+        if (dsv.format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD24UnormS8Uint) ||
+            dsv.format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD32FloatS8X24Uint)) {
+            flags = static_cast<D3D12_CLEAR_FLAGS>(flags | D3D12_CLEAR_FLAG_STENCIL);
+        }
+        cmd.list->ClearDepthStencilView(dsv.handle, flags, depth_val, stencil_val, 0, nullptr);
+    }
+    if (FAILED(cmd.list->Close())) {
+        ++impl.counts.record_failed;
+        return false;
+    }
+    ID3D12CommandList* lists[1] = {cmd.list.Get()};
+    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
+    cmd.fence = impl.device->Signal();
+    impl.last_draw_fence = cmd.fence;
+    impl.in_flight.push_back(std::move(cmd));
+    ++impl.counts.target_clears;
+    return true;
+}
+
+bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) {
+    if (impl_ == nullptr || !Ready() || dst_va == 0 || src_va == 0 || dst_va == src_va || bytes == 0) return false;
+    Impl& impl = *impl_;
+
+    // Check color RTV pool for a target rooted at `src_va`.
+    auto best_rtv = impl.rtv_pool.end();
+    for (auto it = impl.rtv_pool.begin(); it != impl.rtv_pool.end(); ++it) {
+        if (it->first.va == src_va) {
+            if (best_rtv == impl.rtv_pool.end() || it->second.last_used_seq > best_rtv->second.last_used_seq) {
+                best_rtv = it;
+            }
+        }
+    }
+    if (best_rtv != impl.rtv_pool.end()) {
+        const Impl::TargetKey src_key = best_rtv->first;
+        best_rtv->second.last_used_seq = ++impl.target_use_seq;
+        DrawTarget dst_t{};
+        dst_t.index = 0;
+        dst_t.base = dst_va;
+        dst_t.width = src_key.width;
+        dst_t.height = src_key.height;
+        dst_t.format = src_key.format;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst_handle{};
+        if (!impl.EnsureRenderTarget(dst_t, &dst_handle)) return false;
+
+        const Impl::TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
+        const auto src_it = impl.rtv_pool.find(src_key);
+        const auto dst_it = impl.rtv_pool.find(dst_key);
+        if (src_it == impl.rtv_pool.end() || dst_it == impl.rtv_pool.end() ||
+            src_it->second.resource == nullptr || dst_it->second.resource == nullptr) {
+            return false;
+        }
+
+        Impl::CommandSlot cmd;
+        if (!impl.AcquireCommandList(&cmd)) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        D3D12_RESOURCE_BARRIER pre[2] = {
+            TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE),
+            TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                              D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        cmd.list->ResourceBarrier(2, pre);
+        cmd.list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
+        D3D12_RESOURCE_BARRIER post[2] = {
+            TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET),
+            TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET),
+        };
+        cmd.list->ResourceBarrier(2, post);
+        if (FAILED(cmd.list->Close())) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        ID3D12CommandList* lists[1] = {cmd.list.Get()};
+        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
+        cmd.fence = impl.device->Signal();
+        impl.last_draw_fence = cmd.fence;
+        impl.in_flight.push_back(std::move(cmd));
+        ++impl.counts.target_copies;
+        return true;
+    }
+
+    // Check depth DSV pool for a target rooted at `src_va`.
+    auto best_dsv = impl.dsv_pool.end();
+    for (auto it = impl.dsv_pool.begin(); it != impl.dsv_pool.end(); ++it) {
+        if (it->first.va == src_va) {
+            if (best_dsv == impl.dsv_pool.end() || it->second.last_used_seq > best_dsv->second.last_used_seq) {
+                best_dsv = it;
+            }
+        }
+    }
+    if (best_dsv != impl.dsv_pool.end()) {
+        const Impl::TargetKey src_key = best_dsv->first;
+        best_dsv->second.last_used_seq = ++impl.target_use_seq;
+        D3D12_CPU_DESCRIPTOR_HANDLE dst_handle{};
+        if (!impl.EnsureDepthTarget(dst_va, src_key.format, src_key.width, src_key.height, &dst_handle)) return false;
+
+        const Impl::TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
+        const auto src_it = impl.dsv_pool.find(src_key);
+        const auto dst_it = impl.dsv_pool.find(dst_key);
+        if (src_it == impl.dsv_pool.end() || dst_it == impl.dsv_pool.end() ||
+            src_it->second.resource == nullptr || dst_it->second.resource == nullptr) {
+            return false;
+        }
+
+        Impl::CommandSlot cmd;
+        if (!impl.AcquireCommandList(&cmd)) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        D3D12_RESOURCE_BARRIER pre[2] = {
+            TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE),
+            TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                              D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        cmd.list->ResourceBarrier(2, pre);
+        cmd.list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
+        D3D12_RESOURCE_BARRIER post[2] = {
+            TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        };
+        cmd.list->ResourceBarrier(2, post);
+        if (FAILED(cmd.list->Close())) {
+            ++impl.counts.record_failed;
+            return false;
+        }
+        ID3D12CommandList* lists[1] = {cmd.list.Get()};
+        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
+        cmd.fence = impl.device->Signal();
+        impl.last_draw_fence = cmd.fence;
+        impl.in_flight.push_back(std::move(cmd));
+        ++impl.counts.target_copies;
+        return true;
+    }
+
+    return false;
+}
+
+void GuestGraphics::ForgetRegion(std::uint64_t lo, std::uint64_t hi) {
+    if (impl_ == nullptr || lo >= hi) return;
+    Impl& impl = *impl_;
+    const std::uint64_t retire_fence = impl.device != nullptr ? impl.device->SubmittedValue() : 0;
+
+    for (auto it = impl.rtv_pool.begin(); it != impl.rtv_pool.end();) {
+        const std::uint64_t entry_lo = it->first.va;
+        const std::uint64_t entry_hi = entry_lo + (it->second.bytes != 0 ? it->second.bytes : 4ull);
+        if (entry_lo < hi && entry_hi > lo) {
+            impl.free_rtv_slots.push_back(it->second.slot);
+            impl.retired_targets.push_back({std::move(it->second.resource), it->second.bytes, retire_fence});
+            it = impl.rtv_pool.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = impl.dsv_pool.begin(); it != impl.dsv_pool.end();) {
+        const std::uint64_t entry_lo = it->first.va;
+        const std::uint64_t entry_hi = entry_lo + (it->second.bytes != 0 ? it->second.bytes : 4ull);
+        if (entry_lo < hi && entry_hi > lo) {
+            impl.free_dsv_slots.push_back(it->second.slot);
+            impl.retired_targets.push_back({std::move(it->second.resource), it->second.bytes, retire_fence});
+            it = impl.dsv_pool.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    InvalidatePrograms(lo, hi);
+}
+
+void GuestGraphics::InvalidatePrograms(std::uint64_t lo, std::uint64_t hi) {
+    if (impl_ == nullptr || lo >= hi) return;
+    Impl& impl = *impl_;
+    for (auto it = impl.programs.begin(); it != impl.programs.end();) {
+        const std::uint64_t prog_lo = it->first;
+        const std::uint64_t prog_hi =
+            prog_lo + static_cast<std::uint64_t>(it->second.words.size()) * sizeof(std::uint32_t);
+        if (prog_lo < hi && prog_hi > lo) {
+            it = impl.programs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 std::string GuestGraphics::Report() const {
     if (impl_ == nullptr) return "guest graphics: none";
     const Impl& impl = *impl_;
     char line[512];
     std::snprintf(line, sizeof(line),
-                  "guest graphics: %llu draw(s) run (%llu indexed, %llu indirect), %llu shader(s) noted, "
-                  "%llu PSO(s) (%llu evicted, %llu failed), %llu target(s), "
+                  "guest graphics: %llu draw(s) run (%llu indexed, %llu indirect), %llu clear(s), %llu copy(s), "
+                  "%llu shader(s) noted, %llu PSO(s) (%llu evicted, %llu failed), %llu target(s), "
                   "%llu miss(es) (vs %llu, ps %llu), %llu space-1 slot(s) (%llu srv, %llu refused)",
                   static_cast<unsigned long long>(impl.counts.drawn),
                   static_cast<unsigned long long>(impl.counts.indexed),
                   static_cast<unsigned long long>(impl.counts.indirect),
+                  static_cast<unsigned long long>(impl.counts.target_clears),
+                  static_cast<unsigned long long>(impl.counts.target_copies),
                   static_cast<unsigned long long>(impl.counts.shaders_noted),
                   static_cast<unsigned long long>(impl.counts.created_psos),
                   static_cast<unsigned long long>(impl.counts.evicted_psos),

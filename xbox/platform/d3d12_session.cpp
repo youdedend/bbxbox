@@ -2,6 +2,7 @@
 // The console session (see d3d12_session.h): device, swapchain, pipelines, replay.
 #include "xbox/platform/d3d12_session.h"
 
+#include "hle/modules.h"
 #include "src/host/d3d12/bbx_descriptors.h"
 #include "src/host/d3d12/bbx_guest_mem.h"
 #include "src/host/d3d12/bbx_guest_root.h"
@@ -136,6 +137,44 @@ struct D3d12Session::Impl {
     static bool Draw(void* user, const GpuDraw& d, const d3d12::DrawIdentity& identity) {
         return static_cast<Impl*>(user)->guest_graphics.Draw(d, identity);
     }
+    static bool ClearView(void* user, const d3d12::DecodedClearView& view, bool apply, bool* out_created) {
+        return static_cast<Impl*>(user)->guest_graphics.ClearView(view, apply, out_created);
+    }
+    static bool ClearTarget(void* user, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
+        return static_cast<Impl*>(user)->guest_graphics.ClearTargetAt(va, value, bytes);
+    }
+    static bool CopyTarget(void* user, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) {
+        return static_cast<Impl*>(user)->guest_graphics.CopyTarget(dst_va, src_va, bytes);
+    }
+    static void ForgetRegion(void* user, std::uint64_t lo, std::uint64_t hi) {
+        static_cast<Impl*>(user)->guest_graphics.ForgetRegion(lo, hi);
+    }
+    static void TextureWritten(void* user, std::uint64_t va, std::size_t bytes) {
+        Impl& impl = *static_cast<Impl*>(user);
+        if (va != 0 && bytes != 0 && hle_kernel_va_mapped(va, bytes)) {
+            (void)impl.guest_memory.WriteGuest(
+                impl.guest_plan.table, va,
+                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
+        }
+        impl.guest_graphics.InvalidatePrograms(va, va + bytes);
+    }
+    static bool MemoryGlance(void* user, GpuMemoryGlance* out) {
+        if (out == nullptr) return false;
+        const Impl& impl = *static_cast<const Impl*>(user);
+        const d3d12::Budget& b = impl.device.Memory();
+        out->vram = b.used();
+        out->cache = b.used_by(d3d12::Owner::kShaderTools) + b.used_by(d3d12::Owner::kHeaps);
+        out->shared = b.used_by(d3d12::Owner::kGuest) + b.used_by(d3d12::Owner::kGpuShadows);
+        out->cache_known = true;
+        out->integrated = impl.device.IsUma();
+        return true;
+    }
+    static std::string MemoryBudgetReport(void* user) {
+        return static_cast<const Impl*>(user)->device.DescribeMemory();
+    }
+    static std::string DeviceIdentity(void* user) {
+        return static_cast<const Impl*>(user)->report.adapter;
+    }
 
     // Installs the binding the guest's HLE calls through (host_gpu_d3d12.h).
     void InstallGuestBinding() {
@@ -149,6 +188,10 @@ struct D3d12Session::Impl {
         guest_binding.mem_fill = &Impl::MemFill;
         guest_binding.mem_copy = &Impl::MemCopy;
         guest_binding.read_guest = &Impl::ReadGuest;
+        guest_binding.texture_written = &Impl::TextureWritten;
+        guest_binding.memory_glance = &Impl::MemoryGlance;
+        guest_binding.memory_budget_report = &Impl::MemoryBudgetReport;
+        guest_binding.device_identity = &Impl::DeviceIdentity;
         if (guest_compute.Ready()) {
             guest_binding.dispatch_key = &Impl::DispatchKey;
             guest_binding.dispatch = &Impl::Dispatch;
@@ -156,6 +199,10 @@ struct D3d12Session::Impl {
         if (guest_graphics.Ready()) {
             guest_binding.note_shader_created = &Impl::NoteShaderCreated;
             guest_binding.draw = &Impl::Draw;
+            guest_binding.clear_view = &Impl::ClearView;
+            guest_binding.clear_target = &Impl::ClearTarget;
+            guest_binding.copy_target = &Impl::CopyTarget;
+            guest_binding.forget_region = &Impl::ForgetRegion;
         }
         guest_binding.ready = ready && guest_memory.Ready();
         d3d12::SetGuestGpuBinding(&guest_binding);
@@ -416,7 +463,7 @@ Hud D3d12Session::BuildReportHud() const {
     return hud;
 }
 
-bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
+bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_upscale) {
     if (impl_ == nullptr || !impl_->ready) { return d3d12::Status::kUnavailable; }
     Impl& impl = *impl_;
     if (impl.device.DeviceLost()) {
@@ -435,6 +482,7 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
     // the copy is not, so the guest thread's flip costs it a memcpy.
     std::vector<std::uint8_t> frame;
     d3d12::ScanoutDesc frame_desc;
+    bool has_guest_frame = false;
     {
         std::lock_guard<std::mutex> lk(impl.frame_mutex);
         if (impl.frame_pending) {
@@ -443,6 +491,7 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
             frame_desc = impl.frame_desc;
             impl.frame_pending = false;
         }
+        has_guest_frame = impl.guest_frames > 0;
     }
     if (!frame.empty() && frame_desc.width != 0 && frame_desc.height != 0) {
         // The upload is the description's: the image is made in the guest's
@@ -459,12 +508,19 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync) {
                 ++impl.guest_frames_dropped;
             } else {
                 ++impl.guest_frames;
+                has_guest_frame = true;
             }
             impl.frame_upload.swap(frame);
         }
     }
-    // The boot colour: near-black, so a missed quad is visible rather than hidden.
-    status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f);
+    // Before the first guest flip, tint the placeholder quad near-black behind
+    // the launcher HUD. Once Bloodborne presents frames, draw at full 1.0
+    // brightness with optional HLSL SM 6.4 RCAS contrast-adaptive sharpening.
+    if (has_guest_frame) {
+        status = impl.replay.DrawPresent(1.0f, 1.0f, 1.0f, sharp_upscale ? 0.75f : 0.0f);
+    } else {
+        status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f, 0.0f);
+    }
     if (status != d3d12::Status::kOk) { return status; }
     LogCrumb("replay: overlay");
     impl.replay.ResetOverlay();
@@ -526,6 +582,22 @@ std::uint64_t D3d12Session::GuestFrames() const {
     if (impl_ == nullptr) { return 0; }
     std::lock_guard<std::mutex> lk(impl_->frame_mutex);
     return impl_->guest_frames;
+}
+
+std::uint64_t D3d12Session::GuestFramesDropped() const {
+    if (impl_ == nullptr) { return 0; }
+    std::lock_guard<std::mutex> lk(impl_->frame_mutex);
+    return impl_->guest_frames_dropped;
+}
+
+std::uint32_t D3d12Session::OutputWidth() const {
+    if (impl_ == nullptr || !impl_->ready) { return 0; }
+    return impl_->swapchain.Width();
+}
+
+std::uint32_t D3d12Session::OutputHeight() const {
+    if (impl_ == nullptr || !impl_->ready) { return 0; }
+    return impl_->swapchain.Height();
 }
 
 bbx::d3d12::Status D3d12Session::OnModeChanged(std::uint32_t window_width,

@@ -262,4 +262,39 @@ struct DrawIdentity {
 // it sees a draw, and the same line in the tests.
 [[nodiscard]] std::string DrawIdentityLine(const DrawIdentity& identity);
 
+// Portable input for GX ClearRenderTargetView / ClearDepthStencilView tokens
+// (`GpuClearView` in host/gpu.h), kept header-independent so host tests can
+// verify format/extent/plane resolution without pulling in bbhost headers.
+struct ClearViewInput {
+    bool depth = false;
+    std::uint32_t extent = 0;       // (width << 16) | height, 0 when unknown
+    std::uint32_t color[5] = {};    // CB_COLOR BASE, PITCH, SLICE, VIEW, INFO
+    float rgba[4] = {};
+    std::uint32_t z_info = 0;       // DB_Z_INFO
+    std::uint32_t stencil_info = 0; // DB_STENCIL_INFO
+    std::uint32_t z_read_base = 0;  // DB_Z_READ_BASE
+    std::uint32_t depth_size = 0;   // DB_DEPTH_SIZE
+    std::uint32_t flags = 0;        // bit 0 = depth, bit 1 = stencil (0 = default both)
+    float depth_value = 1.0f;
+    std::uint32_t stencil = 0;
+};
+
+struct DecodedClearView {
+    bool ok = false;
+    const char* why = "invalid view";
+    bool depth = false;
+    std::uint64_t base = 0;
+    std::uint32_t format = 0;
+    bool srgb = false;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    float rgba[4] = {};
+    bool clear_depth = false;
+    bool clear_stencil = false;
+    float depth_value = 1.0f;
+    std::uint8_t stencil_value = 0;
+};
+
+[[nodiscard]] DecodedClearView DecodeClearView(const ClearViewInput& in);
+
 }  // namespace bbx::d3d12

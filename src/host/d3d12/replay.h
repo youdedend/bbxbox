@@ -79,7 +79,7 @@ public:
     // Replays one recorded block. Walks it first: a truncated block replays what
     // is structurally valid and reports the error instead of reading past it.
     Status ExecuteStreamBlock(std::span<const std::uint8_t> block);
-    Status DrawPresent(float red, float green, float blue);
+    Status DrawPresent(float red, float green, float blue, float sharpness = 0.0f);
 
     // The guest's scanout buffer, uploaded into the image DrawPresent samples.
     // Called inside a frame, between BeginFrame and DrawPresent: the copy goes on

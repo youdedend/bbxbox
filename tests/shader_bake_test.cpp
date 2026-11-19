@@ -124,13 +124,76 @@ TEST(shader_bake_hud_progress_line) {
     snap.signed_count = 490;
     snap.refused_count = 8;
     snap.quarantined_count = 2;
+    snap.workers = 4;
     snap.elapsed_seconds = 42;
     const std::string line = FormatBakeHudLine(snap);
-    CHECK(line.find("COMPILING DXIL 6.4") != std::string::npos);
+    CHECK(line.find("COMPILING DXIL 6.4 (4T)") != std::string::npos);
     CHECK(line.find("500 / 2000 (25%)") != std::string::npos);
     CHECK(line.find("OK 490") != std::string::npos);
     CHECK(line.find("SKIP 10") != std::string::npos);
     CHECK(line.find("[42s]") != std::string::npos);
+}
+
+TEST(shader_bake_worker_count_policy) {
+    CHECK_EQ(ChooseBakeWorkerCount(8, 4, true), 1u);
+    CHECK_EQ(ChooseBakeWorkerCount(1, 4, false), 1u);
+    CHECK_EQ(ChooseBakeWorkerCount(2, 4, false), 2u);
+    CHECK_EQ(ChooseBakeWorkerCount(4, 4, false), 2u);
+    CHECK_EQ(ChooseBakeWorkerCount(8, 4, false), 4u);
+    CHECK_EQ(ChooseBakeWorkerCount(16, 6, false), 4u);
+}
+
+TEST(shader_bake_checkpoint_roundtrip_and_integrity) {
+    CacheStamp stamp;
+    stamp.translator = "0123456789abcdef";
+    stamp.dxil_target = "dxil-6.4";
+    stamp.dxc_version = "1.8.2403";
+
+    std::vector<CacheEntry> entries;
+    CacheEntry e0{};
+    e0.key = 0x1111222233334444ull;
+    e0.program_hash = 0xaaaaull;
+    e0.bytecode_hash = 0xbbbbull;
+    e0.stage = Stage::kCompute;
+    e0.offset = 0;
+    e0.size = 4;
+    e0.raw_size = 64;
+    entries.push_back(e0);
+
+    CacheEntry e1{};
+    e1.key = 0x5555666677778888ull;
+    e1.program_hash = 0xccccull;
+    e1.bytecode_hash = 0xddddull;
+    e1.stage = Stage::kPixel;
+    e1.offset = 4;
+    e1.size = 4;
+    e1.raw_size = 128;
+    entries.push_back(e1);
+
+    const std::vector<std::uint8_t> blobs = {1, 2, 3, 4, 9, 10, 11, 12};
+    const std::string bindings = "1111222233334444 u0 direct 0\n5555666677778888 t1 table 2 4\n";
+
+    const std::vector<std::uint8_t> bytes = SerializeBakeCheckpoint(stamp, entries, blobs, bindings);
+    CHECK(!bytes.empty());
+
+    BakeCheckpoint out;
+    CHECK(ParseBakeCheckpoint(bytes, stamp, &out));
+    CHECK_EQ(out.entries.size(), 2u);
+    CHECK_EQ(out.entries[0].key, 0x1111222233334444ull);
+    CHECK_EQ(out.entries[0].raw_size, 64u);
+    CHECK_EQ(out.entries[1].key, 0x5555666677778888ull);
+    CHECK_EQ(out.blobs.size(), 8u);
+    CHECK_EQ(out.bindings_text, bindings);
+
+    // Stamp mismatch must reject the checkpoint.
+    CacheStamp wrong_stamp = stamp;
+    wrong_stamp.translator = "fedcba9876543210";
+    CHECK(!ParseBakeCheckpoint(bytes, wrong_stamp, &out));
+
+    // Corrupted payload byte must fail FNV-1a integrity verification.
+    std::vector<std::uint8_t> corrupted = bytes;
+    corrupted[corrupted.size() / 2] ^= 0xFFu;
+    CHECK(!ParseBakeCheckpoint(corrupted, stamp, &out));
 }
 
 }  // namespace

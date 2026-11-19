@@ -61,7 +61,7 @@ public:
     [[nodiscard]] Hud BuildReportHud() const;
 
     // Draws one HUD frame and presents it. `hud` is consumed as it is.
-    bbx::d3d12::Status Present(const Hud& hud, bool vsync = true);
+    bbx::d3d12::Status Present(const Hud& hud, bool vsync = true, bool sharp_upscale = true);
 
     // The guest's scanout frame, handed over from the guest thread on its flip
     // (host_present): copied here and uploaded on the next Present, which keeps
@@ -73,6 +73,9 @@ public:
     // Frames the guest offered and the presenter took (and how many it dropped
     // because the guest outran it), for the HUD.
     [[nodiscard]] std::uint64_t GuestFrames() const;
+    [[nodiscard]] std::uint64_t GuestFramesDropped() const;
+    [[nodiscard]] std::uint32_t OutputWidth() const;
+    [[nodiscard]] std::uint32_t OutputHeight() const;
     // A television mode change: re-plan, resize the swapchain, resize the HUD.
     bbx::d3d12::Status OnModeChanged(std::uint32_t window_width, std::uint32_t window_height);
 

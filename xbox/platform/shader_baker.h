@@ -24,12 +24,15 @@ struct BakeRequest {
     std::string update_dir;  // optional v1.09 update overlay root (scanned first)
     std::string eboot;       // full path to eboot.bin (fake SELF or flat ELF)
     std::string out_dir;     // writable output dir (LocalState\data)
+    std::uint32_t max_workers = 0;  // 0 = auto (up to 4 DXC worker threads)
+    bool force_rebuild = false;     // true = discard prior checkpoint and rebuild fresh
 };
 
 struct BakeResult {
     bool ok = false;
     bool cancelled = false;
     std::uint32_t entries_written = 0;
+    std::uint32_t resumed_count = 0;
     std::uint32_t refused_count = 0;
     std::uint32_t quarantined_count = 0;
     std::uint32_t elapsed_seconds = 0;
@@ -72,12 +75,35 @@ private:
 // no first-boot baking is needed and `dxcompiler.dll` is never loaded.
 [[nodiscard]] bool HasValidConsoleCache(const std::vector<std::string>& search_dirs,
                                         std::string* found_dir = nullptr,
-                                        std::string* report = nullptr);
+                                        std::string* report = nullptr,
+                                        std::size_t* out_stages = nullptr,
+                                        std::string* out_stamp = nullptr);
 
 // Runs the complete first-boot bake on the calling thread (expected to be a
 // background thread so the UI thread keeps pumping CoreWindow events and
 // presenting the HUD progress bar). Unloads `dxcompiler.dll` and `dxil.dll`
 // before returning regardless of outcome.
 [[nodiscard]] BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progress);
+
+// Copies the validated `bbx_shaders.cache` + `.stamp.txt` + `bbx_shaders.paths`
+// triple atomically between two directories (e.g. LocalState\data <-> USB dump)
+// using `bbx::hostfs` so UWP FutureAccessList USB folders work cleanly.
+[[nodiscard]] bool SyncShaderCacheFiles(const std::string& src_dir,
+                                        const std::string& dst_dir,
+                                        std::string* detail = nullptr);
+
+// Backs up Bloodborne save data (`LocalState\data\savedata` + `bbxbox.ini`) and
+// console logs (`loader.log`, `errors.log`, `crash.log`) into
+// `<usb_root>\bbxbox_backups` so reinstalling the .appx never loses progress.
+[[nodiscard]] bool BackupSavesAndLogsToUsb(const std::string& local_state_dir,
+                                           const std::string& data_dir,
+                                           const std::string& usb_root,
+                                           std::string* detail = nullptr);
+
+// Restores Bloodborne save data from `<usb_root>\bbxbox_backups\savedata` back
+// into `LocalState\data\savedata` using atomic file writes.
+[[nodiscard]] bool RestoreSavesFromUsb(const std::string& usb_root,
+                                       const std::string& data_dir,
+                                       std::string* detail = nullptr);
 
 }  // namespace bbx::platform

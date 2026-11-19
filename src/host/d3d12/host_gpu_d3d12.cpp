@@ -77,6 +77,9 @@ struct Counters {
     // makes the same draw thousands of times and the answer is one line.
     std::set<std::uint64_t> logged_draws;
     std::set<std::uint64_t> logged_draw_refusals;
+    std::uint64_t clears = 0;
+    std::uint64_t target_copies = 0;
+    std::uint64_t texture_writes = 0;
     std::uint64_t mem_writes = 0, mem_fills = 0, mem_copies = 0, mem_reads = 0;
     std::uint64_t mem_refused = 0;
     GuestGpuCounts published;  // the snapshot host_gpu_d3d12.h hands out
@@ -114,6 +117,9 @@ void Publish() {
     c.published.draws_executed = c.draws_executed;
     c.published.draw_refusals = c.draw_refusals;
     c.published.draw_pipeline_missing = c.draw_pipeline_missing;
+    c.published.clears = c.clears;
+    c.published.target_copies = c.target_copies;
+    c.published.texture_writes = c.texture_writes;
     c.published.mem_writes = c.mem_writes;
     c.published.mem_fills = c.mem_fills;
     c.published.mem_copies = c.mem_copies;
@@ -143,6 +149,22 @@ void Refuse(std::uint64_t key, GuestDispatchRefusal why, const std::string& deta
     Publish();
 }
 
+ClearViewInput ToClearViewInput(const GpuClearView& c) {
+    ClearViewInput in{};
+    in.depth = c.depth;
+    in.extent = c.extent;
+    for (int i = 0; i < 5; ++i) in.color[i] = c.color[i];
+    for (int i = 0; i < 4; ++i) in.rgba[i] = c.rgba[i];
+    in.z_info = c.z_info;
+    in.stencil_info = c.stencil_info;
+    in.z_read_base = c.z_read_base;
+    in.depth_size = c.depth_size;
+    in.flags = c.flags;
+    in.depth_value = c.depth_value;
+    in.stencil = c.stencil;
+    return in;
+}
+
 }  // namespace
 
 void SetGuestGpuBinding(const GuestGpuBinding* binding) {
@@ -168,13 +190,15 @@ std::string FormatGuestGpuReportLocked(const Counters& c) {
     std::snprintf(line, sizeof(line),
                   "guest gpu: %llu dispatch(es) (%llu dispatched, %llu cache miss, %llu no pipeline, %llu no device, "
                   "%llu bad program), %llu draw(s) (%llu drawn, %llu refused, %llu no pipeline), "
-                  "%llu upload(s) (%llu refused)",
+                  "%llu clear(s), %llu copy(s), %llu upload(s) (%llu refused)",
                   static_cast<unsigned long long>(c.dispatches), static_cast<unsigned long long>(c.dispatched),
                   static_cast<unsigned long long>(c.cache_misses), static_cast<unsigned long long>(c.no_pipeline),
                   static_cast<unsigned long long>(c.no_device), static_cast<unsigned long long>(c.bad_program),
                   static_cast<unsigned long long>(c.draws), static_cast<unsigned long long>(c.draws_executed),
                   static_cast<unsigned long long>(c.draw_refusals),
                   static_cast<unsigned long long>(c.draw_pipeline_missing),
+                  static_cast<unsigned long long>(c.clears),
+                  static_cast<unsigned long long>(c.target_copies),
                   static_cast<unsigned long long>(c.mem_writes + c.mem_fills + c.mem_copies),
                   static_cast<unsigned long long>(c.mem_refused));
     return line;
@@ -212,8 +236,11 @@ bool host_gpu_init(const char* const*, std::uint32_t, bool) {
 bool host_gpu_available() { return GuestGpu() != nullptr; }
 bool host_gpu_memory_tight() { return false; }
 bool host_gpu_small_vram() { return false; }
-bool host_gpu_integrated() { return false; }
-bool host_gpu_integrated_with_room() { return false; }
+bool host_gpu_integrated() {
+    GpuMemoryGlance g{};
+    return host_gpu_memory_glance(g) ? g.integrated : false;
+}
+bool host_gpu_integrated_with_room() { return host_gpu_integrated(); }
 const memory_policy::Policy& host_gpu_memory_policy() {
     static const memory_policy::Policy p;
     return p;
@@ -446,14 +473,170 @@ void host_gpu_report() {
 }
 
 GpuStats host_gpu_stats() {
-    GpuStats stats;
+    GpuStats stats{};
     const GuestGpuCounts counts = GuestGpuStats();
     stats.dispatches = counts.dispatches;
     stats.draws = counts.draws;
+    stats.draw_calls = counts.draws;
+    stats.transfers = counts.mem_writes + counts.mem_fills + counts.mem_copies;
     return stats;
 }
 
-void host_gpu_forget_region(std::uint64_t, std::uint64_t) {}
+// ---- render targets, clears, copies, texture updates, and memory queries ----------
+bool host_gpu_clear_view_resolvable(const GpuClearView& c, const char** why) {
+    const DecodedClearView decoded = DecodeClearView(ToClearViewInput(c));
+    if (!decoded.ok) {
+        if (why) *why = decoded.why;
+        return false;
+    }
+    const GuestGpuBinding* gpu = GuestGpu();
+    if (!gpu || !gpu->clear_view) {
+        if (why) *why = "no GPU";
+        return false;
+    }
+    if (why) *why = nullptr;
+    return true;
+}
+
+bool host_gpu_clear_view(const GpuClearView& c, bool apply, GpuClearViewResult* out) {
+    const DecodedClearView decoded = DecodeClearView(ToClearViewInput(c));
+    if (!decoded.ok) return false;
+    std::lock_guard<std::mutex> lock(mutex());
+    Counters& cnt = counters();
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->clear_view) return false;
+    bool created = false;
+    if (!gpu->clear_view(gpu->user, decoded, apply, &created)) return false;
+    if (apply) {
+        ++cnt.clears;
+        Publish();
+    }
+    if (out != nullptr) {
+        out->image = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(decoded.base));
+        out->first_layer = c.first_slice;
+        out->layers = c.slices != 0 ? c.slices : 1u;
+        out->created = created;
+    }
+    return true;
+}
+
+bool host_gpu_clear_target(std::uint64_t va, std::uint32_t value, std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex());
+    Counters& cnt = counters();
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->clear_target || va == 0 || bytes == 0) return false;
+    if (!gpu->clear_target(gpu->user, va, value, bytes)) return false;
+    ++cnt.clears;
+    Publish();
+    return true;
+}
+
+bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes, std::uint64_t, std::uint64_t,
+                         std::uint32_t, std::uint32_t) {
+    if (dst == 0 || src == 0 || bytes == 0 || dst == src) return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex());
+        Counters& cnt = counters();
+        const GuestGpuBinding* gpu = g_bound;
+        if (gpu && gpu->copy_target && gpu->copy_target(gpu->user, dst, src, bytes)) {
+            ++cnt.target_copies;
+            if (gpu->mem_copy && gpu->mem_copy(gpu->user, dst, src, bytes)) {
+                ++cnt.mem_copies;
+            }
+            Publish();
+            return true;
+        }
+    }
+    return host_gpu_mem_copy(dst, src, bytes);
+}
+
+bool host_gpu_copy_back(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
+    return host_gpu_copy_guest(dst, src, bytes);
+}
+
+std::size_t host_gpu_copy_backs(const std::uint64_t* dst, const std::uint64_t* src, const std::uint64_t* bytes,
+                                std::size_t n) {
+    if (dst == nullptr || src == nullptr || bytes == nullptr) return 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bytes[i] == 0) continue;
+        if (!host_gpu_copy_guest(dst[i], src[i], static_cast<std::size_t>(bytes[i]))) return i;
+    }
+    return n;
+}
+
+bool host_gpu_draw_window(std::uint64_t dst, const void* data, std::uint32_t bytes) {
+    return host_gpu_mem_write(dst, data, bytes);
+}
+
+std::uint64_t host_gpu_guest_copy_targets() { return GuestGpuStats().target_copies; }
+
+void host_gpu_forget_region(std::uint64_t lo, std::uint64_t hi) {
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (gpu && gpu->forget_region && lo < hi) {
+        gpu->forget_region(gpu->user, lo, hi);
+    }
+}
+
+void host_gpu_targets_rebuild(bool on) {
+    if (!on) {
+        host_gpu_forget_region(0, ~0ull);
+    }
+}
+
+void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex());
+    Counters& cnt = counters();
+    const GuestGpuBinding* gpu = g_bound;
+    if (gpu && gpu->texture_written && base != 0 && bytes != 0) {
+        gpu->texture_written(gpu->user, base, bytes);
+        ++cnt.texture_writes;
+        Publish();
+    }
+}
+
+bool host_gpu_yebis_texture_update(std::uint64_t memory, std::uint64_t, std::uint32_t mip, std::uint32_t slice,
+                                   std::uint32_t x, std::uint32_t y, std::uint32_t, std::uint32_t h, const void* rows,
+                                   std::uint32_t pitch, std::uint64_t) {
+    if (mip == 0 && slice == 0 && x == 0 && y == 0 && memory != 0 && rows != nullptr && pitch != 0 && h != 0) {
+        (void)host_gpu_mem_write(memory, rows, static_cast<std::size_t>(pitch) * h);
+    }
+    // Return false so gx_resources also calls host_gpu_texture_written after the
+    // guest UpdateSubresource finishes writing its tiled/linear memory.
+    return false;
+}
+
+bool host_gpu_memory_glance(GpuMemoryGlance& out) {
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->memory_glance) return false;
+    return gpu->memory_glance(gpu->user, &out);
+}
+
+std::string host_gpu_memory_budget_report() {
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->memory_budget_report) return {};
+    return gpu->memory_budget_report(gpu->user);
+}
+
+std::string host_gpu_video_memory_report(bool) { return host_gpu_memory_budget_report(); }
+
+std::string host_gpu_device_identity() {
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->device_identity) return {};
+    return gpu->device_identity(gpu->user);
+}
+
+bool host_gpu_fsr_upscale(void*, void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                          std::uint32_t, std::uint32_t, void*, std::int32_t, std::int32_t, std::uint32_t,
+                          std::uint32_t) {
+    // D3d12Session::Present applies native SM 6.4 RCAS contrast-adaptive
+    // sharpening directly in present.hlsl when sharp_upscale is enabled.
+    return false;
+}
+
 void host_gpu_save_pipeline_cache() {}
 void host_gpu_save_pipeline_cache_at_exit() {}
 std::string host_gpu_compile_report() { return {}; }
