@@ -924,7 +924,7 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
         hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.12f, 0.14f, 0.18f, 0.95f});
         float frac = 0.0f;
         if (snap.total > 0) {
-            frac = static_cast<float>(snap.completed) / static_cast<float>(snap.total);
+            frac = static_cast<float>(snap.done) / static_cast<float>(snap.total);
             if (frac > 1.0f) frac = 1.0f;
         } else if (snap.phase == bbx::d3d12::BakePhase::kDone) {
             frac = 1.0f;
@@ -941,8 +941,8 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
                       "WORKERS: %u  |  RESUMED: %u  |  REFUSED: %u  |  QUARANTINED: %u",
                       static_cast<unsigned>(snap.workers),
                       static_cast<unsigned>(snap.resumed_count),
-                      static_cast<unsigned>(snap.refused),
-                      static_cast<unsigned>(snap.quarantined));
+                      static_cast<unsigned>(snap.refused_count),
+                      static_cast<unsigned>(snap.quarantined_count));
         hud.Text(x, y, scale, stats, bbx::platform::HudColor::White());
         y += line;
 
