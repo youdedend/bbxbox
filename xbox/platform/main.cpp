@@ -1261,7 +1261,6 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
 
     float y = margin * 0.7f + static_cast<float>(scale) * 3.8f;
     const float x = margin * 1.6f;
-    const float inner_w = width - margin * 3.2f;
 
     // Header: Hunter's Mark Caryll Rune + Title + Paleblood motto
     const float rune_cx = x + static_cast<float>(scale) * 4.0f;
