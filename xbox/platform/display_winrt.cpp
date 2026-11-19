@@ -7,6 +7,7 @@
 #include "xbox/platform/log.h"
 
 #include <cmath>
+#include <windows.h>
 #include <gamingdeviceinformation.h>
 
 #include <winrt/Windows.Graphics.Display.Core.h>
