@@ -92,8 +92,8 @@
 #include "host/perf_meter.h"
 #include "host/settings.h"
 #include "host/settings_store.h"
-#include "log.h"
 #include "src/host/core/bbx_self.h"
+#include "upstream/bbhost/src/log.h"
 
 
 namespace {
