@@ -78,6 +78,7 @@ struct Session {
     bbx::platform::LauncherModel model;
     bbx::platform::Chords chords;
     bbx::platform::VirtualKeyboard keyboard;
+    int launcher_tab = 0;  // 0 = PLAY, 1 = SETTINGS, 2 = STORAGE
     bool keyboard_open = false;
     bool quit = false;
     bool start_requested = false;
@@ -988,14 +989,86 @@ void OnAction(PadAction action) {
         }
     }
 
+int LauncherTabForAction(bbx::platform::Action action) {
+    using bbx::platform::Action;
+    switch (action) {
+    case Action::kStartGame:
+    case Action::kContinueUnpatched:
+    case Action::kPrecompile:
+    case Action::kPickDump:
+    case Action::kPickPatch:
+    case Action::kTogglePatch:
+    case Action::kToggleModdedEboot:
+    case Action::kQuit:
+        return 0;  // PLAY
+    case Action::kToggleFpsCap:
+    case Action::kCycleResolution:
+    case Action::kToggleVsync:
+    case Action::kToggleSharpUpscale:
+    case Action::kTogglePerformanceMode:
+    case Action::kCycleShadowRes:
+    case Action::kToggleSkipLogos:
+    case Action::kToggleEnhancements:
+    case Action::kCycleDeadzone:
+    case Action::kTogglePerfHud:
+        return 1;  // SETTINGS
+    default:
+        return 2;  // STORAGE
+    }
+}
+
+void MoveInTab(int delta) {
+    const std::size_t count = g_session.model.items.size();
+    if (count == 0) return;
+    std::vector<std::size_t> tab_indices;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (LauncherTabForAction(g_session.model.items[i].action) == g_session.launcher_tab &&
+            g_session.model.items[i].enabled) {
+            tab_indices.push_back(i);
+        }
+    }
+    if (tab_indices.empty()) {
+        g_session.model.Move(delta);
+        return;
+    }
+    std::size_t pos = 0;
+    for (std::size_t j = 0; j < tab_indices.size(); ++j) {
+        if (tab_indices[j] == g_session.model.selected) {
+            pos = j;
+            break;
+        }
+    }
+    const std::size_t n = tab_indices.size();
+    const std::size_t next = delta >= 0 ? (pos + 1) % n : (pos + n - 1) % n;
+    g_session.model.selected = tab_indices[next];
+}
+
+void SwitchTab(int delta) {
+    g_session.launcher_tab = (g_session.launcher_tab + delta + 3) % 3;
+    const std::size_t count = g_session.model.items.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        if (LauncherTabForAction(g_session.model.items[i].action) == g_session.launcher_tab &&
+            g_session.model.items[i].enabled) {
+            g_session.model.selected = i;
+            return;
+        }
+    }
+}
+
     // No rumble call here: the pad belongs to WinRT on this target and a launcher
     // menu does not need haptics badly enough to initialise a second input stack.
     switch (action) {
     case PadAction::kNavigateUp:
-        g_session.model.Move(-1);
+        MoveInTab(-1);
         return;
     case PadAction::kNavigateDown:
-        g_session.model.Move(1);
+        MoveInTab(1);
+        return;
+    case PadAction::kNavigateLeft:
+        SwitchTab(-1);
+        return;
+    case PadAction::kNavigateRight:
+        SwitchTab(1);
         return;
     case PadAction::kMenu:
         g_session.keyboard_open = true;
@@ -1218,103 +1291,148 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     const float height = hud.Height();
     const std::uint32_t scale = width >= 3000.0f ? 5u : (height >= 950.0f ? 3u : 2u);
     const std::uint32_t small_scale = scale > 2u ? (scale - 1u) : scale;
-    const float margin = static_cast<float>(scale) * 7.0f;
-    const float line = bbx::platform::Hud::TextHeight(scale) + static_cast<float>(scale) * 2.5f;
-    const float inner_w = width - margin * 3.2f;
-    const std::size_t max_footer_chars = std::max<std::size_t>(
-        32u, static_cast<std::size_t>(inner_w / static_cast<float>(bbx::platform::HudFont::kColumns * scale)));
+    const float px = static_cast<float>(scale);
+    const float pad_x = px * 11.0f;
+    const float pad_y = px * 8.0f;
+    const float row_h = bbx::platform::Hud::TextHeight(scale) + px * 3.6f;
 
-    const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer(), max_footer_chars);
-    const float max_panel_h = std::max(line * 10.0f, height - margin * 1.4f);
-    const float fixed_h = line * static_cast<float>(3.5 + static_cast<double>(footer_lines.size())) +
-                          margin * 1.4f;
-    const std::size_t max_visible_rows = std::max<std::size_t>(
-        5u, static_cast<std::size_t>(std::max(0.0f, (max_panel_h - fixed_h) / line)));
-
-    const std::size_t total_items = g_session.model.items.size();
-    const bool list_mode = !g_session.baking && !g_session.keyboard_open;
-    const bool scrolling = list_mode && total_items > max_visible_rows;
-    const std::size_t visible_items =
-        scrolling ? (max_visible_rows > 1u ? max_visible_rows - 1u : 1u) : total_items;
-    std::size_t first_row = 0;
-    if (scrolling) {
-        const std::size_t half = visible_items / 2u;
-        if (g_session.model.selected > half) {
-            first_row = g_session.model.selected - half;
+    // Collect items for the active tab (PLAY / SETTINGS / STORAGE).
+    std::vector<std::size_t> tab_items;
+    if (!g_session.baking && !g_session.keyboard_open) {
+        if (const bbx::platform::Item* cur = g_session.model.Current()) {
+            const int cur_tab = LauncherTabForAction(cur->action);
+            if (cur_tab != g_session.launcher_tab) {
+                for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
+                    if (LauncherTabForAction(g_session.model.items[i].action) == g_session.launcher_tab &&
+                        g_session.model.items[i].enabled) {
+                        g_session.model.selected = i;
+                        break;
+                    }
+                }
+            }
         }
-        if (first_row + visible_items > total_items) {
-            first_row = total_items - visible_items;
+        for (std::size_t i = 0; i < g_session.model.items.size(); ++i) {
+            if (LauncherTabForAction(g_session.model.items[i].action) == g_session.launcher_tab) {
+                tab_items.push_back(i);
+            }
         }
     }
 
     const std::size_t body_rows =
         g_session.baking
             ? 7u
-            : (g_session.keyboard_open
-                   ? (1u + g_session.keyboard.RowCount())
-                   : (scrolling ? (visible_items + 1u) : total_items));
-    const float panel_w = width - margin * 2.0f;
-    const float panel_height = std::min(
-        max_panel_h,
-        line * static_cast<float>(3u + footer_lines.size() + body_rows) + margin * 1.2f);
-    hud.GothicPanel(margin, margin * 0.7f, panel_w, panel_height);
+            : (g_session.keyboard_open ? (1u + g_session.keyboard.RowCount()) : std::max<std::size_t>(1u, tab_items.size()));
 
-    float y = margin * 0.7f + static_cast<float>(scale) * 3.8f;
-    const float x = margin * 1.6f;
+    const float panel_w = std::min(width * 0.72f, px * 420.0f);
+    const float inner_w = panel_w - pad_x * 2.0f;
+    const std::size_t max_chars = std::max<std::size_t>(
+        32u, static_cast<std::size_t>(inner_w / static_cast<float>(bbx::platform::HudFont::kColumns * small_scale)));
 
-    // Header: Hunter's Mark Caryll Rune + Title + Paleblood motto
-    const float rune_cx = x + static_cast<float>(scale) * 4.0f;
-    const float rune_cy = y + line * 0.55f;
+    const bool has_status = !g_session.model.status_banner.empty();
+    std::vector<std::string> hint_lines;
+    if (!g_session.baking && !g_session.keyboard_open) {
+        if (const bbx::platform::Item* cur = g_session.model.Current(); cur && !cur->hint.empty()) {
+            hint_lines = WrapLines(cur->hint, max_chars);
+            if (hint_lines.size() > 2u) hint_lines.resize(2u);
+        }
+    }
+    const std::size_t footer_rows = (has_status ? 1u : 0u) + hint_lines.size() + 1u;
+
+    const float header_h = row_h * 1.45f;
+    const float tab_h = (!g_session.baking && !g_session.keyboard_open) ? (row_h * 1.25f) : 0.0f;
+    const float body_h = row_h * static_cast<float>(body_rows);
+    const float footer_h = (bbx::platform::Hud::TextHeight(small_scale) + px * 2.2f) * static_cast<float>(footer_rows);
+    const float panel_h = std::min(height - px * 16.0f, pad_y * 2.0f + header_h + tab_h + body_h + footer_h + px * 6.0f);
+
+    const float panel_x = (width - panel_w) * 0.5f;
+    const float panel_y = (height - panel_h) * 0.5f;
+
+    // Apple-style deep obsidian glass card with Bloodborne hairline gold border & crimson top accent.
+    const bbx::platform::HudColor card_bg{0.055f, 0.048f, 0.060f, 0.94f};
+    const bbx::platform::HudColor hairline{0.62f, 0.48f, 0.24f, 0.45f};
+    const bbx::platform::HudColor divider{0.62f, 0.48f, 0.24f, 0.22f};
+    const bbx::platform::HudColor crimson_bar{0.58f, 0.10f, 0.16f, 0.95f};
+    const float border_t = std::max(1.5f, px * 0.5f);
+
+    hud.Panel(panel_x, panel_y, panel_w, panel_h, card_bg);
+    hud.Panel(panel_x, panel_y, panel_w, border_t, hairline);
+    hud.Panel(panel_x, panel_y + panel_h - border_t, panel_w, border_t, hairline);
+    hud.Panel(panel_x, panel_y, border_t, panel_h, hairline);
+    hud.Panel(panel_x + panel_w - border_t, panel_y, border_t, panel_h, hairline);
+    hud.Panel(panel_x, panel_y, panel_w, px * 1.1f, crimson_bar);
+
+    const float x = panel_x + pad_x;
+    float y = panel_y + pad_y;
+
+    // Clean Header: Hunter's Mark + Title on left, compact version/cache pill on right.
+    const float rune_cx = x + px * 3.5f;
+    const float rune_cy = y + bbx::platform::Hud::TextHeight(scale) * 0.55f;
     hud.HuntersMark(rune_cx, rune_cy, scale, bbx::platform::HudColor::TarnishedGold(),
                     bbx::platform::HudColor::BloodCrimson());
-    const float title_x = x + static_cast<float>(scale) * 11.0f;
-    hud.Text(title_x, y, scale, g_session.model.Title(), bbx::platform::HudColor::TarnishedGold());
-    y += line * 0.95f;
-    hud.Text(title_x, y, small_scale,
-             "SEEK PALEBLOOD TO TRANSCEND THE HUNT  |  XBOX SERIES X|S EDITION",
-             bbx::platform::HudColor::BloodCrimson());
-    y += line * 0.85f;
-    hud.GothicDivider(x, y, inner_w, scale);
-    y += line * 0.45f;
+    hud.Text(x + px * 10.5f, y, scale, "BLOODBORNE", bbx::platform::HudColor::BoneIvory());
 
-    for (const std::string& info : footer_lines) {
-        hud.Text(x, y, scale, info, bbx::platform::HudColor::AshSilver());
-        y += line;
+    std::string badge = "NO DUMP";
+    bbx::platform::HudColor badge_col = bbx::platform::HudColor::AshSilver();
+    if (!g_session.layout.base_path.empty()) {
+        const std::string ver = g_session.layout.EffectiveVersion();
+        badge = ver.empty() ? "DUMP READY" : ("V" + ver);
+        if (g_session.model.pipelines > 0) {
+            badge += "  |  " + std::to_string(g_session.model.pipelines) + " SHADERS";
+        }
+        badge_col = bbx::platform::HudColor::TarnishedGold();
     }
-    y += line * 0.25f;
-    hud.GothicDivider(x, y, inner_w, scale);
-    y += line * 0.45f;
+    const float badge_w = bbx::platform::Hud::TextWidth(badge, small_scale);
+    hud.Text(x + inner_w - badge_w, y + px * 0.6f, small_scale, badge, badge_col);
+    y += row_h * 1.15f;
+
+    // Apple-style Segmented Control for tabs: PLAY | SETTINGS | STORAGE
+    if (!g_session.baking && !g_session.keyboard_open) {
+        static constexpr const char* kTabs[3] = {"PLAY", "SETTINGS", "STORAGE"};
+        const float seg_h = bbx::platform::Hud::TextHeight(small_scale) + px * 2.6f;
+        const float seg_w = inner_w / 3.0f;
+        hud.Panel(x, y, inner_w, seg_h, bbx::platform::HudColor{0.032f, 0.028f, 0.036f, 0.96f});
+        for (int t = 0; t < 3; ++t) {
+            const float sx = x + seg_w * static_cast<float>(t);
+            const bool active = (t == g_session.launcher_tab);
+            if (active) {
+                hud.Panel(sx + px * 0.6f, y + px * 0.6f, seg_w - px * 1.2f, seg_h - px * 1.2f,
+                          bbx::platform::HudColor{0.46f, 0.09f, 0.14f, 0.90f});
+                hud.Panel(sx + px * 0.6f, y + seg_h - px * 1.1f, seg_w - px * 1.2f, px * 0.7f,
+                          bbx::platform::HudColor::TarnishedGold());
+            }
+            const float tw = bbx::platform::Hud::TextWidth(kTabs[t], small_scale);
+            const float ty = y + (seg_h - bbx::platform::Hud::TextHeight(small_scale)) * 0.5f;
+            hud.Text(sx + (seg_w - tw) * 0.5f, ty, small_scale, kTabs[t],
+                     active ? bbx::platform::HudColor::BoneIvory() : bbx::platform::HudColor::AshSilver());
+        }
+        y += seg_h + px * 3.5f;
+    } else {
+        hud.Panel(x, y, inner_w, 1.0f, divider);
+        y += px * 3.5f;
+    }
 
     if (g_session.baking) {
         const bbx::d3d12::BakeProgressSnapshot snap = g_session.bake_progress.Snapshot();
         const std::string headline = bbx::d3d12::FormatBakeHudLine(snap);
         hud.Text(x, y, scale, headline, bbx::platform::HudColor::TarnishedGold());
-        y += line * 1.15f;
+        y += row_h * 1.1f;
 
-        // Blood Transfusion Shader Baker Bar: tarnished-brass frame + blood-crimson fill.
         const float bar_w = inner_w;
-        const float bar_h = static_cast<float>(scale) * 5.2f;
-        const float border_t = std::max(1.5f, static_cast<float>(scale) * 0.5f);
-        hud.Panel(x - border_t, y - border_t, bar_w + border_t * 2.0f, bar_h + border_t * 2.0f,
-                  bbx::platform::HudColor::GothicBorder());
-        hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.08f, 0.04f, 0.06f, 0.96f});
+        const float bar_h = px * 4.5f;
+        hud.Panel(x, y, bar_w, bar_h, bbx::platform::HudColor{0.08f, 0.05f, 0.07f, 0.96f});
         float frac = 0.0f;
         if (snap.total > 0) {
-            frac = static_cast<float>(snap.done) / static_cast<float>(snap.total);
-            if (frac > 1.0f) frac = 1.0f;
+            frac = std::min(1.0f, static_cast<float>(snap.done) / static_cast<float>(snap.total));
         } else if (snap.phase == bbx::d3d12::BakePhase::kDone) {
             frac = 1.0f;
         }
         if (frac > 0.0f) {
             const float fill_w = bar_w * frac;
             hud.Panel(x, y, fill_w, bar_h, bbx::platform::HudColor::BloodCrimson());
-            const float tip_w = std::min(fill_w, static_cast<float>(scale) * 3.0f);
-            hud.Panel(x + fill_w - tip_w, y, tip_w, bar_h,
-                      bbx::platform::HudColor::PalebloodEmber());
-        } else {
-            hud.Panel(x, y, bar_w * 0.08f, bar_h, bbx::platform::HudColor::TarnishedGold());
+            const float tip_w = std::min(fill_w, px * 2.5f);
+            hud.Panel(x + fill_w - tip_w, y, tip_w, bar_h, bbx::platform::HudColor::TarnishedGold());
         }
-        y += bar_h + line * 0.7f;
+        y += bar_h + px * 3.5f;
 
         char stats[160];
         std::snprintf(stats, sizeof(stats),
@@ -1323,73 +1441,103 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
                       static_cast<unsigned>(snap.resumed_count),
                       static_cast<unsigned>(snap.refused_count),
                       static_cast<unsigned>(snap.quarantined_count));
-        hud.Text(x, y, scale, stats, bbx::platform::HudColor::BoneIvory());
-        y += line;
+        hud.Text(x, y, small_scale, stats, bbx::platform::HudColor::BoneIvory());
+        y += row_h;
 
         if (!snap.current_name.empty()) {
-            hud.Text(x, y, scale, "CARYLL RUNE: " + TruncateLabel(snap.current_name, 54),
+            hud.Text(x, y, small_scale, "SHADER: " + TruncateLabel(snap.current_name, 54),
                      bbx::platform::HudColor::AshSilver());
         } else {
-            hud.Text(x, y, scale, "ETCHING PS4 GCN SHADERS TO NATIVE XBOX DXIL 6.4...",
+            hud.Text(x, y, small_scale, "COMPILING PS4 GCN SHADERS TO DXIL 6.4...",
                      bbx::platform::HudColor::AshSilver());
         }
-        y += line * 1.2f;
+        y += row_h;
 
         const bool cancelling = g_session.bake_progress.CancelRequested();
-        hud.Text(x, y, scale,
-                 cancelling ? "HALTING RITUAL... SAVING CHECKPOINT FOR RESUME"
-                            : "PRESS B TO HALT RITUAL (CHECKPOINT IS SAVED FOR RESUME)",
+        hud.Text(x, y, small_scale,
+                 cancelling ? "SAVING CHECKPOINT..." : "PRESS B TO PAUSE (CHECKPOINT SAVED)",
                  bbx::platform::HudColor::TarnishedGold());
-        y += line;
+        y += row_h;
     } else if (g_session.keyboard_open) {
-        hud.Text(x, y, scale, "HUNTER CONTRACT NAME: " + g_session.keyboard.Text(),
+        hud.Text(x, y, scale, "HUNTER NAME: " + g_session.keyboard.Text(),
                  bbx::platform::HudColor::TarnishedGold());
-        y += line;
+        y += row_h;
         for (std::size_t row = 0; row < g_session.keyboard.RowCount(); ++row) {
             std::string label = g_session.keyboard.Row(row);
             if (row == g_session.keyboard.CursorRow()) {
                 const std::size_t column = g_session.keyboard.CursorColumn() * 2;
                 if (column < label.size()) label[column] = '>';
             }
-            hud.Text(x + margin * 0.5f, y, scale, label, bbx::platform::HudColor::BoneIvory());
-            y += line;
+            hud.Text(x + px * 3.0f, y, scale, label, bbx::platform::HudColor::BoneIvory());
+            y += row_h;
         }
     } else {
-        const std::size_t end_row = std::min(total_items, first_row + visible_items);
-        for (std::size_t i = first_row; i < end_row; ++i) {
-            const bbx::platform::Item& item = g_session.model.items[i];
-            const bool selected = (i == g_session.model.selected);
+        for (const std::size_t idx : tab_items) {
+            const bbx::platform::Item& item = g_session.model.items[idx];
+            const bool selected = (idx == g_session.model.selected);
+            const float text_y = y + (row_h - bbx::platform::Hud::TextHeight(scale)) * 0.5f;
+
             if (selected) {
-                const float sel_pad = static_cast<float>(scale) * 1.2f;
-                hud.Panel(x - sel_pad, y - sel_pad * 0.6f, inner_w + sel_pad * 2.0f,
-                          line - sel_pad * 0.3f, bbx::platform::HudColor::CrimsonSelection());
-                hud.Panel(x - sel_pad, y - sel_pad * 0.6f, static_cast<float>(scale) * 1.4f,
-                          line - sel_pad * 0.3f, bbx::platform::HudColor::TarnishedGold());
+                hud.Panel(x, y + px * 0.4f, inner_w, row_h - px * 0.8f,
+                          bbx::platform::HudColor{0.38f, 0.08f, 0.12f, 0.55f});
+                hud.Panel(x, y + px * 0.4f, px * 1.2f, row_h - px * 0.8f,
+                          bbx::platform::HudColor::TarnishedGold());
             }
-            bbx::platform::HudColor colour = bbx::platform::HudColor::AshSilver();
+
+            bbx::platform::HudColor label_col = bbx::platform::HudColor::AshSilver();
             if (item.enabled) {
                 if (item.dangerous) {
-                    colour = bbx::platform::HudColor::PalebloodEmber();
+                    label_col = bbx::platform::HudColor::PalebloodEmber();
                 } else if (selected) {
-                    colour = bbx::platform::HudColor::TarnishedGold();
+                    label_col = bbx::platform::HudColor::TarnishedGold();
                 } else {
-                    colour = bbx::platform::HudColor::BoneIvory();
+                    label_col = bbx::platform::HudColor::BoneIvory();
                 }
             }
-            const std::string label = std::string(selected ? "<> " : "   ") + item.label;
-            hud.Text(x + static_cast<float>(scale) * 1.5f, y, scale, label, colour);
-            y += line;
-        }
-        if (scrolling) {
-            char scroll_hint[96];
-            std::snprintf(scroll_hint, sizeof(scroll_hint),
-                          "%s ITEMS %zu-%zu OF %zu  |  D-PAD UP/DOWN TO SCROLL %s",
-                          first_row > 0u ? "[^]" : "   ", first_row + 1u, end_row, total_items,
-                          end_row < total_items ? "[v]" : "   ");
-            hud.Text(x + static_cast<float>(scale) * 1.5f, y, small_scale, scroll_hint,
-                     bbx::platform::HudColor::AshSilver());
+
+            const std::size_t colon = item.label.find(": ");
+            const float rx = x + px * 3.5f;
+            if (colon != std::string::npos) {
+                const std::string left = item.label.substr(0, colon);
+                const std::string right = item.label.substr(colon + 2);
+                bbx::platform::HudColor val_col = bbx::platform::HudColor::AshSilver();
+                if (right == "off" || right == "OFF") {
+                    val_col = bbx::platform::HudColor::AshSilver();
+                } else if (item.dangerous) {
+                    val_col = bbx::platform::HudColor::PalebloodEmber();
+                } else {
+                    val_col = bbx::platform::HudColor::TarnishedGold();
+                }
+                hud.Text(rx, text_y, scale, left, label_col);
+                const float vw = bbx::platform::Hud::TextWidth(right, scale);
+                hud.Text(x + inner_w - vw - px * 2.5f, text_y, scale, right, val_col);
+            } else {
+                hud.Text(rx, text_y, scale, item.label, label_col);
+            }
+            y += row_h;
         }
     }
+
+    // Minimal Apple-style bottom footer: optional status pill, 1-2 line hint, and control legend.
+    y += px * 2.0f;
+    hud.Panel(x, y, inner_w, 1.0f, divider);
+    y += px * 2.5f;
+    const float small_line = bbx::platform::Hud::TextHeight(small_scale) + px * 1.8f;
+
+    if (has_status) {
+        const std::vector<std::string> st = WrapLines(g_session.model.status_banner, max_chars);
+        hud.Text(x, y, small_scale, st[0], bbx::platform::HudColor::PalebloodEmber());
+        y += small_line;
+    }
+    for (const std::string& hl : hint_lines) {
+        hud.Text(x, y, small_scale, hl, bbx::platform::HudColor::AshSilver());
+        y += small_line;
+    }
+    hud.Text(x, y, small_scale,
+             g_session.keyboard_open
+                 ? "A: TYPE   B: BACKSPACE   MENU: SAVE   VIEW: CANCEL"
+                 : "A: SELECT   LEFT/RIGHT: TAB   MENU: HUNTER NAME",
+             bbx::platform::HudColor::TarnishedGold());
 }
 
 void AppendInGameOverlays(bbx::platform::Hud& hud) {
