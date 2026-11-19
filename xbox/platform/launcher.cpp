@@ -17,8 +17,11 @@ const char* ActionName(Action action) {
     case Action::kToggleModdedEboot: return "toggle-modded-eboot";
     case Action::kContinueUnpatched: return "continue-unpatched";
     case Action::kToggleFpsCap: return "toggle-fps-cap";
+    case Action::kCycleResolution: return "cycle-resolution";
     case Action::kToggleVsync: return "toggle-vsync";
     case Action::kToggleSharpUpscale: return "toggle-sharp-upscale";
+    case Action::kTogglePerformanceMode: return "toggle-performance-mode";
+    case Action::kCycleShadowRes: return "cycle-shadow-res";
     case Action::kTogglePerfHud: return "toggle-perf-hud";
     case Action::kToggleSkipLogos: return "toggle-skip-logos";
     case Action::kToggleEnhancements: return "toggle-enhancements";
@@ -82,13 +85,37 @@ void LauncherModel::Rebuild() {
                          fps_cap >= 60 ? "Frame rate cap: 60 FPS++" : "Frame rate cap: 30 FPS",
                          "Toggle native 30 FPS or true 60 FPS++ timestep patching (live in L3+R3 menu)",
                          !precompiling, false});
+    const char* res_label = "Render resolution: 1080p (1920x1080)";
+    if (render_res_mode == 1) {
+        res_label = "Render resolution: 900p (1600x900)";
+    } else if (render_res_mode == 2) {
+        res_label = "Render resolution: 720p (1280x720)";
+    }
+    items.push_back(Item{Action::kCycleResolution, res_label,
+                         "Internal guest render size upscaled by FSR RCAS (live in L3+R3 menu)",
+                         !precompiling, false});
     items.push_back(Item{Action::kToggleVsync,
-                         vsync ? "VSync: on" : "VSync: off",
-                         "Lock presentation to display refresh to eliminate tearing",
+                         vsync ? "VSync: on" : "VSync: off (VRR / FreeSync)",
+                         "Lock to refresh or unlock with DXGI ALLOW_TEARING for VRR displays",
                          !precompiling, false});
     items.push_back(Item{Action::kToggleSharpUpscale,
                          sharp_upscale ? "Upscaling: FSR RCAS" : "Upscaling: Bilinear",
                          "HLSL SM 6.4 contrast-adaptive sharpening for 1440p/4K TVs",
+                         !precompiling, false});
+    items.push_back(Item{Action::kTogglePerformanceMode,
+                         performance_mode ? "Performance mode: on" : "Performance mode: off",
+                         "Disable heavy YEBIS post-processing passes for maximum 60 FPS headroom",
+                         !precompiling, false});
+    const char* shadow_label = "Shadow resolution: Default";
+    if (shadow_resolution <= 0) {
+        shadow_label = "Shadow resolution: Lowest";
+    } else if (shadow_resolution == 1) {
+        shadow_label = "Shadow resolution: Low";
+    } else if (shadow_resolution >= 3) {
+        shadow_label = "Shadow resolution: High";
+    }
+    items.push_back(Item{Action::kCycleShadowRes, shadow_label,
+                         "Sun, lamp, and torch shadow map resolution (live in L3+R3 menu)",
                          !precompiling, false});
     items.push_back(Item{Action::kToggleSkipLogos,
                          skip_logos ? "Skip intro logos: on" : "Skip intro logos: off",

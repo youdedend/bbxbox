@@ -234,13 +234,16 @@ bool host_gpu_init(const char* const*, std::uint32_t, bool) {
 }
 
 bool host_gpu_available() { return GuestGpu() != nullptr; }
-bool host_gpu_memory_tight() { return false; }
+// Xbox Dev Mode enforces a 5,120 MiB unified memory cap; reporting tight memory
+// keeps live_resolution's display buffers and GFX_GraphicsPrivate heap capped at
+// 1920x1080 (avoiding 5120x2160 buffers, +1,088 MiB heap bloat, and 5K clears).
+bool host_gpu_memory_tight() { return true; }
 bool host_gpu_small_vram() { return false; }
 bool host_gpu_integrated() {
     GpuMemoryGlance g{};
     return host_gpu_memory_glance(g) ? g.integrated : false;
 }
-bool host_gpu_integrated_with_room() { return host_gpu_integrated(); }
+bool host_gpu_integrated_with_room() { return false; }
 const memory_policy::Policy& host_gpu_memory_policy() {
     static const memory_policy::Policy p;
     return p;
@@ -304,9 +307,14 @@ bool host_gpu_mem_write(std::uint64_t va, const void* data, std::size_t bytes) {
 
 bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t bytes, std::uint64_t* serial) {
     if (!host_gpu_mem_write(va, data, bytes)) return false;
-    // The upload path waits the fence, so it is complete before this returns; the
-    // serial a caller records is the one the wait proved.
-    if (serial) *serial = host_gpu_submissions_completed();
+    if (serial) {
+        const GuestGpuBinding* gpu = GuestGpu();
+        if (gpu && gpu->fence_signal) {
+            *serial = gpu->fence_signal(gpu->user);
+        } else {
+            *serial = host_gpu_submissions_completed();
+        }
+    }
     return true;
 }
 

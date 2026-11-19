@@ -42,7 +42,7 @@ add_library(bbx_zlib STATIC
 target_include_directories(bbx_zlib PUBLIC "${BBX_ZLIB_ROOT}")
 set_target_properties(bbx_zlib PROPERTIES C_STANDARD 99)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    target_compile_options(bbx_zlib PRIVATE /W0 /D_CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bbx_zlib PRIVATE /W0 /D_CRT_SECURE_NO_WARNINGS /arch:AVX2 /clang:-mtune=znver2 /Gw)
 endif()
 endif()
 
@@ -55,7 +55,7 @@ target_include_directories(bbx_atrac9 PUBLIC "${BBX_BBHOST_ROOT}/third_party/lib
 target_compile_definitions(bbx_atrac9 PUBLIC ATRAC9_STATIC)
 set_target_properties(bbx_atrac9 PROPERTIES C_STANDARD 99)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    target_compile_options(bbx_atrac9 PRIVATE /W0)
+    target_compile_options(bbx_atrac9 PRIVATE /W0 /arch:AVX2 /clang:-mtune=znver2 /Gw)
 endif()
 
 # --- monocypher (BSD-2/CC0) --------------------------------------------------
@@ -64,6 +64,9 @@ add_library(bbx_monocypher STATIC
     "${BBX_BBHOST_ROOT}/third_party/monocypher/monocypher-ed25519.c")
 target_include_directories(bbx_monocypher PUBLIC "${BBX_BBHOST_ROOT}/third_party/monocypher")
 set_target_properties(bbx_monocypher PROPERTIES C_STANDARD 99)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(bbx_monocypher PRIVATE /W0 /arch:AVX2 /clang:-mtune=znver2 /Gw)
+endif()
 
 # --- the GCN shader library (upstream's `gcn` target) ------------------------
 add_library(bbhost_gcn STATIC
@@ -97,7 +100,7 @@ target_compile_definitions(bbhost_gcn PUBLIC
 # Upstream's code is not /W4-clean on clang-cl and its warnings are not this
 # port's to fix; the port's own TUs keep /W4 /WX.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(bbhost_gcn PRIVATE /W3 /EHsc /permissive-)
+    target_compile_options(bbhost_gcn PRIVATE /W3 /EHsc /permissive- /arch:AVX2 /clang:-mtune=znver2 /Gw)
 endif()
 target_link_libraries(bbhost_gcn PUBLIC bbx_zlib)
 
@@ -215,8 +218,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # `/arch:AVX2`: `core/thunk.cpp`'s save/restore of the vector register file
     # uses `vmovdqu`, and every Xbox Series X|S CPU (Zen 2) has AVX2, FMA and
     # BMI2 natively - the console is not a lowest-common-denominator CPU.
-    target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
-        -Wno-delayed-template-parsing-in-cxx20)
+    target_compile_options(bbhost_guest PRIVATE /W3 /EHsc /permissive- /arch:AVX2 /clang:-mtune=znver2 /Gw
+        -fdelayed-template-parsing -Wno-delayed-template-parsing-in-cxx20)
 endif()
 
 # --- the portable host layer, for the console --------------------------------
@@ -304,8 +307,8 @@ target_compile_definitions(bbhost_host PUBLIC
     NOMINMAX)
 target_link_libraries(bbhost_host PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(bbhost_host PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
-        -Wno-delayed-template-parsing-in-cxx20)
+    target_compile_options(bbhost_host PRIVATE /W3 /EHsc /permissive- /arch:AVX2 /clang:-mtune=znver2 /Gw
+        -fdelayed-template-parsing -Wno-delayed-template-parsing-in-cxx20)
 endif()
 
 # --- the guest's own code: decomp, engine patches, the network stack ----------
@@ -445,6 +448,6 @@ target_compile_definitions(bbhost_engine PUBLIC
     NOMINMAX)
 target_link_libraries(bbhost_engine PUBLIC bbx_zlib bbx_atrac9 bbx_monocypher)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(bbhost_engine PRIVATE /W3 /EHsc /permissive- /arch:AVX2 -fdelayed-template-parsing
-        -Wno-delayed-template-parsing-in-cxx20)
+    target_compile_options(bbhost_engine PRIVATE /W3 /EHsc /permissive- /arch:AVX2 /clang:-mtune=znver2 /Gw
+        -fdelayed-template-parsing -Wno-delayed-template-parsing-in-cxx20)
 endif()

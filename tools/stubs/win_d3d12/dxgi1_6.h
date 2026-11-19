@@ -20,6 +20,7 @@ enum DXGI_FORMAT : UINT {
     DXGI_FORMAT_R8G8B8A8_UNORM = 28,
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB = 29,
     DXGI_FORMAT_B8G8R8A8_UNORM = 87,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB = 91,
     DXGI_FORMAT_R10G10B10A2_UNORM = 24,
     DXGI_FORMAT_R32G32B32A32_FLOAT = 2,
     DXGI_FORMAT_R32G32B32A32_UINT = 3,
@@ -214,7 +215,13 @@ struct DECLSPEC_UUID("1bc6ea02-ef36-464f-bf0c-21ca39e5168a") IDXGISwapChain4 : I
     virtual HRESULT SetHDRMetaData(UINT type, UINT size, void* metadata) = 0;
 };
 
+enum DXGI_FEATURE : UINT {
+    DXGI_FEATURE_PRESENT_ALLOW_TEARING = 0,
+};
+
 struct DECLSPEC_UUID("3c9d1d1a-3f8a-4f4b-8b0f-7a0d0b1c9e2f") IDXGIFactory6 : IDXGIFactory2 {
+    virtual HRESULT CheckFeatureSupport(DXGI_FEATURE feature, void* feature_support_data,
+                                        UINT feature_support_data_size) = 0;
     virtual HRESULT EnumAdapterByGpuPreference(UINT index, DXGI_GPU_PREFERENCE preference,
                                                REFIID riid, void** adapter) = 0;
     virtual HRESULT EnumAdapterByLuid(const GUID& luid, REFIID riid, void** adapter) = 0;

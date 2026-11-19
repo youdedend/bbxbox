@@ -288,19 +288,43 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 GuestMemory::~GuestMemory() { Destroy(); }
 
 void GuestMemory::Destroy() {
+    if (owner_ != nullptr) {
+        if (batch_open_) {
+            (void)Flush();
+        }
+        (void)owner_->WaitIdle();
+    }
+    if (upload_ != nullptr && upload_mapped_ != nullptr) {
+        upload_->Unmap(0, nullptr);
+        upload_mapped_ = nullptr;
+    }
     slabs_.clear();
+    free_allocators_.clear();
+    pending_allocators_.clear();
+    active_list_.Reset();
+    active_allocator_.Reset();
+    copy_scratch_.Reset();
     owner_ = nullptr;
     budget_ = nullptr;
     page_table_.Reset();
     guard_.Reset();
     upload_.Reset();
     readback_.Reset();
+    readback_bytes_ = 0;
     heap_.Reset();
     device_ = nullptr;
+    upload_slice_ = 0;
+    upload_slice_cursor_ = 0;
+    upload_slice_fence_.fill(0);
+    batch_open_ = false;
+    batch_ops_ = 0;
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
+    slab_batch_dirty_mask_ = 0;
     slabs_resident_ = 0;
     committed_bytes_ = 0;
     uploads_ = 0;
     upload_bytes_ = 0;
+    flushes_ = 0;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE GuestMemory::SlabUav(std::uint32_t slab) const {
@@ -318,6 +342,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     device_ = device.Get();
     budget_ = &budget;
     table_ = plan.table;
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
 
     D3D12_HEAP_PROPERTIES default_heap{};
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -405,9 +430,12 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     list->CopyBufferRegion(page_table_.Get(), 0, upload.Get(), 0, bytes.size());
     list->Close();
     ID3D12CommandList* lists[] = {list.Get()};
-    owner_->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    const std::uint64_t value = owner_->Signal();
+    const std::uint64_t value = owner_->ExecuteAndSignal(lists, 1);
     if (!owner_->WaitFor(value)) return owner_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+
+    // Keep the boot allocator and list in the pool so future async batches reuse them.
+    active_list_ = std::move(list);
+    free_allocators_.push_back(std::move(allocator));
 
     committed_bytes_ = bytes.size() + kGuardBytes;
     slabs_resident_ = 1;  // only the guard slab is resident until EnsureSlab commits a data slab
@@ -469,153 +497,385 @@ Status GuestMemory::EnsureSlab(std::uint32_t slab) {
 std::string GuestMemory::Describe() const {
     std::ostringstream out;
     out << "guest memory: " << (committed_bytes_ >> 20) << " MiB committed, " << slabs_resident_ << "/" << kGuestSlabCount
-        << " slab(s) resident, " << uploads_ << " upload(s), " << (upload_bytes_ >> 10) << " KiB copied";
+        << " slab(s) resident, " << uploads_ << " upload(s) (" << flushes_ << " batch(es)), " << (upload_bytes_ >> 10)
+        << " KiB copied";
     return out.str();
 }
 
-// The one submission path both directions use: record, execute, wait. There is no
-// ring because an upload is a boot-time or a one-off event, not a per-frame flow,
-// and a wait that a frame would not tolerate is exactly what makes the write
-// complete for the CPU when the call returns.
-Status GuestMemory::Submit(ID3D12GraphicsCommandList* list, const std::function<void(ID3D12GraphicsCommandList*)>& record) {
-    record(list);
-    list->Close();
-    ID3D12CommandList* lists[] = {list};
-    owner_->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    const std::uint64_t value = owner_->Signal();
-    if (!owner_->WaitFor(value)) return owner_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+void GuestMemory::OnFrame(std::uint64_t completed) {
+    if (pending_allocators_.empty()) return;
+    std::size_t write = 0;
+    for (std::size_t read = 0; read < pending_allocators_.size(); ++read) {
+        if (pending_allocators_[read].fence <= completed) {
+            free_allocators_.push_back(std::move(pending_allocators_[read].allocator));
+        } else {
+            if (write != read) pending_allocators_[write] = std::move(pending_allocators_[read]);
+            ++write;
+        }
+    }
+    pending_allocators_.resize(write);
+}
+
+Status GuestMemory::EnsureUploadRing() {
+    if (upload_ != nullptr && upload_mapped_ != nullptr) return Status::kOk;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    const D3D12_RESOURCE_DESC desc = RawBuffer(kUploadRingBytes);
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                nullptr, IID_PPV_ARGS(upload_.GetAddressOf())))) {
+        return Status::kOutOfMemory;
+    }
+    void* mapped = nullptr;
+    const D3D12_RANGE no_read{0, 0};
+    if (FAILED(upload_->Map(0, &no_read, &mapped)) || mapped == nullptr) {
+        upload_.Reset();
+        return Status::kOutOfMemory;
+    }
+    upload_mapped_ = static_cast<std::uint8_t*>(mapped);
+    upload_slice_ = 0;
+    upload_slice_cursor_ = 0;
+    upload_slice_fence_.fill(0);
     return Status::kOk;
 }
 
-Status GuestMemory::Record(ID3D12GraphicsCommandList** list_out, ComPtr<ID3D12CommandAllocator>* allocator_out) {
-    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator_out->GetAddressOf())))) {
+Status GuestMemory::EnsureCopyScratch() {
+    if (copy_scratch_ != nullptr) return Status::kOk;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    const D3D12_RESOURCE_DESC desc = RawBuffer(kCopyScratchBytes);
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                nullptr, IID_PPV_ARGS(copy_scratch_.GetAddressOf())))) {
         return Status::kOutOfMemory;
     }
-    ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator_out->Get(), nullptr,
-                                          IID_PPV_ARGS(list.GetAddressOf())))) {
-        return Status::kOutOfMemory;
-    }
-    *list_out = list.Detach();
     return Status::kOk;
 }
 
-Status GuestMemory::WriteGuest(const GuestPageTable& table, std::uint64_t va, const void* data, std::size_t bytes) {
-    std::vector<GuestRun> runs;
-    if (!device_ || !data || bytes == 0 || bytes % 4 != 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
-    if (!SlabRuns(table, va, bytes, &runs)) return Status::kInvalidArgument;  // unmapped: never the guard page
-    for (const GuestRun& run : runs) {
-        if (const Status status = EnsureSlab(run.slab); status != Status::kOk) return status;
+Status GuestMemory::ReserveUpload(std::size_t bytes, std::uint64_t* out_offset) {
+    if (bytes == 0 || bytes > kUploadSliceBytes || out_offset == nullptr) return Status::kInvalidArgument;
+    const std::uint64_t aligned = (static_cast<std::uint64_t>(bytes) + 15ull) & ~15ull;
+    if (upload_slice_cursor_ + aligned > kUploadSliceBytes) {
+        if (batch_open_) {
+            const Status flushed = Flush();
+            if (flushed != Status::kOk) return flushed;
+        }
+        upload_slice_fence_[upload_slice_] = owner_->SubmittedValue();
+        upload_slice_ = (upload_slice_ + 1u) % kUploadSlices;
+        upload_slice_cursor_ = 0;
+        const std::uint64_t wait_fence = upload_slice_fence_[upload_slice_];
+        if (wait_fence != 0 && owner_->CompletedValue() < wait_fence) {
+            if (!owner_->WaitFor(wait_fence)) {
+                return owner_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+            }
+            OnFrame(owner_->CompletedValue());
+        }
     }
-    if (!upload_) {
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        const D3D12_RESOURCE_DESC desc = RawBuffer(kStagingBytes);
-        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                   nullptr, IID_PPV_ARGS(upload_.GetAddressOf())))) {
+    *out_offset = static_cast<std::uint64_t>(upload_slice_) * kUploadSliceBytes + upload_slice_cursor_;
+    upload_slice_cursor_ += aligned;
+    return Status::kOk;
+}
+
+Status GuestMemory::BeginBatch() {
+    if (batch_open_) return Status::kOk;
+    OnFrame(owner_->CompletedValue());
+    ComPtr<ID3D12CommandAllocator> allocator;
+    if (!free_allocators_.empty()) {
+        allocator = std::move(free_allocators_.back());
+        free_allocators_.pop_back();
+        if (FAILED(allocator->Reset())) return Status::kUnavailable;
+    } else {
+        if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   IID_PPV_ARGS(allocator.GetAddressOf())))) {
             return Status::kOutOfMemory;
         }
     }
-    void* mapped = nullptr;
-    if (FAILED(upload_->Map(0, nullptr, &mapped))) return Status::kOutOfMemory;
-    std::memcpy(mapped, data, bytes);
-    upload_->Unmap(0, nullptr);
+    if (!active_list_) {
+        if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                              IID_PPV_ARGS(active_list_.GetAddressOf())))) {
+            free_allocators_.push_back(std::move(allocator));
+            return Status::kOutOfMemory;
+        }
+    } else {
+        if (FAILED(active_list_->Reset(allocator.Get(), nullptr))) {
+            free_allocators_.push_back(std::move(allocator));
+            return Status::kUnavailable;
+        }
+    }
+    active_allocator_ = std::move(allocator);
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
+    slab_batch_dirty_mask_ = 0;
+    batch_open_ = true;
+    batch_ops_ = 0;
+    return Status::kOk;
+}
 
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ID3D12GraphicsCommandList* raw = nullptr;
-    if (const Status status = Record(&raw, &allocator); status != Status::kOk) return status;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    list.Attach(raw);
-    std::size_t from = 0;
-    const Status status = Submit(list.Get(), [&](ID3D12GraphicsCommandList* l) {
-        for (const GuestRun& run : runs) {
+void GuestMemory::TransitionSlab(std::uint32_t slab, D3D12_RESOURCE_STATES target_state) {
+    if (slab >= kGuestSlabCount) return;
+    const D3D12_RESOURCE_STATES current = slab_batch_state_[slab];
+    if (current == target_state) return;
+    ID3D12Resource* target = SlabBuffer(slab);
+    if (target == nullptr) return;
+    const D3D12_RESOURCE_BARRIER b = Transition(target, current, target_state);
+    active_list_->ResourceBarrier(1, &b);
+    slab_batch_state_[slab] = target_state;
+    if (target_state == D3D12_RESOURCE_STATE_COMMON) {
+        slab_batch_dirty_mask_ &= ~(1u << slab);
+    } else {
+        slab_batch_dirty_mask_ |= (1u << slab);
+    }
+}
+
+Status GuestMemory::Flush() {
+    if (!batch_open_) return Status::kOk;
+    D3D12_RESOURCE_BARRIER barriers[kGuestSlabCount];
+    UINT barrier_count = 0;
+    std::uint32_t mask = slab_batch_dirty_mask_;
+    for (std::uint32_t slab = 0; mask != 0 && slab < kGuestSlabCount; ++slab, mask >>= 1u) {
+        if ((mask & 1u) == 0u) continue;
+        ID3D12Resource* res = SlabBuffer(slab);
+        if (res != nullptr && slab_batch_state_[slab] != D3D12_RESOURCE_STATE_COMMON) {
+            barriers[barrier_count++] = Transition(res, slab_batch_state_[slab], D3D12_RESOURCE_STATE_COMMON);
+        }
+        slab_batch_state_[slab] = D3D12_RESOURCE_STATE_COMMON;
+    }
+    slab_batch_dirty_mask_ = 0;
+    if (barrier_count > 0) {
+        active_list_->ResourceBarrier(barrier_count, barriers);
+    }
+    const HRESULT closed = active_list_->Close();
+    batch_open_ = false;
+    batch_ops_ = 0;
+    if (FAILED(closed)) {
+        free_allocators_.push_back(std::move(active_allocator_));
+        return FromHresult(closed);
+    }
+    ID3D12CommandList* lists[] = {active_list_.Get()};
+    const std::uint64_t fence = owner_->ExecuteAndSignal(lists, 1);
+    pending_allocators_.push_back(PendingAllocator{std::move(active_allocator_), fence});
+    ++flushes_;
+    return owner_->DeviceLost() ? Status::kDeviceLost : Status::kOk;
+}
+
+Status GuestMemory::WriteGuest(const GuestPageTable& table, std::uint64_t va, const void* data, std::size_t bytes) {
+    if (!device_ || !data || bytes == 0 || bytes % 4 != 0) return Status::kInvalidArgument;
+    if (const Status ring = EnsureUploadRing(); ring != Status::kOk) return ring;
+
+    const auto* src = static_cast<const std::uint8_t*>(data);
+    std::size_t done = 0;
+    while (done < bytes) {
+        const std::size_t chunk = std::min<std::size_t>(bytes - done, static_cast<std::size_t>(kUploadSliceBytes));
+        if (!SlabRuns(table, va + done, chunk, &runs_scratch_)) return Status::kInvalidArgument;
+        for (const GuestRun& run : runs_scratch_) {
+            if (const Status status = EnsureSlab(run.slab); status != Status::kOk) return status;
+        }
+        std::uint64_t ring_offset = 0;
+        if (const Status reserved = ReserveUpload(chunk, &ring_offset); reserved != Status::kOk) return reserved;
+        std::memcpy(upload_mapped_ + ring_offset, src + done, chunk);
+
+        if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+        std::size_t from = 0;
+        for (const GuestRun& run : runs_scratch_) {
             ID3D12Resource* target = slabs_.at(run.slab).Get();
-            const D3D12_RESOURCE_BARRIER before[] = {Transition(target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)};
-            l->ResourceBarrier(1, &before[0]);
-            l->CopyBufferRegion(target, run.offset, upload_.Get(), from, run.bytes);
-            const D3D12_RESOURCE_BARRIER after[] = {Transition(target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)};
-            l->ResourceBarrier(1, &after[0]);
+            TransitionSlab(run.slab, D3D12_RESOURCE_STATE_COPY_DEST);
+            active_list_->CopyBufferRegion(target, run.offset, upload_.Get(), ring_offset + from, run.bytes);
             from += run.bytes;
         }
-    });
-    if (status != Status::kOk) return status;
+        ++batch_ops_;
+        if (batch_ops_ >= kMaxBatchOps) {
+            if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+        }
+        done += chunk;
+    }
     ++uploads_;
     upload_bytes_ += bytes;
     return Status::kOk;
 }
 
 Status GuestMemory::FillGuest(const GuestPageTable& table, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
-    if (!device_ || bytes == 0 || bytes % 4 != 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
-    // A fill is a write of one dword repeated, through the same upload path so
-    // there is one rule for what reaches the slabs.
-    std::vector<std::uint8_t> pattern(bytes, 0);
-    for (std::size_t at = 0; at + 4 <= bytes; at += 4) std::memcpy(pattern.data() + at, &value, 4);
-    return WriteGuest(table, va, pattern.data(), bytes);
+    if (!device_ || bytes == 0 || bytes % 4 != 0) return Status::kInvalidArgument;
+    if (const Status ring = EnsureUploadRing(); ring != Status::kOk) return ring;
+
+    std::size_t done = 0;
+    while (done < bytes) {
+        const std::size_t chunk = std::min<std::size_t>(bytes - done, static_cast<std::size_t>(kUploadSliceBytes));
+        if (!SlabRuns(table, va + done, chunk, &runs_scratch_)) return Status::kInvalidArgument;
+        for (const GuestRun& run : runs_scratch_) {
+            if (const Status status = EnsureSlab(run.slab); status != Status::kOk) return status;
+        }
+        std::uint64_t ring_offset = 0;
+        if (const Status reserved = ReserveUpload(chunk, &ring_offset); reserved != Status::kOk) return reserved;
+        // Write the 32-bit pattern directly into the mapped upload ring (zero heap alloc).
+        auto* dst_words = reinterpret_cast<std::uint32_t*>(upload_mapped_ + ring_offset);
+        std::fill_n(dst_words, chunk / 4u, value);
+
+        if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+        std::size_t from = 0;
+        for (const GuestRun& run : runs_scratch_) {
+            ID3D12Resource* target = slabs_.at(run.slab).Get();
+            TransitionSlab(run.slab, D3D12_RESOURCE_STATE_COPY_DEST);
+            active_list_->CopyBufferRegion(target, run.offset, upload_.Get(), ring_offset + from, run.bytes);
+            from += run.bytes;
+        }
+        ++batch_ops_;
+        if (batch_ops_ >= kMaxBatchOps) {
+            if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+        }
+        done += chunk;
+    }
+    ++uploads_;
+    upload_bytes_ += bytes;
+    return Status::kOk;
 }
 
 Status GuestMemory::ReadGuest(const GuestPageTable& table, std::uint64_t va, void* out, std::size_t bytes) {
-    std::vector<GuestRun> runs;
-    if (!device_ || !out || bytes == 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
-    if (!SlabRuns(table, va, bytes, &runs)) return Status::kInvalidArgument;
-    if (!readback_) {
+    if (!device_ || !out || bytes == 0 || bytes > kUploadSliceBytes) return Status::kInvalidArgument;
+    if (!SlabRuns(table, va, bytes, &runs_scratch_)) return Status::kInvalidArgument;
+    // Flush any queued async uploads/copies before reading back so readback observes them.
+    if (batch_open_) {
+        if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+    }
+    const std::uint64_t needed = std::max<std::uint64_t>(kStagingBytes, bytes);
+    if (!readback_ || readback_bytes_ < needed) {
+        readback_.Reset();
+        readback_bytes_ = 0;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
-        const D3D12_RESOURCE_DESC desc = RawBuffer(kStagingBytes);
+        const D3D12_RESOURCE_DESC desc = RawBuffer(needed);
         if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                   IID_PPV_ARGS(readback_.GetAddressOf())))) {
+                                                    IID_PPV_ARGS(readback_.GetAddressOf())))) {
             return Status::kOutOfMemory;
         }
+        readback_bytes_ = needed;
     }
     // A slab the guest never made resident holds the guard page's contents, which
     // is no data at all: those runs read as zero rather than as a walk's leftovers.
     std::memset(out, 0, bytes);
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ID3D12GraphicsCommandList* raw = nullptr;
-    if (const Status status = Record(&raw, &allocator); status != Status::kOk) return status;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    list.Attach(raw);
-    std::size_t at = 0;
-    bool copied = false;
-    const Status status = Submit(list.Get(), [&](ID3D12GraphicsCommandList* l) {
-        for (const GuestRun& run : runs) {
-            const auto it = slabs_.find(run.slab);
-            if (it != slabs_.end()) {
-                ID3D12Resource* source = it->second.Get();
-                const D3D12_RESOURCE_BARRIER before[] = {
-                    Transition(source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)};
-                l->ResourceBarrier(1, &before[0]);
-                l->CopyBufferRegion(readback_.Get(), at, source, run.offset, run.bytes);
-                const D3D12_RESOURCE_BARRIER after[] = {
-                    Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)};
-                l->ResourceBarrier(1, &after[0]);
-                copied = true;
-            }
-            at += run.bytes;
+
+    bool any_resident = false;
+    for (const GuestRun& run : runs_scratch_) {
+        if (slabs_.find(run.slab) != slabs_.end()) {
+            any_resident = true;
+            break;
         }
-    });
-    if (status != Status::kOk || !copied) return status;
+    }
+    if (!any_resident) return Status::kOk;
+
+    if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+    std::size_t at = 0;
+    for (const GuestRun& run : runs_scratch_) {
+        const auto it = slabs_.find(run.slab);
+        if (it != slabs_.end()) {
+            TransitionSlab(run.slab, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            active_list_->CopyBufferRegion(readback_.Get(), at, it->second.Get(), run.offset, run.bytes);
+        }
+        at += run.bytes;
+    }
+    if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+    const std::uint64_t fence = owner_->SubmittedValue();
+    if (!owner_->WaitFor(fence)) return owner_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+
     void* mapped = nullptr;
-    if (FAILED(readback_->Map(0, nullptr, &mapped))) return Status::kOutOfMemory;
+    const D3D12_RANGE read_range{0, bytes};
+    if (FAILED(readback_->Map(0, &read_range, &mapped))) return Status::kOutOfMemory;
     const auto* src = static_cast<const std::uint8_t*>(mapped);
     auto* dst = static_cast<std::uint8_t*>(out);
     std::size_t out_at = 0;
-    for (const GuestRun& run : runs) {
+    for (const GuestRun& run : runs_scratch_) {
         if (slabs_.find(run.slab) != slabs_.end()) {
             std::memcpy(dst + out_at, src + out_at, run.bytes);
         }
         out_at += run.bytes;
     }
-    readback_->Unmap(0, nullptr);
+    const D3D12_RANGE no_write{0, 0};
+    readback_->Unmap(0, &no_write);
     return Status::kOk;
 }
 
 Status GuestMemory::CopyGuest(const GuestPageTable& table, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) {
-    if (!device_ || bytes == 0 || bytes % 4 != 0 || bytes > kStagingBytes) return Status::kInvalidArgument;
-    // Read back and write again: the source's bytes are the ones the GPU wrote,
-    // and a shadow copy here would be a second answer to what guest memory holds.
-    std::vector<std::uint8_t> staging(bytes);
-    if (const Status status = ReadGuest(table, src_va, staging.data(), bytes); status != Status::kOk) return status;
-    return WriteGuest(table, dst_va, staging.data(), bytes);
+    if (!device_ || bytes == 0 || bytes % 4 != 0) return Status::kInvalidArgument;
+    if (dst_va == src_va) return Status::kOk;
+    if (!SlabRuns(table, src_va, bytes, &runs_scratch_)) return Status::kInvalidArgument;
+    if (!SlabRuns(table, dst_va, bytes, &dst_runs_scratch_)) return Status::kInvalidArgument;
+    for (const GuestRun& run : dst_runs_scratch_) {
+        if (const Status status = EnsureSlab(run.slab); status != Status::kOk) return status;
+    }
+
+    // Pure GPU-to-GPU copy across runs: no CPU readback and no WaitFor() stall.
+    std::size_t si = 0, di = 0;
+    std::size_t s_off = 0, d_off = 0;
+    std::uint64_t dst_cursor = dst_va;
+    while (si < runs_scratch_.size() && di < dst_runs_scratch_.size()) {
+        const GuestRun& sr = runs_scratch_[si];
+        const GuestRun& dr = dst_runs_scratch_[di];
+        const std::size_t step = std::min(sr.bytes - s_off, dr.bytes - d_off);
+        const auto src_it = slabs_.find(sr.slab);
+        if (src_it == slabs_.end()) {
+            // Unallocated source slab is logically zero; zero-fill destination via ring.
+            if (const Status ring = EnsureUploadRing(); ring != Status::kOk) return ring;
+            std::size_t z_done = 0;
+            while (z_done < step) {
+                const std::size_t chunk = std::min<std::size_t>(step - z_done, static_cast<std::size_t>(kUploadSliceBytes));
+                std::uint64_t ring_offset = 0;
+                if (const Status res = ReserveUpload(chunk, &ring_offset); res != Status::kOk) return res;
+                std::memset(upload_mapped_ + ring_offset, 0, chunk);
+                if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+                TransitionSlab(dr.slab, D3D12_RESOURCE_STATE_COPY_DEST);
+                active_list_->CopyBufferRegion(slabs_.at(dr.slab).Get(), dr.offset + d_off + z_done,
+                                               upload_.Get(), ring_offset, chunk);
+                ++batch_ops_;
+                if (batch_ops_ >= kMaxBatchOps) {
+                    if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+                }
+                z_done += chunk;
+            }
+        } else if (sr.slab != dr.slab) {
+            if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+            TransitionSlab(sr.slab, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            TransitionSlab(dr.slab, D3D12_RESOURCE_STATE_COPY_DEST);
+            active_list_->CopyBufferRegion(slabs_.at(dr.slab).Get(), dr.offset + d_off,
+                                           src_it->second.Get(), sr.offset + s_off, step);
+            ++batch_ops_;
+            if (batch_ops_ >= kMaxBatchOps) {
+                if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+            }
+        } else {
+            // Same-slab copy: bounce through DEFAULT-heap copy_scratch_ so the
+            // slab is never simultaneously COPY_SOURCE and COPY_DEST.
+            if (const Status sc = EnsureCopyScratch(); sc != Status::kOk) return sc;
+            ID3D12Resource* slab_res = src_it->second.Get();
+            std::size_t c_done = 0;
+            while (c_done < step) {
+                const std::size_t sub = std::min<std::size_t>(step - c_done, static_cast<std::size_t>(kCopyScratchBytes));
+                if (const Status begun = BeginBatch(); begun != Status::kOk) return begun;
+                TransitionSlab(sr.slab, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                active_list_->CopyBufferRegion(copy_scratch_.Get(), 0, slab_res, sr.offset + s_off + c_done, sub);
+                const D3D12_RESOURCE_BARRIER mid[2] = {
+                    Transition(copy_scratch_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    Transition(slab_res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                };
+                active_list_->ResourceBarrier(2, mid);
+                slab_batch_state_[sr.slab] = D3D12_RESOURCE_STATE_COPY_DEST;
+                slab_batch_dirty_mask_ |= (1u << sr.slab);
+                active_list_->CopyBufferRegion(slab_res, dr.offset + d_off + c_done, copy_scratch_.Get(), 0, sub);
+                const D3D12_RESOURCE_BARRIER restore =
+                    Transition(copy_scratch_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                active_list_->ResourceBarrier(1, &restore);
+                ++batch_ops_;
+                if (batch_ops_ >= kMaxBatchOps) {
+                    if (const Status flushed = Flush(); flushed != Status::kOk) return flushed;
+                }
+                c_done += sub;
+            }
+        }
+        s_off += step;
+        d_off += step;
+        dst_cursor += step;
+        (void)dst_cursor;
+        if (s_off >= sr.bytes) { ++si; s_off = 0; }
+        if (d_off >= dr.bytes) { ++di; d_off = 0; }
+    }
+    ++uploads_;
+    upload_bytes_ += bytes;
+    return Status::kOk;
 }
 
 }  // namespace bbx::d3d12

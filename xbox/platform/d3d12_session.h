@@ -70,6 +70,14 @@ public:
     // yet is counted and dropped rather than queued behind it.
     void SubmitGuestFrame(const bbx::platform::GuestFrame& frame);
 
+    // Waits for the guest thread to signal a new frame (or until timeout_ms
+    // elapses), replacing Sleep(1) polling in the UI present loop.
+    bool WaitForGuestFrame(std::uint32_t timeout_ms);
+
+    // Loads bbx_shaders.cache and kicks off multi-threaded compute PSO
+    // pre-warming immediately after the guest mounts its roots.
+    void PrewarmShaders();
+
     // Frames the guest offered and the presenter took (and how many it dropped
     // because the guest outran it), for the HUD.
     [[nodiscard]] std::uint64_t GuestFrames() const;

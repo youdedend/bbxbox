@@ -28,8 +28,11 @@ enum class Action : std::uint8_t {
     kToggleModdedEboot,
     kContinueUnpatched,
     kToggleFpsCap,
+    kCycleResolution,
     kToggleVsync,
     kToggleSharpUpscale,
+    kTogglePerformanceMode,
+    kCycleShadowRes,
     kTogglePerfHud,
     kToggleSkipLogos,
     kToggleEnhancements,
@@ -68,8 +71,15 @@ struct LauncherModel {
     // Video, gameplay, post-processing, camera & control preferences
     // (persisted in LocalState\bbxbox.ini and editable live in L3+R3 menu).
     int fps_cap = 60;                  // 30 (native PS4 pacing) or 60 (60 FPS++)
-    bool vsync = true;                 // DXGI sync interval 1 vs 0
+    int render_res_mode = 0;           // 0 = 1920x1080, 1 = 1600x900, 2 = 1280x720
+    bool vsync = true;                 // DXGI sync interval 1 vs 0 (VRR/FreeSync when off)
     bool sharp_upscale = true;         // HLSL SM 6.4 RCAS sharpening vs plain bilinear
+    bool performance_mode = false;     // disables heavy YEBIS post passes (full effect on boot)
+    bool ssao = true;                  // live ambient occlusion toggle
+    bool anti_alias = true;            // live engine AA toggle
+    bool dynamic_shadows = true;       // live dynamic light shadows toggle
+    int shadow_resolution = 2;         // 0 Lowest, 1 Low, 2 Default, 3 High (live)
+    int lod_bias = 0;                  // -2 finest .. +2 coarsest (live)
     bool perf_hud = false;             // compact corner FPS / RAM / GPU stats overlay
     bool skip_logos = true;            // skip intro company logos at boot
     bool enhancements = true;          // Hunter's Dream mirror, Rebirth Altar, Auto-Replenish

@@ -213,6 +213,9 @@ TEST(ShaderCacheLooksUpWhatTheBakeWroteAndRefusesTheRest) {
     ShaderCache cache;
     CHECK(cache.Load(file, recorded.Serialize()) == CacheStatus::kOk);
     CHECK_EQ(cache.entries(), static_cast<std::size_t>(2));
+    CHECK_EQ(cache.Entries().size(), static_cast<std::size_t>(2));
+    CHECK_EQ(cache.Entries()[0].key, 0x11ull);
+    CHECK_EQ(cache.Entries()[1].key, 0x22ull);
     CHECK_EQ(cache.bytes(), file.size());
     BakedBlob blob;
     CHECK(cache.Lookup(0x22, &blob));

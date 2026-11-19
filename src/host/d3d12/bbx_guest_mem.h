@@ -34,6 +34,7 @@
 // because it needs the device; tools/syntax_check.sh type-checks it.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -259,35 +260,68 @@ public:
     // and points its UAV at it. Called the first time an upload touches it.
     Status EnsureSlab(std::uint32_t slab);
 
-    // host_gpu_mem_write / mem_fill / mem_copy: an upload through a staging
-    // buffer and the graphics queue's fence, so the write is complete for the
-    // CPU when it returns and visible to the next dispatch.
+    // host_gpu_mem_write / mem_fill / mem_copy: batched asynchronously through an
+    // 8 MiB persistently-mapped upload ring (or pure GPU-to-GPU for CopyGuest) so
+    // hot-path guest writes never stall the CPU. Call Flush() before compute,
+    // graphics, readback, or fence signal to preserve strict queue order.
     Status WriteGuest(const GuestPageTable& table, std::uint64_t va, const void* data, std::size_t bytes);
     Status FillGuest(const GuestPageTable& table, std::uint64_t va, std::uint32_t value, std::size_t bytes);
     Status CopyGuest(const GuestPageTable& table, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes);
-    // The other way: a slab run into host memory (a read of what the GPU wrote).
+    // The other way: flushes pending writes, then reads a slab run into host memory.
     Status ReadGuest(const GuestPageTable& table, std::uint64_t va, void* out, std::size_t bytes);
+
+    // Flushes any open batched upload/copy command list to the graphics queue.
+    Status Flush();
+    [[nodiscard]] bool HasPending() const { return batch_open_; }
+    // Reclaims completed command allocators once the GPU fence passes them.
+    void OnFrame(std::uint64_t completed);
 
     [[nodiscard]] std::uint32_t SlabsResident() const { return slabs_resident_; }
     [[nodiscard]] std::uint64_t BytesCommitted() const { return committed_bytes_; }
     [[nodiscard]] std::string Describe() const;
 
 private:
-    // The one submission shape an upload and a readback share: record, execute,
-    // wait. An upload is a boot-time or a one-off event, not a per-frame flow, so
-    // the wait that a frame would not tolerate is exactly what makes the write
-    // complete for the CPU when the call returns.
+    static constexpr std::uint32_t kUploadSlices = 4;
+    static constexpr std::uint64_t kUploadSliceBytes = 2ull << 20;  // 4 x 2 MiB = 8 MiB ring
+    static constexpr std::uint64_t kUploadRingBytes = kUploadSlices * kUploadSliceBytes;
+    static constexpr std::uint64_t kCopyScratchBytes = 256ull << 10;
+    static constexpr std::uint32_t kMaxBatchOps = 256;
+
+    struct PendingAllocator {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        std::uint64_t fence = 0;
+    };
+
     D3D12_CPU_DESCRIPTOR_HANDLE VisibleCpu(std::uint32_t index) const;
-    Status Submit(ID3D12GraphicsCommandList* list, const std::function<void(ID3D12GraphicsCommandList*)>& record);
-    Status Record(ID3D12GraphicsCommandList** list, ComPtr<ID3D12CommandAllocator>* allocator);
+    Status EnsureUploadRing();
+    Status EnsureCopyScratch();
+    Status ReserveUpload(std::size_t bytes, std::uint64_t* out_offset);
+    Status BeginBatch();
+    void TransitionSlab(std::uint32_t slab, D3D12_RESOURCE_STATES target_state);
 
     Device* owner_ = nullptr;  // the port's Device: the queue and the fence
     ID3D12Device* device_ = nullptr;
     Budget* budget_ = nullptr;
     ComPtr<ID3D12Resource> page_table_;
     ComPtr<ID3D12Resource> guard_;
-    ComPtr<ID3D12Resource> upload_;    // kStagingBytes, HEAP_TYPE_UPLOAD
-    ComPtr<ID3D12Resource> readback_;  // kStagingBytes, HEAP_TYPE_READBACK
+    ComPtr<ID3D12Resource> upload_;        // kUploadRingBytes, HEAP_TYPE_UPLOAD, persistently mapped
+    std::uint8_t* upload_mapped_ = nullptr;
+    std::uint32_t upload_slice_ = 0;
+    std::uint64_t upload_slice_cursor_ = 0;
+    std::array<std::uint64_t, kUploadSlices> upload_slice_fence_{};
+    ComPtr<ID3D12Resource> copy_scratch_;  // kCopyScratchBytes, HEAP_TYPE_DEFAULT (same-slab copy)
+    ComPtr<ID3D12Resource> readback_;      // HEAP_TYPE_READBACK
+    std::uint64_t readback_bytes_ = 0;
+    std::vector<ComPtr<ID3D12CommandAllocator>> free_allocators_;
+    std::vector<PendingAllocator> pending_allocators_;
+    ComPtr<ID3D12CommandAllocator> active_allocator_;
+    ComPtr<ID3D12GraphicsCommandList> active_list_;
+    bool batch_open_ = false;
+    std::uint32_t batch_ops_ = 0;
+    std::array<D3D12_RESOURCE_STATES, kGuestSlabCount> slab_batch_state_{};
+    std::uint32_t slab_batch_dirty_mask_ = 0;
+    std::vector<GuestRun> runs_scratch_;
+    std::vector<GuestRun> dst_runs_scratch_;
     std::map<std::uint32_t, ComPtr<ID3D12Resource>> slabs_;
     GuestPageTable table_;               // the plan's table, copied: the run lists' source
     ComPtr<ID3D12DescriptorHeap> heap_;  // 1 SRV + 32 UAVs, FLAG_NONE (a copy's source)
@@ -298,6 +332,7 @@ private:
     std::uint32_t slabs_resident_ = 0;
     std::uint64_t committed_bytes_ = 0;
     std::uint64_t uploads_ = 0, upload_bytes_ = 0;
+    std::uint64_t flushes_ = 0;
 };
 
 }  // namespace bbx::d3d12

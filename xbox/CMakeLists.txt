@@ -291,6 +291,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     # /WX only on the port's own TUs: upstream's code is built with /W3 and its
     # warnings are not this port's to fix.
     target_compile_options(bbxbox PRIVATE /EHsc /W4 /WX /permissive- /Zc:__cplusplus
+        # Xbox Series X|S runs custom AMD Zen 2 silicon (AVX2, FMA, BMI2); tune
+        # instruction scheduling and enable per-global COMDAT folding (/Gw) for
+        # /OPT:REF /OPT:ICF without ThinLTO so bbxbox.map archive checks remain intact.
+        /arch:AVX2 /clang:-mtune=znver2 /Gw
         # C++/WinRT is written for MSVC's non-conforming two-phase lookup, which
         # is what -fdelayed-template-parsing restores for clang-cl.
         -fdelayed-template-parsing

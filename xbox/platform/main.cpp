@@ -462,12 +462,53 @@ int ParseIntClamped(const std::string& s, int fallback, int lo, int hi) {
     return static_cast<int>(val);
 }
 
+int RenderWidthForMode(int mode) {
+    if (mode == 1) return 1600;
+    if (mode == 2) return 1280;
+    return 1920;
+}
+
+int RenderHeightForMode(int mode) {
+    if (mode == 1) return 900;
+    if (mode == 2) return 720;
+    return 1080;
+}
+
+const char* RenderResShortLabel(int mode) {
+    if (mode == 1) return "900P";
+    if (mode == 2) return "720P";
+    return "1080P";
+}
+
+const char* ShadowResLabel(int tier) {
+    if (tier <= 0) return "LOWEST";
+    if (tier == 1) return "LOW";
+    if (tier >= 3) return "HIGH";
+    return "DEFAULT";
+}
+
+std::string LodBiasLabel(int bias) {
+    if (bias <= -2) return "-2 (FINEST)";
+    if (bias == -1) return "-1 (SHARP)";
+    if (bias == 0) return "0 (DEFAULT)";
+    if (bias == 1) return "+1 (FAST)";
+    return "+2 (COARSEST)";
+}
+
 void SyncBridgeSettings() {
     bbx::bridge::ConsoleSettings cfg;
     cfg.fps_cap = g_session.model.fps_cap >= 60 ? 60 : 30;
+    cfg.render_width = RenderWidthForMode(g_session.model.render_res_mode);
+    cfg.render_height = RenderHeightForMode(g_session.model.render_res_mode);
     cfg.vsync = g_session.model.vsync;
     cfg.skip_logos = g_session.model.skip_logos;
     cfg.enhancements = g_session.model.enhancements;
+    cfg.performance_mode = g_session.model.performance_mode;
+    cfg.ssao = g_session.model.ssao;
+    cfg.anti_alias = g_session.model.anti_alias;
+    cfg.dynamic_shadows = g_session.model.dynamic_shadows;
+    cfg.shadow_resolution = std::clamp(g_session.model.shadow_resolution, 0, 3);
+    cfg.lod_bias = std::clamp(g_session.model.lod_bias, -2, 2);
     cfg.chromatic_aberration = g_session.model.chromatic_aberration;
     cfg.motion_blur = g_session.model.motion_blur;
     cfg.depth_of_field = g_session.model.depth_of_field;
@@ -509,6 +550,8 @@ void SaveLayoutSettings() {
                                 g_session.model.modded_eboot_ok ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "fps_cap",
                                 g_session.model.fps_cap >= 60 ? "60" : "30");
+    (void)bbx::platform::IniSet(g_session.ini_text, "video", "render_res_mode",
+                                std::to_string(std::clamp(g_session.model.render_res_mode, 0, 2)));
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "vsync", g_session.model.vsync ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "video", "sharp_upscale",
                                 g_session.model.sharp_upscale ? "1" : "0");
@@ -520,6 +563,18 @@ void SaveLayoutSettings() {
                                 g_session.model.enhancements ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "gameplay", "auto_backup_saves",
                                 g_session.model.auto_backup_saves ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "performance_mode",
+                                g_session.model.performance_mode ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "ssao",
+                                g_session.model.ssao ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "anti_alias",
+                                g_session.model.anti_alias ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "dynamic_shadows",
+                                g_session.model.dynamic_shadows ? "1" : "0");
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "shadow_resolution",
+                                std::to_string(std::clamp(g_session.model.shadow_resolution, 0, 3)));
+    (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "lod_bias",
+                                std::to_string(std::clamp(g_session.model.lod_bias, -2, 2)));
     (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "chromatic_aberration",
                                 g_session.model.chromatic_aberration ? "1" : "0");
     (void)bbx::platform::IniSet(g_session.ini_text, "graphics", "motion_blur",
@@ -874,6 +929,15 @@ void OnAction(PadAction action) {
             SaveLayoutSettings();
             RefreshLauncher();
             return;
+        case bbx::platform::Action::kCycleResolution:
+            g_session.model.render_res_mode = (g_session.model.render_res_mode + 1) % 3;
+            SyncBridgeSettings();
+            bbx::platform::LogF("video: render_res=%dx%d",
+                                RenderWidthForMode(g_session.model.render_res_mode),
+                                RenderHeightForMode(g_session.model.render_res_mode));
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
         case bbx::platform::Action::kToggleVsync:
             g_session.model.vsync = !g_session.model.vsync;
             SyncBridgeSettings();
@@ -884,6 +948,22 @@ void OnAction(PadAction action) {
         case bbx::platform::Action::kToggleSharpUpscale:
             g_session.model.sharp_upscale = !g_session.model.sharp_upscale;
             bbx::platform::LogF("video: sharp_upscale=%s", g_session.model.sharp_upscale ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kTogglePerformanceMode:
+            g_session.model.performance_mode = !g_session.model.performance_mode;
+            SyncBridgeSettings();
+            bbx::platform::LogF("graphics: performance_mode=%s",
+                                g_session.model.performance_mode ? "on" : "off");
+            SaveLayoutSettings();
+            RefreshLauncher();
+            return;
+        case bbx::platform::Action::kCycleShadowRes:
+            g_session.model.shadow_resolution = (g_session.model.shadow_resolution + 1) % 4;
+            SyncBridgeSettings();
+            bbx::platform::LogF("graphics: shadow_resolution=%s",
+                                ShadowResLabel(g_session.model.shadow_resolution));
             SaveLayoutSettings();
             RefreshLauncher();
             return;
@@ -1176,9 +1256,10 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
         const bbx::platform::TelemetrySample mem = QueryTelemetrySample();
         const float line =
             bbx::platform::Hud::TextHeight(small_scale) + static_cast<float>(small_scale) * 2.5f;
-        char line1[128];
-        std::snprintf(line1, sizeof(line1), "FPS %4.1f (%4.1f MS) | CAP %d | VSYNC %s | RCAS %s",
+        char line1[160];
+        std::snprintf(line1, sizeof(line1), "FPS %4.1f (%4.1f MS) | %s | CAP %d | VSYNC %s | RCAS %s",
                       static_cast<double>(perf.fps), static_cast<double>(perf.frame_ms),
+                      RenderResShortLabel(g_session.model.render_res_mode),
                       g_session.model.fps_cap,
                       bbx::bridge::VsyncEnabled() ? "ON" : "OFF",
                       g_session.model.sharp_upscale ? "ON" : "OFF");
@@ -1262,9 +1343,23 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
             "RETURN TO THE HUNT (RESUME)",
             std::string("FRAME RATE CAP: ") +
                 (g_session.model.fps_cap >= 60 ? "60 FPS++" : "30 FPS"),
-            std::string("VSYNC: ") + (bbx::bridge::VsyncEnabled() ? "ON" : "OFF"),
+            std::string("RENDER RESOLUTION: ") +
+                RenderResShortLabel(g_session.model.render_res_mode),
+            std::string("VSYNC: ") +
+                (bbx::bridge::VsyncEnabled() ? "ON" : "OFF (VRR / FREESYNC)"),
             std::string("SHARP UPSCALE (FSR RCAS): ") +
                 (g_session.model.sharp_upscale ? "ON" : "OFF"),
+            std::string("PERFORMANCE MODE (YEBIS OFF): ") +
+                (g_session.model.performance_mode ? "ON" : "OFF"),
+            std::string("SHADOW RESOLUTION: ") +
+                ShadowResLabel(g_session.model.shadow_resolution),
+            std::string("DYNAMIC SHADOWS: ") +
+                (g_session.model.dynamic_shadows ? "ON" : "OFF"),
+            std::string("AMBIENT OCCLUSION (SSAO): ") +
+                (g_session.model.ssao ? "ON" : "OFF"),
+            std::string("ANTI-ALIASING: ") +
+                (g_session.model.anti_alias ? "ON" : "OFF"),
+            "MODEL LOD BIAS: " + LodBiasLabel(g_session.model.lod_bias),
             std::string("CHROMATIC ABERRATION: ") +
                 (g_session.model.chromatic_aberration ? "ON" : "OFF"),
             std::string("MOTION BLUR: ") + (g_session.model.motion_blur ? "ON" : "OFF"),
@@ -1277,8 +1372,25 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
             g_session.model.auto_backup_saves ? "AWAKEN FROM THE DREAM (EXIT & SYNC SAVES)"
                                               : "AWAKEN FROM THE DREAM (EXIT GAME)",
         };
-        const float panel_w = width * 0.70f;
-        const float panel_h = line * static_cast<float>(rows.size() + 4u) + menu_margin;
+        const std::size_t total_rows = rows.size();
+        const std::size_t max_visible_rows = 12u;
+        const bool scrolling = total_rows > max_visible_rows;
+        const std::size_t visible_rows = scrolling ? max_visible_rows : total_rows;
+        std::size_t first_row = 0;
+        if (scrolling) {
+            const std::size_t half = visible_rows / 2u;
+            if (g_session.quick_menu_selected > half) {
+                first_row = g_session.quick_menu_selected - half;
+            }
+            if (first_row + visible_rows > total_rows) {
+                first_row = total_rows - visible_rows;
+            }
+        }
+        const std::size_t end_row = std::min(total_rows, first_row + visible_rows);
+
+        const float panel_w = width * 0.72f;
+        const float panel_h =
+            line * static_cast<float>(visible_rows + (scrolling ? 5u : 4u)) + menu_margin;
         const float px = (width - panel_w) * 0.5f;
         const float py = (height - panel_h) * 0.5f;
         hud.GothicPanel(px, py, panel_w, panel_h);
@@ -1296,7 +1408,7 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
         hud.GothicDivider(tx, y, inner_w, menu_scale);
         y += line * 0.5f;
 
-        for (std::size_t i = 0; i < rows.size(); ++i) {
+        for (std::size_t i = first_row; i < end_row; ++i) {
             const bool sel = (i == g_session.quick_menu_selected);
             if (sel) {
                 const float sel_pad = static_cast<float>(menu_scale) * 1.1f;
@@ -1306,11 +1418,21 @@ void AppendInGameOverlays(bbx::platform::Hud& hud) {
                           line - sel_pad * 0.3f, bbx::platform::HudColor::TarnishedGold());
             }
             const bbx::platform::HudColor col =
-                sel ? (i == rows.size() - 1 ? bbx::platform::HudColor::PalebloodEmber()
-                                            : bbx::platform::HudColor::TarnishedGold())
+                sel ? (i == total_rows - 1 ? bbx::platform::HudColor::PalebloodEmber()
+                                           : bbx::platform::HudColor::TarnishedGold())
                     : bbx::platform::HudColor::BoneIvory();
             hud.Text(tx + static_cast<float>(menu_scale) * 1.5f, y, menu_scale,
                      std::string(sel ? "<> " : "   ") + rows[i], col);
+            y += line;
+        }
+        if (scrolling) {
+            char scroll_hint[96];
+            std::snprintf(scroll_hint, sizeof(scroll_hint),
+                          "%s OPTIONS %zu-%zu OF %zu  |  D-PAD UP/DOWN TO SCROLL %s",
+                          first_row > 0u ? "[^]" : "   ", first_row + 1u, end_row, total_rows,
+                          end_row < total_rows ? "[v]" : "   ");
+            hud.Text(tx + static_cast<float>(menu_scale) * 1.5f, y, hint_scale, scroll_hint,
+                     bbx::platform::HudColor::AshSilver());
             y += line;
         }
         y += line * 0.35f;
@@ -1486,18 +1608,31 @@ void LoadSettings() {
     // Video & overlay settings persisted across launches.
     const std::string fps_str = bbx::platform::IniGet(g_session.ini, "video.fps_cap", "60");
     g_session.model.fps_cap = (fps_str == "30") ? 30 : 60;
+    g_session.model.render_res_mode = ParseIntClamped(
+        bbx::platform::IniGet(g_session.ini, "video.render_res_mode", "0"), 0, 0, 2);
     g_session.model.vsync = bbx::platform::IniFlag(g_session.ini, "video.vsync", true);
     g_session.model.sharp_upscale =
         bbx::platform::IniFlag(g_session.ini, "video.sharp_upscale", true);
     g_session.model.perf_hud = bbx::platform::IniFlag(g_session.ini, "video.perf_hud", false);
 
-    // Gameplay, post-processing, camera, and controller deadzone settings.
+    // Gameplay, performance, shadows, post-processing, camera, and controller deadzone settings.
     g_session.model.skip_logos =
         bbx::platform::IniFlag(g_session.ini, "gameplay.skip_logos", true);
     g_session.model.enhancements =
         bbx::platform::IniFlag(g_session.ini, "gameplay.enhancements", true);
     g_session.model.auto_backup_saves =
         bbx::platform::IniFlag(g_session.ini, "gameplay.auto_backup_saves", true);
+    g_session.model.performance_mode =
+        bbx::platform::IniFlag(g_session.ini, "graphics.performance_mode", false);
+    g_session.model.ssao = bbx::platform::IniFlag(g_session.ini, "graphics.ssao", true);
+    g_session.model.anti_alias =
+        bbx::platform::IniFlag(g_session.ini, "graphics.anti_alias", true);
+    g_session.model.dynamic_shadows =
+        bbx::platform::IniFlag(g_session.ini, "graphics.dynamic_shadows", true);
+    g_session.model.shadow_resolution = ParseIntClamped(
+        bbx::platform::IniGet(g_session.ini, "graphics.shadow_resolution", "2"), 2, 0, 3);
+    g_session.model.lod_bias = ParseIntClamped(
+        bbx::platform::IniGet(g_session.ini, "graphics.lod_bias", "0"), 0, -2, 2);
     g_session.model.chromatic_aberration =
         bbx::platform::IniFlag(g_session.ini, "graphics.chromatic_aberration", true);
     g_session.model.motion_blur =
@@ -1908,7 +2043,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             bbx::platform::Bit(Pad::kView) | bbx::platform::Bit(Pad::kMenu);
         const bbx::platform::ButtonMask kQuickMenuMask =
             bbx::platform::Bit(Pad::kLeftStick) | bbx::platform::Bit(Pad::kRightStick);
-        constexpr std::size_t kQuickMenuCount = 13;
+        constexpr std::size_t kQuickMenuCount = 20;
 
         while (!g_session.quit && !g_window_closed.load(std::memory_order_relaxed)) {
             if (stored_window) {
@@ -2020,31 +2155,87 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 settings_changed = true;
                                 break;
                             case 2:
-                                g_session.model.vsync = !bbx::bridge::VsyncEnabled();
+                                if (confirm) {
+                                    g_session.model.render_res_mode =
+                                        (g_session.model.render_res_mode + 1) % 3;
+                                } else if (step_left) {
+                                    g_session.model.render_res_mode =
+                                        std::max(0, g_session.model.render_res_mode - 1);
+                                } else if (step_right) {
+                                    g_session.model.render_res_mode =
+                                        std::min(2, g_session.model.render_res_mode + 1);
+                                }
                                 settings_changed = true;
                                 break;
                             case 3:
+                                g_session.model.vsync = !bbx::bridge::VsyncEnabled();
+                                settings_changed = true;
+                                break;
+                            case 4:
                                 g_session.model.sharp_upscale = !g_session.model.sharp_upscale;
                                 SaveLayoutSettings();
                                 break;
-                            case 4:
+                            case 5:
+                                g_session.model.performance_mode = !g_session.model.performance_mode;
+                                settings_changed = true;
+                                break;
+                            case 6:
+                                if (confirm) {
+                                    g_session.model.shadow_resolution =
+                                        (g_session.model.shadow_resolution + 1) % 4;
+                                } else if (step_left) {
+                                    g_session.model.shadow_resolution =
+                                        std::max(0, g_session.model.shadow_resolution - 1);
+                                } else if (step_right) {
+                                    g_session.model.shadow_resolution =
+                                        std::min(3, g_session.model.shadow_resolution + 1);
+                                }
+                                settings_changed = true;
+                                break;
+                            case 7:
+                                g_session.model.dynamic_shadows = !g_session.model.dynamic_shadows;
+                                settings_changed = true;
+                                break;
+                            case 8:
+                                g_session.model.ssao = !g_session.model.ssao;
+                                settings_changed = true;
+                                break;
+                            case 9:
+                                g_session.model.anti_alias = !g_session.model.anti_alias;
+                                settings_changed = true;
+                                break;
+                            case 10:
+                                if (confirm) {
+                                    g_session.model.lod_bias =
+                                        (g_session.model.lod_bias >= 2) ? -2
+                                                                        : (g_session.model.lod_bias + 1);
+                                } else if (step_left) {
+                                    g_session.model.lod_bias =
+                                        std::max(-2, g_session.model.lod_bias - 1);
+                                } else if (step_right) {
+                                    g_session.model.lod_bias =
+                                        std::min(2, g_session.model.lod_bias + 1);
+                                }
+                                settings_changed = true;
+                                break;
+                            case 11:
                                 g_session.model.chromatic_aberration =
                                     !g_session.model.chromatic_aberration;
                                 settings_changed = true;
                                 break;
-                            case 5:
+                            case 12:
                                 g_session.model.motion_blur = !g_session.model.motion_blur;
                                 settings_changed = true;
                                 break;
-                            case 6:
+                            case 13:
                                 g_session.model.depth_of_field = !g_session.model.depth_of_field;
                                 settings_changed = true;
                                 break;
-                            case 7:
+                            case 14:
                                 g_session.model.vignette = !g_session.model.vignette;
                                 settings_changed = true;
                                 break;
-                            case 8:
+                            case 15:
                                 if (confirm) {
                                     g_session.model.fov_percent =
                                         (g_session.model.fov_percent >= 125)
@@ -2059,7 +2250,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 }
                                 settings_changed = true;
                                 break;
-                            case 9:
+                            case 16:
                                 if (confirm) {
                                     g_session.model.camera_distance_percent =
                                         (g_session.model.camera_distance_percent >= 130)
@@ -2074,7 +2265,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 }
                                 settings_changed = true;
                                 break;
-                            case 10:
+                            case 17:
                                 if (confirm) {
                                     g_session.model.stick_deadzone_percent =
                                         (g_session.model.stick_deadzone_percent >= 20)
@@ -2089,11 +2280,11 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 }
                                 settings_changed = true;
                                 break;
-                            case 11:
+                            case 18:
                                 g_session.model.perf_hud = !g_session.model.perf_hud;
                                 SaveLayoutSettings();
                                 break;
-                            case 12:
+                            case 19:
                                 if (confirm) {
                                     g_session.quick_menu_open = false;
                                     bbx::bridge::SetGuestInputSuppressed(false);
@@ -2134,6 +2325,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         SyncBridgeSettings();
                         if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
                             guest_ever_started = true;
+                            if (g_session.gpu) g_session.gpu->PrewarmShaders();
                         } else {
                             bbx::platform::LogMessage(
                                 bbx::platform::Level::kError,
@@ -2187,6 +2379,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         found_cache_dir.c_str(), found_cache_report.c_str());
                     if (bbx::bridge::StartGuest(req)) {
                         guest_ever_started = true;
+                        if (g_session.gpu) g_session.gpu->PrewarmShaders();
                     } else {
                         bbx::platform::LogMessage(
                             bbx::platform::Level::kError,
@@ -2197,7 +2390,12 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     StartShaderBake(/*start_after=*/true, /*force_rebuild=*/false);
                 }
             }
-            ::Sleep(bbx::bridge::Running() ? 1 : 8);
+            if (bbx::bridge::Running() && !g_session.quick_menu_open && !g_session.ime_open &&
+                g_session.gpu != nullptr) {
+                (void)g_session.gpu->WaitForGuestFrame(8);
+            } else {
+                ::Sleep(8);
+            }
         }
         bbx::bridge::StopPadRumble();
         if (g_session.bake_thread.joinable()) {

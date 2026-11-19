@@ -80,6 +80,12 @@ public:
     // is structurally valid and reports the error instead of reading past it.
     Status ExecuteStreamBlock(std::span<const std::uint8_t> block);
     Status DrawPresent(float red, float green, float blue, float sharpness = 0.0f);
+    // Zero-copy direct GPU scanout: samples a native GPU render target owned by
+    // GuestGraphics directly (transitioning RENDER_TARGET -> PIXEL_SHADER_RESOURCE
+    // -> RENDER_TARGET) without CPU readback, staging copy, or UntileCs.
+    Status DrawPresentDirect(ID3D12Resource* src_rt, DXGI_FORMAT format, std::uint32_t width,
+                             std::uint32_t height, float red, float green, float blue,
+                             float sharpness = 0.0f);
 
     // The guest's scanout buffer, uploaded into the image DrawPresent samples.
     // Called inside a frame, between BeginFrame and DrawPresent: the copy goes on
@@ -171,6 +177,7 @@ private:
     Slice white_srv_{};
     Slice untile_srv_{};
     Slice untile_uav_{};
+    std::array<Slice, 3> direct_frame_srvs_{};
 
     ComPtr<ID3D12Resource> overlay_vertices_;
     void* overlay_mapped_ = nullptr;

@@ -22,11 +22,22 @@ std::optional<DescriptorSlice> DescriptorRing::Allocate(std::uint32_t count,
         const DescriptorSlice slice{aligned, count};
         const std::uint32_t tail = range.count - padding - count;
         const std::uint32_t front = padding;
-        free_list_.erase(free_list_.begin() + static_cast<std::ptrdiff_t>(i));
-        if (front > 0) free_list_.push_back(Range{range.offset, front});
-        if (tail > 0) free_list_.push_back(Range{aligned + count, tail});
-        std::sort(free_list_.begin(), free_list_.end(),
-                  [](const Range& a, const Range& b) { return a.offset < b.offset; });
+        if (front == 0) {
+            if (tail > 0) {
+                range.offset = aligned + count;
+                range.count = tail;
+            } else {
+                free_list_.erase(free_list_.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        } else {
+            // `free_list_` stays sorted: front sits at `range.offset` and tail
+            // (if any) immediately follows it at `aligned + count`.
+            range.count = front;
+            if (tail > 0) {
+                free_list_.insert(free_list_.begin() + static_cast<std::ptrdiff_t>(i + 1),
+                                  Range{aligned + count, tail});
+            }
+        }
         free_ -= count;
         high_water_ = std::max(high_water_, used());
         return slice;
@@ -60,20 +71,31 @@ void DescriptorRing::Release(DescriptorSlice slice, std::uint64_t fence_value) {
 }
 
 std::uint32_t DescriptorRing::Collect(std::uint64_t fence_value) {
+    if (pending_.empty()) return 0;
     std::uint32_t collected = 0;
-    std::vector<Pending> keep;
-    keep.reserve(pending_.size());
-    for (const Pending& p : pending_) {
+    std::size_t write = 0;
+    for (std::size_t read = 0; read < pending_.size(); ++read) {
+        const Pending p = pending_[read];
         if (p.fence <= fence_value) {
             InsertFree(Range{p.slice.offset, p.slice.count});
             free_ += p.slice.count;
             ++collected;
         } else {
-            keep.push_back(p);
+            if (write != read) pending_[write] = p;
+            ++write;
         }
     }
-    pending_.swap(keep);
+    pending_.resize(write);
     return collected;
+}
+
+std::uint64_t DescriptorRing::OldestPendingFence() const {
+    if (pending_.empty()) return 0;
+    std::uint64_t oldest = pending_[0].fence;
+    for (std::size_t i = 1; i < pending_.size(); ++i) {
+        if (pending_[i].fence < oldest) oldest = pending_[i].fence;
+    }
+    return oldest;
 }
 
 std::optional<DescriptorSlice> DescriptorRing::ReservePermanent(std::uint32_t count) {

@@ -101,6 +101,9 @@ Status Replay::Create(Device& device, Swapchain& swapchain, PipelineSet& pipelin
     if (status != Status::kOk) { return status; }
     untile_srv_ = AllocateCbvSrvUav();
     untile_uav_ = AllocateCbvSrvUav();
+    for (Slice& direct_srv : direct_frame_srvs_) {
+        direct_srv = AllocateCbvSrvUav();
+    }
 
     // The pipelines are created lazily by PipelineSet::Ensure; ask for the two the
     // frame needs now so a missing PSO is reported at boot, not mid-frame.
@@ -172,7 +175,9 @@ Status Replay::CreateFrameImage(std::uint32_t width, std::uint32_t height, DxgiF
         frame_image_.Reset();
         return FromHresult(hr);
     }
-    frame_srv_ = AllocateCbvSrvUav();
+    if (frame_srv_.cpu.ptr == 0) {
+        frame_srv_ = AllocateCbvSrvUav();
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = static_cast<DXGI_FORMAT>(format);
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -215,7 +220,6 @@ Status Replay::UploadFrame(const std::uint8_t* pixels, const ScanoutDesc& desc) 
         // flip): the old image goes rather than being stretched over the frame,
         // or sampled in a format its bytes are not in.
         frame_image_.Reset();
-        frame_srv_ = {};
         const Status recreated = CreateFrameImage(width, height, scanout.format);
         if (recreated != Status::kOk) { return recreated; }
     }
@@ -463,8 +467,12 @@ Replay::Slice Replay::ReserveSamplers(std::uint32_t count) {
 Status Replay::BeginFrame() {
     if (command_list_ == nullptr || device_ == nullptr) { return Status::kUnavailable; }
     if (in_frame_) { return Status::kInvalidArgument; }
-    // The allocator may only be reset once the GPU has finished the frame that
-    // used it; Device::NextFrame already cycled after that proof.
+    // The allocator and direct_frame_srvs_[frame_] may only be reused once the
+    // GPU has finished the previous submission that used this frame slot (critical
+    // when VRR / ALLOW_TEARING lets Present(0) return immediately).
+    if (!device_->WaitForFrameSlot()) {
+        return device_->DeviceLost() ? Status::kDeviceLost : Status::kUnavailable;
+    }
     const HRESULT reset = device_->FrameAllocator()->Reset();
     if (FAILED(reset)) {
         Log("replay: allocator reset failed: 0x%08lX", static_cast<unsigned long>(reset));
@@ -593,6 +601,65 @@ Status Replay::DrawPresent(float red, float green, float blue, float sharpness) 
     command_list_->RSSetViewports(1, &viewport);
     command_list_->RSSetScissorRects(1, &scissor);
     command_list_->DrawInstanced(3, 1, 0, 0);
+    return Status::kOk;
+}
+
+Status Replay::DrawPresentDirect(ID3D12Resource* src_rt, DXGI_FORMAT format, std::uint32_t width,
+                                 std::uint32_t height, float red, float green, float blue,
+                                 float sharpness) {
+    if (!in_frame_ || src_rt == nullptr || width == 0 || height == 0) {
+        return Status::kInvalidArgument;
+    }
+    ID3D12PipelineState* pso = pipelines_->Ensure(PassKind::kPresent);
+    if (pso == nullptr) { return Status::kUnavailable; }
+    ID3D12Resource* buffer = swapchain_->CurrentBackBuffer();
+    if (buffer == nullptr) { return Status::kUnavailable; }
+
+    const std::uint32_t index = swapchain_->CurrentIndex();
+    D3D12_RESOURCE_STATES& state = buffer_state_[index % buffer_state_.size()];
+    const Status transition = TransitionBarrier(buffer, state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (transition != Status::kOk) { return transition; }
+    state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    // Sample the native GPU render target directly without CPU copy or UntileCs.
+    (void)TransitionBarrier(src_rt, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    const std::uint32_t slot = device_->FrameIndex() % static_cast<std::uint32_t>(direct_frame_srvs_.size());
+    const Slice& direct_srv = direct_frame_srvs_[slot];
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device_->Get()->CreateShaderResourceView(src_rt, &srv, direct_srv.cpu);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swapchain_->Rtv(index);
+    const float clear[4] = {red, green, blue, 1.0f};
+    command_list_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    const float texel_x = 1.0f / static_cast<float>(width);
+    const float texel_y = 1.0f / static_cast<float>(height);
+    const float clamped_sharp = sharpness < 0.0f ? 0.0f : (sharpness > 1.0f ? 1.0f : sharpness);
+    const float present_constants[8] = {red, green, blue, 1.0f, texel_x, texel_y, clamped_sharp, 0.0f};
+    command_list_->SetGraphicsRootSignature(pipelines_->RootSignature(PassKind::kPresent));
+    command_list_->SetPipelineState(pso);
+    command_list_->SetGraphicsRoot32BitConstants(0, 8, present_constants, 0);
+    command_list_->SetGraphicsRootDescriptorTable(1, direct_srv.gpu);
+
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(frame_width_),
+                                  static_cast<float>(frame_height_), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(frame_width_),
+                             static_cast<LONG>(frame_height_)};
+    command_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    command_list_->RSSetViewports(1, &viewport);
+    command_list_->RSSetScissorRects(1, &scissor);
+    command_list_->DrawInstanced(3, 1, 0, 0);
+
+    // Restore the native render target to GuestGraphics' invariant RENDER_TARGET state.
+    (void)TransitionBarrier(src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET);
     return Status::kOk;
 }
 
@@ -854,8 +921,8 @@ Status Replay::CloseAndSubmit() {
         return FromHresult(closed);
     }
     ID3D12CommandList* lists[] = {command_list_.Get()};
-    device_->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    device_->Signal();
+    const std::uint64_t fence = device_->ExecuteAndSignal(lists, 1);
+    device_->MarkFrameSubmitted(fence);
     return Status::kOk;
 }
 
@@ -1042,6 +1109,7 @@ void Replay::Destroy() {
     selftest_descriptor_ = Slice{};
     untile_srv_ = Slice{};
     untile_uav_ = Slice{};
+    direct_frame_srvs_.fill(Slice{});
     overlay_vertices_.Reset();
     atlas_.Reset();
     white_.Reset();

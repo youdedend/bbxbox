@@ -47,6 +47,7 @@
 #include "core/config.h"
 #include "engine/graphics_patch.h"
 #include "engine/frame_rate.h"
+#include "engine/live_resolution.h"
 #include "host/framegen.h"
 #include "host/translation_cache.h"
 #include "host/options.h"
@@ -106,6 +107,8 @@ std::atomic<int> g_target_fps{60};
 std::atomic<bool> g_vsync_enabled{true};
 std::atomic<int> g_display_w{1920};
 std::atomic<int> g_display_h{1080};
+std::atomic<int> g_render_w{1920};
+std::atomic<int> g_render_h{1080};
 std::atomic<float> g_display_hz{60.0f};
 std::atomic<bool> g_quit_requested{false};
 std::atomic<std::uint64_t> g_last_present_ns{0};
@@ -119,8 +122,8 @@ HostSettings BuildHostSettings(const bbx::bridge::ConsoleSettings& cfg) {
     hs.fullscreen = true;
     hs.vsync = cfg.vsync;
     hs.frame_cap = cfg.fps_cap >= 60 ? 60 : 30;
-    hs.res_width = 1920;
-    hs.res_height = 1080;
+    hs.res_width = std::clamp(cfg.render_width, 1280, 1920);
+    hs.res_height = std::clamp(cfg.render_height, 720, 1080);
     hs.fov_scale = std::clamp(cfg.fov_scale, 1.0f, 1.25f);
     hs.camera_distance_scale = std::clamp(cfg.camera_distance_scale, 0.9f, 1.3f);
     hs.button_prompts = 2;  // Always display controller prompts on Xbox.
@@ -129,6 +132,12 @@ HostSettings BuildHostSettings(const bbx::bridge::ConsoleSettings& cfg) {
     hs.stick_inner[1] = dz;
     hs.stick_outer[0] = 1.0f;
     hs.stick_outer[1] = 1.0f;
+    hs.performance_mode = cfg.performance_mode;
+    hs.ssao = cfg.ssao;
+    hs.anti_alias = cfg.anti_alias;
+    hs.dynamic_shadows = cfg.dynamic_shadows;
+    hs.shadow_resolution = std::clamp(cfg.shadow_resolution, 0, 3);
+    hs.lod_bias = std::clamp(cfg.lod_bias, -2, 2);
     hs.chromatic_aberration = cfg.chromatic_aberration;
     hs.motion_blur = cfg.motion_blur;
     hs.depth_of_field = cfg.depth_of_field;
@@ -231,21 +240,39 @@ ConsoleSettings GetConsoleSettings() {
 void ApplyConsoleSettings(const ConsoleSettings& settings) {
     ConsoleSettings clean = settings;
     clean.fps_cap = clean.fps_cap >= 60 ? 60 : 30;
+    clean.render_width = std::clamp(clean.render_width, 1280, 1920);
+    clean.render_height = std::clamp(clean.render_height, 720, 1080);
+    clean.shadow_resolution = std::clamp(clean.shadow_resolution, 0, 3);
+    clean.lod_bias = std::clamp(clean.lod_bias, -2, 2);
     clean.fov_scale = std::clamp(clean.fov_scale, 1.0f, 1.25f);
     clean.camera_distance_scale = std::clamp(clean.camera_distance_scale, 0.9f, 1.3f);
     clean.stick_deadzone = std::clamp(clean.stick_deadzone, 0.0f, 0.25f);
+    ConsoleSettings prev{};
     {
         std::lock_guard<std::mutex> lock(g_console_settings_mu);
+        prev = g_console_settings;
         g_console_settings = clean;
     }
     g_target_fps.store(clean.fps_cap, std::memory_order_relaxed);
     g_vsync_enabled.store(clean.vsync, std::memory_order_relaxed);
+    g_render_w.store(clean.render_width, std::memory_order_relaxed);
+    g_render_h.store(clean.render_height, std::memory_order_relaxed);
     g_settings_store.publish(BuildHostSettings(clean));
 #if defined(BBX_GUEST_BOOT)
     hle_video_set_fps_cap(clean.fps_cap);
     if (Running()) {
         (void)frame_rate_request(clean.fps_cap);
+        if (clean.render_width != prev.render_width || clean.render_height != prev.render_height) {
+            (void)live_resolution_request(static_cast<unsigned>(clean.render_width),
+                                          static_cast<unsigned>(clean.render_height), false);
+        }
+        if (clean.shadow_resolution != prev.shadow_resolution ||
+            clean.performance_mode != prev.performance_mode) {
+            live_shadows_request();
+        }
     }
+#else
+    (void)prev;
 #endif
 }
 
@@ -512,6 +539,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     const std::uint8_t* pixels = nullptr;
     if (!GuestScanoutPixels(display_va, state.bytes, &pixels)) { return; }
     bbx::platform::GuestFrame frame;
+    frame.display_va = display_va;
     frame.pixels = pixels;
     frame.width = display_w;
     frame.height = display_h;
@@ -692,18 +720,18 @@ void host_opt_menu_colour(float* hue_degrees, float* vibrance) { (void)hue_degre
 float host_opt_menu_text_scale() { return {}; }
 int host_opt_motion_rebuilt_bits() { return {}; }
 bool host_opt_motion_wanted() { return {}; }
-// Pin the guest render resolution to 1920x1080 even on 4K TVs so Bloodborne's
-// render-target heap stays inside the 5,120 MiB Xbox Dev Mode memory cap; the
-// D3D12 presentation pass upscales crisply to the TV via FSR RCAS.
+// Return the player's chosen internal guest render resolution (1080p/900p/720p)
+// capped at 1920x1080 even on 4K TVs so Bloodborne's render-target heap stays
+// inside the 5,120 MiB Xbox Dev Mode memory cap while FSR RCAS upscales crisply.
 bool host_opt_output_size(int* w, int* h) {
-    if (w != nullptr) *w = 1920;
-    if (h != nullptr) *h = 1080;
+    if (w != nullptr) *w = g_render_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_render_h.load(std::memory_order_relaxed);
     return true;
 }
 void host_opt_republish() {  }
 bool host_opt_resolution(int* w, int* h) {
-    if (w != nullptr) *w = 1920;
-    if (h != nullptr) *h = 1080;
+    if (w != nullptr) *w = g_render_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_render_h.load(std::memory_order_relaxed);
     return true;
 }
 int host_opt_resolution_index() { return {}; }
@@ -1188,9 +1216,13 @@ bool StartGuest(const GuestRequest& req) {
     config_set_enhancements(cfg.enhancements, cfg.enhancements, false, false, true,
                             cfg.enhancements);
     bbx::platform::LogF(
-        "boot: settings fps=%d vsync=%u skip_logos=%u enhancements=%u ca=%u blur=%u dof=%u "
-        "vignette=%u fov=%.2f cam_dist=%.2f deadzone=%.2f hunter=\"%s\"",
-        cfg.fps_cap, static_cast<unsigned>(cfg.vsync), static_cast<unsigned>(cfg.skip_logos),
+        "boot: settings fps=%d res=%dx%d vsync=%u perf=%u ssao=%u aa=%u dyn_sh=%u sh_res=%d lod=%d "
+        "skip_logos=%u enhancements=%u ca=%u blur=%u dof=%u vignette=%u fov=%.2f cam_dist=%.2f "
+        "deadzone=%.2f hunter=\"%s\"",
+        cfg.fps_cap, cfg.render_width, cfg.render_height, static_cast<unsigned>(cfg.vsync),
+        static_cast<unsigned>(cfg.performance_mode), static_cast<unsigned>(cfg.ssao),
+        static_cast<unsigned>(cfg.anti_alias), static_cast<unsigned>(cfg.dynamic_shadows),
+        cfg.shadow_resolution, cfg.lod_bias, static_cast<unsigned>(cfg.skip_logos),
         static_cast<unsigned>(cfg.enhancements), static_cast<unsigned>(cfg.chromatic_aberration),
         static_cast<unsigned>(cfg.motion_blur), static_cast<unsigned>(cfg.depth_of_field),
         static_cast<unsigned>(cfg.vignette), static_cast<double>(cfg.fov_scale),

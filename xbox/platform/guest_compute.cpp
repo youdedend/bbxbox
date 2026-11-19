@@ -50,11 +50,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "gcn/isa.h"
@@ -63,6 +66,7 @@
 #include "hle/modules.h"
 #include "host/shader_patch.h"
 #include "src/host/d3d12/bbx_cache.h"
+#include "src/host/d3d12/bbx_descriptors.h"
 #include "src/host/d3d12/bbx_guest_root.h"
 #include "src/host/d3d12/bbx_psocache.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
@@ -228,16 +232,46 @@ bool ReadGuestMemory(void*, std::uint64_t va, void* out, std::size_t bytes) {
     return true;
 }
 
+struct DispatchId {
+    std::uint64_t code_va = 0;
+    std::uint32_t rsrc1 = 0;
+    std::uint32_t rsrc2 = 0;
+    std::uint32_t tx = 0;
+    std::uint32_t ty = 0;
+    std::uint32_t tz = 0;
+    bool operator==(const DispatchId&) const = default;
+};
+
+struct DispatchIdHash {
+    std::size_t operator()(const DispatchId& k) const noexcept {
+        std::uint64_t h = k.code_va ^ 0x9e3779b97f4a7c15ull;
+        const auto mix = [&h](std::uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix((static_cast<std::uint64_t>(k.rsrc1) << 32) | k.rsrc2);
+        mix((static_cast<std::uint64_t>(k.tx) << 32) | k.ty);
+        mix(k.tz);
+        return static_cast<std::size_t>(h);
+    }
+};
+
 }  // namespace
 
 struct GuestCompute::Impl {
     d3d12::Device* device = nullptr;
     d3d12::PipelineSet* pipelines = nullptr;
     d3d12::GuestMemory* memory = nullptr;
+    d3d12::DescriptorRing* descriptor_ring = nullptr;
     ID3D12RootSignature* root = nullptr;  // the compute signature (bbx_guest_root.h)
     std::uint32_t arena_base = 0;         // the guest arena's first descriptor (space 3)
     std::uint32_t sampler_base = 0;
     std::uint32_t cbv_stride = 0, sampler_stride = 0;
+
+    // Non-shader-visible CPU heap pre-populated with 191 null space-1
+    // descriptors so freshly allocated ring slices initialize in a single
+    // CopyDescriptorsSimple call without 191 per-slot Create*View calls.
+    ComPtr<ID3D12DescriptorHeap> null_template_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE null_template_cpu{};
 
     ShaderCache cache;
     bool cache_tried = false;
@@ -249,9 +283,7 @@ struct GuestCompute::Impl {
     d3d12::PathTable paths;
     bool paths_tried = false;
     std::string paths_line = "binding table: not loaded";
-    // Which key's plans (and user_data SGPRs) are in the compute stage's slots
-    // right now. The region is one per stage, not one per program, so a key or
-    // user_data change has to wait for idle and rewrite the region.
+
     struct SrvCopy {
         std::uint32_t slab = 0;
         std::uint64_t src_offset = 0;
@@ -260,29 +292,45 @@ struct GuestCompute::Impl {
     };
     std::uint64_t bound_key = 0;
     std::array<std::uint32_t, 16> bound_user_data{};
+    d3d12::DescriptorSlice bound_slice{};
+    std::uint64_t bound_srv_ring_gen = 0;
     bool bound_valid = false;
     std::vector<SrvCopy> bound_srv_copies;
+    std::unordered_set<std::uint64_t> logged_binding_keys;
 
-    std::unordered_map<std::uint64_t, Program> programs;              // code VA -> program
-    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>,
-             std::uint64_t> keys;                                      // (va, rsrc1, rsrc2, x, y, z) -> key
-    std::map<std::uint64_t, std::uint64_t> key_refusals;              // key -> how often it was asked for
+    std::unordered_map<std::uint64_t, Program> programs;                   // code VA -> program
+    std::unordered_map<DispatchId, std::uint64_t, DispatchIdHash> keys;    // dispatch tuple -> key
 
     // The compute PSOs: the portable cache decides the budget and the eviction,
     // the device owns the objects. Evicted PSOs stay alive until the GPU fence
-    // passes their retirement value.
+    // passes their retirement value. Guarded by pso_mutex so background compute
+    // PSO pre-warming workers can safely populate the cache concurrently.
     struct RetiredPso {
         ID3D12PipelineState* pso = nullptr;
         std::uint64_t fence = 0;
     };
+    std::mutex pso_mutex;
     std::unique_ptr<d3d12::PsoCache> psos;
+    std::uint64_t pso_budget_bytes = 0;
     std::unordered_map<std::uint64_t, ID3D12PipelineState*> pso_objects;
     std::vector<RetiredPso> retired_psos;
+    std::vector<ID3D12PipelineState*> batch_retired_psos;
     std::uint64_t clock = 0;
     std::uint64_t completed = 0;  // the fence's last completed value (OnFrame)
 
-    // Fence-tracked command allocator/list pool: never destroy a command
-    // allocator while its submitted command list is still executing on the GPU.
+    // Multi-threaded compute PSO pre-warmer: inflates Stage::kCompute blobs from
+    // bbx_shaders.cache across worker threads using free-threaded
+    // CreateComputePipelineState (never ID3D12PipelineLibrary, which removes the
+    // device on Xbox).
+    bool prewarm_started = false;
+    std::atomic<bool> prewarm_stop{false};
+    std::atomic<std::size_t> prewarm_next{0};
+    std::atomic<std::uint64_t> prewarm_created{0};
+    std::atomic<std::uint64_t> prewarm_failed{0};
+    std::vector<std::uint64_t> prewarm_keys;
+    std::vector<std::thread> prewarm_threads;
+
+    // Fence-tracked command allocator/list pool and open batch state.
     struct CommandSlot {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -290,28 +338,57 @@ struct GuestCompute::Impl {
     };
     std::vector<CommandSlot> free_lists;
     std::vector<CommandSlot> in_flight;
+    CommandSlot active_cmd;
+    bool batch_open = false;
+    std::uint32_t batch_dispatches = 0;
+    static constexpr std::uint32_t kMaxBatchDispatches = 128;
+    bool batch_heaps_bound = false;
+    bool batch_root_bound = false;
+    bool batch_samplers_bound = false;
+    bool batch_space3_bound = false;
+    ID3D12PipelineState* batch_pso = nullptr;
+    std::uint32_t batch_space1_offset = UINT32_MAX;
+    std::vector<d3d12::DescriptorSlice> batch_retired_slices;
+    std::vector<d3d12::GuestRun> scratch_runs;
 
-    // The StageParams block: a ring of upload slots, one per dispatch, so a
-    // dispatch recorded now never rewrites the constants of one still in flight.
+    // The StageParams ring: 4 slices x 512 slots = 2048 slots (1 MiB) of
+    // persistently-mapped upload memory, fence-tracked per slice so writes
+    // never overwrite in-flight dispatch constants.
     ComPtr<ID3D12Resource> params;
     void* params_mapped = nullptr;
-    static constexpr std::uint32_t kParamSlots = 256;
-    std::uint32_t params_next = 0;
+    static constexpr std::uint32_t kParamSlices = 4;
+    static constexpr std::uint32_t kParamSlotsPerSlice = 512;
+    static constexpr std::uint32_t kParamSlots = kParamSlices * kParamSlotsPerSlice;
+    std::uint32_t param_slice = 0;
+    std::uint32_t param_slot_in_slice = 0;
+    std::array<std::uint64_t, kParamSlices> param_slice_fence{};
+    std::uint32_t param_slices_pending_mask = 0;
 
-    // GPU-side SRV snapshot ring (DEFAULT heap, resting state COPY_DEST): space-1
-    // read-only t# buffer bindings copy their slice out of guest memory slabs into
-    // this ring before the shader runs, avoiding UAV/SRV state aliasing on slabs
-    // that are simultaneously bound as u0..u31 in space3.
-    static constexpr std::uint64_t kSrvRingBytes = 16ull * 1024ull * 1024ull;
+    // GPU-side SRV snapshot ring (DEFAULT heap, resting state COPY_DEST): 4 x 4 MiB
+    // = 16 MiB fence-tracked slices. Space-1 read-only t# buffer bindings copy
+    // their slice out of guest memory slabs into this ring before the shader runs,
+    // avoiding UAV/SRV state aliasing on space3 slabs.
+    static constexpr std::uint32_t kSrvRingSlices = 4;
+    static constexpr std::uint64_t kSrvRingSliceBytes = 4ull * 1024ull * 1024ull;
+    static constexpr std::uint64_t kSrvRingBytes = kSrvRingSlices * kSrvRingSliceBytes;
     ComPtr<ID3D12Resource> srv_ring;
-    std::uint64_t srv_ring_cursor = 0;
+    std::uint32_t srv_slice = 0;
+    std::uint64_t srv_slice_cursor = 0;
+    std::array<std::uint64_t, kSrvRingSlices> srv_slice_fence{};
+    std::uint32_t srv_slices_pending_mask = 0;
+    std::uint64_t srv_ring_gen = 1;
     bool srv_ring_budgeted = false;
 
-    // Tiny DEFAULT-heap staging buffer (resting state COPY_DEST) for ExecuteIndirect
-    // dispatch arguments so indirect args never alias a slab's space3 UAV state.
-    static constexpr std::uint64_t kIndirectStagingBytes = 4096ull;
+    // DEFAULT-heap staging ring (resting state COPY_DEST) for ExecuteIndirect
+    // dispatch arguments: 4 x 16 KiB = 64 KiB, fence-tracked per slice.
+    static constexpr std::uint32_t kIndirectSlices = 4;
+    static constexpr std::uint64_t kIndirectSliceBytes = 16384ull;
+    static constexpr std::uint64_t kIndirectStagingBytes = kIndirectSlices * kIndirectSliceBytes;
     ComPtr<ID3D12Resource> indirect_staging;
-    std::uint64_t indirect_cursor = 0;
+    std::uint32_t indirect_slice = 0;
+    std::uint64_t indirect_slice_cursor = 0;
+    std::array<std::uint64_t, kIndirectSlices> indirect_slice_fence{};
+    std::uint32_t indirect_slices_pending_mask = 0;
 
     // ExecuteIndirect's signature: one DISPATCH argument.
     ComPtr<ID3D12CommandSignature> indirect;
@@ -329,6 +406,7 @@ struct GuestCompute::Impl {
                 ++i;
             }
         }
+        std::lock_guard<std::mutex> lk(pso_mutex);
         for (std::size_t i = 0; i < retired_psos.size();) {
             if (retired_psos[i].fence <= done) {
                 if (retired_psos[i].pso != nullptr) retired_psos[i].pso->Release();
@@ -362,40 +440,191 @@ struct GuestCompute::Impl {
         return true;
     }
 
-    bool ReserveSrvSlice(std::uint64_t bytes, std::uint64_t* out_offset) {
-        if (srv_ring == nullptr || bytes == 0 || bytes > kSrvRingBytes) return false;
-        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
-        if (srv_ring_cursor + aligned > kSrvRingBytes) {
-            // Wait for prior GPU consumers before wrapping the shared snapshot ring.
-            (void)device->WaitIdle();
-            ReclaimCompleted(device->CompletedValue());
-            srv_ring_cursor = 0;
-        }
-        *out_offset = srv_ring_cursor;
-        srv_ring_cursor += aligned;
+    bool BeginBatch() {
+        if (batch_open) return true;
+        if (!AcquireCommandList(&active_cmd)) return false;
+        batch_open = true;
+        batch_dispatches = 0;
+        batch_heaps_bound = false;
+        batch_root_bound = false;
+        batch_samplers_bound = false;
+        batch_space3_bound = false;
+        batch_pso = nullptr;
+        batch_space1_offset = UINT32_MAX;
         return true;
     }
 
-    // --- the space-1 slots (5B-2b) ------------------------------------------------
-    // The compute stage's 191 descriptors in the device's one shader-visible
-    // CBV/SRV/UAV heap: b1..b63 at kCbvOffset, t0..t63 at kSrvOffset, u0..u63 at
-    // kUavOffset (bbx_guest_root.h's GuestHeapLayout). Slot indices here are
-    // relative to the stage's region, which is what GuestHeapSlotFor answers.
+    void MarkSrvSnapshotsSubmitted(std::uint64_t fence) {
+        if (srv_slices_pending_mask == 0) return;
+        for (std::uint32_t s = 0; s < kSrvRingSlices; ++s) {
+            if ((srv_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > srv_slice_fence[s]) srv_slice_fence[s] = fence;
+            }
+        }
+        srv_slices_pending_mask = 0;
+    }
+
+    void TouchSrvOffset(std::uint64_t offset) {
+        const std::uint32_t slice = static_cast<std::uint32_t>(offset / kSrvRingSliceBytes);
+        if (slice < kSrvRingSlices) {
+            srv_slices_pending_mask |= (1u << slice);
+        }
+    }
+
+    void FlushBatch() {
+        if (!batch_open) return;
+        ID3D12GraphicsCommandList* list = active_cmd.list.Get();
+        const HRESULT close_hr = list->Close();
+        batch_open = false;
+        batch_dispatches = 0;
+        batch_heaps_bound = false;
+        batch_root_bound = false;
+        batch_samplers_bound = false;
+        batch_space3_bound = false;
+        batch_pso = nullptr;
+        batch_space1_offset = UINT32_MAX;
+
+        std::uint64_t fence = device->SubmittedValue();
+        if (SUCCEEDED(close_hr)) {
+            ID3D12CommandList* lists[1] = {list};
+            fence = device->ExecuteAndSignal(lists, 1);
+            active_cmd.fence = fence;
+            in_flight.push_back(std::move(active_cmd));
+            ++counts.batches;
+        } else {
+            ++counts.record_failed;
+            active_cmd = CommandSlot{};
+        }
+
+        for (std::uint32_t s = 0; s < kParamSlices; ++s) {
+            if ((param_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > param_slice_fence[s]) param_slice_fence[s] = fence;
+            }
+        }
+        param_slices_pending_mask = 0;
+
+        for (std::uint32_t s = 0; s < kIndirectSlices; ++s) {
+            if ((indirect_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > indirect_slice_fence[s]) indirect_slice_fence[s] = fence;
+            }
+        }
+        indirect_slices_pending_mask = 0;
+
+        MarkSrvSnapshotsSubmitted(fence);
+
+        if (descriptor_ring != nullptr && !batch_retired_slices.empty()) {
+            for (const d3d12::DescriptorSlice& slice : batch_retired_slices) {
+                descriptor_ring->Release(slice, fence);
+            }
+        }
+        batch_retired_slices.clear();
+
+        if (!batch_retired_psos.empty()) {
+            std::lock_guard<std::mutex> lk(pso_mutex);
+            for (ID3D12PipelineState* pso : batch_retired_psos) {
+                retired_psos.push_back({pso, fence});
+            }
+            batch_retired_psos.clear();
+        }
+    }
+
+    std::uint32_t ReserveParamSlot() {
+        if (param_slot_in_slice >= kParamSlotsPerSlice) {
+            const std::uint32_t next = (param_slice + 1) % kParamSlices;
+            if ((param_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = param_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            param_slice = next;
+            param_slot_in_slice = 0;
+        }
+        const std::uint32_t slot = param_slice * kParamSlotsPerSlice + param_slot_in_slice++;
+        param_slices_pending_mask |= (1u << param_slice);
+        return slot;
+    }
+
+    std::uint64_t ReserveIndirectOffset() {
+        if (indirect_slice_cursor + 16ull > kIndirectSliceBytes) {
+            const std::uint32_t next = (indirect_slice + 1) % kIndirectSlices;
+            if ((indirect_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = indirect_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            indirect_slice = next;
+            indirect_slice_cursor = 0;
+        }
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(indirect_slice) * kIndirectSliceBytes + indirect_slice_cursor;
+        indirect_slice_cursor += 16ull;
+        indirect_slices_pending_mask |= (1u << indirect_slice);
+        return offset;
+    }
+
+    bool ReserveSrvSlice(std::uint64_t bytes, std::uint64_t* out_offset,
+                         GuestCompute::FlushCallback flush_cb, void* flush_user) {
+        if (srv_ring == nullptr || bytes == 0 || bytes > kSrvRingBytes) return false;
+        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
+        if (aligned > kSrvRingSliceBytes) {
+            // Oversized t# buffer (> 4 MiB): flush open work and wait for the
+            // highest in-flight slice fence before placing at offset 0.
+            FlushBatch();
+            if (flush_cb != nullptr) flush_cb(flush_user);
+            std::uint64_t max_fence = 0;
+            for (const std::uint64_t f : srv_slice_fence) {
+                if (f > max_fence) max_fence = f;
+            }
+            if (max_fence > device->CompletedValue()) {
+                (void)device->WaitFor(max_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            *out_offset = 0;
+            const std::uint32_t covered =
+                static_cast<std::uint32_t>((aligned + kSrvRingSliceBytes - 1ull) / kSrvRingSliceBytes);
+            for (std::uint32_t s = 0; s < covered && s < kSrvRingSlices; ++s) {
+                srv_slices_pending_mask |= (1u << s);
+            }
+            srv_slice = std::min<std::uint32_t>(covered > 0 ? covered - 1 : 0, kSrvRingSlices - 1);
+            srv_slice_cursor = kSrvRingSliceBytes;  // force slice advance on next reserve
+            ++srv_ring_gen;
+            return true;
+        }
+        if (srv_slice_cursor + aligned > kSrvRingSliceBytes) {
+            const std::uint32_t next = (srv_slice + 1) % kSrvRingSlices;
+            if ((srv_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+                if (flush_cb != nullptr) flush_cb(flush_user);
+            }
+            const std::uint64_t wait_fence = srv_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            srv_slice = next;
+            srv_slice_cursor = 0;
+            ++srv_ring_gen;
+        }
+        *out_offset = static_cast<std::uint64_t>(srv_slice) * kSrvRingSliceBytes + srv_slice_cursor;
+        srv_slice_cursor += aligned;
+        srv_slices_pending_mask |= (1u << srv_slice);
+        return true;
+    }
+
+    // --- the space-1 slots (ring-buffered per dispatch/state change) --------------
     D3D12_CPU_DESCRIPTOR_HANDLE SlotHandleAt(std::uint32_t absolute) const {
         D3D12_CPU_DESCRIPTOR_HANDLE handle = device->CbvSrvUavHeap()->GetCPUDescriptorHandleForHeapStart();
         handle.ptr += static_cast<SIZE_T>(absolute) * cbv_stride;
         return handle;
     }
-    // The compute stage's slice of the arena, as a slot index inside it.
-    D3D12_CPU_DESCRIPTOR_HANDLE SlotHandle(std::uint32_t slot) const {
-        return SlotHandleAt(arena_base + GuestHeapLayout::StageRegion(2) + slot);
-    }
 
-    // A null CBV/SRV/UAV: D3D12 reads such a descriptor as "nothing bound", which
-    // is a defined zero for every load a shader makes through it. `slot` is the
-    // stage-relative index the layout's ranges are counted in.
-    void WriteNullSlotAt(std::uint32_t absolute, std::uint32_t slot) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE handle = SlotHandleAt(absolute);
+    void WriteNullSlotToHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::uint32_t slot) {
         if (slot >= GuestHeapLayout::kUavOffset) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
             uav.Format = DXGI_FORMAT_R32_UINT;
@@ -417,18 +646,52 @@ struct GuestCompute::Impl {
         }
     }
 
-    void WriteNullSlot(std::uint32_t slot) {
-        WriteNullSlotAt(arena_base + GuestHeapLayout::StageRegion(2) + slot, slot);
+    void RetireSlice(d3d12::DescriptorSlice slice) {
+        if (!slice.valid() || descriptor_ring == nullptr) return;
+        if (batch_open) {
+            batch_retired_slices.push_back(slice);
+        } else {
+            descriptor_ring->Release(slice, device->SubmittedValue());
+        }
     }
 
-    void WriteNullRegion() {
-        for (std::uint32_t slot = 0; slot < GuestHeapLayout::kSpace1Count; ++slot) WriteNullSlot(slot);
+    d3d12::DescriptorSlice AllocateSpace1Slice() {
+        if (descriptor_ring == nullptr || null_template_heap == nullptr) return {};
+        descriptor_ring->Collect(device->CompletedValue());
+        std::optional<d3d12::DescriptorSlice> slice =
+            descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        if (!slice.has_value() && batch_open) {
+            FlushBatch();
+            descriptor_ring->Collect(device->CompletedValue());
+            slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        }
+        if (!slice.has_value()) {
+            const std::uint64_t oldest = descriptor_ring->OldestPendingFence();
+            if (oldest != 0) {
+                (void)device->WaitFor(oldest);
+                const std::uint64_t done = device->CompletedValue();
+                ReclaimCompleted(done);
+                descriptor_ring->Collect(done);
+                slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+            }
+        }
+        if (!slice.has_value()) {
+            (void)device->WaitIdle();
+            const std::uint64_t done = device->CompletedValue();
+            ReclaimCompleted(done);
+            descriptor_ring->Collect(done);
+            slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        }
+        if (!slice.has_value()) return {};
+        device->Get()->CopyDescriptorsSimple(GuestHeapLayout::kSpace1Count, SlotHandleAt(slice->offset),
+                                             null_template_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return *slice;
     }
 
     // One buffer view over the slab a plan resolved to: the resource is the slab
     // itself (never a copy, so a store lands in the guest's own memory), and the
     // view names the range inside it - offset in dwords, length in dwords.
-    bool WriteBufferUav(std::uint32_t slot, const d3d12::BindingWrite& write) {
+    bool WriteBufferUav(std::uint32_t table_offset, std::uint32_t slot, const d3d12::BindingWrite& write) {
         if (memory->EnsureSlab(write.slab) != d3d12::Status::kOk) return false;
         ID3D12Resource* slab = memory->SlabBuffer(write.slab);
         if (slab == nullptr) return false;
@@ -440,19 +703,20 @@ struct GuestCompute::Impl {
         uav.Buffer.StructureByteStride = 0;
         uav.Buffer.CounterOffsetInBytes = 0;
         uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-        device->Get()->CreateUnorderedAccessView(slab, nullptr, &uav, SlotHandle(slot));
+        device->Get()->CreateUnorderedAccessView(slab, nullptr, &uav, SlotHandleAt(table_offset + slot));
         return true;
     }
 
     // One read-only t# buffer view over the GPU-side SRV snapshot ring. The
     // dispatch command list copies the guest slab slice into this offset right
     // before Dispatch(), avoiding UAV/SRV state aliasing on space3 slabs.
-    bool WriteBufferSrv(std::uint32_t slot, const d3d12::BindingWrite& write, SrvCopy* out_copy) {
+    bool WriteBufferSrv(std::uint32_t table_offset, std::uint32_t slot, const d3d12::BindingWrite& write,
+                        SrvCopy* out_copy) {
         if (memory->EnsureSlab(write.slab) != d3d12::Status::kOk) return false;
         if (memory->SlabBuffer(write.slab) == nullptr) return false;
         const std::uint64_t bytes = static_cast<std::uint64_t>(write.dwords) * 4ull;
         std::uint64_t ring_offset = 0;
-        if (!ReserveSrvSlice(bytes, &ring_offset)) return false;
+        if (!ReserveSrvSlice(bytes, &ring_offset, nullptr, nullptr)) return false;
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R32_UINT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -461,7 +725,7 @@ struct GuestCompute::Impl {
         srv.Buffer.NumElements = write.dwords;
         srv.Buffer.StructureByteStride = 0;
         srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-        device->Get()->CreateShaderResourceView(srv_ring.Get(), &srv, SlotHandle(slot));
+        device->Get()->CreateShaderResourceView(srv_ring.Get(), &srv, SlotHandleAt(table_offset + slot));
         out_copy->slab = write.slab;
         out_copy->src_offset = write.offset;
         out_copy->dst_offset = ring_offset;
@@ -469,68 +733,108 @@ struct GuestCompute::Impl {
         return true;
     }
 
-    // The plans for `key`, written into this stage's slots. Called before the
-    // command list that reads them, and - when another key's or user_data's
-    // plans are in place - after the device is idle, because a submission still
-    // reading the previous descriptors is a race the API would not report.
-    void BindResources(std::uint64_t key, const GpuDispatch& d) {
-        if (paths.status() != d3d12::PathTableStatus::kOk) return;
+    // Ring-buffered space-1 resource binding: reuses the active slice when
+    // `(key, user_data)` and `srv_ring_gen` match; otherwise allocates a fresh
+    // 191-slot slice from `descriptor_ring` and retires the previous slice with
+    // the batch fence, eliminating every GPU idle stall on shader/resource change.
+    std::uint32_t BindResources(std::uint64_t key, const GpuDispatch& d) {
+        const std::uint32_t static_null_offset = arena_base + GuestHeapLayout::StageRegion(2);
+        if (paths.status() != d3d12::PathTableStatus::kOk) return static_null_offset;
         const bool same_user_data =
             std::memcmp(bound_user_data.data(), d.user_data, sizeof(bound_user_data)) == 0;
-        if (bound_valid && bound_key == key && same_user_data) return;
-        if (bound_valid) {
-            (void)device->WaitIdle();
-            ReclaimCompleted(device->CompletedValue());
-            WriteNullRegion();
-            bound_srv_copies.clear();
-            bound_valid = false;
+        const bool srv_valid = bound_srv_copies.empty() || bound_srv_ring_gen == srv_ring_gen;
+        if (bound_valid && bound_key == key && same_user_data && srv_valid) {
+            for (const SrvCopy& copy : bound_srv_copies) {
+                TouchSrvOffset(copy.dst_offset);
+            }
+            return bound_slice.valid() ? bound_slice.offset : static_null_offset;
         }
-        std::uint32_t written = 0, srvs = 0, refused = 0, nulls = 0, planned = 0;
-        std::string line;
+
+        // Collect plans for this key onto the stack first so a key with 0 plans
+        // binds the permanent static null region without touching the ring.
+        const d3d12::BindingPlan* active_plans[GuestHeapLayout::kSpace1Count];
+        std::uint32_t active_bindings[GuestHeapLayout::kSpace1Count];
+        std::uint32_t planned = 0;
         for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
             const d3d12::BindingPlan* plan = paths.Find(key, binding);
             if (plan == nullptr) continue;
+            active_plans[planned] = plan;
+            active_bindings[planned] = binding;
             ++planned;
+        }
+
+        if (bound_slice.valid()) {
+            RetireSlice(bound_slice);
+            bound_slice = {};
+        }
+        bound_srv_copies.clear();
+        bound_key = key;
+        std::memcpy(bound_user_data.data(), d.user_data, sizeof(bound_user_data));
+
+        if (planned == 0) {
+            bound_srv_ring_gen = srv_ring_gen;
+            bound_valid = true;
+            return static_null_offset;
+        }
+
+        const d3d12::DescriptorSlice new_slice = AllocateSpace1Slice();
+        if (!new_slice.valid()) {
+            bound_valid = false;
+            return static_null_offset;
+        }
+
+        const bool should_log = logged_binding_keys.find(key) == logged_binding_keys.end();
+        std::uint32_t written = 0, srvs = 0, refused = 0, nulls = 0;
+        std::string line;
+        for (std::uint32_t i = 0; i < planned; ++i) {
+            const d3d12::BindingPlan* plan = active_plans[i];
+            const std::uint32_t binding = active_bindings[i];
             d3d12::GuestHeapSlot slot{};
             const d3d12::GuestRangeKind kind =
                 plan->kind == d3d12::BindingKind::kUav ? d3d12::GuestRangeKind::kUav : d3d12::GuestRangeKind::kSrv;
             if (!d3d12::GuestHeapSlotFor(GuestStage::kCompute, kind, binding, d3d12::kGuestParamsSpace, &slot)) {
                 ++refused;
-                line += " " + std::to_string(binding) + ": the root signature has no space-1 slot for it";
+                if (should_log) {
+                    line += " " + std::to_string(binding) + ": the root signature has no space-1 slot for it";
+                }
                 continue;
             }
             const d3d12::BindingWrite write =
                 d3d12::DecideBindingWrite(*plan, d.user_data, memory->Table(), ReadGuestMemory, nullptr);
             switch (write.verdict) {
             case d3d12::BindingVerdict::kNull:
-                ++nulls;  // the null descriptor is the right answer, and it is already there
+                ++nulls;
                 break;
             case d3d12::BindingVerdict::kWrite:
                 if (write.kind == d3d12::BindingKind::kUav) {
-                    if (!WriteBufferUav(slot.index, write)) {
+                    if (!WriteBufferUav(new_slice.offset, slot.index, write)) {
                         ++refused;
-                        line += " " + d3d12::BindingWriteLine(write) + " refused (the slab is not resident)";
+                        if (should_log) {
+                            line += " " + d3d12::BindingWriteLine(write) + " refused (the slab is not resident)";
+                        }
                         break;
                     }
                     ++written;
-                    line += " " + d3d12::BindingWriteLine(write);
+                    if (should_log) line += " " + d3d12::BindingWriteLine(write);
                 } else {
                     SrvCopy copy{};
-                    if (!WriteBufferSrv(slot.index, write, &copy)) {
+                    if (!WriteBufferSrv(new_slice.offset, slot.index, write, &copy)) {
                         ++refused;
-                        line += " " + d3d12::BindingWriteLine(write) +
-                                " refused (SRV snapshot ring full or slab not resident)";
+                        if (should_log) {
+                            line += " " + d3d12::BindingWriteLine(write) +
+                                    " refused (SRV snapshot ring full or slab not resident)";
+                        }
                         break;
                     }
                     bound_srv_copies.push_back(copy);
                     ++written;
                     ++srvs;
-                    line += " " + d3d12::BindingWriteLine(write);
+                    if (should_log) line += " " + d3d12::BindingWriteLine(write);
                 }
                 break;
             default:
                 ++refused;
-                line += " " + d3d12::BindingWriteLine(write);
+                if (should_log) line += " " + d3d12::BindingWriteLine(write);
                 break;
             }
         }
@@ -538,10 +842,12 @@ struct GuestCompute::Impl {
         counts.bindings_srv += srvs;
         counts.bindings_refused += refused;
         counts.bindings_null += nulls;
-        bound_key = key;
-        std::memcpy(bound_user_data.data(), d.user_data, sizeof(bound_user_data));
-        bound_valid = planned != 0;
-        if (planned != 0) {
+        bound_slice = new_slice;
+        bound_srv_ring_gen = srv_ring_gen;
+        bound_valid = true;
+
+        if (should_log) {
+            logged_binding_keys.insert(key);
             std::string text = "guest compute: key ";
             char head[192];
             std::snprintf(head, sizeof(head), "%016llx: %u plan(s), %u slot(s) written (%u srv), %u null, %u refused",
@@ -550,6 +856,107 @@ struct GuestCompute::Impl {
             text += line;
             LogMessage(refused != 0 ? Level::kWarn : Level::kInfo, "%s", text.c_str());
         }
+        return bound_slice.offset;
+    }
+
+    // --- multi-threaded compute PSO pre-warming ----------------------------------
+    void StartPrewarm() {
+        if (prewarm_started || device == nullptr || root == nullptr || psos == nullptr) return;
+        if (cache.status() != d3d12::CacheStatus::kOk) return;
+        prewarm_started = true;
+        prewarm_stop.store(false, std::memory_order_relaxed);
+        prewarm_next.store(0, std::memory_order_relaxed);
+        prewarm_created.store(0, std::memory_order_relaxed);
+        prewarm_failed.store(0, std::memory_order_relaxed);
+
+        prewarm_keys.clear();
+        const auto& entries = cache.Entries();
+        prewarm_keys.reserve(std::min<std::size_t>(entries.size(), 1024));
+        for (const d3d12::CacheEntry& entry : entries) {
+            if (entry.stage == Stage::kCompute && entry.raw_size != 0) {
+                prewarm_keys.push_back(entry.key);
+                if (prewarm_keys.size() >= 1024) break;
+            }
+        }
+        if (prewarm_keys.empty()) return;
+
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t max_workers = hw > 2 ? std::min<std::size_t>(4, hw / 2) : 1;
+        const std::size_t workers = std::min<std::size_t>(prewarm_keys.size(), std::max<std::size_t>(1, max_workers));
+        const std::uint64_t byte_cap = (pso_budget_bytes * 3ull) / 4ull;
+
+        LogMessage(Level::kInfo, "guest compute: pre-warming %zu compute PSO(s) across %zu worker thread(s)",
+                   prewarm_keys.size(), workers);
+
+        prewarm_threads.reserve(workers);
+        for (std::size_t w = 0; w < workers; ++w) {
+            prewarm_threads.emplace_back([this, byte_cap]() {
+                std::vector<std::uint8_t> dxil;
+                while (!prewarm_stop.load(std::memory_order_relaxed)) {
+                    const std::size_t idx = prewarm_next.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= prewarm_keys.size()) break;
+                    const std::uint64_t key = prewarm_keys[idx];
+                    {
+                        std::lock_guard<std::mutex> lk(pso_mutex);
+                        if (pso_objects.find(key) != pso_objects.end()) continue;
+                        if (psos->Stats().live >= 1024 ||
+                            (byte_cap != 0 && psos->Stats().live_bytes >= byte_cap)) {
+                            break;
+                        }
+                    }
+                    d3d12::BakedBlob blob{};
+                    if (!cache.Lookup(key, &blob) || blob.data == nullptr || blob.raw_size == 0) continue;
+                    dxil.resize(blob.raw_size);
+                    if (!Inflate(blob, &dxil)) {
+                        prewarm_failed.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (prewarm_stop.load(std::memory_order_relaxed)) break;
+
+                    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+                    desc.pRootSignature = root;
+                    desc.CS.pShaderBytecode = dxil.data();
+                    desc.CS.BytecodeLength = dxil.size();
+                    ComPtr<ID3D12PipelineState> created;
+                    if (FAILED(device->Get()->CreateComputePipelineState(&desc,
+                                                                         IID_PPV_ARGS(created.GetAddressOf())))) {
+                        prewarm_failed.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+
+                    std::lock_guard<std::mutex> lk(pso_mutex);
+                    if (prewarm_stop.load(std::memory_order_relaxed)) break;
+                    if (pso_objects.find(key) != pso_objects.end()) continue;
+                    if (psos->Stats().live >= 1024 ||
+                        (byte_cap != 0 && psos->Stats().live_bytes + dxil.size() > byte_cap)) {
+                        break;
+                    }
+                    ID3D12PipelineState* raw = created.Detach();
+                    pso_objects.emplace(key, raw);
+                    const std::vector<PsoKey> evicted = psos->Insert(PsoKey{key, 0}, key, dxil.size(), 1);
+                    if (!evicted.empty()) {
+                        const std::uint64_t retire_fence = device->SubmittedValue() + 1;
+                        for (const PsoKey& ev : evicted) {
+                            if (const auto it = pso_objects.find(ev.lo); it != pso_objects.end()) {
+                                retired_psos.push_back({it->second, retire_fence});
+                                pso_objects.erase(it);
+                            }
+                        }
+                    }
+                    prewarm_created.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+    }
+
+    void StopPrewarm() {
+        prewarm_stop.store(true, std::memory_order_relaxed);
+        for (std::thread& t : prewarm_threads) {
+            if (t.joinable()) t.join();
+        }
+        prewarm_threads.clear();
+        prewarm_keys.clear();
+        prewarm_started = false;
     }
 
     // --- cache -------------------------------------------------------------------
@@ -629,6 +1036,7 @@ struct GuestCompute::Impl {
             if (status == d3d12::CacheStatus::kOk) {
                 cache_dir = candidate;
                 LogMessage(Level::kInfo, "guest compute: %s", cache_line.c_str());
+                StartPrewarm();
                 return;
             }
             LogMessage(Level::kWarn, "guest compute: %s (%s); checking next location",
@@ -696,12 +1104,14 @@ GuestCompute::GuestCompute() : impl_(std::make_unique<Impl>()) {}
 GuestCompute::~GuestCompute() { Destroy(); }
 
 d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pipelines,
-                                   d3d12::GuestMemory& memory, std::uint32_t arena_base, std::uint32_t sampler_base) {
+                                   d3d12::GuestMemory& memory, d3d12::DescriptorRing* descriptor_ring,
+                                   std::uint32_t arena_base, std::uint32_t sampler_base) {
     if (impl_ == nullptr) return d3d12::Status::kUnavailable;
     Impl& impl = *impl_;
     impl.device = &device;
     impl.pipelines = &pipelines;
     impl.memory = &memory;
+    impl.descriptor_ring = descriptor_ring;
     impl.root = pipelines.GuestRootSignature(GuestStage::kCompute);
     impl.arena_base = arena_base;
     impl.sampler_base = sampler_base;
@@ -712,19 +1122,33 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
         return d3d12::Status::kUnavailable;
     }
 
-    // The space-1 regions start as null descriptors: a baked shader that reads
-    // t7 before 5B-2b binds it must read "nothing bound", which is a defined
-    // value in D3D12, rather than whatever descriptor was there before.
-    // bbx_guest_root.h's rule 4: these are written straight into the device's one
-    // shader-visible heap, because a view created there is legal and a copy from
-    // a shader-visible heap is not.
+    // Create a 191-slot non-shader-visible CPU heap pre-populated with null
+    // space-1 descriptors so both GuestCompute and GuestGraphics initialize each
+    // ring slice in a single CopyDescriptorsSimple call.
+    D3D12_DESCRIPTOR_HEAP_DESC tmpl_desc{};
+    tmpl_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    tmpl_desc.NumDescriptors = GuestHeapLayout::kSpace1Count;
+    tmpl_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(device.Get()->CreateDescriptorHeap(&tmpl_desc, IID_PPV_ARGS(impl.null_template_heap.GetAddressOf())))) {
+        LogMessage(Level::kError, "guest compute: failed to create null descriptor template heap");
+        return d3d12::Status::kOutOfMemory;
+    }
+    impl.null_template_cpu = impl.null_template_heap->GetCPUDescriptorHandleForHeapStart();
+    for (std::uint32_t i = 0; i < GuestHeapLayout::kSpace1Count; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = impl.null_template_cpu;
+        h.ptr += static_cast<SIZE_T>(i) * impl.cbv_stride;
+        impl.WriteNullSlotToHandle(h, i);
+    }
+
+    // Populate the three permanent static null space-1 regions (fallback when a
+    // shader has zero space-1 plans) directly from the CPU null template heap.
     for (std::uint32_t stage = 0; stage < GuestHeapLayout::kStageRegions; ++stage) {
         const std::uint32_t base = impl.arena_base + GuestHeapLayout::StageRegion(stage);
-        for (std::uint32_t i = 0; i < GuestHeapLayout::kSpace1Count; ++i) impl.WriteNullSlotAt(base + i, i);
+        device.Get()->CopyDescriptorsSimple(GuestHeapLayout::kSpace1Count, impl.SlotHandleAt(base),
+                                            impl.null_template_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    // s0..s63 in the sampler heap: one linear-clamp sampler repeated. A shader
-    // that samples before 5B-2b binds its S# gets a defined filter rather than a
-    // descriptor that was never written.
+
+    // s0..s63 in the sampler heap: one linear-clamp sampler repeated.
     D3D12_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -739,8 +1163,8 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
         }
     }
 
-    // The StageParams ring: kParamSlots * 512 B of upload memory, written by the
-    // CPU per dispatch and read by the root CBV.
+    // The StageParams ring: kParamSlots * 512 B (1 MiB) of persistently-mapped
+    // upload memory, fence-tracked in 4 slices.
     D3D12_HEAP_PROPERTIES upload{};
     upload.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC desc{};
@@ -784,8 +1208,7 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
         LogMessage(Level::kWarn, "guest compute: heaps budget full for 16 MiB SRV snapshot ring");
     }
 
-    // Tiny DEFAULT-heap staging buffer for ExecuteIndirect arguments so indirect
-    // reads never alias a space3 slab's UNORDERED_ACCESS state.
+    // DEFAULT-heap staging ring for ExecuteIndirect arguments (4 x 16 KiB).
     D3D12_RESOURCE_DESC ind_desc = srv_desc;
     ind_desc.Width = Impl::kIndirectStagingBytes;
     if (FAILED(device.Get()->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ind_desc,
@@ -795,10 +1218,7 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
         impl.indirect_staging.Reset();
     }
 
-    // ExecuteIndirect's command signature: one DISPATCH argument (three
-    // workgroup counts, 4-byte stride), so an indirect dispatch reads the guest's
-    // own {x,y,z} where the title wrote it. D3D12 requires pRootSignature == nullptr
-    // when the command signature does not modify any root arguments.
+    // ExecuteIndirect's command signature: one DISPATCH argument.
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     D3D12_COMMAND_SIGNATURE_DESC signature{};
@@ -811,7 +1231,8 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
         impl.indirect.Reset();
     }
 
-    impl.psos = std::make_unique<d3d12::PsoCache>(device.Memory().cap(d3d12::Owner::kShaderTools));
+    impl.pso_budget_bytes = device.Memory().cap(d3d12::Owner::kShaderTools);
+    impl.psos = std::make_unique<d3d12::PsoCache>(impl.pso_budget_bytes);
     LogMessage(Level::kInfo, "guest compute: ready (%s)", d3d12::GuestRootDescription(GuestStage::kCompute).c_str());
     return d3d12::Status::kOk;
 }
@@ -819,9 +1240,18 @@ d3d12::Status GuestCompute::Create(d3d12::Device& device, d3d12::PipelineSet& pi
 void GuestCompute::Destroy() {
     if (impl_ == nullptr) return;
     Impl& impl = *impl_;
+    // Stop and join background pre-warming threads before touching device or PSO maps.
+    impl.StopPrewarm();
+    impl.batch_open = false;
+    impl.batch_dispatches = 0;
+    impl.active_cmd = Impl::CommandSlot{};
     if (impl.device != nullptr) {
         (void)impl.device->WaitIdle();
     }
+    for (ID3D12PipelineState* pso : impl.batch_retired_psos) {
+        if (pso != nullptr) pso->Release();
+    }
+    impl.batch_retired_psos.clear();
     for (Impl::RetiredPso& retired : impl.retired_psos) {
         if (retired.pso != nullptr) retired.pso->Release();
     }
@@ -834,33 +1264,53 @@ void GuestCompute::Destroy() {
     }
     impl.pso_objects.clear();
     impl.psos.reset();
+    impl.pso_budget_bytes = 0;
     if (impl.srv_ring_budgeted && impl.device != nullptr) {
         impl.device->Memory().Free(d3d12::Owner::kHeaps, Impl::kSrvRingBytes);
         impl.srv_ring_budgeted = false;
     }
     impl.srv_ring.Reset();
-    impl.srv_ring_cursor = 0;
+    impl.srv_slice = 0;
+    impl.srv_slice_cursor = 0;
+    impl.srv_slice_fence.fill(0);
+    impl.srv_slices_pending_mask = 0;
+    impl.srv_ring_gen = 1;
     impl.indirect_staging.Reset();
-    impl.indirect_cursor = 0;
+    impl.indirect_slice = 0;
+    impl.indirect_slice_cursor = 0;
+    impl.indirect_slice_fence.fill(0);
+    impl.indirect_slices_pending_mask = 0;
     if (impl.params != nullptr && impl.params_mapped != nullptr) {
         impl.params->Unmap(0, nullptr);
     }
     impl.params_mapped = nullptr;
     impl.params.Reset();
+    impl.param_slice = 0;
+    impl.param_slot_in_slice = 0;
+    impl.param_slice_fence.fill(0);
+    impl.param_slices_pending_mask = 0;
     impl.indirect.Reset();
+    impl.null_template_heap.Reset();
+    impl.null_template_cpu = {};
     impl.programs.clear();
     impl.keys.clear();
+    impl.logged_binding_keys.clear();
+    impl.batch_retired_slices.clear();
+    impl.scratch_runs.clear();
     impl.paths = d3d12::PathTable{};
     impl.paths_tried = false;
     impl.cache_tried = false;
     impl.cache_dir.clear();
     impl.bound_key = 0;
     impl.bound_user_data.fill(0);
+    impl.bound_slice = {};
+    impl.bound_srv_ring_gen = 0;
     impl.bound_srv_copies.clear();
     impl.bound_valid = false;
     impl.device = nullptr;
     impl.pipelines = nullptr;
     impl.memory = nullptr;
+    impl.descriptor_ring = nullptr;
     impl.root = nullptr;
 }
 
@@ -871,7 +1321,7 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     Impl& impl = *impl_;
     impl.LoadCache();
     impl.LoadPaths();
-    const auto id = std::make_tuple(d.code_va, d.rsrc1, d.rsrc2, d.threads[0], d.threads[1], d.threads[2]);
+    const DispatchId id{d.code_va, d.rsrc1, d.rsrc2, d.threads[0], d.threads[1], d.threads[2]};
     if (const auto it = impl.keys.find(id); it != impl.keys.end()) return it->second;
 
     auto program = impl.programs.find(d.code_va);
@@ -882,11 +1332,6 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
             return 0;
         }
         program = impl.programs.emplace(d.code_va, std::move(read)).first;
-        // Said once per program, not per dispatch: a dispatch runs thousands of
-        // times and the answer is a property of the program. This is the line that
-        // makes the next step (binding the table's entries) checkable against a
-        // real dump instead of against a guess: the slot, the instruction it came
-        // from, and how many reads the program makes through it.
         const Program& decoded = program->second;
         if (decoded.table_slot >= 0) {
             std::string offsets;
@@ -912,8 +1357,6 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     for (int i = 0; i < 3; ++i) key.threads[i] = d.threads[i];
     std::string why;
     if (!PredictPaths(program->second, d.rsrc1, d.rsrc2, &key, &why)) {
-        // A program the translator cannot read has no key in the bake either: it
-        // was counted there and refused here, by name.
         if (++impl.counts.bad_program <= 4) {
             LogMessage(Level::kWarn, "guest compute: dispatch at 0x%llx has no key (%s)",
                        static_cast<unsigned long long>(d.code_va), why.c_str());
@@ -922,10 +1365,6 @@ std::uint64_t GuestCompute::KeyFor(const GpuDispatch& d) {
     }
     const std::uint64_t built = d3d12::ConsoleStageKeyOf(program->second.words, key);
     impl.keys.emplace(id, built);
-    // What the bake assigned this key, said once and next to the table line it
-    // belongs with: a program that reads a resource table and a key the bake gave
-    // no binding to is the one case where a dispatch runs with every t#/u# null,
-    // and it has to be a line in the log rather than a silent zero.
     std::uint32_t plans = 0;
     for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
         if (impl.paths.Find(built, binding) != nullptr) ++plans;
@@ -956,23 +1395,28 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
         ++impl.counts.no_cache;
         return false;
     }
-    d3d12::BakedBlob blob{};
-    if (!impl.cache.Lookup(key, &blob) || blob.data == nullptr || blob.raw_size == 0) {
-        ++impl.counts.miss;
-        return false;
-    }
-    std::vector<std::uint8_t> dxil(blob.raw_size);
-    if (!Inflate(blob, &dxil)) {
-        ++impl.counts.bad_blob;
-        return false;
-    }
 
-    // The PSO: created once per key, and the cache decides when one is evicted.
+    // Check the live PSO table FIRST so cached dispatches skip both cache lookup
+    // and zlib decompression completely.
     ID3D12PipelineState* pso = nullptr;
-    if (const auto it = impl.pso_objects.find(key); it != impl.pso_objects.end()) {
-        pso = it->second;
-        impl.psos->Acquire(PsoKey{key, 0}, impl.clock);
-    } else {
+    {
+        std::lock_guard<std::mutex> lk(impl.pso_mutex);
+        if (const auto it = impl.pso_objects.find(key); it != impl.pso_objects.end()) {
+            pso = it->second;
+            impl.psos->Acquire(PsoKey{key, 0}, impl.clock);
+        }
+    }
+    if (pso == nullptr) {
+        d3d12::BakedBlob blob{};
+        if (!impl.cache.Lookup(key, &blob) || blob.data == nullptr || blob.raw_size == 0) {
+            ++impl.counts.miss;
+            return false;
+        }
+        std::vector<std::uint8_t> dxil(blob.raw_size);
+        if (!Inflate(blob, &dxil)) {
+            ++impl.counts.bad_blob;
+            return false;
+        }
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = impl.root;
         desc.CS.pShaderBytecode = dxil.data();
@@ -986,18 +1430,28 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
                        static_cast<unsigned long long>(key), static_cast<unsigned long>(hr));
             return false;
         }
-        pso = created.Get();
-        impl.pso_objects.emplace(key, pso);
-        (void)created.Detach();  // the map owns it; Destroy releases them all
-        const std::uint64_t retire_fence = impl.device->SubmittedValue();
-        for (const PsoKey& evicted : impl.psos->Insert(PsoKey{key, 0}, key, dxil.size(), impl.clock)) {
-            if (const auto it = impl.pso_objects.find(evicted.lo); it != impl.pso_objects.end()) {
-                impl.retired_psos.push_back({it->second, retire_fence});
-                impl.pso_objects.erase(it);
-                ++impl.counts.evicted;
+        std::lock_guard<std::mutex> lk(impl.pso_mutex);
+        if (const auto it = impl.pso_objects.find(key); it != impl.pso_objects.end()) {
+            // A pre-warming worker finished this same PSO concurrently.
+            pso = it->second;
+            impl.psos->Acquire(PsoKey{key, 0}, impl.clock);
+        } else {
+            pso = created.Detach();
+            impl.pso_objects.emplace(key, pso);
+            const std::uint64_t retire_fence = impl.device->SubmittedValue();
+            for (const PsoKey& evicted : impl.psos->Insert(PsoKey{key, 0}, key, dxil.size(), impl.clock)) {
+                if (const auto it = impl.pso_objects.find(evicted.lo); it != impl.pso_objects.end()) {
+                    if (impl.batch_open) {
+                        impl.batch_retired_psos.push_back(it->second);
+                    } else {
+                        impl.retired_psos.push_back({it->second, retire_fence});
+                    }
+                    impl.pso_objects.erase(it);
+                    ++impl.counts.evicted;
+                }
             }
+            ++impl.counts.created;
         }
-        ++impl.counts.created;
     }
 
     // Which workgroup counts: the packet's own, or the guest's memory through
@@ -1008,19 +1462,19 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
         return false;
     }
 
-    // Resolve indirect args before acquiring a command list so a refusal leaves
-    // no half-recorded command allocator.
+    // Resolve indirect args before touching ring cursors so a refusal leaves no
+    // half-allocated staging slice.
     ID3D12Resource* indirect_slab = nullptr;
     std::uint64_t indirect_src_offset = 0;
     std::uint64_t indirect_dst_offset = 0;
     if (indirect) {
-        std::vector<d3d12::GuestRun> runs;
-        if (!d3d12::SlabRuns(impl.memory->Table(), d.indirect_va, 3 * sizeof(std::uint32_t), &runs) ||
-            runs.empty()) {
+        impl.scratch_runs.clear();
+        if (!d3d12::SlabRuns(impl.memory->Table(), d.indirect_va, 3 * sizeof(std::uint32_t), &impl.scratch_runs) ||
+            impl.scratch_runs.empty()) {
             ++impl.counts.no_indirect;
             return false;
         }
-        const d3d12::GuestRun run = runs.front();
+        const d3d12::GuestRun run = impl.scratch_runs.front();
         if (impl.memory->EnsureSlab(run.slab) != d3d12::Status::kOk) {
             ++impl.counts.no_indirect;
             return false;
@@ -1031,40 +1485,28 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
             return false;
         }
         indirect_src_offset = run.offset;
-        if (impl.indirect_cursor + 16ull > Impl::kIndirectStagingBytes) {
-            impl.indirect_cursor = 0;
-        }
-        indirect_dst_offset = impl.indirect_cursor;
-        impl.indirect_cursor += 16ull;
+        indirect_dst_offset = impl.ReserveIndirectOffset();
     }
 
-    // StageParams: user_sgpr only (see this file's header for why that is the
-    // whole contract on the console), from a slot of the ring.
-    const std::uint32_t slot = impl.params_next++ % Impl::kParamSlots;
-    auto* params = static_cast<std::uint8_t*>(impl.params_mapped) + static_cast<std::size_t>(slot) * d3d12::kStageParamsBytes;
+    // StageParams: user_sgpr + gds_base from the 4-slice upload ring.
+    const std::uint32_t slot = impl.ReserveParamSlot();
+    auto* params = static_cast<std::uint8_t*>(impl.params_mapped) +
+                   static_cast<std::size_t>(slot) * d3d12::kStageParamsBytes;
     std::memset(params, 0, d3d12::kStageParamsBytes);
-    // StageParams::user_sgpr is at offset 16, after two 64-bit members
-    // (gcn/translate.h's static_assert).
     std::memcpy(params + 16, d.user_data, sizeof(d.user_data));
-    // GDS: the counters a dispatch's ds_append/ds_consume count in. Its words are
-    // the guest's, so the addresses are the guest's; with no GDS base the field
-    // stays zero, which the shader reads as "no counter".
     if (d.gds_base != 0) {
         std::memcpy(params + 88, &d.gds_base, sizeof(d.gds_base));
     }
 
-    // The space-1 slots, from the bake's plans for this key (5B-2b): before the
-    // list that reads them, and never mid-flight - BindResources waits when
-    // another key's descriptors are still in the region.
-    impl.BindResources(key, d);
+    // Ring-buffered space-1 slots for this dispatch (may flush if a ring wraps).
+    const std::uint32_t space1_offset = impl.BindResources(key, d);
 
-    // Record it on a fence-tracked command allocator/list from the pool.
-    Impl::CommandSlot cmd;
-    if (!impl.AcquireCommandList(&cmd)) {
+    // Ensure a batch command list is open.
+    if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
     }
-    ID3D12GraphicsCommandList* list = cmd.list.Get();
+    ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
 
     const auto transition = [](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
         D3D12_RESOURCE_BARRIER b{};
@@ -1078,13 +1520,16 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     };
 
     // Snapshot any space-1 read-only t# slices from guest slabs into srv_ring,
-    // and stage indirect dispatch arguments into indirect_staging, keeping all
-    // guest slabs in UNORDERED_ACCESS during the dispatch itself.
-    std::vector<ID3D12Resource*> copy_slabs;
-    const auto add_copy_slab = [&copy_slabs](ID3D12Resource* res) {
-        if (res != nullptr && std::find(copy_slabs.begin(), copy_slabs.end(), res) == copy_slabs.end()) {
-            copy_slabs.push_back(res);
+    // and stage indirect dispatch arguments into indirect_staging, using stack
+    // arrays (zero heap allocations per dispatch).
+    ID3D12Resource* copy_slabs[33];
+    std::uint32_t copy_slab_count = 0;
+    const auto add_copy_slab = [&copy_slabs, &copy_slab_count](ID3D12Resource* res) {
+        if (res == nullptr) return;
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            if (copy_slabs[i] == res) return;
         }
+        if (copy_slab_count < 33) copy_slabs[copy_slab_count++] = res;
     };
     const bool has_srv_copies = !impl.bound_srv_copies.empty() && impl.srv_ring != nullptr;
     if (has_srv_copies) {
@@ -1094,13 +1539,12 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     }
     if (indirect) add_copy_slab(indirect_slab);
 
-    if (!copy_slabs.empty()) {
-        std::vector<D3D12_RESOURCE_BARRIER> pre;
-        pre.reserve(copy_slabs.size());
-        for (ID3D12Resource* slab : copy_slabs) {
-            pre.push_back(transition(slab, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    if (copy_slab_count != 0) {
+        D3D12_RESOURCE_BARRIER pre[33];
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            pre[i] = transition(copy_slabs[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         }
-        list->ResourceBarrier(static_cast<UINT>(pre.size()), pre.data());
+        list->ResourceBarrier(copy_slab_count, pre);
 
         if (has_srv_copies) {
             for (const Impl::SrvCopy& copy : impl.bound_srv_copies) {
@@ -1114,42 +1558,58 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
                                    3 * sizeof(std::uint32_t));
         }
 
-        std::vector<D3D12_RESOURCE_BARRIER> post;
-        post.reserve(copy_slabs.size() + 2);
-        for (ID3D12Resource* slab : copy_slabs) {
-            post.push_back(transition(slab, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        D3D12_RESOURCE_BARRIER post[35];
+        std::uint32_t post_count = 0;
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            post[post_count++] =
+                transition(copy_slabs[i], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         if (has_srv_copies) {
-            post.push_back(transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                                      D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+            post[post_count++] = transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
         }
         if (indirect) {
-            post.push_back(transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                                      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+            post[post_count++] = transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
-        list->ResourceBarrier(static_cast<UINT>(post.size()), post.data());
+        list->ResourceBarrier(post_count, post);
     }
 
-    // One CBV/SRV/UAV heap and one sampler heap, set once: the guest arena's
-    // descriptors for both are in these two (bbx_guest_root.h's rule 4).
-    ID3D12DescriptorHeap* heaps[2] = {impl.device->CbvSrvUavHeap(), impl.device->SamplerHeap()};
-    list->SetDescriptorHeaps(2, heaps);
-    list->SetComputeRootSignature(impl.root);
-    list->SetPipelineState(pso);
-    const std::uint32_t compute_region = impl.arena_base + GuestHeapLayout::StageRegion(2);
-    const std::uint32_t compute_samplers = impl.sampler_base + 2 * GuestHeapLayout::kSamplerCount;
-    D3D12_GPU_DESCRIPTOR_HANDLE resources = impl.device->CbvSrvUavHeap()->GetGPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE samplers = impl.device->SamplerHeap()->GetGPUDescriptorHandleForHeapStart();
-    D3D12_GPU_VIRTUAL_ADDRESS where = impl.params->GetGPUVirtualAddress() +
-                                      static_cast<UINT64>(slot) * d3d12::kStageParamsBytes;
-    // The parameter order is the layout's: 0 the root CBV, 1 the resources table,
-    // 2 the sampler table, 3 the guest memory (bbx_guest_root.cpp builds it).
+    // Bind descriptor heaps, root signature, samplers, space3 table, PSO, and
+    // space1 table only when they changed within this batch.
+    if (!impl.batch_heaps_bound) {
+        ID3D12DescriptorHeap* heaps[2] = {impl.device->CbvSrvUavHeap(), impl.device->SamplerHeap()};
+        list->SetDescriptorHeaps(2, heaps);
+        impl.batch_heaps_bound = true;
+    }
+    if (!impl.batch_root_bound) {
+        list->SetComputeRootSignature(impl.root);
+        impl.batch_root_bound = true;
+    }
+    if (impl.batch_pso != pso) {
+        list->SetPipelineState(pso);
+        impl.batch_pso = pso;
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS where = impl.params->GetGPUVirtualAddress() +
+                                            static_cast<UINT64>(slot) * d3d12::kStageParamsBytes;
     list->SetComputeRootConstantBufferView(0, where);
-    resources.ptr += static_cast<UINT64>(compute_region) * impl.cbv_stride;
-    list->SetComputeRootDescriptorTable(1, resources);
-    samplers.ptr += static_cast<UINT64>(compute_samplers) * impl.sampler_stride;
-    list->SetComputeRootDescriptorTable(2, samplers);
-    list->SetComputeRootDescriptorTable(3, impl.memory->TableHandle());
+    if (impl.batch_space1_offset != space1_offset) {
+        D3D12_GPU_DESCRIPTOR_HANDLE resources = impl.device->CbvSrvUavHeap()->GetGPUDescriptorHandleForHeapStart();
+        resources.ptr += static_cast<UINT64>(space1_offset) * impl.cbv_stride;
+        list->SetComputeRootDescriptorTable(1, resources);
+        impl.batch_space1_offset = space1_offset;
+    }
+    if (!impl.batch_samplers_bound) {
+        const std::uint32_t compute_samplers = impl.sampler_base + 2 * GuestHeapLayout::kSamplerCount;
+        D3D12_GPU_DESCRIPTOR_HANDLE samplers = impl.device->SamplerHeap()->GetGPUDescriptorHandleForHeapStart();
+        samplers.ptr += static_cast<UINT64>(compute_samplers) * impl.sampler_stride;
+        list->SetComputeRootDescriptorTable(2, samplers);
+        impl.batch_samplers_bound = true;
+    }
+    if (!impl.batch_space3_bound) {
+        list->SetComputeRootDescriptorTable(3, impl.memory->TableHandle());
+        impl.batch_space3_bound = true;
+    }
 
     if (indirect) {
         list->ExecuteIndirect(impl.indirect.Get(), 1, impl.indirect_staging.Get(), indirect_dst_offset, nullptr, 0);
@@ -1157,35 +1617,42 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     } else {
         list->Dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
+
     // Restore staging buffers to COPY_DEST and issue a global UAV barrier so the
     // next dispatch/draw sees everything this dispatch wrote.
-    std::vector<D3D12_RESOURCE_BARRIER> epilogue;
-    epilogue.reserve(3);
+    D3D12_RESOURCE_BARRIER epilogue[3];
+    std::uint32_t epilogue_count = 0;
     if (has_srv_copies) {
-        epilogue.push_back(transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
-                                      D3D12_RESOURCE_STATE_COPY_DEST));
+        epilogue[epilogue_count++] = transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                                D3D12_RESOURCE_STATE_COPY_DEST);
     }
     if (indirect) {
-        epilogue.push_back(transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                                      D3D12_RESOURCE_STATE_COPY_DEST));
+        epilogue[epilogue_count++] = transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                                D3D12_RESOURCE_STATE_COPY_DEST);
     }
     D3D12_RESOURCE_BARRIER uav_barrier{};
     uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    uav_barrier.UAV.pResource = nullptr;  // every UAV
-    epilogue.push_back(uav_barrier);
-    list->ResourceBarrier(static_cast<UINT>(epilogue.size()), epilogue.data());
+    uav_barrier.UAV.pResource = nullptr;
+    epilogue[epilogue_count++] = uav_barrier;
+    list->ResourceBarrier(epilogue_count, epilogue);
     ++impl.counts.uav_barriers;
-    if (FAILED(list->Close())) {
-        ++impl.counts.record_failed;
-        return false;
-    }
-    ID3D12CommandList* lists[1] = {list};
-    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    cmd.fence = impl.device->Signal();
-    impl.in_flight.push_back(std::move(cmd));
+
     ++impl.counts.ran;
+    ++impl.batch_dispatches;
+    if (impl.batch_dispatches >= Impl::kMaxBatchDispatches) {
+        impl.FlushBatch();
+    }
     return true;
+}
+
+void GuestCompute::Flush() {
+    if (impl_ == nullptr) return;
+    impl_->FlushBatch();
+}
+
+bool GuestCompute::HasPending() const {
+    return impl_ != nullptr && impl_->batch_open;
 }
 
 void GuestCompute::EnsureCacheLoaded() {
@@ -1202,25 +1669,47 @@ bool GuestCompute::CacheReady() const {
     return impl_ != nullptr && impl_->cache.status() == d3d12::CacheStatus::kOk;
 }
 
+D3D12_CPU_DESCRIPTOR_HANDLE GuestCompute::NullTemplateCpu() const {
+    return impl_ != nullptr ? impl_->null_template_cpu : D3D12_CPU_DESCRIPTOR_HANDLE{};
+}
+
 ID3D12Resource* GuestCompute::SrvSnapshotRing() const {
     return impl_ != nullptr ? impl_->srv_ring.Get() : nullptr;
 }
 
-bool GuestCompute::ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset) {
+std::uint64_t GuestCompute::SrvRingGeneration() const {
+    return impl_ != nullptr ? impl_->srv_ring_gen : 0;
+}
+
+bool GuestCompute::ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset,
+                                      FlushCallback flush_cb, void* flush_user) {
     if (impl_ == nullptr || out_offset == nullptr) return false;
-    return impl_->ReserveSrvSlice(bytes, out_offset);
+    return impl_->ReserveSrvSlice(bytes, out_offset, flush_cb, flush_user);
+}
+
+void GuestCompute::TouchSrvSnapshotOffset(std::uint64_t offset) {
+    if (impl_ == nullptr) return;
+    impl_->TouchSrvOffset(offset);
+}
+
+void GuestCompute::MarkSrvSnapshotsSubmitted(std::uint64_t fence) {
+    if (impl_ == nullptr) return;
+    impl_->MarkSrvSnapshotsSubmitted(fence);
 }
 
 std::string GuestCompute::Report() const {
     if (impl_ == nullptr) return "guest compute: none";
     const Impl& impl = *impl_;
-    char line[512];
+    char line[576];
     std::snprintf(line, sizeof(line),
-                  "guest compute: %llu dispatch(es) run, %llu indirect, %llu cache miss, %llu no cache, "
-                  "%llu bad program, %llu bad blob, %llu bad PSO, %llu evicted, %llu record failure(s), "
-                  "%llu space-1 slot(s) written (%llu srv), %llu refused, %llu null, %llu key(s) without plans",
+                  "guest compute: %llu dispatch(es) in %llu batch(es), %llu indirect, %llu prewarmed, "
+                  "%llu cache miss, %llu no cache, %llu bad program, %llu bad blob, %llu bad PSO, %llu evicted, "
+                  "%llu record failure(s), %llu space-1 slot(s) written (%llu srv), %llu refused, %llu null, "
+                  "%llu key(s) without plans",
                   static_cast<unsigned long long>(impl.counts.ran),
+                  static_cast<unsigned long long>(impl.counts.batches),
                   static_cast<unsigned long long>(impl.counts.indirect),
+                  static_cast<unsigned long long>(impl.prewarm_created.load(std::memory_order_relaxed)),
                   static_cast<unsigned long long>(impl.counts.miss),
                   static_cast<unsigned long long>(impl.counts.no_cache),
                   static_cast<unsigned long long>(impl.counts.bad_program),
@@ -1240,12 +1729,15 @@ void GuestCompute::OnFrame(std::uint64_t completed) {
     if (impl_ == nullptr) return;
     impl_->ReclaimCompleted(completed);
     if (impl_->psos != nullptr) {
+        std::lock_guard<std::mutex> lk(impl_->pso_mutex);
         const std::uint64_t retire_fence = impl_->device != nullptr ? impl_->device->SubmittedValue() : completed;
-        // The cache hands back the keys it evicted; their objects stay alive
-        // until the GPU fence passes `retire_fence`.
         for (const PsoKey& evicted : impl_->psos->Trim(0)) {
             if (const auto it = impl_->pso_objects.find(evicted.lo); it != impl_->pso_objects.end()) {
-                impl_->retired_psos.push_back({it->second, retire_fence});
+                if (impl_->batch_open) {
+                    impl_->batch_retired_psos.push_back(it->second);
+                } else {
+                    impl_->retired_psos.push_back({it->second, retire_fence});
+                }
                 impl_->pso_objects.erase(it);
             }
         }

@@ -31,6 +31,7 @@ namespace bbx::platform {
 // One scanout buffer, as the guest registered it.
 struct GuestFrame {
     const std::uint8_t* pixels = nullptr;  // the guest's bytes, in its own layout
+    std::uint64_t display_va = 0;          // guest virtual address for zero-copy GPU scanout lookup
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t format = 0;  // SceVideoOutPixelFormat word (bit 31 set)
@@ -48,7 +49,10 @@ inline void SetGuestFrameSink(GuestFrameSink sink) { g_guest_frame_sink.store(si
 
 inline void SubmitGuestFrame(const GuestFrame& frame) {
     const GuestFrameSink sink = g_guest_frame_sink.load(std::memory_order_acquire);
-    if (sink == nullptr || frame.pixels == nullptr || frame.width == 0 || frame.height == 0 || frame.bytes == 0) {
+    if (sink == nullptr || frame.width == 0 || frame.height == 0) {
+        return;
+    }
+    if (frame.display_va == 0 && (frame.pixels == nullptr || frame.bytes == 0)) {
         return;
     }
     sink(frame);

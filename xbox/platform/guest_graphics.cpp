@@ -35,11 +35,9 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
-#include <map>
-#include <set>
 #include <string>
-#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,6 +47,7 @@
 #include "hle/modules.h"
 #include "host/shader_patch.h"
 #include "src/host/d3d12/bbx_cache.h"
+#include "src/host/d3d12/bbx_descriptors.h"
 #include "src/host/d3d12/bbx_guest_binding.h"
 #include "src/host/d3d12/bbx_guest_path.h"
 #include "src/host/d3d12/bbx_guest_root.h"
@@ -283,20 +282,103 @@ D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* res, D3D12_RESOURCE_STA
     return b;
 }
 
+bool IsDirectPresentFormat(std::uint32_t fmt) {
+    switch (static_cast<DXGI_FORMAT>(fmt)) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct PsoMapKey {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+    bool operator==(const PsoMapKey&) const = default;
+};
+
+struct PsoMapKeyHash {
+    std::size_t operator()(const PsoMapKey& k) const noexcept {
+        return static_cast<std::size_t>(k.lo ^ (k.hi + 0x9e3779b97f4a7c15ull + (k.lo << 6) + (k.lo >> 2)));
+    }
+};
+
+struct TargetKey {
+    std::uint64_t va = 0;
+    std::uint32_t format = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    bool operator==(const TargetKey&) const = default;
+};
+
+struct TargetKeyHash {
+    std::size_t operator()(const TargetKey& k) const noexcept {
+        std::uint64_t h = k.va ^ 0x9e3779b97f4a7c15ull;
+        h ^= (static_cast<std::uint64_t>(k.format) << 32 | k.width) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= static_cast<std::uint64_t>(k.height) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return static_cast<std::size_t>(h);
+    }
+};
+
+struct NotedKey {
+    int stage = 0;
+    std::uint64_t hash = 0;
+    bool operator==(const NotedKey&) const = default;
+};
+
+struct NotedKeyHash {
+    std::size_t operator()(const NotedKey& k) const noexcept {
+        return static_cast<std::size_t>(k.hash ^ (static_cast<std::uint64_t>(k.stage) * 0x9e3779b97f4a7c15ull));
+    }
+};
+
+struct FallbackKey {
+    int stage = 0;
+    std::uint64_t hash = 0;
+    std::uint32_t rsrc1 = 0;
+    std::uint32_t rsrc2 = 0;
+    std::uint32_t mask = 0;
+    bool operator==(const FallbackKey&) const = default;
+};
+
+struct FallbackKeyHash {
+    std::size_t operator()(const FallbackKey& k) const noexcept {
+        std::uint64_t h = k.hash ^ (static_cast<std::uint64_t>(k.stage) * 0x9e3779b97f4a7c15ull);
+        h ^= (static_cast<std::uint64_t>(k.rsrc1) << 32 | k.rsrc2) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= static_cast<std::uint64_t>(k.mask) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return static_cast<std::size_t>(h);
+    }
+};
+
 }  // namespace
 
 struct GuestGraphics::Impl {
-    static constexpr std::uint32_t kParamSlots = 512;  // 256 KiB upload ring (2 slots per draw)
-    static constexpr std::uint32_t kMaxRtvs = 64;
-    static constexpr std::uint32_t kMaxDsvs = 16;
-    static constexpr std::uint64_t kIndexStagingBytes = 4ull << 20;   // 4 MiB DEFAULT-heap IB ring
-    static constexpr std::uint64_t kIndexUploadBytes = 4ull << 20;    // 4 MiB UPLOAD-heap IB ring
-    static constexpr std::uint64_t kIndirectStagingBytes = 4096;      // 4 KiB DEFAULT-heap indirect args
+    static constexpr std::uint32_t kParamSlices = 4;
+    static constexpr std::uint32_t kParamSlotsPerSlice = 1024;
+    static constexpr std::uint32_t kParamSlots = kParamSlices * kParamSlotsPerSlice;  // 2 MiB (2 slots per draw)
+    static constexpr std::uint32_t kMaxRtvs = 128;
+    static constexpr std::uint32_t kMaxDsvs = 32;
+    static constexpr std::uint32_t kIndexSlices = 4;
+    static constexpr std::uint64_t kIndexSliceBytes = 1ull << 20;
+    static constexpr std::uint64_t kIndexStagingBytes = kIndexSlices * kIndexSliceBytes;  // 4 MiB DEFAULT IB ring
+    static constexpr std::uint32_t kIndexUploadSlices = 4;
+    static constexpr std::uint64_t kIndexUploadSliceBytes = 1ull << 20;
+    static constexpr std::uint64_t kIndexUploadBytes = kIndexUploadSlices * kIndexUploadSliceBytes;  // 4 MiB UPLOAD IB ring
+    static constexpr std::uint32_t kIndirectSlices = 4;
+    static constexpr std::uint64_t kIndirectSliceBytes = 16384ull;
+    static constexpr std::uint64_t kIndirectStagingBytes = kIndirectSlices * kIndirectSliceBytes;  // 64 KiB DEFAULT indirect
+    static constexpr std::uint32_t kMaxBatchOps = 256;
 
     d3d12::Device* device = nullptr;
     d3d12::PipelineSet* pipelines = nullptr;
     d3d12::GuestMemory* memory = nullptr;
     GuestCompute* compute = nullptr;
+    d3d12::DescriptorRing* descriptor_ring = nullptr;
     ID3D12RootSignature* root = nullptr;  // GuestStage::kGraphics
     std::uint32_t arena_base = 0;
     std::uint32_t sampler_base = 0;
@@ -310,27 +392,39 @@ struct GuestGraphics::Impl {
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> dsv_heap;
 
-    // StageParams upload ring (512 B per stage, 2 slots consumed per draw).
+    // StageParams 4-slice upload ring (512 B per stage, 2 slots consumed per draw).
     ComPtr<ID3D12Resource> params;
     void* params_mapped = nullptr;
-    std::uint32_t param_cursor = 0;
+    std::uint32_t param_slice = 0;
+    std::uint32_t param_slot_in_slice = 0;
+    std::array<std::uint64_t, kParamSlices> param_slice_fence{};
+    std::uint32_t param_slices_pending_mask = 0;
 
-    // Staging rings for indexed and indirect draws (zero slab state aliasing).
+    // 4-slice fence-tracked staging rings for indexed and indirect draws.
     ComPtr<ID3D12Resource> index_staging;
     bool index_staging_budgeted = false;
-    std::uint64_t index_staging_cursor = 0;
+    std::uint32_t idx_slice = 0;
+    std::uint64_t idx_slice_cursor = 0;
+    std::array<std::uint64_t, kIndexSlices> idx_slice_fence{};
+    std::uint32_t idx_slices_pending_mask = 0;
 
     ComPtr<ID3D12Resource> index_upload;
     void* index_upload_mapped = nullptr;
     bool index_upload_budgeted = false;
-    std::uint64_t index_upload_cursor = 0;
+    std::uint32_t idx_up_slice = 0;
+    std::uint64_t idx_up_slice_cursor = 0;
+    std::array<std::uint64_t, kIndexUploadSlices> idx_up_slice_fence{};
+    std::uint32_t idx_up_slices_pending_mask = 0;
 
     ComPtr<ID3D12Resource> indirect_staging;
-    std::uint64_t indirect_cursor = 0;
+    std::uint32_t indirect_slice = 0;
+    std::uint64_t indirect_slice_cursor = 0;
+    std::array<std::uint64_t, kIndirectSlices> indirect_slice_fence{};
+    std::uint32_t indirect_slices_pending_mask = 0;
     ComPtr<ID3D12CommandSignature> indirect_draw_sig;
     ComPtr<ID3D12CommandSignature> indirect_draw_indexed_sig;
 
-    // Fence-tracked reusable command allocator/list pool.
+    // Fence-tracked reusable command allocator/list pool + batched recording state.
     struct CommandSlot {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -338,6 +432,30 @@ struct GuestGraphics::Impl {
     };
     std::vector<CommandSlot> free_lists;
     std::vector<CommandSlot> in_flight;
+    CommandSlot active_cmd;
+    bool batch_open = false;
+    std::uint32_t batch_ops = 0;
+    bool batch_heaps_bound = false;
+    bool batch_root_bound = false;
+    bool batch_samplers_bound = false;
+    bool batch_space3_bound = false;
+    ID3D12PipelineState* batch_pso = nullptr;
+    std::uint32_t batch_vs_table = UINT32_MAX;
+    std::uint32_t batch_ps_table = UINT32_MAX;
+    D3D12_PRIMITIVE_TOPOLOGY batch_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool batch_stencil_ref_set = false;
+    std::uint32_t batch_stencil_ref = 0;
+    bool batch_om_set = false;
+    std::uint32_t batch_num_rtvs = 0;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> batch_rtvs{};
+    bool batch_has_dsv = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE batch_dsv{};
+    bool batch_vp_set = false;
+    D3D12_VIEWPORT batch_vp{};
+    bool batch_scissor_set = false;
+    D3D12_RECT batch_scissor{};
+    std::vector<d3d12::DescriptorSlice> batch_retired_slices;
+    std::vector<ID3D12PipelineState*> batch_retired_psos;
     std::uint64_t last_draw_fence = 0;
 
     // Bounded graphics PSO cache + deferred fence-gated retirement.
@@ -346,32 +464,25 @@ struct GuestGraphics::Impl {
         std::uint64_t fence = 0;
     };
     std::unique_ptr<d3d12::PsoCache> psos;
-    std::map<std::pair<std::uint64_t, std::uint64_t>, ID3D12PipelineState*> pso_objects;
+    std::unordered_map<PsoMapKey, ID3D12PipelineState*, PsoMapKeyHash> pso_objects;
     std::vector<RetiredPso> retired_psos;
+    std::uint64_t clock = 0;
 
     // Cached native 2D render targets and depth-stencil textures.
-    struct TargetKey {
-        std::uint64_t va = 0;
-        std::uint32_t format = 0;
-        std::uint32_t width = 0;
-        std::uint32_t height = 0;
-        bool operator<(const TargetKey& o) const {
-            return std::tie(va, format, width, height) < std::tie(o.va, o.format, o.width, o.height);
-        }
-    };
     struct TargetEntry {
         ComPtr<ID3D12Resource> resource;
         std::uint32_t slot = 0;
         std::uint64_t bytes = 0;
         std::uint64_t last_used_seq = 0;
+        bool gpu_rendered = false;
     };
     struct RetiredTarget {
         ComPtr<ID3D12Resource> resource;
         std::uint64_t bytes = 0;
         std::uint64_t fence = 0;
     };
-    std::map<TargetKey, TargetEntry> rtv_pool;
-    std::map<TargetKey, TargetEntry> dsv_pool;
+    std::unordered_map<TargetKey, TargetEntry, TargetKeyHash> rtv_pool;
+    std::unordered_map<TargetKey, TargetEntry, TargetKeyHash> dsv_pool;
     std::vector<std::uint32_t> free_rtv_slots;
     std::vector<std::uint32_t> free_dsv_slots;
     std::vector<RetiredTarget> retired_targets;
@@ -379,23 +490,36 @@ struct GuestGraphics::Impl {
 
     // Shader analysis caches: container-noted keys (exact bake match) +
     // extracted guest programs + fallback register-derived stage keys.
-    std::map<std::pair<int, std::uint64_t>, NotedShader> noted_by_hash;
+    std::unordered_map<NotedKey, NotedShader, NotedKeyHash> noted_by_hash;
     std::unordered_map<std::uint64_t, ExtractedProgram> programs;
-    std::map<std::tuple<int, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t>, std::uint64_t> fallback_keys;
+    std::unordered_map<FallbackKey, std::uint64_t, FallbackKeyHash> fallback_keys;
 
-    // Space-1 descriptor tracking for VS (stage 0) and PS (stage 1).
+    // Ring-buffered space-1 descriptor state for VS (stage 0) and PS (stage 1).
     struct SrvCopy {
         std::uint32_t slab = 0;
         std::uint64_t src_offset = 0;
         std::uint64_t dst_offset = 0;
         std::uint64_t bytes = 0;
     };
-    std::vector<SrvCopy> pending_srv_copies;
-    std::set<std::uint64_t> logged_misses;
-    std::set<std::uint64_t> logged_pso_failures;
-    std::set<std::uint64_t> logged_binding_refusals;
+    struct StageBindState {
+        std::uint64_t key = 0;
+        std::array<std::uint32_t, 16> user_data{};
+        d3d12::DescriptorSlice slice{};
+        std::uint64_t srv_ring_gen = 0;
+        bool valid = false;
+        std::vector<SrvCopy> srv_copies;
+    };
+    std::array<StageBindState, 2> stage_state{};
+
+    std::unordered_set<std::uint64_t> logged_misses;
+    std::unordered_set<std::uint64_t> logged_pso_failures;
+    std::unordered_set<std::uint64_t> logged_binding_refusals;
     Counts counts;
     std::uint64_t completed = 0;
+
+    static void FlushThunk(void* user) {
+        if (user != nullptr) static_cast<Impl*>(user)->FlushBatch();
+    }
 
     void ReclaimCompleted(std::uint64_t done) {
         for (auto it = in_flight.begin(); it != in_flight.end();) {
@@ -448,6 +572,228 @@ struct GuestGraphics::Impl {
         return true;
     }
 
+    void ResetBatchState() {
+        batch_open = false;
+        batch_ops = 0;
+        batch_heaps_bound = false;
+        batch_root_bound = false;
+        batch_samplers_bound = false;
+        batch_space3_bound = false;
+        batch_pso = nullptr;
+        batch_vs_table = UINT32_MAX;
+        batch_ps_table = UINT32_MAX;
+        batch_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        batch_stencil_ref_set = false;
+        batch_stencil_ref = 0;
+        batch_om_set = false;
+        batch_num_rtvs = 0;
+        batch_has_dsv = false;
+        batch_vp_set = false;
+        batch_scissor_set = false;
+    }
+
+    bool BeginBatch() {
+        if (batch_open) return true;
+        if (!AcquireCommandList(&active_cmd)) return false;
+        ResetBatchState();
+        batch_open = true;
+        return true;
+    }
+
+    void FlushBatch() {
+        if (!batch_open) return;
+        ID3D12GraphicsCommandList* list = active_cmd.list.Get();
+        const HRESULT close_hr = list->Close();
+        ResetBatchState();
+
+        std::uint64_t fence = device->SubmittedValue();
+        if (SUCCEEDED(close_hr)) {
+            ID3D12CommandList* lists[1] = {list};
+            fence = device->ExecuteAndSignal(lists, 1);
+            active_cmd.fence = fence;
+            last_draw_fence = fence;
+            in_flight.push_back(std::move(active_cmd));
+            ++counts.batches;
+        } else {
+            ++counts.record_failed;
+            active_cmd = CommandSlot{};
+        }
+
+        for (std::uint32_t s = 0; s < kParamSlices; ++s) {
+            if ((param_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > param_slice_fence[s]) param_slice_fence[s] = fence;
+            }
+        }
+        param_slices_pending_mask = 0;
+
+        for (std::uint32_t s = 0; s < kIndexSlices; ++s) {
+            if ((idx_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > idx_slice_fence[s]) idx_slice_fence[s] = fence;
+            }
+        }
+        idx_slices_pending_mask = 0;
+
+        for (std::uint32_t s = 0; s < kIndexUploadSlices; ++s) {
+            if ((idx_up_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > idx_up_slice_fence[s]) idx_up_slice_fence[s] = fence;
+            }
+        }
+        idx_up_slices_pending_mask = 0;
+
+        for (std::uint32_t s = 0; s < kIndirectSlices; ++s) {
+            if ((indirect_slices_pending_mask & (1u << s)) != 0) {
+                if (fence > indirect_slice_fence[s]) indirect_slice_fence[s] = fence;
+            }
+        }
+        indirect_slices_pending_mask = 0;
+
+        if (compute != nullptr) {
+            compute->MarkSrvSnapshotsSubmitted(fence);
+        }
+
+        if (descriptor_ring != nullptr && !batch_retired_slices.empty()) {
+            for (const d3d12::DescriptorSlice& slice : batch_retired_slices) {
+                descriptor_ring->Release(slice, fence);
+            }
+        }
+        batch_retired_slices.clear();
+
+        if (!batch_retired_psos.empty()) {
+            for (ID3D12PipelineState* pso : batch_retired_psos) {
+                retired_psos.push_back({pso, fence});
+            }
+            batch_retired_psos.clear();
+        }
+    }
+
+    void ReserveParamPair(std::uint32_t* out_vs_slot, std::uint32_t* out_ps_slot) {
+        if (param_slot_in_slice + 2 > kParamSlotsPerSlice) {
+            const std::uint32_t next = (param_slice + 1) % kParamSlices;
+            if ((param_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = param_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            param_slice = next;
+            param_slot_in_slice = 0;
+        }
+        const std::uint32_t base = param_slice * kParamSlotsPerSlice + param_slot_in_slice;
+        param_slot_in_slice += 2;
+        param_slices_pending_mask |= (1u << param_slice);
+        *out_vs_slot = base;
+        *out_ps_slot = base + 1;
+    }
+
+    bool ReserveIndexStaging(std::uint64_t bytes, std::uint64_t* out_offset) {
+        if (index_staging == nullptr || bytes == 0 || bytes > kIndexStagingBytes) return false;
+        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
+        if (aligned > kIndexSliceBytes) {
+            FlushBatch();
+            std::uint64_t max_fence = 0;
+            for (const std::uint64_t f : idx_slice_fence) {
+                if (f > max_fence) max_fence = f;
+            }
+            if (max_fence > device->CompletedValue()) {
+                (void)device->WaitFor(max_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            *out_offset = 0;
+            const std::uint32_t covered =
+                static_cast<std::uint32_t>((aligned + kIndexSliceBytes - 1ull) / kIndexSliceBytes);
+            for (std::uint32_t s = 0; s < covered && s < kIndexSlices; ++s) {
+                idx_slices_pending_mask |= (1u << s);
+            }
+            idx_slice = std::min<std::uint32_t>(covered > 0 ? covered - 1 : 0, kIndexSlices - 1);
+            idx_slice_cursor = kIndexSliceBytes;
+            return true;
+        }
+        if (idx_slice_cursor + aligned > kIndexSliceBytes) {
+            const std::uint32_t next = (idx_slice + 1) % kIndexSlices;
+            if ((idx_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = idx_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            idx_slice = next;
+            idx_slice_cursor = 0;
+        }
+        *out_offset = static_cast<std::uint64_t>(idx_slice) * kIndexSliceBytes + idx_slice_cursor;
+        idx_slice_cursor += aligned;
+        idx_slices_pending_mask |= (1u << idx_slice);
+        return true;
+    }
+
+    bool ReserveIndexUpload(std::uint64_t bytes, std::uint64_t* out_offset) {
+        if (index_upload == nullptr || index_upload_mapped == nullptr || bytes == 0 || bytes > kIndexUploadBytes) {
+            return false;
+        }
+        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
+        if (aligned > kIndexUploadSliceBytes) {
+            FlushBatch();
+            std::uint64_t max_fence = 0;
+            for (const std::uint64_t f : idx_up_slice_fence) {
+                if (f > max_fence) max_fence = f;
+            }
+            if (max_fence > device->CompletedValue()) {
+                (void)device->WaitFor(max_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            *out_offset = 0;
+            const std::uint32_t covered =
+                static_cast<std::uint32_t>((aligned + kIndexUploadSliceBytes - 1ull) / kIndexUploadSliceBytes);
+            for (std::uint32_t s = 0; s < covered && s < kIndexUploadSlices; ++s) {
+                idx_up_slices_pending_mask |= (1u << s);
+            }
+            idx_up_slice = std::min<std::uint32_t>(covered > 0 ? covered - 1 : 0, kIndexUploadSlices - 1);
+            idx_up_slice_cursor = kIndexUploadSliceBytes;
+            return true;
+        }
+        if (idx_up_slice_cursor + aligned > kIndexUploadSliceBytes) {
+            const std::uint32_t next = (idx_up_slice + 1) % kIndexUploadSlices;
+            if ((idx_up_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = idx_up_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            idx_up_slice = next;
+            idx_up_slice_cursor = 0;
+        }
+        *out_offset = static_cast<std::uint64_t>(idx_up_slice) * kIndexUploadSliceBytes + idx_up_slice_cursor;
+        idx_up_slice_cursor += aligned;
+        idx_up_slices_pending_mask |= (1u << idx_up_slice);
+        return true;
+    }
+
+    std::uint64_t ReserveIndirectOffset(std::uint64_t aligned_bytes) {
+        if (indirect_slice_cursor + aligned_bytes > kIndirectSliceBytes) {
+            const std::uint32_t next = (indirect_slice + 1) % kIndirectSlices;
+            if ((indirect_slices_pending_mask & (1u << next)) != 0) {
+                FlushBatch();
+            }
+            const std::uint64_t wait_fence = indirect_slice_fence[next];
+            if (wait_fence > device->CompletedValue()) {
+                (void)device->WaitFor(wait_fence);
+                ReclaimCompleted(device->CompletedValue());
+            }
+            indirect_slice = next;
+            indirect_slice_cursor = 0;
+        }
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(indirect_slice) * kIndirectSliceBytes + indirect_slice_cursor;
+        indirect_slice_cursor += aligned_bytes;
+        indirect_slices_pending_mask |= (1u << indirect_slice);
+        return offset;
+    }
+
     D3D12_CPU_DESCRIPTOR_HANDLE VisibleCpu(std::uint32_t index) const {
         D3D12_CPU_DESCRIPTOR_HANDLE handle = device->CbvSrvUavHeap()->GetCPUDescriptorHandleForHeapStart();
         handle.ptr += static_cast<SIZE_T>(index) * cbv_stride;
@@ -466,25 +812,46 @@ struct GuestGraphics::Impl {
         return handle;
     }
 
-    void WriteNullSlotAt(std::uint32_t index, std::uint32_t relative_in_stage) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE dst = VisibleCpu(index);
-        if (relative_in_stage < GuestHeapLayout::kSrvOffset) {
-            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
-            device->Get()->CreateConstantBufferView(&cbv, dst);
-        } else if (relative_in_stage < GuestHeapLayout::kUavOffset) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = DXGI_FORMAT_R32_TYPELESS;
-            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-            device->Get()->CreateShaderResourceView(nullptr, &srv, dst);
+    void RetireSlice(d3d12::DescriptorSlice slice) {
+        if (!slice.valid() || descriptor_ring == nullptr) return;
+        if (batch_open) {
+            batch_retired_slices.push_back(slice);
         } else {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-            uav.Format = DXGI_FORMAT_R32_TYPELESS;
-            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-            device->Get()->CreateUnorderedAccessView(nullptr, nullptr, &uav, dst);
+            descriptor_ring->Release(slice, device->SubmittedValue());
         }
+    }
+
+    d3d12::DescriptorSlice AllocateSpace1Slice() {
+        if (descriptor_ring == nullptr || compute == nullptr || compute->NullTemplateCpu().ptr == 0) return {};
+        descriptor_ring->Collect(device->CompletedValue());
+        std::optional<d3d12::DescriptorSlice> slice =
+            descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        if (!slice.has_value() && batch_open) {
+            FlushBatch();
+            descriptor_ring->Collect(device->CompletedValue());
+            slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        }
+        if (!slice.has_value()) {
+            const std::uint64_t oldest = descriptor_ring->OldestPendingFence();
+            if (oldest != 0) {
+                (void)device->WaitFor(oldest);
+                const std::uint64_t done = device->CompletedValue();
+                ReclaimCompleted(done);
+                descriptor_ring->Collect(done);
+                slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+            }
+        }
+        if (!slice.has_value()) {
+            (void)device->WaitIdle();
+            const std::uint64_t done = device->CompletedValue();
+            ReclaimCompleted(done);
+            descriptor_ring->Collect(done);
+            slice = descriptor_ring->Allocate(GuestHeapLayout::kSpace1Count);
+        }
+        if (!slice.has_value()) return {};
+        device->Get()->CopyDescriptorsSimple(GuestHeapLayout::kSpace1Count, VisibleCpu(slice->offset),
+                                             compute->NullTemplateCpu(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return *slice;
     }
 
     bool WriteBufferUav(std::uint32_t stage_base, std::uint32_t slot, const d3d12::BindingWrite& write) {
@@ -509,7 +876,10 @@ struct GuestGraphics::Impl {
         if (memory->SlabBuffer(write.slab) == nullptr) return false;
         const std::uint64_t bytes = static_cast<std::uint64_t>(write.dwords) * 4ull;
         std::uint64_t ring_offset = 0;
-        if (compute->SrvSnapshotRing() == nullptr || !compute->ReserveSrvSnapshot(bytes, &ring_offset)) return false;
+        if (compute->SrvSnapshotRing() == nullptr ||
+            !compute->ReserveSrvSnapshot(bytes, &ring_offset, &Impl::FlushThunk, this)) {
+            return false;
+        }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R32_UINT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -526,20 +896,57 @@ struct GuestGraphics::Impl {
         return true;
     }
 
-    void BindStageResources(std::uint32_t stage_region_idx, std::uint64_t stage_key,
-                            const std::uint32_t user_data[16]) {
-        if (compute->Paths().status() != d3d12::PathTableStatus::kOk) return;
-        const std::uint32_t stage_base = arena_base + GuestHeapLayout::StageRegion(stage_region_idx);
+    // Ring-buffered VS (stage 0) and PS (stage 1) space-1 resource binding:
+    // reuses the active slice when `(stage_key, user_data, srv_ring_gen)` match;
+    // otherwise allocates a fresh 191-slot slice and retires the previous one
+    // with the batch fence, eliminating every per-draw GPU WaitFor stall.
+    std::uint32_t BindStageResources(std::uint32_t stage_idx, std::uint64_t stage_key,
+                                     const std::uint32_t user_data[16]) {
+        const std::uint32_t static_null_offset = arena_base + GuestHeapLayout::StageRegion(stage_idx);
+        if (compute->Paths().status() != d3d12::PathTableStatus::kOk) return static_null_offset;
 
-        // Wait before overwriting descriptors if the previous draw is still in flight.
-        bool waited = false;
+        StageBindState& st = stage_state[stage_idx];
+        const std::uint64_t current_gen = compute->SrvRingGeneration();
+        const bool same_user = std::memcmp(st.user_data.data(), user_data, sizeof(st.user_data)) == 0;
+        const bool srv_valid = st.srv_copies.empty() || st.srv_ring_gen == current_gen;
+        if (st.valid && st.key == stage_key && same_user && srv_valid) {
+            return st.slice.valid() ? st.slice.offset : static_null_offset;
+        }
+
+        const d3d12::BindingPlan* active_plans[GuestHeapLayout::kSpace1Count];
+        std::uint32_t active_bindings[GuestHeapLayout::kSpace1Count];
+        std::uint32_t planned = 0;
         for (std::uint32_t binding = 0; binding < GuestHeapLayout::kSpace1Count; ++binding) {
             const d3d12::BindingPlan* plan = compute->Paths().Find(stage_key, binding);
             if (plan == nullptr) continue;
-            if (!waited && last_draw_fence != 0 && device->CompletedValue() < last_draw_fence) {
-                (void)device->WaitFor(last_draw_fence);
-                waited = true;
-            }
+            active_plans[planned] = plan;
+            active_bindings[planned] = binding;
+            ++planned;
+        }
+
+        if (st.slice.valid()) {
+            RetireSlice(st.slice);
+            st.slice = {};
+        }
+        st.srv_copies.clear();
+        st.key = stage_key;
+        std::memcpy(st.user_data.data(), user_data, sizeof(st.user_data));
+
+        if (planned == 0) {
+            st.srv_ring_gen = compute->SrvRingGeneration();
+            st.valid = true;
+            return static_null_offset;
+        }
+
+        const d3d12::DescriptorSlice new_slice = AllocateSpace1Slice();
+        if (!new_slice.valid()) {
+            st.valid = false;
+            return static_null_offset;
+        }
+
+        for (std::uint32_t i = 0; i < planned; ++i) {
+            const d3d12::BindingPlan* plan = active_plans[i];
+            const std::uint32_t binding = active_bindings[i];
             d3d12::GuestHeapSlot slot{};
             const d3d12::GuestRangeKind kind =
                 plan->kind == d3d12::BindingKind::kUav ? d3d12::GuestRangeKind::kUav : d3d12::GuestRangeKind::kSrv;
@@ -547,7 +954,6 @@ struct GuestGraphics::Impl {
                 ++counts.bindings_refused;
                 continue;
             }
-            WriteNullSlotAt(stage_base + slot.index, slot.index);
             const d3d12::BindingWrite write =
                 d3d12::DecideBindingWrite(*plan, user_data, memory->Table(), ReadGuestMemory, nullptr);
             switch (write.verdict) {
@@ -556,15 +962,15 @@ struct GuestGraphics::Impl {
                 break;
             case d3d12::BindingVerdict::kWrite:
                 if (write.kind == d3d12::BindingKind::kUav) {
-                    if (WriteBufferUav(stage_base, slot.index, write)) {
+                    if (WriteBufferUav(new_slice.offset, slot.index, write)) {
                         ++counts.bindings_written;
                     } else {
                         ++counts.bindings_refused;
                     }
                 } else {
                     SrvCopy copy{};
-                    if (WriteBufferSrv(stage_base, slot.index, write, &copy)) {
-                        pending_srv_copies.push_back(copy);
+                    if (WriteBufferSrv(new_slice.offset, slot.index, write, &copy)) {
+                        st.srv_copies.push_back(copy);
                         ++counts.bindings_written;
                         ++counts.bindings_srv;
                     } else {
@@ -582,18 +988,23 @@ struct GuestGraphics::Impl {
                 break;
             }
         }
+        st.slice = new_slice;
+        st.srv_ring_gen = compute->SrvRingGeneration();
+        st.valid = true;
+        return st.slice.offset;
     }
 
     // Resolves or creates a native 2D RTV texture for a guest DrawTarget.
-    bool EnsureRenderTarget(const DrawTarget& t, D3D12_CPU_DESCRIPTOR_HANDLE* out_handle) {
+    bool EnsureRenderTarget(const DrawTarget& t, bool mark_rendered, D3D12_CPU_DESCRIPTOR_HANDLE* out_handle) {
         if (t.width == 0 || t.height == 0 || t.width > 8192 || t.height > 8192 || t.format == 0) return false;
         const TargetKey key{t.base, t.format, t.width, t.height};
         if (const auto it = rtv_pool.find(key); it != rtv_pool.end()) {
             it->second.last_used_seq = ++target_use_seq;
+            if (mark_rendered) it->second.gpu_rendered = true;
             *out_handle = RtvCpu(it->second.slot);
             return true;
         }
-        // Evict LRU if all 64 RTV slots are occupied.
+        // Evict LRU if all kMaxRtvs slots are occupied.
         if (free_rtv_slots.empty()) {
             auto victim = rtv_pool.end();
             for (auto it = rtv_pool.begin(); it != rtv_pool.end(); ++it) {
@@ -602,6 +1013,7 @@ struct GuestGraphics::Impl {
                 }
             }
             if (victim == rtv_pool.end()) return false;
+            FlushBatch();
             if (last_draw_fence != 0 && device->CompletedValue() < last_draw_fence) {
                 (void)device->WaitFor(last_draw_fence);
             }
@@ -645,7 +1057,7 @@ struct GuestGraphics::Impl {
         rtv.Format = desc.Format;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         device->Get()->CreateRenderTargetView(res.Get(), &rtv, RtvCpu(slot));
-        rtv_pool.emplace(key, TargetEntry{std::move(res), slot, bytes, ++target_use_seq});
+        rtv_pool.emplace(key, TargetEntry{std::move(res), slot, bytes, ++target_use_seq, mark_rendered});
         ++counts.targets_created;
         *out_handle = RtvCpu(slot);
         return true;
@@ -669,6 +1081,7 @@ struct GuestGraphics::Impl {
                 }
             }
             if (victim == dsv_pool.end()) return false;
+            FlushBatch();
             if (last_draw_fence != 0 && device->CompletedValue() < last_draw_fence) {
                 (void)device->WaitFor(last_draw_fence);
             }
@@ -713,7 +1126,7 @@ struct GuestGraphics::Impl {
         dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         dsv.Flags = D3D12_DSV_FLAG_NONE;
         device->Get()->CreateDepthStencilView(res.Get(), &dsv, DsvCpu(slot));
-        dsv_pool.emplace(key, TargetEntry{std::move(res), slot, bytes, ++target_use_seq});
+        dsv_pool.emplace(key, TargetEntry{std::move(res), slot, bytes, ++target_use_seq, false});
         ++counts.targets_created;
         *out_handle = DsvCpu(slot);
         return true;
@@ -725,7 +1138,7 @@ struct GuestGraphics::Impl {
         const std::uint32_t rsrc1 = stage == 0 ? id.vs.rsrc1 : id.ps.rsrc1;
         const std::uint32_t rsrc2 = stage == 0 ? id.vs.rsrc2 : id.ps.rsrc2;
         const std::uint32_t mask = stage == 0 ? id.vs_out_cntl : id.ps_input_ena;
-        const auto cache_id = std::make_tuple(stage, prog_data.hash, rsrc1, rsrc2, mask);
+        const FallbackKey cache_id{stage, prog_data.hash, rsrc1, rsrc2, mask};
         if (const auto it = fallback_keys.find(cache_id); it != fallback_keys.end()) return it->second;
 
         const gcn::Program decoded = gcn::decode(prog_data.words.data(), prog_data.words.size());
@@ -772,9 +1185,9 @@ struct GuestGraphics::Impl {
     ID3D12PipelineState* EnsureGraphicsPso(const PsoKey& pso_key, const std::vector<std::uint8_t>& vs_dxil,
                                            const std::vector<std::uint8_t>& ps_dxil, std::uint32_t vs_elements,
                                            const DrawIdentity& id, const DrawTopologyInfo& topo) {
-        const auto map_key = std::make_pair(pso_key.lo, pso_key.hi);
+        const PsoMapKey map_key{pso_key.lo, pso_key.hi};
         if (const auto it = pso_objects.find(map_key); it != pso_objects.end()) {
-            (void)psos->Acquire(pso_key, device->SubmittedValue());
+            (void)psos->Acquire(pso_key, ++clock);
             return it->second;
         }
 
@@ -885,39 +1298,22 @@ struct GuestGraphics::Impl {
         }
         ++counts.created_psos;
         const std::uint64_t estimated_bytes = static_cast<std::uint64_t>(vs_dxil.size() + ps_dxil.size() + 65536);
-        const std::uint64_t now = device->SubmittedValue();
-        const std::vector<PsoKey> evicted = psos->Insert(pso_key, pso_key.lo ^ pso_key.hi, estimated_bytes, now);
-        const std::uint64_t retire_fence = now;
+        const std::vector<PsoKey> evicted = psos->Insert(pso_key, pso_key.lo ^ pso_key.hi, estimated_bytes, ++clock);
+        const std::uint64_t retire_fence = device->SubmittedValue();
         for (const PsoKey& gone : evicted) {
-            const auto gone_key = std::make_pair(gone.lo, gone.hi);
+            const PsoMapKey gone_key{gone.lo, gone.hi};
             if (const auto it = pso_objects.find(gone_key); it != pso_objects.end()) {
-                retired_psos.push_back({it->second, retire_fence});
+                if (batch_open) {
+                    batch_retired_psos.push_back(it->second);
+                } else {
+                    retired_psos.push_back({it->second, retire_fence});
+                }
                 pso_objects.erase(it);
                 ++counts.evicted_psos;
             }
         }
         pso_objects.emplace(map_key, pso);
         return pso;
-    }
-
-    bool ReserveIndexStaging(std::uint64_t bytes, std::uint64_t* out_offset) {
-        if (index_staging == nullptr || bytes == 0 || bytes > kIndexStagingBytes) return false;
-        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
-        if (index_staging_cursor + aligned > kIndexStagingBytes) index_staging_cursor = 0;
-        *out_offset = index_staging_cursor;
-        index_staging_cursor += aligned;
-        return true;
-    }
-
-    bool ReserveIndexUpload(std::uint64_t bytes, std::uint64_t* out_offset) {
-        if (index_upload == nullptr || index_upload_mapped == nullptr || bytes == 0 || bytes > kIndexUploadBytes) {
-            return false;
-        }
-        const std::uint64_t aligned = (bytes + 15ull) & ~15ull;
-        if (index_upload_cursor + aligned > kIndexUploadBytes) index_upload_cursor = 0;
-        *out_offset = index_upload_cursor;
-        index_upload_cursor += aligned;
-        return true;
     }
 };
 
@@ -926,6 +1322,7 @@ GuestGraphics::~GuestGraphics() { Destroy(); }
 
 d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& pipelines,
                                     d3d12::GuestMemory& memory, GuestCompute& compute,
+                                    d3d12::DescriptorRing* descriptor_ring,
                                     std::uint32_t arena_base, std::uint32_t sampler_base) {
     if (impl_ == nullptr) return d3d12::Status::kUnavailable;
     Impl& impl = *impl_;
@@ -933,6 +1330,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
     impl.pipelines = &pipelines;
     impl.memory = &memory;
     impl.compute = &compute;
+    impl.descriptor_ring = descriptor_ring;
     impl.root = pipelines.GuestRootSignature(GuestStage::kGraphics);
     impl.arena_base = arena_base;
     impl.sampler_base = sampler_base;
@@ -967,7 +1365,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
     impl.free_dsv_slots.clear();
     for (std::uint32_t i = Impl::kMaxDsvs; i > 0; --i) impl.free_dsv_slots.push_back(i - 1);
 
-    // StageParams upload ring (VS + PS root CBVs).
+    // StageParams 4-slice upload ring (VS + PS root CBVs, 2 MiB total).
     D3D12_HEAP_PROPERTIES upload_heap{};
     upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC buf_desc{};
@@ -986,7 +1384,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
     }
     if (FAILED(impl.params->Map(0, nullptr, &impl.params_mapped))) return d3d12::Status::kOutOfMemory;
 
-    // DEFAULT-heap index staging ring (COPY_DEST resting state).
+    // DEFAULT-heap index staging ring (COPY_DEST resting state, 4 x 1 MiB).
     D3D12_HEAP_PROPERTIES default_heap{};
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC ib_desc = buf_desc;
@@ -1001,7 +1399,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
         }
     }
 
-    // UPLOAD-heap index ring for CPU-mapped index buffers not yet mirrored in a slab.
+    // UPLOAD-heap index ring (4 x 1 MiB) for CPU-mapped index buffers.
     D3D12_RESOURCE_DESC ib_up_desc = buf_desc;
     ib_up_desc.Width = Impl::kIndexUploadBytes;
     if (device.Memory().Allocate(d3d12::Owner::kHeaps, Impl::kIndexUploadBytes).ok) {
@@ -1017,7 +1415,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
         }
     }
 
-    // Indirect draw staging buffer + command signatures (DRAW and DRAW_INDEXED).
+    // Indirect draw staging ring (4 x 16 KiB) + command signatures.
     D3D12_RESOURCE_DESC ind_desc = buf_desc;
     ind_desc.Width = Impl::kIndirectStagingBytes;
     (void)device.Get()->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ind_desc,
@@ -1050,9 +1448,15 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
 void GuestGraphics::Destroy() {
     if (impl_ == nullptr) return;
     Impl& impl = *impl_;
+    impl.ResetBatchState();
+    impl.active_cmd = Impl::CommandSlot{};
     if (impl.device != nullptr) {
         (void)impl.device->WaitIdle();
     }
+    for (ID3D12PipelineState* pso : impl.batch_retired_psos) {
+        if (pso != nullptr) pso->Release();
+    }
+    impl.batch_retired_psos.clear();
     for (Impl::RetiredPso& r : impl.retired_psos) {
         if (r.pso != nullptr) r.pso->Release();
     }
@@ -1094,6 +1498,11 @@ void GuestGraphics::Destroy() {
         impl.index_staging_budgeted = false;
     }
     impl.index_staging.Reset();
+    impl.idx_slice = 0;
+    impl.idx_slice_cursor = 0;
+    impl.idx_slice_fence.fill(0);
+    impl.idx_slices_pending_mask = 0;
+
     if (impl.index_upload != nullptr && impl.index_upload_mapped != nullptr) {
         impl.index_upload->Unmap(0, nullptr);
     }
@@ -1103,7 +1512,16 @@ void GuestGraphics::Destroy() {
         impl.index_upload_budgeted = false;
     }
     impl.index_upload.Reset();
+    impl.idx_up_slice = 0;
+    impl.idx_up_slice_cursor = 0;
+    impl.idx_up_slice_fence.fill(0);
+    impl.idx_up_slices_pending_mask = 0;
+
     impl.indirect_staging.Reset();
+    impl.indirect_slice = 0;
+    impl.indirect_slice_cursor = 0;
+    impl.indirect_slice_fence.fill(0);
+    impl.indirect_slices_pending_mask = 0;
     impl.indirect_draw_sig.Reset();
     impl.indirect_draw_indexed_sig.Reset();
 
@@ -1112,16 +1530,25 @@ void GuestGraphics::Destroy() {
     }
     impl.params_mapped = nullptr;
     impl.params.Reset();
+    impl.param_slice = 0;
+    impl.param_slot_in_slice = 0;
+    impl.param_slice_fence.fill(0);
+    impl.param_slices_pending_mask = 0;
+
     impl.rtv_heap.Reset();
     impl.dsv_heap.Reset();
     impl.noted_by_hash.clear();
     impl.programs.clear();
     impl.fallback_keys.clear();
-    impl.pending_srv_copies.clear();
+    impl.batch_retired_slices.clear();
+    for (Impl::StageBindState& st : impl.stage_state) {
+        st = Impl::StageBindState{};
+    }
     impl.device = nullptr;
     impl.pipelines = nullptr;
     impl.memory = nullptr;
     impl.compute = nullptr;
+    impl.descriptor_ring = nullptr;
     impl.root = nullptr;
 }
 
@@ -1146,7 +1573,7 @@ void GuestGraphics::NoteShaderCreated(int stage, const std::uint8_t* container, 
     const std::uint64_t prog_hash = bbx::Fnv1a64(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(words.data()), words.size() * sizeof(std::uint32_t)));
 
-    const auto hash_key = std::make_pair(stage, prog_hash);
+    const NotedKey hash_key{stage, prog_hash};
     if (impl.noted_by_hash.find(hash_key) != impl.noted_by_hash.end()) return;
 
     const gcn::Program decoded = gcn::decode(words.data(), words.size());
@@ -1212,14 +1639,14 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     // to register-derived keys if the container wasn't observed at creation).
     std::uint64_t vs_key = 0;
     std::uint32_t vs_elements = 0;
-    if (const auto it = impl.noted_by_hash.find({0, vs_prog->hash}); it != impl.noted_by_hash.end()) {
+    if (const auto it = impl.noted_by_hash.find(NotedKey{0, vs_prog->hash}); it != impl.noted_by_hash.end()) {
         vs_key = it->second.key;
         vs_elements = it->second.element_count;
     } else {
         vs_key = impl.FallbackStageKey(0, *vs_prog, id);
     }
     std::uint64_t ps_key = 0;
-    if (const auto it = impl.noted_by_hash.find({1, ps_prog->hash}); it != impl.noted_by_hash.end()) {
+    if (const auto it = impl.noted_by_hash.find(NotedKey{1, ps_prog->hash}); it != impl.noted_by_hash.end()) {
         ps_key = it->second.key;
     } else {
         ps_key = impl.FallbackStageKey(1, *ps_prog, id);
@@ -1229,32 +1656,32 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
         return false;
     }
 
-    // Look up and inflate cached vs_6_4 and ps_6_4 DXIL blobs.
-    d3d12::BakedBlob vs_blob{}, ps_blob{};
-    if (!impl.compute->Cache().Lookup(vs_key, &vs_blob)) {
-        ++impl.counts.miss_vs;
-        if (impl.logged_misses.insert(vs_key).second) {
-            LogMessage(Level::kWarn, "guest graphics: VS key %016llx (%s) not in bbx_shaders.cache",
-                       static_cast<unsigned long long>(vs_key), vs_prog->name.c_str());
-        }
-        return false;
-    }
-    if (!impl.compute->Cache().Lookup(ps_key, &ps_blob)) {
-        ++impl.counts.miss_ps;
-        if (impl.logged_misses.insert(ps_key).second) {
-            LogMessage(Level::kWarn, "guest graphics: PS key %016llx (%s) not in bbx_shaders.cache",
-                       static_cast<unsigned long long>(ps_key), ps_prog->name.c_str());
-        }
-        return false;
-    }
-
+    // Check the live PSO table FIRST so cached draws skip both bbx_shaders.cache
+    // lookups and zlib decompression completely.
     const PsoKey pso_key = d3d12::GraphicsPsoKey(vs_key, ps_key, id);
     ID3D12PipelineState* pso = nullptr;
-    const auto pso_map_key = std::make_pair(pso_key.lo, pso_key.hi);
+    const PsoMapKey pso_map_key{pso_key.lo, pso_key.hi};
     if (const auto it = impl.pso_objects.find(pso_map_key); it != impl.pso_objects.end()) {
-        (void)impl.psos->Acquire(pso_key, impl.device->SubmittedValue());
+        (void)impl.psos->Acquire(pso_key, ++impl.clock);
         pso = it->second;
     } else {
+        d3d12::BakedBlob vs_blob{}, ps_blob{};
+        if (!impl.compute->Cache().Lookup(vs_key, &vs_blob)) {
+            ++impl.counts.miss_vs;
+            if (impl.logged_misses.insert(vs_key).second) {
+                LogMessage(Level::kWarn, "guest graphics: VS key %016llx (%s) not in bbx_shaders.cache",
+                           static_cast<unsigned long long>(vs_key), vs_prog->name.c_str());
+            }
+            return false;
+        }
+        if (!impl.compute->Cache().Lookup(ps_key, &ps_blob)) {
+            ++impl.counts.miss_ps;
+            if (impl.logged_misses.insert(ps_key).second) {
+                LogMessage(Level::kWarn, "guest graphics: PS key %016llx (%s) not in bbx_shaders.cache",
+                           static_cast<unsigned long long>(ps_key), ps_prog->name.c_str());
+            }
+            return false;
+        }
         std::vector<std::uint8_t> vs_dxil(vs_blob.raw_size);
         std::vector<std::uint8_t> ps_dxil(ps_blob.raw_size);
         if (!Inflate(vs_blob, &vs_dxil) || !Inflate(ps_blob, &ps_dxil)) {
@@ -1265,14 +1692,15 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
         if (pso == nullptr) return false;
     }
 
-    // Ensure native 2D render targets and optional depth-stencil target.
+    // Ensure native 2D render targets (marking them GPU-rendered for zero-copy
+    // direct scanout) and optional depth-stencil target.
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[8] = {};
     std::uint32_t num_rtvs = 0;
     std::uint32_t primary_w = 0, primary_h = 0;
     for (std::uint32_t i = 0; i < id.target_count && i < 8; ++i) {
         const DrawTarget& t = id.targets[i];
         if (t.index >= 8) continue;
-        if (!impl.EnsureRenderTarget(t, &rtv_handles[t.index])) {
+        if (!impl.EnsureRenderTarget(t, true, &rtv_handles[t.index])) {
             ++impl.counts.bad_target;
             return false;
         }
@@ -1357,14 +1785,12 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
             return false;
         }
         const std::uint64_t aligned = (indirect_bytes + 15ull) & ~15ull;
-        if (impl.indirect_cursor + aligned > Impl::kIndirectStagingBytes) impl.indirect_cursor = 0;
-        indirect_dst_off = impl.indirect_cursor;
-        impl.indirect_cursor += aligned;
+        indirect_dst_off = impl.ReserveIndirectOffset(aligned);
     }
 
-    // Write VS and PS StageParams into the upload ring.
-    const std::uint32_t vs_slot = impl.param_cursor++ % Impl::kParamSlots;
-    const std::uint32_t ps_slot = impl.param_cursor++ % Impl::kParamSlots;
+    // Write VS and PS StageParams into the 4-slice upload ring.
+    std::uint32_t vs_slot = 0, ps_slot = 0;
+    impl.ReserveParamPair(&vs_slot, &ps_slot);
     auto* vs_params = static_cast<std::uint8_t*>(impl.params_mapped) +
                       static_cast<std::size_t>(vs_slot) * d3d12::kStageParamsBytes;
     auto* ps_params = static_cast<std::uint8_t*>(impl.params_mapped) +
@@ -1374,48 +1800,62 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     std::memcpy(vs_params + 16, id.vs.user, sizeof(id.vs.user));
     std::memcpy(ps_params + 16, id.ps.user, sizeof(id.ps.user));
 
-    // Bind VS (stage region 0) and PS (stage region 1) space-1 plans.
-    impl.pending_srv_copies.clear();
-    impl.BindStageResources(0, vs_key, id.vs.user);
-    impl.BindStageResources(1, ps_key, id.ps.user);
+    // Ring-buffered VS (stage 0) and PS (stage 1) space-1 descriptor tables.
+    const std::uint32_t vs_table_off = impl.BindStageResources(0, vs_key, id.vs.user);
+    const std::uint32_t ps_table_off = impl.BindStageResources(1, ps_key, id.ps.user);
 
-    // Record the command list.
-    Impl::CommandSlot cmd;
-    if (!impl.AcquireCommandList(&cmd)) {
+    // Ensure any SRV ring slices used by VS or PS are marked pending for this batch
+    // (even if PS binding caused an intermediate flush).
+    const auto& vs_copies = impl.stage_state[0].srv_copies;
+    const auto& ps_copies = impl.stage_state[1].srv_copies;
+    for (const Impl::SrvCopy& copy : vs_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
+    for (const Impl::SrvCopy& copy : ps_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
+
+    // Open or reuse the active batched command list.
+    if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
     }
-    ID3D12GraphicsCommandList* list = cmd.list.Get();
+    ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
 
     // Pre-draw copies from space-3 slabs into SRV snapshot ring, IB staging, and
-    // indirect staging so guest slabs stay cleanly in UNORDERED_ACCESS during draw.
-    std::vector<ID3D12Resource*> copy_slabs;
-    const auto add_slab = [&copy_slabs](ID3D12Resource* res) {
-        if (res != nullptr && std::find(copy_slabs.begin(), copy_slabs.end(), res) == copy_slabs.end()) {
-            copy_slabs.push_back(res);
+    // indirect staging using stack arrays (zero heap allocations per draw).
+    ID3D12Resource* copy_slabs[34];
+    std::uint32_t copy_slab_count = 0;
+    const auto add_slab = [&copy_slabs, &copy_slab_count](ID3D12Resource* res) {
+        if (res == nullptr) return;
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            if (copy_slabs[i] == res) return;
         }
+        if (copy_slab_count < 34) copy_slabs[copy_slab_count++] = res;
     };
-    const bool has_srv_copies = !impl.pending_srv_copies.empty() && impl.compute->SrvSnapshotRing() != nullptr;
+    const bool has_srv_copies =
+        (!vs_copies.empty() || !ps_copies.empty()) && impl.compute->SrvSnapshotRing() != nullptr;
     if (has_srv_copies) {
-        for (const Impl::SrvCopy& copy : impl.pending_srv_copies) add_slab(impl.memory->SlabBuffer(copy.slab));
+        for (const Impl::SrvCopy& copy : vs_copies) add_slab(impl.memory->SlabBuffer(copy.slab));
+        for (const Impl::SrvCopy& copy : ps_copies) add_slab(impl.memory->SlabBuffer(copy.slab));
     }
     if (ib_from_slab) add_slab(ib_slab);
     if (indirect) add_slab(indirect_slab);
 
-    if (!copy_slabs.empty()) {
-        std::vector<D3D12_RESOURCE_BARRIER> pre;
-        pre.reserve(copy_slabs.size());
-        for (ID3D12Resource* slab : copy_slabs) {
-            pre.push_back(TransitionBarrier(slab, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                            D3D12_RESOURCE_STATE_COPY_SOURCE));
+    if (copy_slab_count != 0) {
+        D3D12_RESOURCE_BARRIER pre[34];
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            pre[i] = TransitionBarrier(copy_slabs[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
         }
-        list->ResourceBarrier(static_cast<UINT>(pre.size()), pre.data());
+        list->ResourceBarrier(copy_slab_count, pre);
 
         if (has_srv_copies) {
-            for (const Impl::SrvCopy& copy : impl.pending_srv_copies) {
+            ID3D12Resource* srv_ring = impl.compute->SrvSnapshotRing();
+            for (const Impl::SrvCopy& copy : vs_copies) {
                 if (ID3D12Resource* slab = impl.memory->SlabBuffer(copy.slab)) {
-                    list->CopyBufferRegion(impl.compute->SrvSnapshotRing(), copy.dst_offset, slab, copy.src_offset,
-                                           copy.bytes);
+                    list->CopyBufferRegion(srv_ring, copy.dst_offset, slab, copy.src_offset, copy.bytes);
+                }
+            }
+            for (const Impl::SrvCopy& copy : ps_copies) {
+                if (ID3D12Resource* slab = impl.memory->SlabBuffer(copy.slab)) {
+                    list->CopyBufferRegion(srv_ring, copy.dst_offset, slab, copy.src_offset, copy.bytes);
                 }
             }
         }
@@ -1427,61 +1867,102 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
                                    indirect_bytes);
         }
 
-        std::vector<D3D12_RESOURCE_BARRIER> post;
-        post.reserve(copy_slabs.size() + 3);
-        for (ID3D12Resource* slab : copy_slabs) {
-            post.push_back(TransitionBarrier(slab, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        D3D12_RESOURCE_BARRIER post[37];
+        std::uint32_t post_count = 0;
+        for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
+            post[post_count++] = TransitionBarrier(copy_slabs[i], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         if (has_srv_copies) {
-            post.push_back(TransitionBarrier(impl.compute->SrvSnapshotRing(), D3D12_RESOURCE_STATE_COPY_DEST,
-                                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+            post[post_count++] = TransitionBarrier(impl.compute->SrvSnapshotRing(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
         }
         if (ib_from_slab) {
-            post.push_back(TransitionBarrier(impl.index_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                                             D3D12_RESOURCE_STATE_INDEX_BUFFER));
+            post[post_count++] = TransitionBarrier(impl.index_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   D3D12_RESOURCE_STATE_INDEX_BUFFER);
         }
         if (indirect) {
-            post.push_back(TransitionBarrier(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                                             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT));
+            post[post_count++] = TransitionBarrier(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         }
-        list->ResourceBarrier(static_cast<UINT>(post.size()), post.data());
+        list->ResourceBarrier(post_count, post);
     }
 
-    // Bind heaps, root signature, PSO, and all 7 graphics root parameters
-    // (bbx_guest_root.cpp: 0..2 VS, 3..5 PS, 6 space-3 guest memory).
-    ID3D12DescriptorHeap* heaps[2] = {impl.device->CbvSrvUavHeap(), impl.device->SamplerHeap()};
-    list->SetDescriptorHeaps(2, heaps);
-    list->SetGraphicsRootSignature(impl.root);
-    list->SetPipelineState(pso);
+    // Bind heaps, root signature, samplers, space3, PSO, and space1 tables only
+    // when they actually changed within this command list batch.
+    if (!impl.batch_heaps_bound) {
+        ID3D12DescriptorHeap* heaps[2] = {impl.device->CbvSrvUavHeap(), impl.device->SamplerHeap()};
+        list->SetDescriptorHeaps(2, heaps);
+        impl.batch_heaps_bound = true;
+    }
+    if (!impl.batch_root_bound) {
+        list->SetGraphicsRootSignature(impl.root);
+        impl.batch_root_bound = true;
+    }
+    if (impl.batch_pso != pso) {
+        list->SetPipelineState(pso);
+        impl.batch_pso = pso;
+    }
 
     const D3D12_GPU_VIRTUAL_ADDRESS params_base = impl.params->GetGPUVirtualAddress();
     const D3D12_GPU_DESCRIPTOR_HANDLE cbv_start =
         impl.device->CbvSrvUavHeap()->GetGPUDescriptorHandleForHeapStart();
-    const D3D12_GPU_DESCRIPTOR_HANDLE smp_start =
-        impl.device->SamplerHeap()->GetGPUDescriptorHandleForHeapStart();
-
-    D3D12_GPU_DESCRIPTOR_HANDLE vs_res = cbv_start;
-    vs_res.ptr += static_cast<UINT64>(impl.arena_base + GuestHeapLayout::StageRegion(0)) * impl.cbv_stride;
-    D3D12_GPU_DESCRIPTOR_HANDLE vs_smp = smp_start;
-    vs_smp.ptr += static_cast<UINT64>(impl.sampler_base + 0 * GuestHeapLayout::kSamplerCount) * impl.sampler_stride;
-
-    D3D12_GPU_DESCRIPTOR_HANDLE ps_res = cbv_start;
-    ps_res.ptr += static_cast<UINT64>(impl.arena_base + GuestHeapLayout::StageRegion(1)) * impl.cbv_stride;
-    D3D12_GPU_DESCRIPTOR_HANDLE ps_smp = smp_start;
-    ps_smp.ptr += static_cast<UINT64>(impl.sampler_base + 1 * GuestHeapLayout::kSamplerCount) * impl.sampler_stride;
 
     list->SetGraphicsRootConstantBufferView(0, params_base + static_cast<UINT64>(vs_slot) * d3d12::kStageParamsBytes);
-    list->SetGraphicsRootDescriptorTable(1, vs_res);
-    list->SetGraphicsRootDescriptorTable(2, vs_smp);
+    if (impl.batch_vs_table != vs_table_off) {
+        D3D12_GPU_DESCRIPTOR_HANDLE vs_res = cbv_start;
+        vs_res.ptr += static_cast<UINT64>(vs_table_off) * impl.cbv_stride;
+        list->SetGraphicsRootDescriptorTable(1, vs_res);
+        impl.batch_vs_table = vs_table_off;
+    }
     list->SetGraphicsRootConstantBufferView(3, params_base + static_cast<UINT64>(ps_slot) * d3d12::kStageParamsBytes);
-    list->SetGraphicsRootDescriptorTable(4, ps_res);
-    list->SetGraphicsRootDescriptorTable(5, ps_smp);
-    list->SetGraphicsRootDescriptorTable(6, impl.memory->TableHandle());
+    if (impl.batch_ps_table != ps_table_off) {
+        D3D12_GPU_DESCRIPTOR_HANDLE ps_res = cbv_start;
+        ps_res.ptr += static_cast<UINT64>(ps_table_off) * impl.cbv_stride;
+        list->SetGraphicsRootDescriptorTable(4, ps_res);
+        impl.batch_ps_table = ps_table_off;
+    }
+    if (!impl.batch_samplers_bound) {
+        const D3D12_GPU_DESCRIPTOR_HANDLE smp_start =
+            impl.device->SamplerHeap()->GetGPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE vs_smp = smp_start;
+        vs_smp.ptr += static_cast<UINT64>(impl.sampler_base + 0 * GuestHeapLayout::kSamplerCount) * impl.sampler_stride;
+        D3D12_GPU_DESCRIPTOR_HANDLE ps_smp = smp_start;
+        ps_smp.ptr += static_cast<UINT64>(impl.sampler_base + 1 * GuestHeapLayout::kSamplerCount) * impl.sampler_stride;
+        list->SetGraphicsRootDescriptorTable(2, vs_smp);
+        list->SetGraphicsRootDescriptorTable(5, ps_smp);
+        impl.batch_samplers_bound = true;
+    }
+    if (!impl.batch_space3_bound) {
+        list->SetGraphicsRootDescriptorTable(6, impl.memory->TableHandle());
+        impl.batch_space3_bound = true;
+    }
 
-    // Bind render targets, depth-stencil, viewport, scissor, stencil ref, topology.
-    list->OMSetRenderTargets(num_rtvs, rtv_handles, FALSE, has_dsv ? &dsv_handle : nullptr);
-    list->OMSetStencilRef(id.depth_stencil.stencil_ref);
+    // Output-merger render targets and stencil ref (filtered for redundant sets).
+    bool om_changed = !impl.batch_om_set || impl.batch_num_rtvs != num_rtvs || impl.batch_has_dsv != has_dsv ||
+                      (has_dsv && impl.batch_dsv.ptr != dsv_handle.ptr);
+    if (!om_changed) {
+        for (std::uint32_t i = 0; i < num_rtvs; ++i) {
+            if (impl.batch_rtvs[i].ptr != rtv_handles[i].ptr) {
+                om_changed = true;
+                break;
+            }
+        }
+    }
+    if (om_changed) {
+        list->OMSetRenderTargets(num_rtvs, rtv_handles, FALSE, has_dsv ? &dsv_handle : nullptr);
+        impl.batch_om_set = true;
+        impl.batch_num_rtvs = num_rtvs;
+        for (std::uint32_t i = 0; i < num_rtvs; ++i) impl.batch_rtvs[i] = rtv_handles[i];
+        impl.batch_has_dsv = has_dsv;
+        impl.batch_dsv = dsv_handle;
+    }
+
+    if (!impl.batch_stencil_ref_set || impl.batch_stencil_ref != id.depth_stencil.stencil_ref) {
+        list->OMSetStencilRef(id.depth_stencil.stencil_ref);
+        impl.batch_stencil_ref_set = true;
+        impl.batch_stencil_ref = id.depth_stencil.stencil_ref;
+    }
 
     D3D12_VIEWPORT vp{};
     if (id.viewport.valid) {
@@ -1499,16 +1980,28 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
     }
-    list->RSSetViewports(1, &vp);
+    if (!impl.batch_vp_set || std::memcmp(&impl.batch_vp, &vp, sizeof(vp)) != 0) {
+        list->RSSetViewports(1, &vp);
+        impl.batch_vp = vp;
+        impl.batch_vp_set = true;
+    }
 
     D3D12_RECT scissor{};
     scissor.left = id.scissor[0];
     scissor.top = id.scissor[1];
     scissor.right = id.scissor[2] > id.scissor[0] ? id.scissor[2] : static_cast<LONG>(primary_w);
     scissor.bottom = id.scissor[3] > id.scissor[1] ? id.scissor[3] : static_cast<LONG>(primary_h);
-    list->RSSetScissorRects(1, &scissor);
+    if (!impl.batch_scissor_set || std::memcmp(&impl.batch_scissor, &scissor, sizeof(scissor)) != 0) {
+        list->RSSetScissorRects(1, &scissor);
+        impl.batch_scissor = scissor;
+        impl.batch_scissor_set = true;
+    }
 
-    list->IASetPrimitiveTopology(ToD3d12Topology(topo.topology));
+    const D3D12_PRIMITIVE_TOPOLOGY d3d_topo = ToD3d12Topology(topo.topology);
+    if (impl.batch_topology != d3d_topo) {
+        list->IASetPrimitiveTopology(d3d_topo);
+        impl.batch_topology = d3d_topo;
+    }
     if (indexed) list->IASetIndexBuffer(&ibv);
 
     // Issue the draw call.
@@ -1524,36 +2017,32 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
         list->DrawInstanced(d.index_count, instances, start_vertex, 0);
     }
 
-    // Restore transient staging buffers back to COPY_DEST.
-    std::vector<D3D12_RESOURCE_BARRIER> epilogue;
-    epilogue.reserve(3);
+    // Restore transient staging buffers back to COPY_DEST (stack array, zero alloc).
+    D3D12_RESOURCE_BARRIER epilogue[3];
+    std::uint32_t epilogue_count = 0;
     if (has_srv_copies) {
-        epilogue.push_back(TransitionBarrier(impl.compute->SrvSnapshotRing(),
-                                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
-                                             D3D12_RESOURCE_STATE_COPY_DEST));
+        epilogue[epilogue_count++] = TransitionBarrier(impl.compute->SrvSnapshotRing(),
+                                                       D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST);
     }
     if (ib_from_slab) {
-        epilogue.push_back(TransitionBarrier(impl.index_staging.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                                             D3D12_RESOURCE_STATE_COPY_DEST));
+        epilogue[epilogue_count++] = TransitionBarrier(impl.index_staging.Get(), D3D12_RESOURCE_STATE_INDEX_BUFFER,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST);
     }
     if (indirect) {
-        epilogue.push_back(TransitionBarrier(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                                             D3D12_RESOURCE_STATE_COPY_DEST));
+        epilogue[epilogue_count++] = TransitionBarrier(impl.indirect_staging.Get(),
+                                                       D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    if (!epilogue.empty()) {
-        list->ResourceBarrier(static_cast<UINT>(epilogue.size()), epilogue.data());
+    if (epilogue_count != 0) {
+        list->ResourceBarrier(epilogue_count, epilogue);
     }
 
-    if (FAILED(list->Close())) {
-        ++impl.counts.record_failed;
-        return false;
-    }
-    ID3D12CommandList* lists[1] = {list};
-    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    cmd.fence = impl.device->Signal();
-    impl.last_draw_fence = cmd.fence;
-    impl.in_flight.push_back(std::move(cmd));
     ++impl.counts.drawn;
+    ++impl.batch_ops;
+    if (impl.batch_ops >= Impl::kMaxBatchOps) {
+        impl.FlushBatch();
+    }
     return true;
 }
 
@@ -1562,7 +2051,7 @@ bool GuestGraphics::ClearView(const bbx::d3d12::DecodedClearView& view, bool app
     Impl& impl = *impl_;
 
     if (!view.depth) {
-        const Impl::TargetKey key{view.base, view.format, view.width, view.height};
+        const TargetKey key{view.base, view.format, view.width, view.height};
         const bool existed = impl.rtv_pool.find(key) != impl.rtv_pool.end();
         DrawTarget t{};
         t.index = 0;
@@ -1572,33 +2061,25 @@ bool GuestGraphics::ClearView(const bbx::d3d12::DecodedClearView& view, bool app
         t.format = view.format;
         t.srgb = view.srgb;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{};
-        if (!impl.EnsureRenderTarget(t, &rtv_handle)) {
+        if (!impl.EnsureRenderTarget(t, apply, &rtv_handle)) {
             ++impl.counts.bad_target;
             return false;
         }
         if (out_created != nullptr) *out_created = !existed;
         if (!apply) return true;
 
-        Impl::CommandSlot cmd;
-        if (!impl.AcquireCommandList(&cmd)) {
+        if (!impl.BeginBatch()) {
             ++impl.counts.record_failed;
             return false;
         }
-        cmd.list->ClearRenderTargetView(rtv_handle, view.rgba, 0, nullptr);
-        if (FAILED(cmd.list->Close())) {
-            ++impl.counts.record_failed;
-            return false;
-        }
-        ID3D12CommandList* lists[1] = {cmd.list.Get()};
-        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-        cmd.fence = impl.device->Signal();
-        impl.last_draw_fence = cmd.fence;
-        impl.in_flight.push_back(std::move(cmd));
+        impl.active_cmd.list->ClearRenderTargetView(rtv_handle, view.rgba, 0, nullptr);
         ++impl.counts.target_clears;
+        ++impl.batch_ops;
+        if (impl.batch_ops >= Impl::kMaxBatchOps) impl.FlushBatch();
         return true;
     }
 
-    const Impl::TargetKey key{view.base, view.format, view.width, view.height};
+    const TargetKey key{view.base, view.format, view.width, view.height};
     const bool existed = impl.dsv_pool.find(key) != impl.dsv_pool.end();
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle{};
     if (!impl.EnsureDepthTarget(view.base, view.format, view.width, view.height, &dsv_handle)) {
@@ -1613,22 +2094,14 @@ bool GuestGraphics::ClearView(const bbx::d3d12::DecodedClearView& view, bool app
     if (view.clear_stencil) flags = static_cast<D3D12_CLEAR_FLAGS>(flags | D3D12_CLEAR_FLAG_STENCIL);
     if (flags == 0) return true;
 
-    Impl::CommandSlot cmd;
-    if (!impl.AcquireCommandList(&cmd)) {
+    if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
     }
-    cmd.list->ClearDepthStencilView(dsv_handle, flags, view.depth_value, view.stencil_value, 0, nullptr);
-    if (FAILED(cmd.list->Close())) {
-        ++impl.counts.record_failed;
-        return false;
-    }
-    ID3D12CommandList* lists[1] = {cmd.list.Get()};
-    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    cmd.fence = impl.device->Signal();
-    impl.last_draw_fence = cmd.fence;
-    impl.in_flight.push_back(std::move(cmd));
+    impl.active_cmd.list->ClearDepthStencilView(dsv_handle, flags, view.depth_value, view.stencil_value, 0, nullptr);
     ++impl.counts.target_clears;
+    ++impl.batch_ops;
+    if (impl.batch_ops >= Impl::kMaxBatchOps) impl.FlushBatch();
     return true;
 }
 
@@ -1637,63 +2110,59 @@ bool GuestGraphics::ClearTargetAt(std::uint64_t va, std::uint32_t value, std::si
     Impl& impl = *impl_;
     const std::uint64_t hi = va + bytes;
 
-    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[Impl::kMaxRtvs];
+    std::uint32_t rtv_count = 0;
     struct DsvClearItem {
         D3D12_CPU_DESCRIPTOR_HANDLE handle{};
         std::uint32_t format = 0;
     };
-    std::vector<DsvClearItem> dsvs;
+    DsvClearItem dsvs[Impl::kMaxDsvs];
+    std::uint32_t dsv_count = 0;
 
     for (auto& [key, entry] : impl.rtv_pool) {
         const std::uint64_t entry_hi = key.va + (entry.bytes != 0 ? entry.bytes : 4ull);
         if (key.va < hi && entry_hi > va) {
             entry.last_used_seq = ++impl.target_use_seq;
-            rtvs.push_back(impl.RtvCpu(entry.slot));
+            entry.gpu_rendered = true;
+            if (rtv_count < Impl::kMaxRtvs) rtvs[rtv_count++] = impl.RtvCpu(entry.slot);
         }
     }
     for (auto& [key, entry] : impl.dsv_pool) {
         const std::uint64_t entry_hi = key.va + (entry.bytes != 0 ? entry.bytes : 4ull);
         if (key.va < hi && entry_hi > va) {
             entry.last_used_seq = ++impl.target_use_seq;
-            dsvs.push_back({impl.DsvCpu(entry.slot), key.format});
+            if (dsv_count < Impl::kMaxDsvs) dsvs[dsv_count++] = {impl.DsvCpu(entry.slot), key.format};
         }
     }
-    if (rtvs.empty() && dsvs.empty()) return false;
+    if (rtv_count == 0 && dsv_count == 0) return false;
 
-    Impl::CommandSlot cmd;
-    if (!impl.AcquireCommandList(&cmd)) {
+    if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
     }
+    ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
     const float rgba[4] = {
         static_cast<float>(value & 0xFFu) / 255.0f,
         static_cast<float>((value >> 8) & 0xFFu) / 255.0f,
         static_cast<float>((value >> 16) & 0xFFu) / 255.0f,
         static_cast<float>((value >> 24) & 0xFFu) / 255.0f,
     };
-    for (const D3D12_CPU_DESCRIPTOR_HANDLE& rtv : rtvs) {
-        cmd.list->ClearRenderTargetView(rtv, rgba, 0, nullptr);
+    for (std::uint32_t i = 0; i < rtv_count; ++i) {
+        list->ClearRenderTargetView(rtvs[i], rgba, 0, nullptr);
     }
     const float depth_val = (value == 0u) ? 0.0f : 1.0f;
     const UINT8 stencil_val = static_cast<UINT8>(value & 0xFFu);
-    for (const DsvClearItem& dsv : dsvs) {
+    for (std::uint32_t i = 0; i < dsv_count; ++i) {
         D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH;
-        if (dsv.format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD24UnormS8Uint) ||
-            dsv.format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD32FloatS8X24Uint)) {
+        if (dsvs[i].format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD24UnormS8Uint) ||
+            dsvs[i].format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD32FloatS8X24Uint)) {
             flags = static_cast<D3D12_CLEAR_FLAGS>(flags | D3D12_CLEAR_FLAG_STENCIL);
         }
-        cmd.list->ClearDepthStencilView(dsv.handle, flags, depth_val, stencil_val, 0, nullptr);
+        list->ClearDepthStencilView(dsvs[i].handle, flags, depth_val, stencil_val, 0, nullptr);
     }
-    if (FAILED(cmd.list->Close())) {
-        ++impl.counts.record_failed;
-        return false;
-    }
-    ID3D12CommandList* lists[1] = {cmd.list.Get()};
-    impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-    cmd.fence = impl.device->Signal();
-    impl.last_draw_fence = cmd.fence;
-    impl.in_flight.push_back(std::move(cmd));
     ++impl.counts.target_clears;
+    ++impl.batch_ops;
+    if (impl.batch_ops >= Impl::kMaxBatchOps) impl.FlushBatch();
     return true;
 }
 
@@ -1711,7 +2180,8 @@ bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::
         }
     }
     if (best_rtv != impl.rtv_pool.end()) {
-        const Impl::TargetKey src_key = best_rtv->first;
+        const TargetKey src_key = best_rtv->first;
+        const bool src_rendered = best_rtv->second.gpu_rendered;
         best_rtv->second.last_used_seq = ++impl.target_use_seq;
         DrawTarget dst_t{};
         dst_t.index = 0;
@@ -1720,46 +2190,40 @@ bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::
         dst_t.height = src_key.height;
         dst_t.format = src_key.format;
         D3D12_CPU_DESCRIPTOR_HANDLE dst_handle{};
-        if (!impl.EnsureRenderTarget(dst_t, &dst_handle)) return false;
+        if (!impl.EnsureRenderTarget(dst_t, src_rendered, &dst_handle)) return false;
 
-        const Impl::TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
+        const TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
         const auto src_it = impl.rtv_pool.find(src_key);
         const auto dst_it = impl.rtv_pool.find(dst_key);
         if (src_it == impl.rtv_pool.end() || dst_it == impl.rtv_pool.end() ||
             src_it->second.resource == nullptr || dst_it->second.resource == nullptr) {
             return false;
         }
+        if (src_rendered) dst_it->second.gpu_rendered = true;
 
-        Impl::CommandSlot cmd;
-        if (!impl.AcquireCommandList(&cmd)) {
+        if (!impl.BeginBatch()) {
             ++impl.counts.record_failed;
             return false;
         }
+        ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
         D3D12_RESOURCE_BARRIER pre[2] = {
             TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                               D3D12_RESOURCE_STATE_COPY_SOURCE),
             TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                               D3D12_RESOURCE_STATE_COPY_DEST),
         };
-        cmd.list->ResourceBarrier(2, pre);
-        cmd.list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
+        list->ResourceBarrier(2, pre);
+        list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
         D3D12_RESOURCE_BARRIER post[2] = {
             TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                               D3D12_RESOURCE_STATE_RENDER_TARGET),
             TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_STATE_RENDER_TARGET),
         };
-        cmd.list->ResourceBarrier(2, post);
-        if (FAILED(cmd.list->Close())) {
-            ++impl.counts.record_failed;
-            return false;
-        }
-        ID3D12CommandList* lists[1] = {cmd.list.Get()};
-        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-        cmd.fence = impl.device->Signal();
-        impl.last_draw_fence = cmd.fence;
-        impl.in_flight.push_back(std::move(cmd));
+        list->ResourceBarrier(2, post);
         ++impl.counts.target_copies;
+        ++impl.batch_ops;
+        if (impl.batch_ops >= Impl::kMaxBatchOps) impl.FlushBatch();
         return true;
     }
 
@@ -1773,12 +2237,12 @@ bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::
         }
     }
     if (best_dsv != impl.dsv_pool.end()) {
-        const Impl::TargetKey src_key = best_dsv->first;
+        const TargetKey src_key = best_dsv->first;
         best_dsv->second.last_used_seq = ++impl.target_use_seq;
         D3D12_CPU_DESCRIPTOR_HANDLE dst_handle{};
         if (!impl.EnsureDepthTarget(dst_va, src_key.format, src_key.width, src_key.height, &dst_handle)) return false;
 
-        const Impl::TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
+        const TargetKey dst_key{dst_va, src_key.format, src_key.width, src_key.height};
         const auto src_it = impl.dsv_pool.find(src_key);
         const auto dst_it = impl.dsv_pool.find(dst_key);
         if (src_it == impl.dsv_pool.end() || dst_it == impl.dsv_pool.end() ||
@@ -1786,36 +2250,29 @@ bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::
             return false;
         }
 
-        Impl::CommandSlot cmd;
-        if (!impl.AcquireCommandList(&cmd)) {
+        if (!impl.BeginBatch()) {
             ++impl.counts.record_failed;
             return false;
         }
+        ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
         D3D12_RESOURCE_BARRIER pre[2] = {
             TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                               D3D12_RESOURCE_STATE_COPY_SOURCE),
             TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                               D3D12_RESOURCE_STATE_COPY_DEST),
         };
-        cmd.list->ResourceBarrier(2, pre);
-        cmd.list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
+        list->ResourceBarrier(2, pre);
+        list->CopyResource(dst_it->second.resource.Get(), src_it->second.resource.Get());
         D3D12_RESOURCE_BARRIER post[2] = {
             TransitionBarrier(src_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                               D3D12_RESOURCE_STATE_DEPTH_WRITE),
             TransitionBarrier(dst_it->second.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_STATE_DEPTH_WRITE),
         };
-        cmd.list->ResourceBarrier(2, post);
-        if (FAILED(cmd.list->Close())) {
-            ++impl.counts.record_failed;
-            return false;
-        }
-        ID3D12CommandList* lists[1] = {cmd.list.Get()};
-        impl.device->GraphicsQueue()->ExecuteCommandLists(1, lists);
-        cmd.fence = impl.device->Signal();
-        impl.last_draw_fence = cmd.fence;
-        impl.in_flight.push_back(std::move(cmd));
+        list->ResourceBarrier(2, post);
         ++impl.counts.target_copies;
+        ++impl.batch_ops;
+        if (impl.batch_ops >= Impl::kMaxBatchOps) impl.FlushBatch();
         return true;
     }
 
@@ -1825,12 +2282,22 @@ bool GuestGraphics::CopyTarget(std::uint64_t dst_va, std::uint64_t src_va, std::
 void GuestGraphics::ForgetRegion(std::uint64_t lo, std::uint64_t hi) {
     if (impl_ == nullptr || lo >= hi) return;
     Impl& impl = *impl_;
-    const std::uint64_t retire_fence = impl.device != nullptr ? impl.device->SubmittedValue() : 0;
+
+    bool flushed = false;
+    std::uint64_t retire_fence = impl.device != nullptr ? impl.device->SubmittedValue() : 0;
+    const auto ensure_flushed = [&impl, &flushed, &retire_fence]() {
+        if (!flushed) {
+            impl.FlushBatch();
+            retire_fence = impl.device != nullptr ? impl.device->SubmittedValue() : 0;
+            flushed = true;
+        }
+    };
 
     for (auto it = impl.rtv_pool.begin(); it != impl.rtv_pool.end();) {
         const std::uint64_t entry_lo = it->first.va;
         const std::uint64_t entry_hi = entry_lo + (it->second.bytes != 0 ? it->second.bytes : 4ull);
         if (entry_lo < hi && entry_hi > lo) {
+            ensure_flushed();
             impl.free_rtv_slots.push_back(it->second.slot);
             impl.retired_targets.push_back({std::move(it->second.resource), it->second.bytes, retire_fence});
             it = impl.rtv_pool.erase(it);
@@ -1842,6 +2309,7 @@ void GuestGraphics::ForgetRegion(std::uint64_t lo, std::uint64_t hi) {
         const std::uint64_t entry_lo = it->first.va;
         const std::uint64_t entry_hi = entry_lo + (it->second.bytes != 0 ? it->second.bytes : 4ull);
         if (entry_lo < hi && entry_hi > lo) {
+            ensure_flushed();
             impl.free_dsv_slots.push_back(it->second.slot);
             impl.retired_targets.push_back({std::move(it->second.resource), it->second.bytes, retire_fence});
             it = impl.dsv_pool.erase(it);
@@ -1867,15 +2335,60 @@ void GuestGraphics::InvalidatePrograms(std::uint64_t lo, std::uint64_t hi) {
     }
 }
 
+void GuestGraphics::Flush() {
+    if (impl_ == nullptr) return;
+    impl_->FlushBatch();
+}
+
+bool GuestGraphics::HasPending() const {
+    return impl_ != nullptr && impl_->batch_open;
+}
+
+bool GuestGraphics::HasRenderedTarget(std::uint64_t va, std::uint32_t width, std::uint32_t height) const {
+    if (impl_ == nullptr || va == 0 || width == 0 || height == 0) return false;
+    const Impl& impl = *impl_;
+    for (const auto& [key, entry] : impl.rtv_pool) {
+        if (key.va == va && key.width == width && key.height == height &&
+            entry.gpu_rendered && entry.resource != nullptr && IsDirectPresentFormat(key.format)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool GuestGraphics::TryAcquirePresentTarget(std::uint64_t va, std::uint32_t width, std::uint32_t height,
+                                            bbx::d3d12::ComPtr<ID3D12Resource>* out_resource,
+                                            DXGI_FORMAT* out_format) const {
+    if (impl_ == nullptr || va == 0 || width == 0 || height == 0 ||
+        out_resource == nullptr || out_format == nullptr) {
+        return false;
+    }
+    const Impl& impl = *impl_;
+    auto best = impl.rtv_pool.end();
+    for (auto it = impl.rtv_pool.begin(); it != impl.rtv_pool.end(); ++it) {
+        if (it->first.va == va && it->first.width == width && it->first.height == height &&
+            it->second.gpu_rendered && it->second.resource != nullptr && IsDirectPresentFormat(it->first.format)) {
+            if (best == impl.rtv_pool.end() || it->second.last_used_seq > best->second.last_used_seq) {
+                best = it;
+            }
+        }
+    }
+    if (best == impl.rtv_pool.end()) return false;
+    *out_resource = best->second.resource;
+    *out_format = static_cast<DXGI_FORMAT>(best->first.format);
+    return true;
+}
+
 std::string GuestGraphics::Report() const {
     if (impl_ == nullptr) return "guest graphics: none";
     const Impl& impl = *impl_;
-    char line[512];
+    char line[576];
     std::snprintf(line, sizeof(line),
-                  "guest graphics: %llu draw(s) run (%llu indexed, %llu indirect), %llu clear(s), %llu copy(s), "
-                  "%llu shader(s) noted, %llu PSO(s) (%llu evicted, %llu failed), %llu target(s), "
-                  "%llu miss(es) (vs %llu, ps %llu), %llu space-1 slot(s) (%llu srv, %llu refused)",
+                  "guest graphics: %llu draw(s) in %llu batch(es) (%llu indexed, %llu indirect), "
+                  "%llu clear(s), %llu copy(s), %llu shader(s) noted, %llu PSO(s) (%llu evicted, %llu failed), "
+                  "%llu target(s), %llu miss(es) (vs %llu, ps %llu), %llu space-1 slot(s) (%llu srv, %llu refused)",
                   static_cast<unsigned long long>(impl.counts.drawn),
+                  static_cast<unsigned long long>(impl.counts.batches),
                   static_cast<unsigned long long>(impl.counts.indexed),
                   static_cast<unsigned long long>(impl.counts.indirect),
                   static_cast<unsigned long long>(impl.counts.target_clears),
@@ -1900,9 +2413,13 @@ void GuestGraphics::OnFrame(std::uint64_t completed) {
     if (impl_->psos != nullptr) {
         const std::uint64_t retire_fence = impl_->device != nullptr ? impl_->device->SubmittedValue() : completed;
         for (const PsoKey& evicted : impl_->psos->Trim(0)) {
-            const auto key = std::make_pair(evicted.lo, evicted.hi);
+            const PsoMapKey key{evicted.lo, evicted.hi};
             if (const auto it = impl_->pso_objects.find(key); it != impl_->pso_objects.end()) {
-                impl_->retired_psos.push_back({it->second, retire_fence});
+                if (impl_->batch_open) {
+                    impl_->batch_retired_psos.push_back(it->second);
+                } else {
+                    impl_->retired_psos.push_back({it->second, retire_fence});
+                }
                 impl_->pso_objects.erase(it);
                 ++impl_->counts.evicted_psos;
             }

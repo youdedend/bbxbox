@@ -65,9 +65,17 @@ void CompleteTextEntry(const std::string& utf8_text, bool accepted);
 // `engine/camera.cpp`, `host/shader_patch.cpp`, `engine/patch_manifest.cpp`).
 struct ConsoleSettings {
     int fps_cap = 60;
+    int render_width = 1920;
+    int render_height = 1080;
     bool vsync = true;
     bool skip_logos = true;
     bool enhancements = true;
+    bool performance_mode = false;
+    bool ssao = true;
+    bool anti_alias = true;
+    bool dynamic_shadows = true;
+    int shadow_resolution = 2;  // 0 Lowest, 1 Low, 2 Default, 3 High
+    int lod_bias = 0;           // -2 finest .. +2 coarsest
     bool chromatic_aberration = true;
     bool motion_blur = true;
     bool depth_of_field = true;

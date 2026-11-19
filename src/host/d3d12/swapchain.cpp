@@ -62,14 +62,26 @@ Status Swapchain::Create(Device& device, IUnknown* core_window, const platform::
     ComPtr<IDXGISwapChain1> swapchain1;
     bbx::platform::LogMirroredMessage(
         bbx::platform::Level::kInfo,
-        "d3d12: CreateSwapChainForCoreWindow enter (core_window=%p, %ux%u, buffers=%u)",
-        static_cast<const void*>(core_window), width_, height_, kBufferCount);
+        "d3d12: CreateSwapChainForCoreWindow enter (core_window=%p, %ux%u, buffers=%u, tearing=%d)",
+        static_cast<const void*>(core_window), width_, height_, kBufferCount, allow_tearing ? 1 : 0);
     HRESULT hr = device.Factory()->CreateSwapChainForCoreWindow(
         device.GraphicsQueue(), core_window, &desc, nullptr, swapchain1.GetAddressOf());
+    if (FAILED(hr) && allow_tearing) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "d3d12: CreateSwapChainForCoreWindow with ALLOW_TEARING failed (hr=0x%08lX); retrying without tearing",
+            static_cast<unsigned long>(hr));
+        allow_tearing = false;
+        tearing_allowed_ = false;
+        desc.Flags = 0u;
+        swapchain1.Reset();
+        hr = device.Factory()->CreateSwapChainForCoreWindow(
+            device.GraphicsQueue(), core_window, &desc, nullptr, swapchain1.GetAddressOf());
+    }
     bbx::platform::LogMirroredMessage(
         hr == S_OK ? bbx::platform::Level::kInfo : bbx::platform::Level::kError,
-        "d3d12: CreateSwapChainForCoreWindow exit (hr=0x%08lX)",
-        static_cast<unsigned long>(hr));
+        "d3d12: CreateSwapChainForCoreWindow exit (hr=0x%08lX, tearing=%d)",
+        static_cast<unsigned long>(hr), tearing_allowed_ ? 1 : 0);
     if (FAILED(hr)) {
         Log("CreateSwapChainForCoreWindow(%ux%u, 3 buffers, flip-discard) failed: 0x%08lX", width_,
             height_, static_cast<unsigned long>(hr));

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "src/host/d3d12/device.h"
@@ -53,10 +54,9 @@ struct D3d12Session::Impl {
     GpuReport report;
     bool ready = false;
 
-    // The guest's frame, triple buffered: the guest thread writes `frame_pixels`,
-    // Present swaps it with `frame_upload` and copies that into the scanout image
-    // outside the lock. Two buffers are enough to never wait for the third: the
-    // third frame that arrives before Present takes one is dropped and counted.
+    // The guest's frame, triple buffered: the guest thread writes `frame_pixels`
+    // (or hands over `frame_direct_va` for zero-copy GPU scanout), Present swaps
+    // it with `frame_upload` and presents outside the lock.
     std::mutex frame_mutex;
     std::vector<std::uint8_t> frame_pixels;
     std::vector<std::uint8_t> frame_upload;
@@ -65,7 +65,28 @@ struct D3d12Session::Impl {
     // guest's own layout (format, tiling, pitch), and this says which.
     d3d12::ScanoutDesc frame_desc;
     bool frame_pending = false;
+    std::uint64_t frame_direct_va = 0;
+    std::uint32_t frame_direct_w = 0, frame_direct_h = 0;
+    bool frame_direct_pending = false;
     std::uint64_t guest_frames = 0, guest_frames_dropped = 0;
+    HANDLE frame_event = nullptr;
+
+    // UI-thread-only retention for zero-copy direct GPU scanout targets so an
+    // RTV sampled by DrawPresentDirect stays alive until the present fence completes.
+    struct RetiredPresentTarget {
+        d3d12::ComPtr<ID3D12Resource> resource;
+        std::uint64_t fence = 0;
+    };
+    d3d12::ComPtr<ID3D12Resource> last_direct_rt;
+    DXGI_FORMAT last_direct_fmt = DXGI_FORMAT_UNKNOWN;
+    std::uint32_t last_direct_w = 0, last_direct_h = 0;
+    bool last_frame_was_direct = false;
+    std::vector<RetiredPresentTarget> retired_present_targets;
+
+    // Serializes batched guest GPU recording/flushing (GuestMemory, GuestCompute,
+    // GuestGraphics, DescriptorRing, Budget) between the guest thread and ui-main.
+    // Never held across GPU waits or swapchain Present() calls.
+    mutable std::mutex gpu_mutex;
 
     // The guest's memory (Slice 5B-1): the page table and the lazily resident
     // slabs, and the binding host/gpu.h's implementation sees. The hooks are
@@ -76,14 +97,28 @@ struct D3d12Session::Impl {
     d3d12::GuestGpuBinding guest_binding;
     std::string guest_memory_line;
     // The guest arena's descriptors, reserved once at Create: space 3's 33 and
-    // three stage regions of 191 (bbx_guest_root.h's GuestHeapLayout). One slice
-    // for the CBV/SRV/UAV heap, one for the samplers, both permanent: the guest
-    // heap is fixed, and a dispatch rewrites slots in place.
+    // three stage regions of 191 (bbx_guest_root.h's GuestHeapLayout), followed
+    // by the dynamic ring-buffered CBV/SRV/UAV descriptor pool.
     std::unique_ptr<d3d12::DescriptorRing> guest_arena;
     std::unique_ptr<d3d12::DescriptorRing> guest_sampler_arena;
     std::uint32_t guest_arena_base = 0, guest_sampler_base = 0;
     GuestCompute guest_compute;
     GuestGraphics guest_graphics;
+
+    void FlushMemoryLocked() {
+        if (guest_memory.HasPending()) (void)guest_memory.Flush();
+    }
+    void FlushComputeLocked() {
+        if (guest_compute.HasPending()) guest_compute.Flush();
+    }
+    void FlushGraphicsLocked() {
+        if (guest_graphics.HasPending()) guest_graphics.Flush();
+    }
+    void FlushAllLocked() {
+        FlushMemoryLocked();
+        FlushComputeLocked();
+        FlushGraphicsLocked();
+    }
 
     [[nodiscard]] d3d12::DeviceDesc Desc(bool debug) const {
         d3d12::DeviceDesc desc{};
@@ -95,11 +130,20 @@ struct D3d12Session::Impl {
     // when the thing it names does not exist: a null hook is never installed.
     static std::uint64_t FenceSubmitted(void* user) { return static_cast<Impl*>(user)->device.SubmittedValue(); }
     static std::uint64_t FenceCompleted(void* user) { return static_cast<Impl*>(user)->device.CompletedValue(); }
-    static std::uint64_t FenceSignal(void* user) { return static_cast<Impl*>(user)->device.Signal(); }
-    static bool FenceWait(void* user, std::uint64_t value, std::uint64_t timeout_ms) {
-        // Device::WaitFor takes a 32-bit timeout: a longer ask is a series of
-        // them, and a zero ask is "is it done", which the caller has asked.
+    static std::uint64_t FenceSignal(void* user) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushAllLocked();
+        return impl.device.Signal();
+    }
+    static bool FenceWait(void* user, std::uint64_t value, std::uint64_t timeout_ms) {
+        // Flush any open batched command lists before waiting, then release
+        // gpu_mutex so the UI thread is never blocked on a guest GPU wait.
+        Impl& impl = *static_cast<Impl*>(user);
+        {
+            std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+            impl.FlushAllLocked();
+        }
         while (true) {
             const auto slice = static_cast<std::uint32_t>(timeout_ms > 0xffffffffull ? 0xffffffffull : timeout_ms);
             if (impl.device.WaitFor(value, slice)) return true;
@@ -109,48 +153,90 @@ struct D3d12Session::Impl {
     }
     static bool MemWrite(void* user, std::uint64_t va, const void* data, std::size_t bytes) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushComputeLocked();
+        impl.FlushGraphicsLocked();
         return impl.guest_memory.WriteGuest(impl.guest_plan.table, va, data, bytes) == d3d12::Status::kOk;
     }
     static bool MemFill(void* user, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushComputeLocked();
+        impl.FlushGraphicsLocked();
         return impl.guest_memory.FillGuest(impl.guest_plan.table, va, value, bytes) == d3d12::Status::kOk;
     }
     static bool MemCopy(void* user, std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushComputeLocked();
+        impl.FlushGraphicsLocked();
         return impl.guest_memory.CopyGuest(impl.guest_plan.table, dst, src, bytes) == d3d12::Status::kOk;
     }
     static bool ReadGuest(void* user, std::uint64_t va, void* out, std::size_t bytes) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushAllLocked();
         return impl.guest_memory.ReadGuest(impl.guest_plan.table, va, out, bytes) == d3d12::Status::kOk;
     }
     // The pipeline halves (guest_compute.cpp + guest_graphics.cpp): compute keys
     // and dispatches, plus graphics shader creation notes and draw execution.
     static std::uint64_t DispatchKey(void* user, const GpuDispatch& d) {
-        return static_cast<Impl*>(user)->guest_compute.KeyFor(d);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        return impl.guest_compute.KeyFor(d);
     }
     static bool Dispatch(void* user, std::uint64_t key, const GpuDispatch& d) {
-        return static_cast<Impl*>(user)->guest_compute.Run(key, d);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushMemoryLocked();
+        impl.FlushGraphicsLocked();
+        return impl.guest_compute.Run(key, d);
     }
     static void NoteShaderCreated(void* user, int stage, const std::uint8_t* container, std::size_t size) {
-        static_cast<Impl*>(user)->guest_graphics.NoteShaderCreated(stage, container, size);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.guest_graphics.NoteShaderCreated(stage, container, size);
     }
     static bool Draw(void* user, const GpuDraw& d, const d3d12::DrawIdentity& identity) {
-        return static_cast<Impl*>(user)->guest_graphics.Draw(d, identity);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushMemoryLocked();
+        impl.FlushComputeLocked();
+        return impl.guest_graphics.Draw(d, identity);
     }
     static bool ClearView(void* user, const d3d12::DecodedClearView& view, bool apply, bool* out_created) {
-        return static_cast<Impl*>(user)->guest_graphics.ClearView(view, apply, out_created);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushMemoryLocked();
+        impl.FlushComputeLocked();
+        return impl.guest_graphics.ClearView(view, apply, out_created);
     }
     static bool ClearTarget(void* user, std::uint64_t va, std::uint32_t value, std::size_t bytes) {
-        return static_cast<Impl*>(user)->guest_graphics.ClearTargetAt(va, value, bytes);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushMemoryLocked();
+        impl.FlushComputeLocked();
+        return impl.guest_graphics.ClearTargetAt(va, value, bytes);
     }
     static bool CopyTarget(void* user, std::uint64_t dst_va, std::uint64_t src_va, std::size_t bytes) {
-        return static_cast<Impl*>(user)->guest_graphics.CopyTarget(dst_va, src_va, bytes);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushMemoryLocked();
+        impl.FlushComputeLocked();
+        return impl.guest_graphics.CopyTarget(dst_va, src_va, bytes);
     }
     static void ForgetRegion(void* user, std::uint64_t lo, std::uint64_t hi) {
-        static_cast<Impl*>(user)->guest_graphics.ForgetRegion(lo, hi);
+        Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushComputeLocked();
+        impl.FlushGraphicsLocked();
+        impl.guest_graphics.ForgetRegion(lo, hi);
     }
     static void TextureWritten(void* user, std::uint64_t va, std::size_t bytes) {
         Impl& impl = *static_cast<Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        impl.FlushComputeLocked();
+        impl.FlushGraphicsLocked();
         if (va != 0 && bytes != 0 && hle_kernel_va_mapped(va, bytes)) {
             (void)impl.guest_memory.WriteGuest(
                 impl.guest_plan.table, va,
@@ -161,6 +247,7 @@ struct D3d12Session::Impl {
     static bool MemoryGlance(void* user, GpuMemoryGlance* out) {
         if (out == nullptr) return false;
         const Impl& impl = *static_cast<const Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
         const d3d12::Budget& b = impl.device.Memory();
         out->vram = b.used();
         out->cache = b.used_by(d3d12::Owner::kShaderTools) + b.used_by(d3d12::Owner::kHeaps);
@@ -170,7 +257,9 @@ struct D3d12Session::Impl {
         return true;
     }
     static std::string MemoryBudgetReport(void* user) {
-        return static_cast<const Impl*>(user)->device.DescribeMemory();
+        const Impl& impl = *static_cast<const Impl*>(user);
+        std::lock_guard<std::mutex> lk(impl.gpu_mutex);
+        return impl.device.DescribeMemory();
     }
     static std::string DeviceIdentity(void* user) {
         return static_cast<const Impl*>(user)->report.adapter;
@@ -222,8 +311,9 @@ struct D3d12Session::Impl {
         report.memory = device.DescribeMemory();
         report.guest = guest_memory_line + " | " + guest_compute.Report() + " | " + guest_graphics.Report();
         char text[192];
-        std::snprintf(text, sizeof(text), "%ux%u x%u%s%s", swapchain.Width(), swapchain.Height(),
-                      swapchain.BufferCount(), plan.clamped ? ", clamped" : "",
+        std::snprintf(text, sizeof(text), "%ux%u x%u%s%s%s", swapchain.Width(), swapchain.Height(),
+                      swapchain.BufferCount(), device.TearingSupported() ? ", VRR" : "",
+                      plan.clamped ? ", clamped" : "",
                       plan.scaled() ? ", scaled by the panel" : "");
         report.swapchain = text;
     }
@@ -282,7 +372,8 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     impl.plan = PlanOutput(window_width, window_height, QueryTvMode(), /*allow_4k=*/true);
     LogMessage(Level::kInfo, "d3d12: output plan %s", impl.plan.reason.c_str());
 
-    impl.report.status = impl.swapchain.Create(impl.device, core_window, impl.plan);
+    impl.report.status =
+        impl.swapchain.Create(impl.device, core_window, impl.plan, impl.device.TearingSupported());
     if (impl.report.status != d3d12::Status::kOk) {
         LogMessage(Level::kError, "d3d12: swapchain creation failed (%s)",
                    d3d12::StatusName(impl.report.status));
@@ -359,8 +450,9 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
         LogMessage(Level::kError, "d3d12: %s", impl.guest_plan.refused.c_str());
     }
     if (impl.guest_memory.Ready()) {
-        const d3d12::Status compute = impl.guest_compute.Create(impl.device, impl.pipelines, impl.guest_memory,
-                                                                impl.guest_arena_base, impl.guest_sampler_base);
+        const d3d12::Status compute = impl.guest_compute.Create(
+            impl.device, impl.pipelines, impl.guest_memory, impl.guest_arena.get(),
+            impl.guest_arena_base, impl.guest_sampler_base);
         if (compute != d3d12::Status::kOk) {
             LogMessage(Level::kWarn, "d3d12: guest compute not created (%s): dispatches will be refused",
                        d3d12::StatusName(compute));
@@ -372,7 +464,7 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
             LogMessage(Level::kInfo, "d3d12: %s", line.c_str());
             const d3d12::Status graphics = impl.guest_graphics.Create(
                 impl.device, impl.pipelines, impl.guest_memory, impl.guest_compute,
-                impl.guest_arena_base, impl.guest_sampler_base);
+                impl.guest_arena.get(), impl.guest_arena_base, impl.guest_sampler_base);
             if (graphics != d3d12::Status::kOk) {
                 LogMessage(Level::kWarn, "d3d12: guest graphics not created (%s): draws will be refused",
                            d3d12::StatusName(graphics));
@@ -380,6 +472,9 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
                 LogMessage(Level::kInfo, "d3d12: %s", impl.guest_graphics.Report().c_str());
             }
         }
+    }
+    if (impl.frame_event == nullptr) {
+        impl.frame_event = ::CreateEventExW(nullptr, nullptr, 0, 0x1F0003);
     }
     // The guest's HLE now sees the device's fence and the guest's slabs
     // (host_gpu_d3d12.h): a dispatch checks `available` before anything else.
@@ -478,14 +573,24 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
     LogCrumb("replay: begin frame");
     d3d12::Status status = impl.replay.BeginFrame();
     if (status != d3d12::Status::kOk) { return status; }
-    // The guest's frame first, beneath everything: the swap is under the lock and
-    // the copy is not, so the guest thread's flip costs it a memcpy.
+    // The guest's frame first, beneath everything: zero-copy GPU direct scanout
+    // when display_va matches a GPU-rendered color target, falling back seamlessly
+    // to the CPU staging + UntileCs path for CPU-written frames/movies.
     std::vector<std::uint8_t> frame;
     d3d12::ScanoutDesc frame_desc;
+    bool direct_pending = false;
+    std::uint64_t direct_va = 0;
+    std::uint32_t direct_w = 0, direct_h = 0;
     bool has_guest_frame = false;
     {
         std::lock_guard<std::mutex> lk(impl.frame_mutex);
-        if (impl.frame_pending) {
+        if (impl.frame_direct_pending) {
+            direct_pending = true;
+            direct_va = impl.frame_direct_va;
+            direct_w = impl.frame_direct_w;
+            direct_h = impl.frame_direct_h;
+            impl.frame_direct_pending = false;
+        } else if (impl.frame_pending) {
             impl.frame_upload.swap(impl.frame_pixels);
             frame.swap(impl.frame_upload);
             frame_desc = impl.frame_desc;
@@ -493,13 +598,52 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
         }
         has_guest_frame = impl.guest_frames > 0;
     }
-    if (!frame.empty() && frame_desc.width != 0 && frame_desc.height != 0) {
+
+    if (direct_pending) {
+        d3d12::ComPtr<ID3D12Resource> acquired_rt;
+        DXGI_FORMAT acquired_fmt = DXGI_FORMAT_UNKNOWN;
+        {
+            std::lock_guard<std::mutex> glk(impl.gpu_mutex);
+            impl.FlushAllLocked();
+            (void)impl.guest_graphics.TryAcquirePresentTarget(direct_va, direct_w, direct_h,
+                                                              &acquired_rt, &acquired_fmt);
+        }
+        if (acquired_rt != nullptr) {
+            if (impl.last_direct_rt != nullptr && impl.last_direct_rt.Get() != acquired_rt.Get()) {
+                impl.retired_present_targets.push_back(
+                    {impl.last_direct_rt, impl.device.SubmittedValue()});
+            }
+            impl.last_direct_rt = acquired_rt;
+            impl.last_direct_fmt = acquired_fmt;
+            impl.last_direct_w = direct_w;
+            impl.last_direct_h = direct_h;
+            impl.last_frame_was_direct = true;
+            {
+                std::lock_guard<std::mutex> lk(impl.frame_mutex);
+                ++impl.guest_frames;
+                has_guest_frame = true;
+            }
+        } else {
+            std::lock_guard<std::mutex> lk(impl.frame_mutex);
+            ++impl.guest_frames_dropped;
+        }
+    } else if (!frame.empty() && frame_desc.width != 0 && frame_desc.height != 0) {
         // The upload is the description's: the image is made in the guest's
         // format, and a tiled buffer is detiled on the GPU before the present
         // pass samples it.
-        const d3d12::Status uploaded = impl.replay.UploadFrame(frame.data(), frame_desc);
+        d3d12::Status uploaded = d3d12::Status::kUnavailable;
+        {
+            std::lock_guard<std::mutex> glk(impl.gpu_mutex);
+            uploaded = impl.replay.UploadFrame(frame.data(), frame_desc);
+        }
         if (uploaded != d3d12::Status::kOk) {
             LogCrumb("replay: guest frame dropped");
+        } else {
+            if (impl.last_direct_rt != nullptr) {
+                impl.retired_present_targets.push_back(
+                    {std::move(impl.last_direct_rt), impl.device.SubmittedValue()});
+            }
+            impl.last_frame_was_direct = false;
         }
         // It goes back to the pool for the next flip, with its capacity intact.
         {
@@ -516,7 +660,13 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
     // Before the first guest flip, tint the placeholder quad near-black behind
     // the launcher HUD. Once Bloodborne presents frames, draw at full 1.0
     // brightness with optional HLSL SM 6.4 RCAS contrast-adaptive sharpening.
-    if (has_guest_frame) {
+    d3d12::ComPtr<ID3D12Resource> present_direct_rt;
+    if (has_guest_frame && impl.last_frame_was_direct && impl.last_direct_rt != nullptr) {
+        present_direct_rt = impl.last_direct_rt;
+        status = impl.replay.DrawPresentDirect(present_direct_rt.Get(), impl.last_direct_fmt,
+                                               impl.last_direct_w, impl.last_direct_h,
+                                               1.0f, 1.0f, 1.0f, sharp_upscale ? 0.75f : 0.0f);
+    } else if (has_guest_frame) {
         status = impl.replay.DrawPresent(1.0f, 1.0f, 1.0f, sharp_upscale ? 0.75f : 0.0f);
     } else {
         status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f, 0.0f);
@@ -534,18 +684,58 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
     status = impl.replay.DrawOverlay();
     if (status != d3d12::Status::kOk) { return status; }
     const d3d12::Status presented = impl.replay.EndFrame(vsync);
-    // The frame's fence has passed (or the present failed and the driver is
-    // waiting anyway), so the guest's compute PSOs whose eviction it proves are
-    // released now: a pipeline object freed while a recorded list still names it
-    // is the one lifetime mistake D3D12 does not report.
+    if (present_direct_rt != nullptr) {
+        impl.retired_present_targets.push_back(
+            {std::move(present_direct_rt), impl.device.SubmittedValue()});
+    }
+    // Reclaim completed direct-present references and guest GPU resources whose
+    // fence has passed so shader-visible descriptors and allocators recycle cleanly.
     const std::uint64_t completed = impl.device.CompletedValue();
-    impl.guest_compute.OnFrame(completed);
-    impl.guest_graphics.OnFrame(completed);
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < impl.retired_present_targets.size(); ++i) {
+        if (impl.retired_present_targets[i].fence > completed) {
+            if (keep != i) {
+                impl.retired_present_targets[keep] = std::move(impl.retired_present_targets[i]);
+            }
+            ++keep;
+        }
+    }
+    impl.retired_present_targets.resize(keep);
+    {
+        std::lock_guard<std::mutex> glk(impl.gpu_mutex);
+        impl.guest_memory.OnFrame(completed);
+        impl.guest_compute.OnFrame(completed);
+        impl.guest_graphics.OnFrame(completed);
+        if (impl.guest_arena != nullptr) {
+            (void)impl.guest_arena->Collect(completed);
+        }
+    }
     return presented;
 }
 
 void D3d12Session::SubmitGuestFrame(const bbx::platform::GuestFrame& frame) {
-    if (impl_ == nullptr || frame.pixels == nullptr || frame.width == 0 || frame.height == 0 || frame.bytes == 0) {
+    if (impl_ == nullptr || frame.width == 0 || frame.height == 0) {
+        return;
+    }
+    // Zero-copy direct GPU scanout: when display_va matches a GPU-rendered color
+    // target, skip the 8 MiB CPU memcpy + staging upload + UntileCs dispatch.
+    bool use_direct = false;
+    if (frame.display_va != 0) {
+        std::lock_guard<std::mutex> glk(impl_->gpu_mutex);
+        use_direct = impl_->guest_graphics.HasRenderedTarget(frame.display_va, frame.width, frame.height);
+    }
+    if (use_direct) {
+        std::lock_guard<std::mutex> lk(impl_->frame_mutex);
+        if (impl_->frame_pending || impl_->frame_direct_pending) { ++impl_->guest_frames_dropped; }
+        impl_->frame_direct_va = frame.display_va;
+        impl_->frame_direct_w = frame.width;
+        impl_->frame_direct_h = frame.height;
+        impl_->frame_direct_pending = true;
+        impl_->frame_pending = false;
+        if (impl_->frame_event != nullptr) { ::SetEvent(impl_->frame_event); }
+        return;
+    }
+    if (frame.pixels == nullptr || frame.bytes == 0) {
         return;
     }
     // The console's words, decoded once here: a word this port has no name for
@@ -562,7 +752,7 @@ void D3d12Session::SubmitGuestFrame(const bbx::platform::GuestFrame& frame) {
     std::lock_guard<std::mutex> lk(impl_->frame_mutex);
     // Only the newest survives: a frame the presenter has not taken yet is the
     // one this replaces, which is what a television shows anyway.
-    if (impl_->frame_pending) { ++impl_->guest_frames_dropped; }
+    if (impl_->frame_pending || impl_->frame_direct_pending) { ++impl_->guest_frames_dropped; }
     // The copy is of the guest's own bytes - a tiled buffer is the same size, in
     // micro tiles - and the detile and the format are the GPU's work, not this
     // thread's: the guest is between two waits here.
@@ -576,6 +766,22 @@ void D3d12Session::SubmitGuestFrame(const bbx::platform::GuestFrame& frame) {
     impl_->frame_desc.height = frame.height;
     impl_->frame_desc.pitch_pixels = frame.pitch;
     impl_->frame_pending = true;
+    impl_->frame_direct_pending = false;
+    if (impl_->frame_event != nullptr) { ::SetEvent(impl_->frame_event); }
+}
+
+bool D3d12Session::WaitForGuestFrame(std::uint32_t timeout_ms) {
+    if (impl_ == nullptr || impl_->frame_event == nullptr) {
+        ::Sleep(timeout_ms > 0 ? timeout_ms : 1);
+        return false;
+    }
+    return ::WaitForSingleObjectEx(impl_->frame_event, timeout_ms, FALSE) == WAIT_OBJECT_0;
+}
+
+void D3d12Session::PrewarmShaders() {
+    if (impl_ == nullptr || !impl_->ready) { return; }
+    std::lock_guard<std::mutex> glk(impl_->gpu_mutex);
+    impl_->guest_compute.EnsureCacheLoaded();
 }
 
 std::uint64_t D3d12Session::GuestFrames() const {
@@ -627,6 +833,18 @@ void D3d12Session::Destroy() {
     impl_->ready = false;
     // The guest's HLE must stop calling into this device before it is destroyed.
     d3d12::SetGuestGpuBinding(nullptr);
+    {
+        std::lock_guard<std::mutex> glk(impl_->gpu_mutex);
+        impl_->FlushAllLocked();
+    }
+    (void)impl_->device.WaitIdle();
+    impl_->last_direct_rt.Reset();
+    impl_->last_frame_was_direct = false;
+    impl_->retired_present_targets.clear();
+    if (impl_->frame_event != nullptr) {
+        ::CloseHandle(impl_->frame_event);
+        impl_->frame_event = nullptr;
+    }
     impl_->guest_graphics.Destroy();
     impl_->guest_compute.Destroy();
     impl_->guest_arena.reset();

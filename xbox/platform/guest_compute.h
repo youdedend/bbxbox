@@ -19,6 +19,7 @@
 #include "src/host/d3d12/bbx_d3d12.h"
 
 namespace bbx::d3d12 {
+class DescriptorRing;
 class Device;
 class PathTable;
 class PipelineSet;
@@ -32,6 +33,7 @@ public:
     // What this object did, and why it did not: the report's numbers.
     struct Counts {
         std::uint64_t ran = 0;            // dispatches recorded and submitted
+        std::uint64_t batches = 0;        // batched command lists submitted
         std::uint64_t indirect = 0;       // of them, ExecuteIndirect
         std::uint64_t miss = 0;           // no blob in the baked cache for the key
         std::uint64_t no_cache = 0;       // the cache did not validate: nothing can run
@@ -39,7 +41,7 @@ public:
         std::uint64_t bad_blob = 0;       // the cached blob would not inflate
         std::uint64_t bad_pso = 0;        // the device refused the compute PSO
         std::uint64_t evicted = 0;        // PSOs released by the cache's budget
-        std::uint64_t created = 0;        // PSOs created
+        std::uint64_t created = 0;        // PSOs created on demand
         std::uint64_t no_indirect = 0;    // an indirect dispatch with args that cannot be reached
         std::uint64_t record_failed = 0;  // a command list that would not record
         std::uint64_t uav_barriers = 0;   // one after every dispatch
@@ -57,13 +59,12 @@ public:
 
     // `arena_base` is the guest arena's first CBV/SRV/UAV descriptor in the
     // device's shader-visible heap (bbx_guest_root.h's GuestHeapLayout), and
-    // `sampler_base` the sampler heap's. Both are reserved before this call;
-    // this object fills the space-1 regions with null descriptors and the
-    // sampler regions with one default sampler, so a shader that reads a binding
-    // nobody has set reads "nothing bound" rather than a stale descriptor.
+    // `sampler_base` the sampler heap's. `descriptor_ring` owns the remaining
+    // dynamic region of the shader-visible CBV/SRV/UAV heap so per-dispatch and
+    // per-draw space-1 descriptor tables never stall the GPU.
     bbx::d3d12::Status Create(bbx::d3d12::Device& device, bbx::d3d12::PipelineSet& pipelines,
-                              bbx::d3d12::GuestMemory& memory, std::uint32_t arena_base,
-                              std::uint32_t sampler_base);
+                              bbx::d3d12::GuestMemory& memory, bbx::d3d12::DescriptorRing* descriptor_ring,
+                              std::uint32_t arena_base, std::uint32_t sampler_base);
     void Destroy();
     [[nodiscard]] bool Ready() const;
 
@@ -71,18 +72,28 @@ public:
     // baked under, or 0 when it cannot be read (the caller counts and refuses).
     std::uint64_t KeyFor(const GpuDispatch& d);
     // host_gpu_d3d12.h's `dispatch`: build or find the compute PSO for `key`,
-    // bind the root CBV and the tables, and submit it.
+    // bind the root CBV and the tables, and record into the active batch.
     bool Run(std::uint64_t key, const GpuDispatch& d);
 
-    // Shared baked cache, binding table, and GPU-side SRV snapshot ring used by
-    // GuestGraphics so the console loads bbx_shaders.cache and bbx_shaders.paths
-    // once instead of twice.
+    // Flushes any batched compute dispatches to the GPU queue.
+    void Flush();
+    [[nodiscard]] bool HasPending() const;
+
+    // Shared baked cache, binding table, null descriptor template, and GPU-side
+    // SRV snapshot ring used by GuestGraphics so the console loads
+    // bbx_shaders.cache and bbx_shaders.paths once instead of twice.
     void EnsureCacheLoaded();
     [[nodiscard]] const bbx::d3d12::ShaderCache& Cache() const;
     [[nodiscard]] const bbx::d3d12::PathTable& Paths() const;
     [[nodiscard]] bool CacheReady() const;
+    [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE NullTemplateCpu() const;
     [[nodiscard]] ID3D12Resource* SrvSnapshotRing() const;
-    bool ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset);
+    [[nodiscard]] std::uint64_t SrvRingGeneration() const;
+    using FlushCallback = void (*)(void*);
+    bool ReserveSrvSnapshot(std::uint64_t bytes, std::uint64_t* out_offset,
+                            FlushCallback flush_cb = nullptr, void* flush_user = nullptr);
+    void TouchSrvSnapshotOffset(std::uint64_t offset);
+    void MarkSrvSnapshotsSubmitted(std::uint64_t fence);
 
     // The cache's one line and the counts, for the boot/exit report.
     [[nodiscard]] std::string Report() const;

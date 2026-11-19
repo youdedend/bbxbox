@@ -38,6 +38,10 @@ public:
     // Hands back every released table whose fence is at or before `fence_value`.
     // Returns how many were returned.
     std::uint32_t Collect(std::uint64_t fence_value);
+    // The smallest fence value among released-but-not-yet-collected slices, or 0
+    // when nothing is pending. Lets callers wait only for the oldest slice rather
+    // than draining the entire GPU queue.
+    [[nodiscard]] std::uint64_t OldestPendingFence() const;
 
     // Tables that are permanently allocated (samplers, the white texture) are
     // carved out first and never released.

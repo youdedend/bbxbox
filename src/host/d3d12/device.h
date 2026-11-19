@@ -17,9 +17,12 @@
 //    case Lesson #6 exists for.
 #pragma once
 
-#include <string>
-#include <cstdint>
 #include <array>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "src/host/d3d12/bbx_budget.h"
 #include "src/host/d3d12/bbx_d3d12.h"
@@ -41,11 +44,10 @@ public:
     // Three frames in flight: enough for a GPU to be a frame behind without the
     // CPU stalling, and the number the swapchain is built for.
     static constexpr std::uint32_t kFrameCount = 3;
-    // Bounded descriptor budgets. The console's 5,120 MiB does not stretch to an
-    // unbounded heap: 64K CBV/SRV/UAV is 4 MiB of descriptors and covers a whole
-    // Bloodborne frame with room for the PSO cache, and 2,048 samplers is the
-    // documented cap.
-    static constexpr std::uint32_t kCbvSrvUavDescriptors = 65536;
+    // Bounded descriptor budgets. 128K CBV/SRV/UAV (~8 MiB of descriptors) gives
+    // ring-buffered per-stage space-1 descriptor tables ~680 concurrent 191-slot
+    // slices in flight without GPU stalls, while 2,048 samplers is the documented cap.
+    static constexpr std::uint32_t kCbvSrvUavDescriptors = 131072;
     static constexpr std::uint32_t kSamplerDescriptors = 2048;
     static constexpr std::uint32_t kRtvDescriptors = 64;
     static constexpr std::uint32_t kDsvDescriptors = 16;
@@ -78,11 +80,17 @@ public:
     // fence proves the GPU is done with the oldest.
     [[nodiscard]] ID3D12CommandAllocator* FrameAllocator() const { return frames_[frame_].Get(); }
     [[nodiscard]] std::uint32_t FrameIndex() const { return frame_; }
+    void MarkFrameSubmitted(std::uint64_t fence) { frame_fences_[frame_] = fence; }
+    bool WaitForFrameSlot(std::uint32_t timeout_ms = 4000) {
+        const std::uint64_t fence = frame_fences_[frame_];
+        return fence == 0 || WaitFor(fence, timeout_ms);
+    }
     void NextFrame() { frame_ = (frame_ + 1) % kFrameCount; }
     [[nodiscard]] Budget& Memory() { return budget_; }
     [[nodiscard]] const Budget& Memory() const { return budget_; }
     [[nodiscard]] bool IsUma() const { return uma_; }
-    [[nodiscard]] bool DeviceLost() const { return device_lost_; }
+    [[nodiscard]] bool TearingSupported() const { return tearing_supported_; }
+    [[nodiscard]] bool DeviceLost() const { return device_lost_.load(std::memory_order_acquire); }
     // GetDeviceRemovedReason() as captured when the loss was noticed: the
     // crash report carries it, because "device lost 0x887A0006" and "removed
     // reason 0x887A0005" (an actual GPU hang) mean different bugs.
@@ -97,8 +105,12 @@ public:
 
     // Fences: the graphics fence's value after the frame's last submission.
     [[nodiscard]] ID3D12Fence* GraphicsFence() const { return fence_.Get(); }
-    [[nodiscard]] std::uint64_t SubmittedValue() const { return submitted_; }
+    [[nodiscard]] std::uint64_t SubmittedValue() const { return submitted_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t CompletedValue() const { return fence_ ? fence_->GetCompletedValue() : 0; }
+    // Atomically submits command lists on GraphicsQueue() and signals the fence
+    // under signal_mutex_ so concurrent guest and UI submissions never race on
+    // ID3D12CommandQueue (which is not free-threaded in Direct3D 12).
+    std::uint64_t ExecuteAndSignal(ID3D12CommandList* const* lists, UINT count);
     std::uint64_t Signal();
     // Waits until `value` is complete. False on device loss or a timeout
     // (a hung GPU, which the caller reports as a lost device).
@@ -126,11 +138,16 @@ private:
     ComPtr<ID3D12CommandQueue> graphics_;
     ComPtr<ID3D12Fence> fence_;
     HANDLE fence_event_ = nullptr;
-    std::uint64_t submitted_ = 0;
+    std::mutex signal_mutex_;
+    std::mutex wait_events_mutex_;
+    std::vector<HANDLE> wait_events_;
+    std::atomic<std::uint64_t> submitted_{0};
     bool uma_ = false;
-    bool device_lost_ = false;
+    bool tearing_supported_ = false;
+    std::atomic<bool> device_lost_{false};
     Budget budget_;
     std::array<ComPtr<ID3D12CommandAllocator>, kFrameCount> frames_{};
+    std::array<std::uint64_t, kFrameCount> frame_fences_{};
     std::uint32_t frame_ = 0;
     ComPtr<ID3D12DescriptorHeap> cbv_srv_uav_heap_;
     ComPtr<ID3D12DescriptorHeap> sampler_heap_;

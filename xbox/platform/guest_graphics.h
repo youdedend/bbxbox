@@ -18,6 +18,7 @@
 #include "src/host/d3d12/bbx_guest_mem.h"
 
 namespace bbx::d3d12 {
+class DescriptorRing;
 class Device;
 class PipelineSet;
 }  // namespace bbx::d3d12
@@ -30,6 +31,7 @@ class GuestGraphics {
 public:
     struct Counts {
         std::uint64_t drawn = 0;            // graphics draws recorded and submitted
+        std::uint64_t batches = 0;          // batched graphics command lists submitted
         std::uint64_t indexed = 0;          // of them, indexed draws
         std::uint64_t indirect = 0;         // of them, ExecuteIndirect draws
         std::uint64_t shaders_noted = 0;    // Shdr containers analysed via host_gpu_note_shader_created
@@ -61,6 +63,7 @@ public:
 
     bbx::d3d12::Status Create(bbx::d3d12::Device& device, bbx::d3d12::PipelineSet& pipelines,
                               bbx::d3d12::GuestMemory& memory, GuestCompute& compute,
+                              bbx::d3d12::DescriptorRing* descriptor_ring,
                               std::uint32_t arena_base, std::uint32_t sampler_base);
     void Destroy();
     [[nodiscard]] bool Ready() const;
@@ -73,7 +76,7 @@ public:
     // host_gpu_draw hook: resolves cached vs_6_4 and ps_6_4 DXIL blobs, builds
     // or retrieves the Guard-G4-compliant graphics PSO, binds StageParams,
     // space-1/space-3 descriptor tables, native 2D RTV/DSV targets, viewport
-    // and scissor, and executes the draw on the D3D12 graphics queue.
+    // and scissor, and records the draw into the active graphics batch.
     bool Draw(const GpuDraw& d, const bbx::d3d12::DrawIdentity& identity);
 
     // host_gpu_clear_view hook: clears or creates+clears a color RTV or depth DSV
@@ -94,6 +97,16 @@ public:
     // Invalidates cached shader program extractions overlapping [lo, hi) when
     // guest memory is rewritten.
     void InvalidatePrograms(std::uint64_t lo, std::uint64_t hi);
+
+    // Flushes any batched graphics commands (draws/clears/copies) to the GPU queue.
+    void Flush();
+    [[nodiscard]] bool HasPending() const;
+
+    // Zero-copy direct GPU scanout lookup: checks whether `va` corresponds to a
+    // GPU-rendered color target of matching dimensions and SRV-compatible format.
+    [[nodiscard]] bool HasRenderedTarget(std::uint64_t va, std::uint32_t width, std::uint32_t height) const;
+    bool TryAcquirePresentTarget(std::uint64_t va, std::uint32_t width, std::uint32_t height,
+                                 bbx::d3d12::ComPtr<ID3D12Resource>* out_resource, DXGI_FORMAT* out_format) const;
 
     [[nodiscard]] std::string Report() const;
     // Retires evicted PSOs, evicted targets, and completed command allocators.

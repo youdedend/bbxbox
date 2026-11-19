@@ -89,3 +89,32 @@ TEST(RejectsImpossibleRequests) {
     ring.Release(DescriptorSlice{}, 1);  // an empty slice is not an error
     CHECK_EQ(ring.Collect(100), 0u);
 }
+
+TEST(OldestPendingFenceTracksRetiredSlicesInOrder) {
+    DescriptorRing ring(32);
+    CHECK_EQ(ring.OldestPendingFence(), 0ull);
+    const auto a = ring.Allocate(8);
+    const auto b = ring.Allocate(8);
+    const auto c = ring.Allocate(16);
+    CHECK(a.has_value() && b.has_value() && c.has_value());
+
+    ring.Release(*b, 10);
+    ring.Release(*a, 5);
+    ring.Release(*c, 20);
+    CHECK_EQ(ring.OldestPendingFence(), 5ull);
+
+    CHECK_EQ(ring.Collect(5), 1u);
+    CHECK_EQ(ring.OldestPendingFence(), 10ull);
+    CHECK_EQ(ring.free(), 8u);
+
+    CHECK_EQ(ring.Collect(10), 1u);
+    CHECK_EQ(ring.OldestPendingFence(), 20ull);
+    CHECK_EQ(ring.free(), 16u);
+    // a (0..7) and b (8..15) must have coalesced into one contiguous 16-slot run.
+    const auto merged = ring.Allocate(16);
+    CHECK(merged.has_value());
+    CHECK_EQ(merged->offset, 0u);
+
+    CHECK_EQ(ring.Collect(20), 1u);
+    CHECK_EQ(ring.OldestPendingFence(), 0ull);
+}

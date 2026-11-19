@@ -268,3 +268,39 @@ TEST(GameplayEnhancementsDeadzoneAutoBackupAndHunterName) {
     const std::string footer = model.Footer();
     CHECK(footer.find("Hunter: Gehrman") != std::string::npos);
 }
+
+TEST(PerformanceResolutionAndShadowControls) {
+    LauncherModel model;
+    model.layout = ReadyLayout();
+    model.render_res_mode = 2;       // 720p
+    model.performance_mode = true;
+    model.shadow_resolution = 0;     // Lowest
+    model.Rebuild();
+
+    CHECK(Has(model, Action::kCycleResolution));
+    CHECK(Has(model, Action::kTogglePerformanceMode));
+    CHECK(Has(model, Action::kCycleShadowRes));
+
+    CHECK_EQ(std::string(ActionName(Action::kCycleResolution)), std::string("cycle-resolution"));
+    CHECK_EQ(std::string(ActionName(Action::kTogglePerformanceMode)),
+             std::string("toggle-performance-mode"));
+    CHECK_EQ(std::string(ActionName(Action::kCycleShadowRes)), std::string("cycle-shadow-res"));
+
+    bool found_720p = false;
+    bool found_perf_on = false;
+    bool found_lowest = false;
+    for (const Item& item : model.items) {
+        if (item.action == Action::kCycleResolution) {
+            found_720p = item.label.find("720p") != std::string::npos;
+        }
+        if (item.action == Action::kTogglePerformanceMode) {
+            found_perf_on = item.label.find("on") != std::string::npos;
+        }
+        if (item.action == Action::kCycleShadowRes) {
+            found_lowest = item.label.find("Lowest") != std::string::npos;
+        }
+    }
+    CHECK(found_720p);
+    CHECK(found_perf_on);
+    CHECK(found_lowest);
+}

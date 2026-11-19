@@ -44,6 +44,7 @@ public:
     [[nodiscard]] bool Lookup(std::uint64_t key, BakedBlob* out) const;
 
     [[nodiscard]] std::size_t entries() const { return parsed_.entries.size(); }
+    [[nodiscard]] const std::vector<CacheEntry>& Entries() const { return parsed_.entries; }
     [[nodiscard]] std::size_t bytes() const { return file_.size(); }
     [[nodiscard]] CacheStatus status() const { return parsed_.status; }
     // The stamp the last Load validated against (zeroed when it did not): the

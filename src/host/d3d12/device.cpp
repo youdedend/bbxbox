@@ -165,6 +165,17 @@ Status Device::PickAdapter(bool debug_layer) {
         return FromHresult(hr);
     }
 
+    // Probe VRR / FreeSync tearing support (DXGI_FEATURE_PRESENT_ALLOW_TEARING)
+    // so V-Sync Off on Xbox Series X|S uses true low-latency tearing / VRR.
+    BOOL allow_tearing = FALSE;
+    if (SUCCEEDED(factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                &allow_tearing, sizeof(allow_tearing)))) {
+        tearing_supported_ = allow_tearing != FALSE;
+    } else {
+        tearing_supported_ = false;
+    }
+    Log("dxgi: ALLOW_TEARING / VRR %s", tearing_supported_ ? "supported" : "not supported");
+
     // The console has one adapter and it is the high-performance one; a desktop
     // development machine may have several, and picking the integrated part would
     // make every measurement wrong.
@@ -285,8 +296,10 @@ Status Device::CreateQueuesAndFence() {
             return FromHresult(hr);
         }
     }
+    frame_fences_.fill(0);
     frame_ = 0;
-    submitted_ = 0;
+    submitted_.store(0, std::memory_order_release);
+    device_lost_.store(false, std::memory_order_release);
     return Status::kOk;
 }
 
@@ -353,6 +366,13 @@ void Device::Destroy() {
             CloseHandle(fence_event_);
             fence_event_ = nullptr;
         }
+        {
+            std::lock_guard<std::mutex> lk(wait_events_mutex_);
+            for (HANDLE ev : wait_events_) {
+                if (ev != nullptr) CloseHandle(ev);
+            }
+            wait_events_.clear();
+        }
         return;
     }
     // Everything the GPU was given must be finished before the device goes away,
@@ -373,13 +393,38 @@ void Device::Destroy() {
         CloseHandle(fence_event_);
         fence_event_ = nullptr;
     }
-    submitted_ = 0;
+    {
+        std::lock_guard<std::mutex> lk(wait_events_mutex_);
+        for (HANDLE ev : wait_events_) {
+            if (ev != nullptr) CloseHandle(ev);
+        }
+        wait_events_.clear();
+    }
+    submitted_.store(0, std::memory_order_release);
+    frame_fences_.fill(0);
     frame_ = 0;
+    tearing_supported_ = false;
+    device_lost_.store(false, std::memory_order_release);
+}
+
+std::uint64_t Device::ExecuteAndSignal(ID3D12CommandList* const* lists, UINT count) {
+    std::lock_guard<std::mutex> lk(signal_mutex_);
+    if (fence_ == nullptr || graphics_ == nullptr) { return submitted_.load(std::memory_order_acquire); }
+    if (lists != nullptr && count > 0) {
+        graphics_->ExecuteCommandLists(count, lists);
+    }
+    const std::uint64_t value = submitted_.load(std::memory_order_relaxed) + 1;
+    submitted_.store(value, std::memory_order_release);
+    const HRESULT hr = graphics_->Signal(fence_.Get(), value);
+    if (FAILED(hr)) { NoteDeviceLost(hr); }
+    return value;
 }
 
 std::uint64_t Device::Signal() {
-    if (fence_ == nullptr || graphics_ == nullptr) { return submitted_; }
-    const std::uint64_t value = ++submitted_;
+    std::lock_guard<std::mutex> lk(signal_mutex_);
+    if (fence_ == nullptr || graphics_ == nullptr) { return submitted_.load(std::memory_order_acquire); }
+    const std::uint64_t value = submitted_.load(std::memory_order_relaxed) + 1;
+    submitted_.store(value, std::memory_order_release);
     const HRESULT hr = graphics_->Signal(fence_.Get(), value);
     if (FAILED(hr)) { NoteDeviceLost(hr); }
     return value;
@@ -388,15 +433,34 @@ std::uint64_t Device::Signal() {
 bool Device::WaitFor(std::uint64_t value, std::uint32_t timeout_ms) {
     if (fence_ == nullptr) { return true; }
     if (fence_->GetCompletedValue() >= value) { return true; }
+    if (timeout_ms == 0) { return false; }
+
+    // Acquire a dedicated auto-reset event from the pool so concurrent waiters
+    // (guest thread and UI thread) never collide on a single event handle.
+    HANDLE ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(wait_events_mutex_);
+        if (!wait_events_.empty()) {
+            ev = wait_events_.back();
+            wait_events_.pop_back();
+        }
+    }
+    if (ev == nullptr) {
+        ev = CreateEventExW(nullptr, nullptr, 0, 0x1F0003);
+        if (ev == nullptr) { return false; }
+    }
+
     // SetEventOnCompletion + a bounded wait: an unbounded wait on a hung GPU is how
     // a console app stops responding to the shell.
-    if (fence_event_ == nullptr) { return false; }
-    if (FAILED(fence_->SetEventOnCompletion(value, fence_event_))) {
+    if (FAILED(fence_->SetEventOnCompletion(value, ev))) {
+        CloseHandle(ev);
         NoteDeviceLost(E_FAIL);
         return false;
     }
-    const DWORD waited = WaitForSingleObjectEx(fence_event_, timeout_ms, FALSE);
+    const DWORD waited = WaitForSingleObjectEx(ev, timeout_ms, FALSE);
     if (waited != WAIT_OBJECT_0) {
+        // Do not recycle an event that still has a pending completion callback.
+        CloseHandle(ev);
         Log("fence %llu did not complete within %u ms (wait %lu)",
             static_cast<unsigned long long>(value), timeout_ms, static_cast<unsigned long>(waited));
         if (const HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : S_OK; FAILED(reason)) {
@@ -404,14 +468,21 @@ bool Device::WaitFor(std::uint64_t value, std::uint32_t timeout_ms) {
         }
         return false;
     }
+    {
+        std::lock_guard<std::mutex> lk(wait_events_mutex_);
+        if (wait_events_.size() < 8) {
+            wait_events_.push_back(ev);
+        } else {
+            CloseHandle(ev);
+        }
+    }
     return true;
 }
 
-bool Device::WaitIdle() { return WaitFor(submitted_, 4000); }
+bool Device::WaitIdle() { return WaitFor(submitted_.load(std::memory_order_acquire), 4000); }
 
 void Device::NoteDeviceLost(HRESULT hr) {
-    if (device_lost_) { return; }
-    device_lost_ = true;
+    if (device_lost_.exchange(true, std::memory_order_acq_rel)) { return; }
     removed_reason_ = hr;
     HRESULT reason = S_OK;
     if (device_) { reason = device_->GetDeviceRemovedReason(); }
