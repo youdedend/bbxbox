@@ -108,4 +108,22 @@ struct FselfResult {
 [[nodiscard]] bool InflateAvailable();
 void SetInflateAvailableForTesting(bool available);
 
+// Verifies whether a mapped guest image's .text code matches Bloodborne v1.09
+// at six untouched function prologues (107 exact bytes spanning 0x11bd0f0..0x269e990)
+// plus the v1.09 ELF entry offset (0xa0). Used when an fSELF unwrapped by
+// bbx_self.cpp or a regional v1.09 dump has a different outer ELF file SHA-256
+// than unfself's eboot-109-decrypted.bin, yet carries identical v1.09 machine code.
+struct Eboot109AnchorCheck {
+    bool entry_ok = false;
+    std::size_t matched = 0;
+    std::size_t total = 0;
+    std::string detail;
+
+    [[nodiscard]] bool ok() const { return entry_ok && total > 0 && matched == total; }
+};
+
+[[nodiscard]] Eboot109AnchorCheck VerifyBloodborne109CodeAnchors(const void* guest_base,
+                                                                 std::size_t guest_size,
+                                                                 std::uint64_t entry_elf_va);
+
 }  // namespace bbx::core

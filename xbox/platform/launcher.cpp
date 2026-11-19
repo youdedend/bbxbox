@@ -72,14 +72,12 @@ void LauncherModel::Rebuild() {
         items.push_back(Item{Action::kToggleMods, mods_enabled ? "Mods overlay: on" : "Mods overlay: off",
                              "Dump\\mods resolves ahead of dvdroot_ps4; the dump itself is not modified",
                              true, false});
-        // Only offered with the overlay on: a patched eboot without the files
-        // it was patched for is a build the port cannot vouch for at all.
-        if (mods_enabled) {
-            items.push_back(Item{Action::kToggleModdedEboot,
-                                 modded_eboot_ok ? "Allow modded eboot: on" : "Allow modded eboot: off",
-                                 "Load a v1.09 eboot whose SHA-256 is not the pinned one; the digest is logged",
-                                 true, true});
-        }
+    }
+    if (ready) {
+        items.push_back(Item{Action::kToggleModdedEboot,
+                             modded_eboot_ok ? "Allow modded/alt eboot: on" : "Allow modded/alt eboot: off",
+                             "Boot an eboot whose SHA-256 differs from pinned v1.09 (EU/GOTY/patched); logged",
+                             !precompiling, true});
     }
     items.push_back(Item{Action::kToggleFpsCap,
                          fps_cap >= 60 ? "Frame rate cap: 60 FPS++" : "Frame rate cap: 30 FPS",

@@ -157,7 +157,9 @@ TEST(NoModsFolderNoModsItems) {
     model.mods_present = false;
     model.Rebuild();
     CHECK(!Has(model, Action::kToggleMods));
-    CHECK(!Has(model, Action::kToggleModdedEboot));
+    // Alternate/modded eboot toggle stays reachable even without a mods/ folder
+    // (e.g. regional/GOTY/unwrapped fSELF eboots).
+    CHECK(Has(model, Action::kToggleModdedEboot));
 }
 
 TEST(ModsFolderAddsTheOverlaySwitchOnByDefault) {
@@ -172,19 +174,17 @@ TEST(ModsFolderAddsTheOverlaySwitchOnByDefault) {
         if (item.action == Action::kToggleMods) on = item.label.find("on") != std::string::npos;
     }
     CHECK(on);
-    // On by default also means the modded-eboot switch is offered.
     CHECK(Has(model, Action::kToggleModdedEboot));
 }
 
-TEST(OverlayOffHidesTheModdedEbootSwitch) {
+TEST(OverlayOffKeepsTheModdedEbootSwitchAccessible) {
     LauncherModel model;
     model.layout = ReadyLayout();
     model.mods_present = true;
     model.mods_enabled = false;
     model.Rebuild();
     CHECK(Has(model, Action::kToggleMods));
-    // A patched eboot without the files it was patched for is not offered at all.
-    CHECK(!Has(model, Action::kToggleModdedEboot));
+    CHECK(Has(model, Action::kToggleModdedEboot));
 }
 
 TEST(ModdedEbootSwitchSaysAllowedWhenOn) {

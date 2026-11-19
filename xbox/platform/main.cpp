@@ -81,6 +81,7 @@ struct Session {
     bool keyboard_open = false;
     bool quit = false;
     bool start_requested = false;
+    bool start_force_unverified = false;
     bool baking = false;
     bool start_after_bake = false;
     std::atomic<bool> bake_finished{false};
@@ -742,26 +743,29 @@ std::vector<std::string> CacheSearchDirs() {
     return dirs;
 }
 
-void RefreshLauncher() {
+void RefreshLauncher(bool probe_storage = false) {
     g_session.model.layout = g_session.layout;
     g_session.model.has_usb = !g_session.usb_token.empty() || !g_session.layout.base_path.empty();
     g_session.model.precompiling = g_session.baking;
     g_session.model.syncing = g_session.usb_sync_running;
-    RefreshModsOverlay();
+    if (probe_storage) {
+        RefreshModsOverlay();
 
-    // Probe console DXIL 6.4 shader cache status whenever the baker is idle so
-    // the launcher shows accurate stage counts and offers Rebuild vs Precompile.
-    if (!g_session.baking) {
-        std::size_t stages = 0;
-        std::string stamp;
-        if (bbx::platform::HasValidConsoleCache(CacheSearchDirs(), nullptr, nullptr, &stages, &stamp)) {
-            g_session.model.cache_current = true;
-            g_session.model.stages = stages;
-            g_session.model.cache_stamp = stamp;
-        } else {
-            g_session.model.cache_current = false;
-            g_session.model.stages = 0;
-            g_session.model.cache_stamp.clear();
+        // Probe console DXIL 6.4 shader cache status whenever storage/layout
+        // changed and the baker is idle so the launcher shows accurate stage
+        // counts and offers Rebuild vs Precompile without stalling menu toggles.
+        if (!g_session.baking) {
+            std::size_t stages = 0;
+            std::string stamp;
+            if (bbx::platform::HasValidConsoleCache(CacheSearchDirs(), nullptr, nullptr, &stages, &stamp)) {
+                g_session.model.cache_current = true;
+                g_session.model.stages = stages;
+                g_session.model.cache_stamp = stamp;
+            } else {
+                g_session.model.cache_current = false;
+                g_session.model.stages = 0;
+                g_session.model.cache_stamp.clear();
+            }
         }
     }
     g_session.model.Rebuild();
@@ -884,7 +888,7 @@ void PollUsbSync() {
     bbx::platform::LogMirroredMessage(
         g_session.usb_sync_ok ? bbx::platform::Level::kInfo : bbx::platform::Level::kWarn,
         "usb: %s", g_session.usb_sync_message.c_str());
-    RefreshLauncher();
+    RefreshLauncher(/*probe_storage=*/true);
 }
 
 // The launcher loop is the thread that pumps the CoreWindow dispatcher, and the
@@ -917,7 +921,7 @@ void FinishDumpGrant(const std::string& path, const std::string& token, bool for
                                   g_session.layout.problem.c_str());
     }
     SaveLayoutSettings();
-    RefreshLauncher();
+    RefreshLauncher(/*probe_storage=*/true);
 }
 
 void PickDump(bool for_patch) {
@@ -999,6 +1003,9 @@ void OnAction(PadAction action) {
         return;
     case PadAction::kOpenPcSettings:
         bbx::platform::LogF("PC settings menu requested (L3+R3)");
+        g_session.model.status_banner =
+            "In-game quick menu (L3+R3) opens once Bloodborne starts; configure settings here.";
+        RefreshLauncher();
         return;
     case PadAction::kPersonalEffects:
         bbx::platform::LogF("personal effects requested (touchpad)");
@@ -1021,7 +1028,7 @@ void OnAction(PadAction action) {
                 g_session.layout.CanRunPatched() ? g_session.layout.patch.Version()
                                                  : g_session.layout.base.Version();
             SaveLayoutSettings();
-            RefreshLauncher();
+            RefreshLauncher(/*probe_storage=*/true);
             return;
         case bbx::platform::Action::kToggleMods:
             g_session.model.mods_enabled = !g_session.model.mods_enabled;
@@ -1143,7 +1150,13 @@ void OnAction(PadAction action) {
             return;
         }
         case bbx::platform::Action::kStartGame:
-        case bbx::platform::Action::kContinueUnpatched: g_session.start_requested = true; return;
+            g_session.start_force_unverified = false;
+            g_session.start_requested = true;
+            return;
+        case bbx::platform::Action::kContinueUnpatched:
+            g_session.start_force_unverified = true;
+            g_session.start_requested = true;
+            return;
         case bbx::platform::Action::kQuit: g_session.quit = true; return;
         default: return;
         }
@@ -1565,7 +1578,10 @@ void DrawFrame() {
         bbx::platform::Hud hud = g_session.gpu->BuildReportHud();
         AppendLauncherToHud(hud);
         AppendInGameOverlays(hud);
-        const bool vsync = bbx::bridge::VsyncEnabled();
+        // Only unlock VSync / VRR tearing while Bloodborne is actually running;
+        // keeping the launcher and shader baker synced to display refresh avoids
+        // spinning at 110+ FPS in a static menu and frees CPU/GPU for DXC baking.
+        const bool vsync = bbx::bridge::Running() ? bbx::bridge::VsyncEnabled() : true;
         const bbx::d3d12::Status status =
             g_session.gpu->Present(hud, vsync, g_session.model.sharp_upscale);
         if (status == bbx::d3d12::Status::kOk) {
@@ -1891,36 +1907,50 @@ void RestoreDump() {
         return true;
     };
 
-    add_candidate(protocol_dump_path);
-    add_candidate(path);
-    for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
-        add_candidate(root);
-        if (fs.list_dirs) {
-            const bool dev_files_root = starts_with_icase(root, "D:\\DevelopmentFiles");
-            for (const std::string& child : fs.list_dirs(root)) {
-                if (child == "." || child == ".." || child == "bbxbox_logs") continue;
-                const std::string child_path = JoinScanPath(root, child);
-                add_candidate(child_path);
-                // Also inspect common 2-level layouts such as E:\dumps\Bloodborne or
-                // D:\DevelopmentFiles\Games\Bloodborne without walking the whole disk.
-                if (dev_files_root || equals_icase(child, "dumps") ||
-                    equals_icase(child, "games") || equals_icase(child, "ps4")) {
-                    for (const std::string& grandchild : fs.list_dirs(child_path)) {
-                        if (grandchild == "." || grandchild == ".." || grandchild == "bbxbox_logs") continue;
-                        add_candidate(JoinScanPath(child_path, grandchild));
-                    }
-                }
-            }
-        }
-    }
-
+    // Fast-path: probe the explicit protocol or saved bbxbox.ini dump path first
+    // so launches with an already-configured dump skip the ~3s multi-drive crawl.
     std::vector<std::string> found_dumps;
-    for (const std::string& candidate : candidates) {
-        if (!bbx::platform::IsDumpRoot(fs, candidate)) continue;
+    const auto probe_dump_candidate = [&](const std::string& candidate) -> bool {
+        if (!bbx::platform::IsDumpRoot(fs, candidate)) return false;
         const std::optional<bbx::platform::SfoInfo> info =
             bbx::platform::ReadDumpInfo(fs, candidate);
         if (info && !info->IsPatchContainer()) {
             found_dumps.push_back(candidate);
+            return true;
+        }
+        return false;
+    };
+
+    add_candidate(protocol_dump_path);
+    add_candidate(path);
+    for (const std::string& saved_candidate : candidates) {
+        if (probe_dump_candidate(saved_candidate)) break;
+    }
+
+    if (found_dumps.empty()) {
+        const std::size_t already_checked = candidates.size();
+        for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
+            add_candidate(root);
+            if (fs.list_dirs) {
+                const bool dev_files_root = starts_with_icase(root, "D:\\DevelopmentFiles");
+                for (const std::string& child : fs.list_dirs(root)) {
+                    if (child == "." || child == ".." || child == "bbxbox_logs") continue;
+                    const std::string child_path = JoinScanPath(root, child);
+                    add_candidate(child_path);
+                    // Also inspect common 2-level layouts such as E:\dumps\Bloodborne or
+                    // D:\DevelopmentFiles\Games\Bloodborne without walking the whole disk.
+                    if (dev_files_root || equals_icase(child, "dumps") ||
+                        equals_icase(child, "games") || equals_icase(child, "ps4")) {
+                        for (const std::string& grandchild : fs.list_dirs(child_path)) {
+                            if (grandchild == "." || grandchild == ".." || grandchild == "bbxbox_logs") continue;
+                            add_candidate(JoinScanPath(child_path, grandchild));
+                        }
+                    }
+                }
+            }
+        }
+        for (std::size_t i = already_checked; i < candidates.size(); ++i) {
+            (void)probe_dump_candidate(candidates[i]);
         }
     }
 
@@ -1957,6 +1987,10 @@ void RestoreDump() {
         (void)bbx::platform::LogMirrorToUsb(g_session.layout.base_path);
     }
     Steps().DumpScanFinished(found_dumps.size());
+    // Early-boot 100 ms hang heartbeat is no longer needed once the launcher is
+    // live; TelemetrySampler's 5 s watchdog + stall detector takes over from here
+    // without flooding errors.log or flushing USB 10 times per second.
+    Steps().StopHeartbeatThread();
 }
 
 }  // namespace
@@ -2717,13 +2751,18 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         "launcher: shader bake finished (%s): %s",
                         g_session.bake_result.ok ? "ok" : "incomplete",
                         g_session.bake_result.summary.c_str());
-                    RefreshLauncher();
+                    RefreshLauncher(/*probe_storage=*/true);
                     if (g_session.start_after_bake && !g_session.bake_result.cancelled) {
                         SyncBridgeSettings();
                         if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
                             guest_ever_started = true;
                             if (g_session.gpu) g_session.gpu->PrewarmShaders();
                         } else {
+                            const std::string err = bbx::bridge::LastStartError();
+                            g_session.model.status_banner =
+                                err.empty() ? "Bloodborne did not start after baking (see loader.log)."
+                                            : err;
+                            RefreshLauncher();
                             bbx::platform::LogMessage(
                                 bbx::platform::Level::kError,
                                 "launcher: the guest did not start after baking; staying in the launcher");
@@ -2773,6 +2812,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 bbx::platform::LogF("launcher: start requested (version %s)",
                                     g_session.layout.EffectiveVersion().c_str());
                 g_session.start_requested = false;
+                const bool force_unverified = g_session.start_force_unverified;
+                g_session.start_force_unverified = false;
                 // The guest boots on its own thread and the launcher keeps
                 // drawing: `_start` runs until the game exits, and the window
                 // that presents it is this one (platform/bbhost_bridge.cpp).
@@ -2789,7 +2830,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     req.mods = g_session.layout.base_path + "\\mods";
                 }
                 req.hunter_name = g_session.model.hunter_name;
-                req.modded_eboot_ok = g_session.model.modded_eboot_ok;
+                req.modded_eboot_ok = g_session.model.modded_eboot_ok || force_unverified;
                 SyncBridgeSettings();
 
                 std::string found_cache_dir;
@@ -2801,8 +2842,13 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         found_cache_dir.c_str(), found_cache_report.c_str());
                     if (bbx::bridge::StartGuest(req)) {
                         guest_ever_started = true;
+                        g_session.model.status_banner.clear();
                         if (g_session.gpu) g_session.gpu->PrewarmShaders();
                     } else {
+                        const std::string err = bbx::bridge::LastStartError();
+                        g_session.model.status_banner =
+                            err.empty() ? "Bloodborne did not start (see loader.log)." : err;
+                        RefreshLauncher();
                         bbx::platform::LogMessage(
                             bbx::platform::Level::kError,
                             "launcher: the guest did not start; staying in the launcher");
@@ -2815,6 +2861,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             if (bbx::bridge::Running() && !g_session.quick_menu_open && !g_session.ime_open &&
                 g_session.gpu != nullptr) {
                 (void)g_session.gpu->WaitForGuestFrame(8);
+            } else if (g_session.baking) {
+                ::Sleep(16);
             } else {
                 ::Sleep(8);
             }

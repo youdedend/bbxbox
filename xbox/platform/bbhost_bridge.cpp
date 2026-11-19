@@ -92,6 +92,8 @@
 #include "host/perf_meter.h"
 #include "host/settings.h"
 #include "host/settings_store.h"
+#include "log.h"
+#include "src/host/core/bbx_self.h"
 
 
 namespace {
@@ -1287,10 +1289,55 @@ void LoadShaderCache(const std::string& eboot, const std::string& data_dir) {
                               "shader_cache: no valid cache in dump or LocalState");
 }
 
+std::mutex g_last_start_error_mu;
+std::string g_last_start_error;
+
+void SetLastStartError(std::string message) {
+    std::lock_guard<std::mutex> lock(g_last_start_error_mu);
+    g_last_start_error = std::move(message);
+}
+
+#if defined(_WIN32)
+void BbhostLogWrite(const char* data, std::size_t len) {
+    if (data == nullptr || len == 0) return;
+    std::size_t pos = 0;
+    while (pos < len) {
+        std::size_t end = pos;
+        while (end < len && data[end] != '\n') ++end;
+        std::size_t line_len = end - pos;
+        while (line_len > 0 && data[pos + line_len - 1] == '\r') --line_len;
+        if (line_len > 0) {
+            constexpr std::size_t kMaxChunk = 460;
+            const int chunk = static_cast<int>(std::min<std::size_t>(line_len, kMaxChunk));
+            bbx::platform::LogF("%.*s", chunk, data + pos);
+        }
+        pos = (end < len) ? (end + 1) : len;
+    }
+}
+#endif
+
+void InstallBbhostLogBridge() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+#if defined(_WIN32)
+        host_log_detail::g_console_write.store(&BbhostLogWrite, std::memory_order_release);
+#endif
+        host_log_decide(true);
+    });
+}
+
 }  // namespace
 
+std::string LastStartError() {
+    std::lock_guard<std::mutex> lock(g_last_start_error_mu);
+    return g_last_start_error;
+}
+
 bool StartGuest(const GuestRequest& req) {
+    SetLastStartError({});
+    InstallBbhostLogBridge();
     if (req.eboot.empty()) {
+        SetLastStartError("No eboot.bin found in the selected dump folder.");
         bbx::platform::LogMessage(bbx::platform::Level::kError, "boot: no eboot.bin in the dump");
         return false;
     }
@@ -1341,11 +1388,13 @@ bool StartGuest(const GuestRequest& req) {
     // The loader unwraps the dump's fake SELF (4F 15 3D 1D) itself, so a dumped
     // eboot.bin and a flat ELF both work.
     if (!load_orbis_elf(g_eboot_path.c_str(), &g_image, legacy_cpu_arena_size())) {
+        SetLastStartError("Failed to load or unwrap eboot.bin (see loader.log).");
         bbx::platform::LogMessage(bbx::platform::Level::kError, "boot: %s did not load", g_eboot_path.c_str());
         return false;
     }
+    const std::string raw_sha256 = g_image.sha256;
     bbx::platform::LogF("image: sha256 %s entry 0x%llx base 0x%llx size 0x%zx",
-                        g_image.sha256.c_str(), static_cast<unsigned long long>(g_image.entry),
+                        raw_sha256.c_str(), static_cast<unsigned long long>(g_image.entry),
                         static_cast<unsigned long long>(g_image.mem.slide),
                         static_cast<std::size_t>(g_image.mem.size));
     // The flip's view of the arena, before any guest instruction runs: the
@@ -1354,22 +1403,56 @@ bool StartGuest(const GuestRequest& req) {
     g_guest_base.store(static_cast<std::uint8_t*>(g_image.mem.base), std::memory_order_release);
     g_guest_slide.store(g_image.mem.slide, std::memory_order_relaxed);
     g_guest_size.store(g_image.mem.size, std::memory_order_relaxed);
-    const bool is_109 = g_image.sha256 == kEboot109Sha256;
+    bool is_109 = (raw_sha256 == kEboot109Sha256);
+    bbx::core::Eboot109AnchorCheck anchors{};
+    if (!is_109) {
+        const std::uint64_t entry_elf_va =
+            g_image.entry >= g_image.mem.slide ? (g_image.entry - g_image.mem.slide) : 0ull;
+        anchors = bbx::core::VerifyBloodborne109CodeAnchors(g_image.mem.base, g_image.mem.size,
+                                                            entry_elf_va);
+        if (anchors.ok()) {
+            // An fSELF unwrapped by bbx_self.cpp or a regional v1.09 dump can
+            // differ in outer ELF padding/headers from unfself's flat file while
+            // carrying identical v1.09 machine code. Promoting sha256 once all
+            // 6 untouched v1.09 prologues (107 bytes) + entry 0xa0 match lets
+            // hle_patch_guest and every engine hook apply safely (each hook also
+            // byte-checks its own site before writing).
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kInfo,
+                "boot: eboot file sha256 %s differs from pinned unfself digest, but all %zu/%zu "
+                "Bloodborne v1.09 .text anchors verified (%s); enabling full v1.09 patches",
+                raw_sha256.c_str(), anchors.matched, anchors.total, anchors.detail.c_str());
+            g_image.sha256 = kEboot109Sha256;
+            is_109 = true;
+        } else {
+            bbx::platform::LogMirroredMessage(
+                bbx::platform::Level::kWarn,
+                "boot: v1.09 .text anchor check did not match (%s)", anchors.detail.c_str());
+        }
+    }
     if (!is_109 && !req.modded_eboot_ok) {
         // Every patch, hook and engine address below is an address in 1.09; a
         // different build would fail far from the cause, on a pointer read out
         // of a struct that moved. Refused here, with the digest in the log.
+        const std::string short_sha = raw_sha256.size() > 12 ? raw_sha256.substr(0, 12) : raw_sha256;
+        SetLastStartError("Eboot is not verified v1.09 (sha " + short_sha + "..., anchors " +
+                          std::to_string(anchors.matched) + "/" + std::to_string(anchors.total) +
+                          "). Enable 'Allow modded/alt eboot' in the menu to try anyway.");
         bbx::platform::LogMessage(bbx::platform::Level::kError,
-                                  "boot: this eboot is not 1.09 (sha256 %s, expected %s); enable "
-                                  "\"Allow modded v1.09 eboot\" in the launcher to start it anyway",
-                                  g_image.sha256.c_str(), kEboot109Sha256);
+                                  "boot: this eboot is not 1.09 (sha256 %s, expected %s; %s); "
+                                  "enable \"Allow modded/alt eboot\" in the launcher to start it anyway",
+                                  raw_sha256.c_str(), kEboot109Sha256, anchors.detail.c_str());
+        g_guest_base.store(nullptr, std::memory_order_release);
+        g_guest_slide.store(0, std::memory_order_relaxed);
+        g_guest_size.store(0, std::memory_order_relaxed);
         unload_elf(&g_image);
         return false;
     }
     if (!is_109) {
-        bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                  "boot: starting an eboot that is not 1.09; the patches may write "
-                                  "into the wrong places");
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "boot: starting unverified eboot (sha256 %s, %s); v1.09 address patches skipped",
+            raw_sha256.c_str(), anchors.detail.c_str());
     }
 
     // The baked shaders, from the dump or from LocalState\data (produced by the
@@ -1408,9 +1491,14 @@ bool StartGuest(const GuestRequest& req) {
                                        STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (thread == nullptr) {
         g_running.store(false);
+        const DWORD err = GetLastError();
+        SetLastStartError("CreateThread for Bloodborne failed (win32=" + std::to_string(err) + ").");
         bbx::platform::LogMessage(bbx::platform::Level::kError,
                                   "guest: CreateThread with an %zu MiB stack failed (error %lu)",
-                                  kGuestStack >> 20, static_cast<unsigned long>(GetLastError()));
+                                  kGuestStack >> 20, static_cast<unsigned long>(err));
+        g_guest_base.store(nullptr, std::memory_order_release);
+        g_guest_slide.store(0, std::memory_order_relaxed);
+        g_guest_size.store(0, std::memory_order_relaxed);
         unload_elf(&g_image);
         return false;
     }
@@ -1441,6 +1529,7 @@ bool Running() { return g_running.load(); }
 // and the workflow's "guest link evidence" step fails any package that reached
 // this branch, so an app that boots nothing cannot be shipped by accident.
 namespace bbx::bridge {
+std::string LastStartError() { return "Guest runtime is not linked into this build."; }
 bool StartGuest(const GuestRequest& req) {
     (void)req;
     bbx::platform::LogMessage(bbx::platform::Level::kWarn,

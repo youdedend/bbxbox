@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -32,6 +33,7 @@
 #include <zlib.h>
 
 #include "gcn/container.h"
+#include "gcn/half.h"
 #include "gcn/hlsl.h"
 #include "gcn/isa.h"
 #include "gcn/lift.h"
@@ -534,13 +536,40 @@ void AddEbootContainers(const std::string& eboot_path, std::vector<RawContainerI
     }
 }
 
-bool AnalyseContainer(const RawContainerItem& item, AnalysedProgram& program) {
+int StageSlot(Stage stage) noexcept {
+    if (stage == Stage::kVertex) return 0;
+    if (stage == Stage::kPixel) return 1;
+    return 2;
+}
+
+const char* StageShortName(int slot) noexcept {
+    if (slot == 0) return "VS";
+    if (slot == 1) return "PS";
+    return "CS";
+}
+
+std::string FirstLineTrimmed(const std::string& text) {
+    const std::size_t nl = text.find('\n');
+    std::string line = (nl == std::string::npos) ? text : text.substr(0, nl);
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (line.size() > 140) line.resize(140);
+    return line;
+}
+
+bool AnalyseContainer(const RawContainerItem& item, AnalysedProgram& program, std::string& reason) {
+    reason.clear();
     const Stage stage_kind = StageOfType(item.type);
     const ConsoleContainerStage stage =
         bbx::d3d12::ReadConsoleContainerStage(item.container, item.type);
-    if (!stage.ok) return false;
+    if (!stage.ok) {
+        reason = stage.error.empty() ? "analyse: container stage" : ("analyse: " + stage.error);
+        return false;
+    }
     gcn::ShaderCode code;
-    if (!gcn::shader_code(item.container, code) || code.type != item.type) return false;
+    if (!gcn::shader_code(item.container, code) || code.type != item.type) {
+        reason = "analyse: shader_code";
+        return false;
+    }
 
     program = AnalysedProgram{};
     program.stage = stage_kind;
@@ -554,14 +583,20 @@ bool AnalyseContainer(const RawContainerItem& item, AnalysedProgram& program) {
     program.entry = item.entry;
 
     const gcn::Program prog = gcn::decode(program.words.data(), program.words.size());
-    if (!prog.errors.empty()) return false;
+    if (!prog.errors.empty()) {
+        reason = "decode: " + prog.errors.front().what;
+        return false;
+    }
 
     gcn::TranslateOptions paths_options;
     paths_options.stage = TranslateStage(stage_kind);
     paths_options.rsrc1 = stage.key.rsrc1;
     paths_options.rsrc2 = stage.key.rsrc2;
     const gcn::TranslateResult paths = gcn::translate(prog, paths_options);
-    if (!paths.errors.empty()) return false;
+    if (!paths.errors.empty()) {
+        reason = "translate: " + paths.errors.front();
+        return false;
+    }
 
     ConsoleStageKey key = stage.key;
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) {
@@ -572,6 +607,7 @@ bool AnalyseContainer(const RawContainerItem& item, AnalysedProgram& program) {
         std::string why;
         if (!bbx::d3d12::ConsolePsInputMap(stage, paths.ps_inputs, key.input_map, key.flat_mask,
                                           why)) {
+            reason = why.empty() ? "ps_input_map" : ("ps_input_map: " + why);
             return false;
         }
         key.early_fragment_tests = false;
@@ -655,6 +691,8 @@ bool ValidateCacheDir(const std::string& dir, std::string* report,
 
 struct CompiledProgramOutput {
     bool ok = false;
+    bool lifted = false;
+    std::string reason;
     CacheEntry entry;
     std::vector<std::uint8_t> packed_blob;
     std::string bindings_fragment;
@@ -666,11 +704,17 @@ CompiledProgramOutput CompileOneProgram(const PackagedDxcCompiler& compiler,
                                         const AnalysedProgram& program) {
     CompiledProgramOutput out;
     const gcn::Program decoded = gcn::decode(program.words.data(), program.words.size());
-    if (!decoded.errors.empty()) return out;
+    if (!decoded.errors.empty()) {
+        out.reason = "decode: " + decoded.errors.front().what;
+        return out;
+    }
 
     const gcn::TranslateOptions tr_opts = MakeTranslateOptions(program);
     const gcn::TranslateResult translated = gcn::translate(decoded, tr_opts);
-    if (!translated.errors.empty()) return out;
+    if (!translated.errors.empty()) {
+        out.reason = "translate: " + translated.errors.front();
+        return out;
+    }
 
     std::vector<BindingPlan> bindings;
     std::uint32_t pointer_bindings = 0;
@@ -704,25 +748,51 @@ CompiledProgramOutput CompileOneProgram(const PackagedDxcCompiler& compiler,
             lifted = gcn::lift_compute_shader(decoded, tr_opts, translated);
             break;
     }
-    const std::vector<std::uint32_t>& spv = lifted.ok() ? lifted.spirv : translated.spirv;
+    out.lifted = lifted.ok();
+    const std::vector<std::uint32_t>& spv = out.lifted ? lifted.spirv : translated.spirv;
 
     gcn::HlslOptions hlsl_opts;
     hlsl_opts.title = program.name;
     hlsl_opts.dxil_sm64 = true;
     const gcn::HlslResult hlsl = gcn::emit_hlsl(spv, hlsl_opts);
-    if (!hlsl.ok() || !hlsl.arguments.empty()) return out;
+    if (!hlsl.ok()) {
+        out.reason = "hlsl: " + (hlsl.errors.empty() ? std::string("failed") : hlsl.errors.front());
+        return out;
+    }
+    if (!hlsl.arguments.empty()) {
+        out.reason = "hlsl: needs " + hlsl.arguments.front();
+        return out;
+    }
 
     std::string why;
-    if (bbx::d3d12::Has64BitInteger(hlsl.source, why)) return out;
+    if (bbx::d3d12::Has64BitInteger(hlsl.source, why)) {
+        out.reason = "hlsl: 64-bit type (" + FirstLineTrimmed(why) + ")";
+        return out;
+    }
 
     std::vector<std::uint8_t> dxil_obj;
-    if (!compiler.Compile(program.stage, hlsl.source, dxil_obj, why)) return out;
-    if (!bbx::d3d12::IsSignedDxbc(dxil_obj, why)) return out;
+    if (!compiler.Compile(program.stage, hlsl.source, dxil_obj, why)) {
+        out.reason = "dxc: " + FirstLineTrimmed(why);
+        return out;
+    }
+    if (!bbx::d3d12::IsSignedDxbc(dxil_obj, why)) {
+        out.reason = "signature: " + FirstLineTrimmed(why);
+        return out;
+    }
     const DxilFeatures features = bbx::d3d12::DxilFeatureFlags(dxil_obj);
-    if (bbx::d3d12::HasForbiddenConsoleFeature(features)) return out;
+    if (bbx::d3d12::HasForbiddenConsoleFeature(features)) {
+        char fbuf[64] = {};
+        std::snprintf(fbuf, sizeof(fbuf), "dxil: forbidden SFI0 (present=%u flags=0x%x)",
+                      static_cast<unsigned>(features.present), features.flags);
+        out.reason = fbuf;
+        return out;
+    }
 
     std::vector<std::uint8_t> packed;
-    if (!DeflateBlob(dxil_obj, packed)) return out;
+    if (!DeflateBlob(dxil_obj, packed)) {
+        out.reason = "zlib: deflate failed";
+        return out;
+    }
 
     out.entry.key = program.key;
     out.entry.program_hash = program.program_hash;
@@ -852,6 +922,11 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
         (void)bbx::hostfs::Unlink(checkpoint_path);
     }
 
+    // Console DXIL SM 6.4 dialect: no native 16-bit half rounding and no runtime
+    // sample offsets (mirrors tools/bbx_bake_cache.cpp). Set once before threads.
+    gcn::set_native_half_rtz(false);
+    gcn::set_runtime_sample_offsets(false);
+
     // --- 2. Load packaged dxil.dll + dxcompiler.dll --------------------------
     PackagedDxcCompiler compiler;
     std::string load_error;
@@ -914,43 +989,111 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
         return result;
     }
 
-    // --- 4. Analyse & deduplicate by console stage key -----------------------
+    // --- 4. Analyse & deduplicate by console stage key (multi-threaded) ------
+    struct StageStats {
+        std::uint32_t containers = 0;
+        std::uint32_t analysed = 0;
+        std::uint32_t unique_keys = 0;
+        std::uint32_t lifted = 0;
+        std::uint32_t signed_ok = 0;
+        std::uint32_t refused = 0;
+    };
+    StageStats stage_stats[3]{};
+    std::map<std::string, std::uint32_t> refusal_reasons;
+
+    struct AnalysedSlot {
+        bool ok = false;
+        Stage stage = Stage::kPixel;
+        AnalysedProgram prog;
+        std::string reason;
+    };
+    std::vector<AnalysedSlot> analysed_slots(items.size());
+    std::atomic<std::size_t> next_analyse{0};
+    std::atomic<std::uint32_t> analyse_done{0};
+    std::atomic<std::uint32_t> analyse_refused_atomic{0};
+    std::mutex analyse_progress_mu;
+
+    auto analyse_worker = [&]() {
+        for (;;) {
+            if (progress.CancelRequested()) break;
+            const std::size_t i = next_analyse.fetch_add(1, std::memory_order_relaxed);
+            if (i >= items.size()) break;
+            AnalysedSlot& out_slot = analysed_slots[i];
+            out_slot.stage = StageOfType(items[i].type);
+            out_slot.ok = AnalyseContainer(items[i], out_slot.prog, out_slot.reason);
+            if (!out_slot.ok) {
+                analyse_refused_atomic.fetch_add(1, std::memory_order_relaxed);
+            }
+            const std::uint32_t done_now =
+                analyse_done.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if ((done_now & 31u) == 0u || done_now == static_cast<std::uint32_t>(items.size())) {
+                std::lock_guard<std::mutex> lock(analyse_progress_mu);
+                snap.phase = BakePhase::kAnalysing;
+                snap.done = done_now;
+                snap.total = static_cast<std::uint32_t>(items.size());
+                snap.refused_count = analyse_refused_atomic.load(std::memory_order_relaxed);
+                snap.workers = workers;
+                snap.elapsed_seconds = elapsed_sec();
+                snap.current_name = items[i].name;
+                progress.Update(snap);
+            }
+        }
+    };
+
+    if (workers <= 1u || items.size() < 64u) {
+        analyse_worker();
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (std::uint32_t t = 0; t < workers; ++t) {
+            pool.emplace_back(analyse_worker);
+        }
+        for (std::thread& th : pool) {
+            if (th.joinable()) th.join();
+        }
+    }
+
+    if (progress.CancelRequested()) {
+        result.cancelled = true;
+        result.summary = "shader_baker: cancelled while analysing";
+        compiler.Unload();
+        return result;
+    }
+
     std::vector<AnalysedProgram> unique_programs;
     unique_programs.reserve(items.size());
     std::unordered_map<std::uint64_t, bool> seen_keys;
     std::uint32_t analyse_refused = 0;
-
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        if (progress.CancelRequested()) {
-            result.cancelled = true;
-            result.summary = "shader_baker: cancelled while analysing";
-            compiler.Unload();
-            return result;
-        }
-        if ((i & 31u) == 0u || i + 1 == items.size()) {
-            snap.phase = BakePhase::kAnalysing;
-            snap.done = static_cast<std::uint32_t>(i + 1);
-            snap.total = static_cast<std::uint32_t>(items.size());
-            snap.refused_count = analyse_refused;
-            snap.elapsed_seconds = elapsed_sec();
-            snap.current_name = items[i].name;
-            progress.Update(snap);
-        }
-        AnalysedProgram prog;
-        if (!AnalyseContainer(items[i], prog)) {
+    for (std::size_t i = 0; i < analysed_slots.size(); ++i) {
+        AnalysedSlot& s = analysed_slots[i];
+        const int st = StageSlot(s.stage);
+        ++stage_stats[st].containers;
+        if (!s.ok) {
             ++analyse_refused;
+            ++stage_stats[st].refused;
+            const std::string key = std::string(StageShortName(st)) + " | " +
+                                    (s.reason.empty() ? std::string("analyse failed")
+                                                      : FirstLineTrimmed(s.reason));
+            ++refusal_reasons[key];
             continue;
         }
-        if (seen_keys.emplace(prog.key, true).second) {
-            unique_programs.push_back(std::move(prog));
+        ++stage_stats[st].analysed;
+        if (seen_keys.emplace(s.prog.key, true).second) {
+            ++stage_stats[st].unique_keys;
+            unique_programs.push_back(std::move(s.prog));
         }
     }
+    analysed_slots.clear();
+    analysed_slots.shrink_to_fit();
     // Free raw container bytes before entering DXC to minimize peak RAM.
     items.clear();
     items.shrink_to_fit();
 
-    LogMessage(Level::kInfo, "shader_baker: %zu unique shader key(s) to compile (%u skipped in analysis)",
-               unique_programs.size(), analyse_refused);
+    LogMessage(Level::kInfo,
+               "shader_baker: %zu unique shader key(s) to compile (%u skipped in analysis; "
+               "VS=%u PS=%u CS=%u)",
+               unique_programs.size(), analyse_refused, stage_stats[0].unique_keys,
+               stage_stats[1].unique_keys, stage_stats[2].unique_keys);
 
     // --- 4b. Resume prior checkpoint if present and matching this stamp ------
     std::vector<CacheEntry> entries;
@@ -978,6 +1121,7 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
             for (const CacheEntry& e : entries) {
                 resumed_keys.insert(e.key);
                 raw_dxil_bytes += e.raw_size;
+                ++stage_stats[StageSlot(e.stage)].signed_ok;
             }
             signed_count = static_cast<std::uint32_t>(entries.size());
             resumed_count = signed_count;
@@ -1074,6 +1218,8 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
 
             std::lock_guard<std::mutex> lock(merge_mu);
             ++completed_total;
+            const int st = StageSlot(program.stage);
+            if (compiled.lifted) ++stage_stats[st].lifted;
             if (compiled.ok) {
                 compiled.entry.offset = static_cast<std::uint32_t>(blobs.size());
                 entries.push_back(compiled.entry);
@@ -1082,6 +1228,7 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                 raw_dxil_bytes += compiled.raw_dxil_bytes;
                 planned_bindings += compiled.binding_count;
                 ++signed_count;
+                ++stage_stats[st].signed_ok;
                 ++newly_signed_since_checkpoint;
                 if (newly_signed_since_checkpoint >= kCheckpointInterval) {
                     newly_signed_since_checkpoint = 0;
@@ -1089,6 +1236,12 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                 }
             } else {
                 ++compile_refused;
+                ++stage_stats[st].refused;
+                const std::string key = std::string(StageShortName(st)) + " | " +
+                                        (compiled.reason.empty()
+                                             ? std::string("compile failed")
+                                             : FirstLineTrimmed(compiled.reason));
+                ++refusal_reasons[key];
             }
             if ((completed_total & 3u) == 0u || completed_total == unique_programs.size()) {
                 publish_progress_locked(program.name);
@@ -1136,6 +1289,32 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
 
     unique_programs.clear();
     unique_programs.shrink_to_fit();
+
+    // Emit per-stage scorecard and top refusal reasons so console logs pinpoint
+    // exactly why any shader was skipped or rejected by DXIL SM 6.4 lowering/DXC.
+    for (int st = 0; st < 3; ++st) {
+        LogMessage(Level::kInfo,
+                   "shader_baker: stage %s: containers=%u analysed=%u keys=%u lifted=%u signed=%u refused=%u",
+                   StageShortName(st), stage_stats[st].containers, stage_stats[st].analysed,
+                   stage_stats[st].unique_keys, stage_stats[st].lifted, stage_stats[st].signed_ok,
+                   stage_stats[st].refused);
+    }
+    if (!refusal_reasons.empty()) {
+        std::vector<std::pair<std::uint32_t, std::string>> ranked;
+        ranked.reserve(refusal_reasons.size());
+        for (const auto& [reason, count] : refusal_reasons) {
+            ranked.emplace_back(count, reason);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first != b.first ? (a.first > b.first) : (a.second < b.second);
+                  });
+        const std::size_t limit = std::min<std::size_t>(ranked.size(), 12u);
+        for (std::size_t i = 0; i < limit; ++i) {
+            LogMessage(Level::kInfo, "shader_baker: refused [%u] %s",
+                       ranked[i].first, ranked[i].second.c_str());
+        }
+    }
 
     if (entries.empty()) {
         result.refused_count = compile_refused;

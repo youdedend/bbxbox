@@ -33,8 +33,9 @@ struct GuestRequest {
 
 // Loads, patches and starts the guest on its own thread. True when the thread
 // is running (the launcher then keeps drawing while the game boots); false when
-// the eboot could not be used, with the reason in the log.
+// the eboot could not be used, with the reason in the log and LastStartError().
 bool StartGuest(const GuestRequest& req);
+[[nodiscard]] std::string LastStartError();
 
 // True between StartGuest's success and the guest's `_start` returning.
 bool Running();

@@ -563,4 +563,80 @@ FselfResult UnwrapOrbisFile(const char* path) {
     return result;
 }
 
+Eboot109AnchorCheck VerifyBloodborne109CodeAnchors(const void* guest_base, std::size_t guest_size,
+                                                   std::uint64_t entry_elf_va) {
+    struct Anchor {
+        const char* name;
+        std::uint64_t elf_va;
+        const std::uint8_t* bytes;
+        std::size_t size;
+    };
+
+    static constexpr std::uint8_t kSoundICtor[] = {
+        0x48, 0x8d, 0x47, 0x08, 0x48, 0x89, 0x47, 0x08, 0x48, 0x89,
+        0x47, 0x10, 0x48, 0xc7, 0x47, 0x18, 0x00, 0x00, 0x00, 0x00};
+    static constexpr std::uint8_t kFmgLookup[] = {
+        0x89, 0xf0, 0x48, 0x8b, 0x77, 0x08, 0x48, 0x8b,
+        0x34, 0xc6, 0x31, 0xc0, 0x48, 0x85, 0xf6};
+    static constexpr std::uint8_t kCharaStep[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+        0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x40};
+    static constexpr std::uint8_t kFrameManager[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+        0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
+    static constexpr std::uint8_t kYebisRecord[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+        0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28, 0x4d, 0x89, 0xcd};
+    static constexpr std::uint8_t kRenderView[] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+        0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xa8, 0x0e, 0x00, 0x00};
+
+    static constexpr Anchor kAnchors[] = {
+        {"SoundI::Ctor", 0x11bd0f0ull, kSoundICtor, sizeof(kSoundICtor)},
+        {"FmgLookup", 0x136f340ull, kFmgLookup, sizeof(kFmgLookup)},
+        {"CharaStep", 0x2043ee0ull, kCharaStep, sizeof(kCharaStep)},
+        {"FrameManager", 0x2434770ull, kFrameManager, sizeof(kFrameManager)},
+        {"YebisRecord", 0x25d4860ull, kYebisRecord, sizeof(kYebisRecord)},
+        {"RenderView", 0x269e990ull, kRenderView, sizeof(kRenderView)},
+    };
+    constexpr std::uint64_t kExpectedEntry = 0xa0ull;
+
+    Eboot109AnchorCheck out;
+    out.entry_ok = (entry_elf_va == kExpectedEntry);
+    out.total = sizeof(kAnchors) / sizeof(kAnchors[0]);
+    if (guest_base == nullptr || guest_size == 0) {
+        out.detail = "empty guest image";
+        return out;
+    }
+
+    const auto* base = static_cast<const std::uint8_t*>(guest_base);
+    std::string misses;
+    for (const Anchor& anchor : kAnchors) {
+        const bool in_bounds = anchor.elf_va <= guest_size &&
+                               anchor.size <= guest_size - anchor.elf_va;
+        if (in_bounds && std::memcmp(base + anchor.elf_va, anchor.bytes, anchor.size) == 0) {
+            ++out.matched;
+        } else {
+            if (!misses.empty()) misses += ", ";
+            misses += anchor.name;
+        }
+    }
+
+    char buf[192] = {};
+    if (out.ok()) {
+        std::snprintf(buf, sizeof(buf), "entry=0x%llx, %zu/%zu prologues matched",
+                      static_cast<unsigned long long>(entry_elf_va), out.matched, out.total);
+        out.detail = buf;
+    } else {
+        std::snprintf(buf, sizeof(buf), "entry=0x%llx (%s), %zu/%zu matched",
+                      static_cast<unsigned long long>(entry_elf_va),
+                      out.entry_ok ? "ok" : "want 0xa0", out.matched, out.total);
+        out.detail = buf;
+        if (!misses.empty()) {
+            out.detail += " (miss: " + misses + ")";
+        }
+    }
+    return out;
+}
+
 }  // namespace bbx::core
