@@ -558,6 +558,8 @@ void menu_sound_post(int id, int priority) {  }
 bool option_menu_click_decides(void* list, int index) { return {}; }
 void option_menu_confirm_ask(std::uint32_t message) {  }
 void option_menu_confirm_close() {  }
+bool option_menu_confirm_possible() { return false; }
+int option_menu_confirm_take() { return 0; }
 void option_menu_install(ElfImage* image) {  }
 void option_menu_list_update(void* comp, bool focused) {  }
 void option_menu_poll() {  }
@@ -912,6 +914,11 @@ bool host_window_desktop_size(int* w, int* h) {
     if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
     return true;
 }
+bool host_window_display_now(int* w, int* h) {
+    if (w != nullptr) *w = g_display_w.load(std::memory_order_relaxed);
+    if (h != nullptr) *h = g_display_h.load(std::memory_order_relaxed);
+    return true;
+}
 void host_window_error_box(const char* title, const char* text) {
     bbx::platform::LogMessage(bbx::platform::Level::kError, "%s: %s",
                               title != nullptr ? title : "error",
@@ -1015,6 +1022,11 @@ void keep_off_pool_cpus() {  }
 void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed) {  }
 void cp_look_begin(std::uint64_t id) {  }
 void cp_look_end() {  }
+void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
+    (void)wait_ns;
+    (void)cap_fps;
+    (void)loading;
+}
 void pool_report(bool at_exit) {  }
 }  // namespace gxvk_lists
 
