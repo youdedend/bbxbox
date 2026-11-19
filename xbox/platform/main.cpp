@@ -2176,7 +2176,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             const auto hdmi =
                 winrt::Windows::Graphics::Display::Core::HdmiDisplayInformation::GetForCurrentView();
             if (hdmi) {
-                hdmi_mode_changed_token_ = hdmi.DisplayModeChanged([](const auto&, const auto&) {
+                hdmi_mode_changed_token_ = hdmi.DisplayModesChanged([](const auto&, const auto&) {
                     g_pending_resize_w.store(0, std::memory_order_relaxed);
                     g_pending_resize_h.store(0, std::memory_order_relaxed);
                     g_display_resize_pending.store(true, std::memory_order_release);
