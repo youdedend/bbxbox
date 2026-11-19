@@ -35,9 +35,11 @@ while IFS= read -r file; do files+=("$file"); done < <(
       # The UWP platform TUs that avoid C++/WinRT: the D3D12 session takes an
       # IUnknown* and SDK headers only, precisely so it lands in this check.
       ls "$root"/xbox/platform/d3d12_session.cpp 2>/dev/null
-      # The compute and graphics executors: SDK headers and the translator, no C++/WinRT.
+      # The compute and graphics executors and on-console first-boot shader baker:
+      # SDK headers and the translator, no C++/WinRT.
       ls "$root"/xbox/platform/guest_compute.cpp 2>/dev/null
       ls "$root"/xbox/platform/guest_graphics.cpp 2>/dev/null
+      ls "$root"/xbox/platform/shader_baker.cpp 2>/dev/null
     }
 )
 
@@ -73,8 +75,9 @@ for file in "${files[@]}"; do
     output=$("$cxx" -fsyntax-only -std=c++20 -Wall -Wextra -Werror \
         "${extra[@]}" -fno-exceptions \
         -Wno-unused-parameter -Wno-ignored-attributes \
-        -D_WIN32 -DBBX_UWP=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \
+        -D_WIN32 -DBBX_UWP=1 -DBBX_HAVE_ZLIB=1 -DUNICODE -D_UNICODE -DWINAPI_FAMILY=WINAPI_FAMILY_APP \
         -isystem "$stubs" -I"$root" -I"$root/src" -I"$root/upstream/bbhost/src" \
+        -I"$root/upstream/third_party/zlib" \
         "$file" 2>&1)
     if [ $? -ne 0 ]; then
         echo "syntax_check: FAIL: $(basename "$file")"

@@ -243,8 +243,8 @@ fi
 if ! grep -q -- "-T" xbox/scripts/dxc-run.ps1; then
   fail "dxc-run.ps1 must pass an explicit -T profile"
 fi
-if grep -Eq 'Copy-Item.*(dxcompiler|dxil)' xbox/scripts/package.ps1; then
-  fail "package.ps1 still copies a shader compiler into the package; DXIL is build-time only"
+if ! grep -q 'dxcompiler\.dll' xbox/scripts/package.ps1 || ! grep -q 'dxil\.dll' xbox/scripts/package.ps1; then
+  fail "package.ps1 must stage dxil.dll and dxcompiler.dll for native first-boot shader baking"
 fi
 if ! grep -q "spirv_to_dxil" docs/ARCHITECTURE_XBOX_D3D12.md; then
   fail "docs/ARCHITECTURE_XBOX_D3D12.md must state the SPIR-V -> DXIL plan for guest shaders"

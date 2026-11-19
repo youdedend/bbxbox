@@ -173,6 +173,11 @@ DWORD GetLastError();
 void Sleep(DWORD milliseconds);
 DWORD GetCurrentThreadId();
 
+using FARPROC = INT_PTR(WINAPI*)();
+HMODULE LoadPackagedLibrary(LPCWSTR lib_file_name, DWORD reserved);
+FARPROC GetProcAddress(HMODULE module, LPCSTR proc_name);
+BOOL FreeLibrary(HMODULE module);
+
 template <class T>
 void SecureZeroMemory(T* destination, SIZE_T bytes) {
     auto* bytes_ptr = reinterpret_cast<volatile unsigned char*>(destination);

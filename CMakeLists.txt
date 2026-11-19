@@ -59,6 +59,7 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_budget.cpp
     src/host/d3d12/bbx_cache.cpp
     src/host/d3d12/bbx_shader_cache.cpp
+    src/host/d3d12/bbx_shader_bake.cpp
     src/host/d3d12/bbx_quarantine.cpp
     src/host/d3d12/bbx_precompile.cpp
     src/host/d3d12/bbx_descriptors.cpp
@@ -174,6 +175,7 @@ if(BBX_BUILD_TESTS)
         tests/hostfs_tree_test.cpp
         tests/save_commit_test.cpp
         tests/shaders_test.cpp
+        tests/shader_bake_test.cpp
         tests/guest_core_test.cpp
         tests/guest_core_stubs.cpp
     )

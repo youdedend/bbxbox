@@ -570,79 +570,74 @@ struct GuestCompute::Impl {
             return;
         }
         cache_tried = true;
-        std::string dir;
-        std::string path;
+        bool saw_any = false;
         for (const std::string& candidate : dirs) {
-            const std::string probe = Join(candidate, "bbx_shaders.cache");
-            if (bbx::hostfs::Exists(probe)) {
-                dir = candidate;
-                path = probe;
-                break;
+            const std::string path = Join(candidate, "bbx_shaders.cache");
+            if (!bbx::hostfs::Exists(path)) continue;
+            saw_any = true;
+            bbx::hostfs::FileStat stat{};
+            if (!bbx::hostfs::Stat(path, &stat) || stat.size == 0 || stat.size > (256u << 20)) {
+                cache_line = "shader cache: " + path + " is empty or implausible; skipping";
+                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                continue;
             }
-        }
-        if (path.empty()) {
-            cache_line = "shader cache: bbx_shaders.cache is missing under " + dirs.front() +
-                         "; no guest dispatch can be built (run the bake)";
-            LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
-            return;
-        }
-        cache_dir = dir;
-        bbx::hostfs::FileStat stat{};
-        if (!bbx::hostfs::Stat(path, &stat) || stat.size == 0 || stat.size > (256u << 20)) {
-            cache_line = "shader cache: " + path + " is empty or implausible; refused";
-            LogMessage(Level::kError, "guest compute: %s", cache_line.c_str());
-            return;
-        }
-        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(stat.size));
-        const int handle = bbx::hostfs::Open(path, bbx::hostfs::kRead);
-        if (handle < 0) {
-            cache_line = "shader cache: " + path + " would not open";
-            LogMessage(Level::kError, "guest compute: %s", cache_line.c_str());
-            return;
-        }
-        std::size_t read = 0;
-        while (read < bytes.size()) {
-            const std::int64_t got = bbx::hostfs::Read(handle, bytes.data() + read, bytes.size() - read);
-            if (got <= 0) break;
-            read += static_cast<std::size_t>(got);
-        }
-        (void)bbx::hostfs::Close(handle);
-        if (read != bytes.size()) {
-            cache_line = "shader cache: " + path + " read short";
-            LogMessage(Level::kError, "guest compute: %s", cache_line.c_str());
-            return;
-        }
-        // The stamp beside it: `bbx_bake_cache` writes `<cache>.stamp.txt`, with
-        // a legacy fallback to `bbx_shaders.stamp`.
-        std::string stamp;
-        std::string stamp_path = path + ".stamp.txt";
-        if (!bbx::hostfs::Exists(stamp_path)) {
-            stamp_path = Join(dir, "bbx_shaders.stamp");
-        }
-        if (bbx::hostfs::Exists(stamp_path)) {
-            bbx::hostfs::FileStat stamp_stat{};
-            if (bbx::hostfs::Stat(stamp_path, &stamp_stat) && stamp_stat.size < (1u << 16)) {
-                stamp.resize(static_cast<std::size_t>(stamp_stat.size));
-                const int sh = bbx::hostfs::Open(stamp_path, bbx::hostfs::kRead);
-                if (sh >= 0) {
-                    std::size_t got_total = 0;
-                    while (got_total < stamp.size()) {
-                        const std::int64_t got = bbx::hostfs::Read(sh, stamp.data() + got_total, stamp.size() - got_total);
-                        if (got <= 0) break;
-                        got_total += static_cast<std::size_t>(got);
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(stat.size));
+            const int handle = bbx::hostfs::Open(path, bbx::hostfs::kRead);
+            if (handle < 0) {
+                cache_line = "shader cache: " + path + " would not open";
+                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                continue;
+            }
+            std::size_t read = 0;
+            while (read < bytes.size()) {
+                const std::int64_t got = bbx::hostfs::Read(handle, bytes.data() + read, bytes.size() - read);
+                if (got <= 0) break;
+                read += static_cast<std::size_t>(got);
+            }
+            (void)bbx::hostfs::Close(handle);
+            if (read != bytes.size()) {
+                cache_line = "shader cache: " + path + " read short";
+                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                continue;
+            }
+            // The stamp beside it: `<cache>.stamp.txt`, with legacy fallback `bbx_shaders.stamp`.
+            std::string stamp;
+            std::string stamp_path = path + ".stamp.txt";
+            if (!bbx::hostfs::Exists(stamp_path)) {
+                stamp_path = Join(candidate, "bbx_shaders.stamp");
+            }
+            if (bbx::hostfs::Exists(stamp_path)) {
+                bbx::hostfs::FileStat stamp_stat{};
+                if (bbx::hostfs::Stat(stamp_path, &stamp_stat) && stamp_stat.size < (1u << 16)) {
+                    stamp.resize(static_cast<std::size_t>(stamp_stat.size));
+                    const int sh = bbx::hostfs::Open(stamp_path, bbx::hostfs::kRead);
+                    if (sh >= 0) {
+                        std::size_t got_total = 0;
+                        while (got_total < stamp.size()) {
+                            const std::int64_t got =
+                                bbx::hostfs::Read(sh, stamp.data() + got_total, stamp.size() - got_total);
+                            if (got <= 0) break;
+                            got_total += static_cast<std::size_t>(got);
+                        }
+                        (void)bbx::hostfs::Close(sh);
+                        stamp.resize(got_total);
                     }
-                    (void)bbx::hostfs::Close(sh);
-                    stamp.resize(got_total);
                 }
             }
+            const d3d12::CacheStatus status = cache.Load(bytes, stamp);
+            cache_line = "shader cache: " + path + ", " + cache.Report();
+            if (status == d3d12::CacheStatus::kOk) {
+                cache_dir = candidate;
+                LogMessage(Level::kInfo, "guest compute: %s", cache_line.c_str());
+                return;
+            }
+            LogMessage(Level::kWarn, "guest compute: %s (%s); checking next location",
+                       cache_line.c_str(), d3d12::CacheStatusName(status));
         }
-        const d3d12::CacheStatus status = cache.Load(bytes, stamp);
-        cache_line = "shader cache: " + path + ", " + cache.Report();
-        if (status == d3d12::CacheStatus::kOk) {
-            LogMessage(Level::kInfo, "guest compute: %s", cache_line.c_str());
-        } else {
-            LogMessage(Level::kError, "guest compute: %s (%s)", cache_line.c_str(),
-                       d3d12::CacheStatusName(status));
+        if (!saw_any) {
+            cache_line = "shader cache: bbx_shaders.cache is missing under " + dirs.front() +
+                         " and data root; no guest dispatch can be built";
+            LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
         }
     }
 

@@ -820,15 +820,17 @@ DWORD WINAPI GuestMain(void* p) {
 
 namespace {
 
-// <dump>/bbx_shaders.cache and its sidecar, else the LocalState copy of both.
-// Both are read through the host-fs seam: a dump arrives through a
+// <dump>/bbx_shaders.cache and its sidecar, else LocalState\data (where the
+// on-console first-boot baker writes), else the LocalState root copy of both.
+// All are read through the host-fs seam: a dump arrives through a
 // FutureAccessList token, which fopen cannot open on the console.
-void LoadShaderCache(const std::string& eboot) {
+void LoadShaderCache(const std::string& eboot, const std::string& data_dir) {
     std::string dir;
     const std::size_t slash = eboot.find_last_of("\\/");
     if (slash != std::string::npos) dir = eboot.substr(0, slash + 1);
     std::vector<std::string> candidates;
     if (!dir.empty()) candidates.push_back(dir + "bbx_shaders.cache");
+    if (!data_dir.empty()) candidates.push_back(bbx::hostfs::JoinPath(data_dir, "bbx_shaders.cache"));
     candidates.push_back(bbx::platform::Local("bbx_shaders.cache"));
     for (const std::string& path : candidates) {
         std::vector<std::uint8_t> bytes;
@@ -838,7 +840,7 @@ void LoadShaderCache(const std::string& eboot) {
         // it, which is what ExpectedConsoleStamp pairs with this build's target.
         if (!bbx::hostfs::ReadFileAll(path + ".stamp.txt", &stamp)) {
             bbx::platform::LogMessage(bbx::platform::Level::kWarn,
-                                      "shader_cache: %s has no .stamp.txt beside it; not used", path.c_str());
+                                      "shader_cache: %s has no .stamp.txt beside it; skipping", path.c_str());
             continue;
         }
         const std::string stamp_text(reinterpret_cast<const char*>(stamp.data()), stamp.size());
@@ -846,10 +848,10 @@ void LoadShaderCache(const std::string& eboot) {
         bbx::platform::LogF("shader_cache: status=%s entries=%zu bytes=%zu path=%s detail=%s",
                             bbx::d3d12::CacheStatusName(status), g_shader_cache.entries(), g_shader_cache.bytes(),
                             path.c_str(), g_shader_cache.detail().c_str());
-        return;
+        if (status == bbx::d3d12::CacheStatus::kOk) return;
     }
     bbx::platform::LogMessage(bbx::platform::Level::kInfo,
-                              "shader_cache: none in the dump or LocalState; every program is lifted on this machine");
+                              "shader_cache: no valid cache in dump or LocalState");
 }
 
 }  // namespace
@@ -911,11 +913,11 @@ bool StartGuest(const GuestRequest& req) {
                                   "into the wrong places");
     }
 
-    // The baked shaders, if the dump carries the cache: compiled for this
-    // target on a PC, so the guest's own programs do not have to be lifted and
-    // compiled at the frame they are first drawn.
+    // The baked shaders, from the dump or from LocalState\data (produced by the
+    // on-console first-boot baker): compiled for this build's DXIL 6.4 target so
+    // the guest draws with zero shader compilation overhead at runtime.
     bbx::platform::LogCrumb("boot:shader_cache");
-    LoadShaderCache(g_eboot_path);
+    LoadShaderCache(g_eboot_path, req.data);
 
     bbx::platform::LogCrumb("boot:patch_guest");
     // The instructions this processor cannot run (BMI1, LZCNT, MOVBE), rewritten

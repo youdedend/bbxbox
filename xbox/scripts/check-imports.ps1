@@ -297,7 +297,7 @@ if ($notices.Count -gt 0) {
 # and the module list goes to an annotation, because a run's log is not always
 # reachable afterwards. The three are the ones a load failure can come from: the
 # port's own image, and the two DLLs the package ships.
-$watched = @("bbxbox.exe", "SDL3.dll", "libuwp.dll")
+$watched = @("bbxbox.exe", "SDL3.dll", "libuwp.dll", "dxil.dll", "dxcompiler.dll")
 $importLogDir = Split-Path $PackageDir -Parent
 foreach ($name in $watched) {
     $path = Join-Path $PackageDir $name

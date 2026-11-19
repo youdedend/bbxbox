@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Unit tests for portable DXIL validation, PS4 shader container inspection,
+// eboot scanning, and TV HUD progress formatting used by the on-Xbox baker.
+
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "harness.h"
+#include "host/d3d12/bbx_shader_bake.h"
+
+namespace {
+
+using namespace bbx::d3d12;
+
+std::vector<std::uint8_t> MakeDxbcWithSfi0(bool signed_digest, bool include_sfi0,
+                                           std::uint32_t sfi0_flags) {
+    const std::uint32_t part_count = include_sfi0 ? 1u : 0u;
+    const std::size_t sfi0_off = 32 + 4 * static_cast<std::size_t>(part_count);
+    std::vector<std::uint8_t> blob(sfi0_off + (include_sfi0 ? 16u : 0u), 0);
+    std::memcpy(blob.data(), "DXBC", 4);
+    if (signed_digest) {
+        blob[4] = 0xAA;
+        blob[19] = 0x55;
+    }
+    std::memcpy(blob.data() + 28, &part_count, 4);
+    if (include_sfi0) {
+        const std::uint32_t off32 = static_cast<std::uint32_t>(sfi0_off);
+        std::memcpy(blob.data() + 32, &off32, 4);
+        std::memcpy(blob.data() + sfi0_off, "SFI0", 4);
+        const std::uint32_t chunk_size = 8u;
+        std::memcpy(blob.data() + sfi0_off + 4, &chunk_size, 4);
+        std::memcpy(blob.data() + sfi0_off + 8, &sfi0_flags, 4);
+    }
+    return blob;
+}
+
+std::vector<std::uint8_t> MakeFakePs4Container(std::uint8_t type, std::uint32_t hash) {
+    std::vector<std::uint8_t> c(0x80, 0);
+    std::memcpy(c.data(), "Shdr", 4);
+    c[8] = type;
+    const std::size_t footer = c.size() - 28;
+    std::memcpy(c.data() + footer, "OrbShdr", 7);
+    std::memcpy(c.data() + footer + 16, &hash, 4);
+    return c;
+}
+
+TEST(shader_bake_signed_dxbc_gate) {
+    std::string why;
+    const std::vector<std::uint8_t> signed_blob = MakeDxbcWithSfi0(true, true, 0u);
+    CHECK(IsSignedDxbc(signed_blob, why));
+    CHECK(why.empty());
+
+    const std::vector<std::uint8_t> unsigned_blob = MakeDxbcWithSfi0(false, true, 0u);
+    CHECK(!IsSignedDxbc(unsigned_blob, why));
+    CHECK(why.find("unsigned") != std::string::npos);
+
+    const std::vector<std::uint8_t> tiny = {'D', 'X', 'B', 'C'};
+    CHECK(!IsSignedDxbc(tiny, why));
+}
+
+TEST(shader_bake_sfi0_feature_gate) {
+    const std::vector<std::uint8_t> clean = MakeDxbcWithSfi0(true, true, 0x10u);
+    const DxilFeatures f_clean = DxilFeatureFlags(clean);
+    CHECK(f_clean.present);
+    CHECK_EQ(f_clean.flags, 0x10u);
+    CHECK(!HasForbiddenConsoleFeature(f_clean));
+
+    const std::vector<std::uint8_t> int64 = MakeDxbcWithSfi0(true, true, kDxilFeatureInt64);
+    CHECK(HasForbiddenConsoleFeature(DxilFeatureFlags(int64)));
+
+    const std::vector<std::uint8_t> fp16 = MakeDxbcWithSfi0(true, true, kDxilFeatureNative16Bit);
+    CHECK(HasForbiddenConsoleFeature(DxilFeatureFlags(fp16)));
+
+    const std::vector<std::uint8_t> no_sfi0 = MakeDxbcWithSfi0(true, false, 0u);
+    CHECK(HasForbiddenConsoleFeature(DxilFeatureFlags(no_sfi0)));
+}
+
+TEST(shader_bake_64bit_hlsl_gate) {
+    std::string what;
+    CHECK(!Has64BitInteger("float4 main(uint id : SV_VertexID) : SV_Position { return 0; }", what));
+    CHECK(Has64BitInteger("void main() { uint64_t x = 1; }", what));
+    CHECK(what.find("uint64_t") != std::string::npos);
+    CHECK(Has64BitInteger("void main() { double d = 1.0; }", what));
+}
+
+TEST(shader_bake_bundle_filename_filter) {
+    CHECK(IsShaderBundleFilename("GXShader.shaderbnd.dcx"));
+    CHECK(IsShaderBundleFilename("GXShader.SHADERBND.DCX"));
+    CHECK(IsShaderBundleFilename("test.shaderbnddebug.dcx"));
+    CHECK(!IsShaderBundleFilename("eboot.bin"));
+    CHECK(!IsShaderBundleFilename("shader.dcx"));
+    CHECK(!IsShaderBundleFilename("map.mapbnd.dcx"));
+}
+
+TEST(shader_bake_container_inspection_and_eboot_scan) {
+    const std::vector<std::uint8_t> vs = MakeFakePs4Container(1, 0x1234abcdU);
+    CHECK_EQ(ContainerType(vs), 1);
+    CHECK_EQ(ContainerName(vs), std::string("1234abcd"));
+
+    const std::vector<std::uint8_t> cs = MakeFakePs4Container(4, 0xdeadbeefU);
+    CHECK_EQ(ContainerType(cs), 4);
+    CHECK_EQ(ContainerName(cs), std::string("deadbeef"));
+
+    // Embed two containers in a synthetic ELF buffer with padding between them.
+    std::vector<std::uint8_t> elf(0x40, 0xCC);
+    elf.insert(elf.end(), vs.begin(), vs.end());
+    elf.insert(elf.end(), 0x20, 0x00);
+    elf.insert(elf.end(), cs.begin(), cs.end());
+    const std::vector<EmbeddedContainerSpan> found = ScanEbootForContainers(elf);
+    CHECK_EQ(found.size(), 2u);
+    CHECK_EQ(found[0].type, 1u);
+    CHECK_EQ(found[0].name, std::string("1234abcd"));
+    CHECK_EQ(found[1].type, 4u);
+    CHECK_EQ(found[1].name, std::string("deadbeef"));
+}
+
+TEST(shader_bake_hud_progress_line) {
+    BakeProgressSnapshot snap;
+    snap.phase = BakePhase::kCompiling;
+    snap.done = 500;
+    snap.total = 2000;
+    snap.signed_count = 490;
+    snap.refused_count = 8;
+    snap.quarantined_count = 2;
+    snap.elapsed_seconds = 42;
+    const std::string line = FormatBakeHudLine(snap);
+    CHECK(line.find("COMPILING DXIL 6.4") != std::string::npos);
+    CHECK(line.find("500 / 2000 (25%)") != std::string::npos);
+    CHECK(line.find("OK 490") != std::string::npos);
+    CHECK(line.find("SKIP 10") != std::string::npos);
+    CHECK(line.find("[42s]") != std::string::npos);
+}
+
+}  // namespace

@@ -183,6 +183,7 @@ set(BBX_D3D12_SOURCES
     # half's first step (host_gpu_d3d12.cpp's host_gpu_draw reads it).
     ../src/host/d3d12/bbx_guest_draw.cpp
     ../src/host/d3d12/bbx_guest_root.cpp
+    ../src/host/d3d12/bbx_shader_bake.cpp
     platform/guest_compute.cpp
     platform/guest_graphics.cpp
 )
@@ -204,6 +205,7 @@ set(BBX_APP_SOURCES
     platform/hud.cpp
     platform/d3d12_session.cpp
     platform/shaders.cpp
+    platform/shader_baker.cpp
     # The one translation unit that includes bbhost's own host headers and
     # answers them on the console's behalf (see the file's head comment).
     platform/bbhost_bridge.cpp
@@ -270,6 +272,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 target_compile_definitions(bbxbox PRIVATE
     BBX_UWP=1
+    BBX_HAVE_ZLIB=1
     # windows.h's min/max macros versus std::min/std::max in the same file.
     NOMINMAX
     WINAPI_FAMILY=WINAPI_FAMILY_APP

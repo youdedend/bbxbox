@@ -66,11 +66,18 @@ foreach ($dll in @("sdl3\bin\SDL3.dll", "libuwp\bin\libuwp.dll")) {
     $path = Join-Path $prefix $dll
     if (Test-Path $path) { Copy-Item $path (Join-Path $layout (Split-Path $path -Leaf)) }
 }
-# No shader compiler in the package. Every fixed pass is DXIL compiled at build
-# time (xbox/shaders/*.hlsl -> bbx_shaders_generated.h); shipping
-# dxcompiler.dll and hoping LoadPackagedLibrary accepts its desktop imports was
-# the single point of failure the port is built without. The guest's shaders go
-# SPIR-V -> DXIL in memory (P3), which needs no packaged compiler either.
+# Fixed passes (xbox/shaders/*.hlsl) are still compiled at build time into
+# bbx_shaders_generated.h. For Bloodborne's guest shaders, ship the pinned x64
+# dxil.dll + dxcompiler.dll so the console can bake bbx_shaders.cache natively
+# on first launch (via LoadPackagedLibrary) and unload both DLLs (FreeLibrary)
+# before allocating guest RAM (0 MiB compiler overhead during gameplay).
+foreach ($dxcDll in @("dxc\dxil.dll", "dxc\dxcompiler.dll")) {
+    $dxcPath = Join-Path $prefix $dxcDll
+    if (-not (Test-Path $dxcPath)) {
+        throw "missing required on-console shader compiler payload: $dxcPath (run xbox/scripts/build-deps.ps1)"
+    }
+    Copy-Item $dxcPath (Join-Path $layout (Split-Path $dxcPath -Leaf))
+}
 
 Copy-Item (Join-Path $Root "xbox\AppxManifest.xml") (Join-Path $layout "AppxManifest.xml")
 $assets = Join-Path $Root "xbox\Assets"

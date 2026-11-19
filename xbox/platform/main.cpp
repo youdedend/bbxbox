@@ -56,6 +56,7 @@
 #include "xbox/platform/launcher.h"
 #include "xbox/platform/log.h"
 #include "xbox/platform/memory_selftest.h"
+#include "xbox/platform/shader_baker.h"
 #include "xbox/platform/storage.h"
 #include "xbox/platform/ux.h"
 
@@ -74,6 +75,12 @@ struct Session {
     bool keyboard_open = false;
     bool quit = false;
     bool start_requested = false;
+    bool baking = false;
+    std::atomic<bool> bake_finished{false};
+    bbx::platform::BakeProgressState bake_progress;
+    bbx::platform::BakeResult bake_result;
+    std::thread bake_thread;
+    bbx::bridge::GuestRequest pending_guest_req;
     std::string usb_token;
     std::string patch_token;
     // The only renderer: device, 4K swapchain, pipelines, replay and the HUD. A
@@ -661,7 +668,9 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
 
     const std::vector<std::string> footer_lines = WrapLines(g_session.model.Footer());
     const std::size_t body_rows =
-        g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size();
+        g_session.baking
+            ? 6u
+            : (g_session.keyboard_open ? (1 + g_session.keyboard.RowCount()) : g_session.model.items.size());
     const float panel_height =
         line * static_cast<float>(2 + footer_lines.size() + body_rows) + margin;
     hud.Panel(margin, margin, width - margin * 2.0f, panel_height, bbx::platform::HudColor::Panel());
@@ -1284,6 +1293,29 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     emergency_holding = false;
                 }
                 previous = held;
+            } else if (g_session.baking) {
+                emergency_holding = false;
+                previous = held;
+                if (g_session.bake_finished.load(std::memory_order_acquire)) {
+                    if (g_session.bake_thread.joinable()) g_session.bake_thread.join();
+                    g_session.baking = false;
+                    g_session.bake_finished.store(false, std::memory_order_relaxed);
+                    bbx::platform::LogMirroredMessage(
+                        g_session.bake_result.ok ? bbx::platform::Level::kInfo
+                                                 : bbx::platform::Level::kWarn,
+                        "launcher: first-boot shader bake finished (%s): %s",
+                        g_session.bake_result.ok ? "ok" : "incomplete",
+                        g_session.bake_result.summary.c_str());
+                    if (!g_session.bake_result.cancelled) {
+                        if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
+                            guest_ever_started = true;
+                        } else {
+                            bbx::platform::LogMessage(
+                                bbx::platform::Level::kError,
+                                "launcher: the guest did not start after baking; staying in the launcher");
+                        }
+                    }
+                }
             } else {
                 emergency_holding = false;
                 bbx::platform::PadEdges edges;
@@ -1298,7 +1330,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
 
             DrawFrame();
 
-            if (g_session.start_requested) {
+            if (g_session.start_requested && !g_session.baking) {
                 bbx::platform::LogF("launcher: start requested (version %s)",
                                     g_session.layout.EffectiveVersion().c_str());
                 g_session.start_requested = false;
@@ -1318,14 +1350,61 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     req.mods = g_session.layout.base_path + "\\mods";
                 }
                 req.modded_eboot_ok = g_session.model.modded_eboot_ok;
-                if (bbx::bridge::StartGuest(req)) {
-                    guest_ever_started = true;
+
+                std::vector<std::string> cache_dirs;
+                cache_dirs.push_back(eboot_dir);
+                if (req.app0 != eboot_dir) cache_dirs.push_back(req.app0);
+                cache_dirs.push_back(req.data);
+                cache_dirs.push_back(bbx::platform::Paths().local_state);
+                std::string found_cache_dir;
+                std::string found_cache_report;
+                if (bbx::platform::HasValidConsoleCache(cache_dirs, &found_cache_dir,
+                                                        &found_cache_report)) {
+                    bbx::platform::LogF(
+                        "launcher: valid DXIL 6.4 cache found in %s (%s); skipping DXC load",
+                        found_cache_dir.c_str(), found_cache_report.c_str());
+                    if (bbx::bridge::StartGuest(req)) {
+                        guest_ever_started = true;
+                    } else {
+                        bbx::platform::LogMessage(
+                            bbx::platform::Level::kError,
+                            "launcher: the guest did not start; staying in the launcher");
+                    }
                 } else {
-                    bbx::platform::LogMessage(bbx::platform::Level::kError,
-                                              "launcher: the guest did not start; staying in the launcher");
+                    bbx::platform::LogMirroredMessage(
+                        bbx::platform::Level::kInfo,
+                        "launcher: no valid DXIL 6.4 cache found; starting one-time native Xbox shader bake into %s",
+                        req.data.c_str());
+                    g_session.pending_guest_req = req;
+                    g_session.bake_progress.Reset();
+                    g_session.bake_result = bbx::platform::BakeResult{};
+                    g_session.bake_finished.store(false, std::memory_order_relaxed);
+                    g_session.baking = true;
+
+                    bbx::platform::BakeRequest bake_req;
+                    bake_req.app0 = req.app0;
+                    if (g_session.layout.CanRunPatched()) {
+                        bake_req.update_dir = g_session.layout.patch_path;
+                    }
+                    bake_req.eboot = req.eboot;
+                    bake_req.out_dir = req.data;
+
+                    g_session.bake_thread = std::thread([bake_req]() {
+                        const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+                        (void)pthread_setname_np(pthread_self(), "shader-baker");
+                        Steps().RegisterThread(tid, "shader-baker");
+                        g_session.bake_result =
+                            bbx::platform::BakeConsoleShaders(bake_req, g_session.bake_progress);
+                        Steps().UnregisterThread(tid);
+                        g_session.bake_finished.store(true, std::memory_order_release);
+                    });
                 }
             }
             ::Sleep(8);
+        }
+        if (g_session.bake_thread.joinable()) {
+            g_session.bake_progress.RequestCancel();
+            g_session.bake_thread.join();
         }
         bbx::platform::LogF("launcher: exit; self-test %s", self_test.Passed() ? "PASS" : "FAIL");
         if (guest_ever_started || bbx::bridge::Running()) {

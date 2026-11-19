@@ -20,6 +20,7 @@ sources=(
   "$root"/src/host/d3d12/bbx_budget.cpp
   "$root"/src/host/d3d12/bbx_cache.cpp
   "$root"/src/host/d3d12/bbx_shader_cache.cpp
+  "$root"/src/host/d3d12/bbx_shader_bake.cpp
   "$root"/src/host/d3d12/bbx_quarantine.cpp
   "$root"/src/host/d3d12/bbx_precompile.cpp
   "$root"/src/host/d3d12/bbx_descriptors.cpp
@@ -83,6 +84,7 @@ sources=(
   "$root"/tests/hostfs_tree_test.cpp
   "$root"/tests/save_commit_test.cpp
   "$root"/tests/shaders_test.cpp
+  "$root"/tests/shader_bake_test.cpp
   # The printer, which shaders_test.cpp checks the console's dialect of.
   "$root"/upstream/bbhost/src/gcn/hlsl.cpp
   "$root"/tests/guest_core_test.cpp
