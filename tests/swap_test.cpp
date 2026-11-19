@@ -134,3 +134,11 @@ TEST(SpillWriteFailureDoesNotLeaveTheKeyResident) {
     // The slot went back, so a later successful store is not starved.
     CHECK_EQ(spill.free_slots.size(), static_cast<std::size_t>(1));
 }
+
+TEST(SpillSectorAlignmentIsExact) {
+    CHECK_EQ(kSpillSlotBytes % kSpillSectorAlign, 0u);
+    CHECK_EQ(SpillAlignUp(1), static_cast<std::size_t>(kSpillSectorAlign));
+    CHECK_EQ(SpillAlignUp(kSpillSectorAlign), static_cast<std::size_t>(kSpillSectorAlign));
+    CHECK_EQ(SpillAlignUp(kSpillSectorAlign + 1), static_cast<std::size_t>(kSpillSectorAlign * 2u));
+    CHECK_EQ(SpillAlignUp(kSpillSlotBytes), static_cast<std::size_t>(kSpillSlotBytes));
+}

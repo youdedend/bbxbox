@@ -28,6 +28,7 @@ struct GpuReport {
     bbx::d3d12::Status status = bbx::d3d12::Status::kUnavailable;
     bool ready = false;
     std::string adapter;         // the TV's adapter, as DXGI names it
+    std::string console;         // Xbox Series X / Series S / etc.
     std::string feature_level;   // always 11_0: the console's floor
     std::string memory;          // the budget's own accounting
     std::string swapchain;       // size, buffer count, the plan's reason
@@ -84,6 +85,8 @@ public:
     [[nodiscard]] std::uint64_t GuestFramesDropped() const;
     [[nodiscard]] std::uint32_t OutputWidth() const;
     [[nodiscard]] std::uint32_t OutputHeight() const;
+    [[nodiscard]] float RefreshHz() const;
+    [[nodiscard]] ConsoleCaps Console() const;
     // A television mode change: re-plan, resize the swapchain, resize the HUD.
     bbx::d3d12::Status OnModeChanged(std::uint32_t window_width, std::uint32_t window_height);
 

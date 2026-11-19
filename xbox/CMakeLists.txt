@@ -202,6 +202,7 @@ set(BBX_APP_SOURCES
     platform/ux.cpp
     platform/display.cpp
     platform/display_winrt.cpp
+    platform/protocol_uri.cpp
     platform/hud.cpp
     platform/d3d12_session.cpp
     platform/shaders.cpp

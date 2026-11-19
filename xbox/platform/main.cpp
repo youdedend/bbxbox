@@ -22,6 +22,8 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Gaming.Input.h>
+#include <winrt/Windows.Graphics.Display.Core.h>
+#include <winrt/Windows.Graphics.Display.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.ViewManagement.h>
@@ -33,10 +35,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +50,7 @@
 
 #include "xbox/platform/boot_steps.h"
 #include "xbox/platform/d3d12_session.h"
+#include "xbox/platform/display.h"
 #include "xbox/platform/dump.h"
 #include "xbox/platform/guest_memory.h"
 #include "xbox/platform/bbhost_bridge.h"
@@ -56,6 +61,7 @@
 #include "xbox/platform/launcher.h"
 #include "xbox/platform/log.h"
 #include "xbox/platform/memory_selftest.h"
+#include "xbox/platform/protocol_uri.h"
 #include "xbox/platform/shader_baker.h"
 #include "xbox/platform/storage.h"
 #include "xbox/platform/ux.h"
@@ -115,16 +121,59 @@ winrt::agile_ref<winrt::Windows::UI::Core::CoreWindow> g_core_window;
 std::atomic<std::uint32_t> g_view_thread_id{0};
 std::atomic<void*> g_stored_window_abi{nullptr};
 std::atomic<bool> g_window_closed{false};
+std::atomic<bool> g_window_active{true};
 std::atomic<bool> g_app_visible{true};
 std::atomic<std::uint32_t> g_visibility_events{0};
 std::atomic<bool> g_display_acquire_entered{false};
 std::atomic<bool> g_display_ready{false};
+std::atomic<bool> g_settings_loaded{false};
+std::atomic<bool> g_display_resize_pending{false};
+std::atomic<std::uint32_t> g_pending_resize_w{0};
+std::atomic<std::uint32_t> g_pending_resize_h{0};
 std::atomic<const char*> g_ui_blocker{"none"};
 // Why the display is not up, for the gate line. A pointer to a static string, so
 // the 1 Hz watcher thread can read it without a lock and without touching a
 // std::string that ui-main is assigning.
 std::atomic<const char*> g_display_fault{""};
 std::atomic<std::uint64_t> g_present_count{0};
+
+// Physical USB keyboard queue populated by CoreWindow::CharacterReceived / KeyDown
+// and drained on ui-main for Hunter Name IME and menu navigation.
+std::mutex g_key_mu;
+std::deque<char> g_typed_chars;
+std::atomic<bbx::platform::ButtonMask> g_key_nav_edges{0};
+std::atomic<bool> g_key_backspace{false};
+std::atomic<bool> g_key_enter{false};
+std::atomic<bool> g_key_escape{false};
+std::atomic<bool> g_key_quick_menu{false};
+
+// LaunchPass / RetroPass URI protocol launch parameters (`bbxbox:?cmd=...&launchOnExit=...`).
+std::mutex g_protocol_mu;
+bbx::platform::ProtocolLaunchArgs g_protocol_args;
+std::string g_launch_on_exit_uri;
+
+void LaunchReturnFrontendUri() {
+    std::string uri_utf8;
+    {
+        std::lock_guard<std::mutex> lk(g_protocol_mu);
+        uri_utf8 = g_launch_on_exit_uri;
+    }
+    if (uri_utf8.empty()) return;
+    try {
+        const winrt::Windows::Foundation::Uri uri(winrt::to_hstring(uri_utf8));
+        bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo,
+                                          "protocol: launching return URI \"%s\"",
+                                          uri_utf8.c_str());
+        (void)winrt::Windows::System::Launcher::LaunchUriAsync(uri);
+        ::Sleep(150);
+    } catch (const winrt::hresult_error& err) {
+        bbx::platform::LogMirroredMessage(
+            bbx::platform::Level::kWarn,
+            "protocol: LaunchUriAsync(\"%s\") failed (0x%08x)",
+            uri_utf8.c_str(), static_cast<unsigned>(err.code().value));
+    } catch (...) {
+    }
+}
 
 void SetUiBlocker(const char* blocker) noexcept {
     g_ui_blocker.store(blocker != nullptr ? blocker : "none", std::memory_order_relaxed);
@@ -423,30 +472,94 @@ private:
 // actually exposes to a packaged app.
 bbx::platform::ButtonMask MaskFromPad() {
     using bbx::platform::Bit;
+    using winrt::Windows::Gaming::Input::GameControllerSwitchPosition;
     using winrt::Windows::Gaming::Input::Gamepad;
     using winrt::Windows::Gaming::Input::GamepadButtons;
+    using winrt::Windows::Gaming::Input::RawGameController;
     bbx::platform::ButtonMask mask = 0;
     try {
+        Gamepad pad{nullptr};
+        RawGameController raw_pad{nullptr};
         const auto pads = Gamepad::Gamepads();
-        if (pads.Size() == 0) return 0;
-        const GamepadButtons buttons = pads.GetAt(0).GetCurrentReading().Buttons;
-        const auto has = [buttons](GamepadButtons flag) {
-            return (buttons & flag) == flag;
-        };
-        if (has(GamepadButtons::A)) mask |= Bit(Pad::kSouth);
-        if (has(GamepadButtons::B)) mask |= Bit(Pad::kEast);
-        if (has(GamepadButtons::X)) mask |= Bit(Pad::kWest);
-        if (has(GamepadButtons::Y)) mask |= Bit(Pad::kNorth);
-        if (has(GamepadButtons::View)) mask |= Bit(Pad::kView);
-        if (has(GamepadButtons::Menu)) mask |= Bit(Pad::kMenu);
-        if (has(GamepadButtons::LeftThumbstick)) mask |= Bit(Pad::kLeftStick);
-        if (has(GamepadButtons::RightThumbstick)) mask |= Bit(Pad::kRightStick);
-        if (has(GamepadButtons::LeftShoulder)) mask |= Bit(Pad::kLeftBumper);
-        if (has(GamepadButtons::RightShoulder)) mask |= Bit(Pad::kRightBumper);
-        if (has(GamepadButtons::DPadUp)) mask |= Bit(Pad::kDpadUp);
-        if (has(GamepadButtons::DPadDown)) mask |= Bit(Pad::kDpadDown);
-        if (has(GamepadButtons::DPadLeft)) mask |= Bit(Pad::kDpadLeft);
-        if (has(GamepadButtons::DPadRight)) mask |= Bit(Pad::kDpadRight);
+        if (pads.Size() > 0) {
+            pad = pads.GetAt(0);
+        } else {
+            const auto raws = RawGameController::RawGameControllers();
+            if (raws.Size() > 0) {
+                raw_pad = raws.GetAt(0);
+                if (raw_pad) {
+                    pad = Gamepad::FromGameController(raw_pad);
+                }
+            }
+        }
+        if (pad) {
+            const GamepadButtons buttons = pad.GetCurrentReading().Buttons;
+            const auto has = [buttons](GamepadButtons flag) {
+                return (buttons & flag) == flag;
+            };
+            if (has(GamepadButtons::A)) mask |= Bit(Pad::kSouth);
+            if (has(GamepadButtons::B)) mask |= Bit(Pad::kEast);
+            if (has(GamepadButtons::X)) mask |= Bit(Pad::kWest);
+            if (has(GamepadButtons::Y)) mask |= Bit(Pad::kNorth);
+            if (has(GamepadButtons::View)) mask |= Bit(Pad::kView);
+            if (has(GamepadButtons::Menu)) mask |= Bit(Pad::kMenu);
+            if (has(GamepadButtons::LeftThumbstick)) mask |= Bit(Pad::kLeftStick);
+            if (has(GamepadButtons::RightThumbstick)) mask |= Bit(Pad::kRightStick);
+            if (has(GamepadButtons::LeftShoulder)) mask |= Bit(Pad::kLeftBumper);
+            if (has(GamepadButtons::RightShoulder)) mask |= Bit(Pad::kRightBumper);
+            if (has(GamepadButtons::DPadUp)) mask |= Bit(Pad::kDpadUp);
+            if (has(GamepadButtons::DPadDown)) mask |= Bit(Pad::kDpadDown);
+            if (has(GamepadButtons::DPadLeft)) mask |= Bit(Pad::kDpadLeft);
+            if (has(GamepadButtons::DPadRight)) mask |= Bit(Pad::kDpadRight);
+        } else if (raw_pad) {
+            const std::uint32_t btn_count =
+                static_cast<std::uint32_t>(std::clamp(raw_pad.ButtonCount(), 0, 32));
+            const std::uint32_t sw_count =
+                static_cast<std::uint32_t>(std::clamp(raw_pad.SwitchCount(), 0, 8));
+            const std::uint32_t ax_count =
+                static_cast<std::uint32_t>(std::clamp(raw_pad.AxisCount(), 0, 16));
+            bool btns[32]{};
+            GameControllerSwitchPosition sws[8]{};
+            double axs[16]{};
+            (void)raw_pad.GetCurrentReading(
+                winrt::array_view<bool>(btns, btns + btn_count),
+                winrt::array_view<GameControllerSwitchPosition>(sws, sws + sw_count),
+                winrt::array_view<double>(axs, axs + ax_count));
+            const auto b = [&btns, btn_count](std::uint32_t idx) {
+                return idx < btn_count && btns[idx];
+            };
+            if (b(0)) mask |= Bit(Pad::kSouth);
+            if (b(1)) mask |= Bit(Pad::kEast);
+            if (b(2)) mask |= Bit(Pad::kWest);
+            if (b(3)) mask |= Bit(Pad::kNorth);
+            if (b(4)) mask |= Bit(Pad::kLeftBumper);
+            if (b(5)) mask |= Bit(Pad::kRightBumper);
+            if (b(6)) mask |= Bit(Pad::kView);
+            if (b(7)) mask |= Bit(Pad::kMenu);
+            if (b(8)) mask |= Bit(Pad::kLeftStick);
+            if (b(9)) mask |= Bit(Pad::kRightStick);
+            if (sw_count > 0) {
+                switch (sws[0]) {
+                case GameControllerSwitchPosition::Up: mask |= Bit(Pad::kDpadUp); break;
+                case GameControllerSwitchPosition::UpRight:
+                    mask |= Bit(Pad::kDpadUp) | Bit(Pad::kDpadRight);
+                    break;
+                case GameControllerSwitchPosition::Right: mask |= Bit(Pad::kDpadRight); break;
+                case GameControllerSwitchPosition::DownRight:
+                    mask |= Bit(Pad::kDpadDown) | Bit(Pad::kDpadRight);
+                    break;
+                case GameControllerSwitchPosition::Down: mask |= Bit(Pad::kDpadDown); break;
+                case GameControllerSwitchPosition::DownLeft:
+                    mask |= Bit(Pad::kDpadDown) | Bit(Pad::kDpadLeft);
+                    break;
+                case GameControllerSwitchPosition::Left: mask |= Bit(Pad::kDpadLeft); break;
+                case GameControllerSwitchPosition::UpLeft:
+                    mask |= Bit(Pad::kDpadUp) | Bit(Pad::kDpadLeft);
+                    break;
+                default: break;
+                }
+            }
+        }
     } catch (...) {
     }
     return mask;
@@ -1489,9 +1602,12 @@ bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
     if (stored_window) {
         try {
             const winrt::Windows::Foundation::Rect bounds = stored_window.Bounds();
-            if (bounds.Width >= 320.0f && bounds.Height >= 240.0f) {
-                window_width = static_cast<std::uint32_t>(bounds.Width);
-                window_height = static_cast<std::uint32_t>(bounds.Height);
+            const float scale = bbx::platform::CompositionScale();
+            const float phys_w = std::round(bounds.Width * scale);
+            const float phys_h = std::round(bounds.Height * scale);
+            if (phys_w >= 320.0f && phys_h >= 240.0f) {
+                window_width = static_cast<std::uint32_t>(phys_w);
+                window_height = static_cast<std::uint32_t>(phys_h);
             }
         } catch (const winrt::hresult_error& err) {
             bbx::platform::LogMirroredMessage(
@@ -1512,7 +1628,8 @@ bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
         g_session.gpu->Create(window_abi, window_width, window_height, false);
     if (status == bbx::d3d12::Status::kOk) {
         bbx::bridge::SetDisplayMetrics(static_cast<int>(g_session.gpu->OutputWidth()),
-                                       static_cast<int>(g_session.gpu->OutputHeight()), 60.0f);
+                                       static_cast<int>(g_session.gpu->OutputHeight()),
+                                       g_session.gpu->RefreshHz());
         const bbx::platform::GpuReport& report = g_session.gpu->Report();
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kInfo, "d3d12: %s, %s, self-test %s",
@@ -1563,16 +1680,45 @@ bool AcquireDisplay(const winrt::Windows::UI::Core::CoreWindow& stored_window) {
 
 void InitGamepadInput() {
     unsigned winrt_pads = 0;
+    unsigned raw_pads = 0;
     try {
-        winrt_pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size();
+        using winrt::Windows::Gaming::Input::Gamepad;
+        using winrt::Windows::Gaming::Input::RawGameController;
+        winrt_pads = Gamepad::Gamepads().Size();
+        raw_pads = RawGameController::RawGameControllers().Size();
+        static std::once_flag hotplug_once;
+        std::call_once(hotplug_once, []() {
+            try {
+                Gamepad::GamepadAdded([](const auto&, const Gamepad&) {
+                    bbx::platform::LogF("input: Gamepad connected (total=%u)",
+                                        Gamepad::Gamepads().Size());
+                });
+                Gamepad::GamepadRemoved([](const auto&, const Gamepad&) {
+                    bbx::platform::LogF("input: Gamepad disconnected (total=%u)",
+                                        Gamepad::Gamepads().Size());
+                });
+                RawGameController::RawGameControllerAdded(
+                    [](const auto&, const RawGameController&) {
+                        bbx::platform::LogF("input: RawGameController connected (total=%u)",
+                                            RawGameController::RawGameControllers().Size());
+                    });
+                RawGameController::RawGameControllerRemoved(
+                    [](const auto&, const RawGameController&) {
+                        bbx::platform::LogF("input: RawGameController disconnected (total=%u)",
+                                            RawGameController::RawGameControllers().Size());
+                    });
+            } catch (...) {
+            }
+        });
     } catch (const winrt::hresult_error& err) {
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kWarn,
             "input: Windows.Gaming.Input threw 0x%08x while listing gamepads",
             static_cast<unsigned>(err.code().value));
     }
-    bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo,
-                                      "input: winrt_gamepads=%u (no SDL input stack)", winrt_pads);
+    bbx::platform::LogMirroredMessage(
+        bbx::platform::Level::kInfo,
+        "input: winrt_gamepads=%u, raw_controllers=%u (no SDL input stack)", winrt_pads, raw_pads);
 }
 
 // Only the device and the swapchain go away here: there is no SDL window, pad or
@@ -1591,8 +1737,18 @@ void ShutdownDisplay() {
 void LoadSettings() {
     std::string text;
     const std::string path = bbx::platform::Local("bbxbox.ini");
-    if (!bbx::platform::ReadText(path, text) || text.empty()) {
+    const bool first_run = !bbx::platform::ReadText(path, text) || text.empty();
+    if (first_run) {
         text = bbx::platform::DefaultIni();
+        // Default Xbox Series S to 900p internal render (upscaled via FSR RCAS)
+        // on a fresh install for smoother 60 FPS headroom; user can still toggle freely.
+        const bbx::platform::ConsoleCaps caps =
+            g_session.gpu ? g_session.gpu->Console()
+                          : bbx::platform::ConsoleCapsFor(bbx::platform::QueryConsoleModel());
+        if (caps.default_render_res_mode != 0) {
+            (void)bbx::platform::IniSet(text, "video", "render_res_mode",
+                                        std::to_string(caps.default_render_res_mode));
+        }
         if (!bbx::platform::WriteText(path, text)) {
             bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write %s", path.c_str());
         }
@@ -1651,8 +1807,20 @@ void LoadSettings() {
         bbx::platform::IniGet(g_session.ini, "controls.stick_deadzone_percent", "10"),
         10, 0, 20);
 
+    // Honor per-launch protocol overrides (`bbxbox:?cmd=... --fps=60 --res=900p`).
+    {
+        std::lock_guard<std::mutex> lk(g_protocol_mu);
+        if (g_protocol_args.fps_cap == 30 || g_protocol_args.fps_cap == 60) {
+            g_session.model.fps_cap = g_protocol_args.fps_cap;
+        }
+        if (g_protocol_args.render_res_mode >= 0 && g_protocol_args.render_res_mode <= 2) {
+            g_session.model.render_res_mode = g_protocol_args.render_res_mode;
+        }
+    }
+
     LoadHunterName();
     SyncBridgeSettings();
+    g_settings_loaded.store(true, std::memory_order_release);
 }
 
 std::string NormalizeScanPath(std::string path) {
@@ -1675,6 +1843,7 @@ std::string JoinScanPath(const std::string& parent, const std::string& child) {
 
 void RestoreDump() {
     Steps().DumpScanStarted();
+    bbx::platform::ResetUsbAccessDenied();
     const bbx::platform::DumpFs fs = bbx::platform::MakeDumpFs();
     const std::string token = bbx::platform::IniGet(g_session.ini, "dump.token", "");
     std::string path = bbx::platform::IniGet(g_session.ini, "dump.path", "");
@@ -1684,6 +1853,14 @@ void RestoreDump() {
             path = granted;
             g_session.usb_token = token;
         }
+    }
+    std::string protocol_dump_path;
+    {
+        std::lock_guard<std::mutex> lk(g_protocol_mu);
+        protocol_dump_path = g_protocol_args.dump_path;
+    }
+    if (!protocol_dump_path.empty()) {
+        path = protocol_dump_path;
     }
 
     std::vector<std::string> candidates;
@@ -1714,6 +1891,7 @@ void RestoreDump() {
         return true;
     };
 
+    add_candidate(protocol_dump_path);
     add_candidate(path);
     for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
         add_candidate(root);
@@ -1766,6 +1944,9 @@ void RestoreDump() {
         g_session.layout =
             bbx::platform::DetectLayout(fs, found_dumps.front(), preferred_patch, use_patch, false);
     }
+    if (!g_session.layout.layout_ok() && bbx::platform::SawUsbAccessDenied()) {
+        g_session.model.status_banner = bbx::platform::UsbPermissionHint();
+    }
     bbx::platform::LogMessage(bbx::platform::Level::kInfo, "%s",
                               bbx::platform::LayoutLogLine(g_session.layout).c_str());
     // The black box: from here on every line is also written to
@@ -1786,6 +1967,12 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
     winrt::Windows::UI::Core::CoreWindow window{nullptr};
     winrt::event_token closed_token_{};
     winrt::event_token visibility_token_{};
+    winrt::event_token activated_token_{};
+    winrt::event_token size_changed_token_{};
+    winrt::event_token back_requested_token_{};
+    winrt::event_token dpi_changed_token_{};
+    winrt::event_token hdmi_mode_changed_token_{};
+    winrt::event_token char_received_token_{};
     winrt::event_token key_down_token_{};
     winrt::event_token key_up_token_{};
 
@@ -1795,7 +1982,44 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         (void)g_view_thread_id.compare_exchange_strong(expected, init_tid,
                                                        std::memory_order_relaxed);
 
-        app.Activated([](const auto&, const auto&) {
+        app.Activated([](const auto&,
+                         const winrt::Windows::ApplicationModel::Activation::IActivatedEventArgs& args) {
+            // Parse LaunchPass / RetroPass URI protocol launch parameters
+            // (`bbxbox:?cmd=...&launchOnExit=...`), matching XboxEmulationHub XBSX2/RetroArch.
+            try {
+                using winrt::Windows::ApplicationModel::Activation::ActivationKind;
+                using winrt::Windows::ApplicationModel::Activation::ProtocolActivatedEventArgs;
+                if (args && args.Kind() == ActivationKind::Protocol) {
+                    const auto proto = args.as<ProtocolActivatedEventArgs>();
+                    if (proto && proto.Uri()) {
+                        const std::string raw = winrt::to_string(proto.Uri().RawUri());
+                        const bbx::platform::ProtocolLaunchArgs parsed =
+                            bbx::platform::ParseProtocolUri(raw);
+                        bbx::platform::LogMirroredMessage(
+                            bbx::platform::Level::kInfo,
+                            "protocol: activated URI=\"%s\" (autoboot=%u, force_exit=%u, path=\"%s\")",
+                            raw.c_str(), static_cast<unsigned>(parsed.autoboot),
+                            static_cast<unsigned>(parsed.force_exit), parsed.dump_path.c_str());
+                        if (parsed.force_exit) {
+                            g_session.quit = true;
+                        }
+                        if (parsed.valid) {
+                            std::lock_guard<std::mutex> lk(g_protocol_mu);
+                            g_protocol_args = parsed;
+                            if (!parsed.launch_on_exit.empty()) {
+                                g_launch_on_exit_uri = parsed.launch_on_exit;
+                            }
+                        }
+                    }
+                }
+            } catch (const winrt::hresult_error& err) {
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kWarn,
+                    "protocol: failed to read activation URI (0x%08x)",
+                    static_cast<unsigned>(err.code().value));
+            } catch (...) {
+            }
+
             // Point 5: use the stored CoreWindow from SetWindow, never re-fetching
             // via CoreWindow::GetForCurrentThread().
             winrt::Windows::UI::Core::CoreWindow target = g_core_window.get();
@@ -1826,6 +2050,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     static_cast<unsigned long long>(mem.limit_mib),
                     static_cast<unsigned long long>(mem.presents));
                 bbx::bridge::StopPadRumble();
+                if (g_settings_loaded.load(std::memory_order_acquire)) {
+                    SaveLayoutSettings();
+                }
                 Steps().Shutdown("suspend event");
                 bbx::platform::LogFlush();
                 if (deferral) {
@@ -1838,6 +2065,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         winrt::Windows::ApplicationModel::Core::CoreApplication::Resuming(
             [](const auto&, const auto&) {
                 Steps().LogCallback("Resuming");
+                // Re-check display mode after resume in case TV/HDMI state changed.
+                g_display_resize_pending.store(true, std::memory_order_release);
                 bbx::platform::LogFlush();
             });
         Steps().LogCallback("Initialize (registered Activated, Suspending, Resuming)");
@@ -1857,6 +2086,26 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         } catch (...) {
         }
         g_app_visible.store(initial_visible, std::memory_order_relaxed);
+
+        // Hide the OS pointer cursor so an attached USB mouse never floats over Bloodborne.
+        try {
+            if (window) window.PointerCursor(nullptr);
+        } catch (...) {
+        }
+
+        // CRITICAL Xbox UWP fix (from XboxEmulationHub XBSX2 & RetroArch):
+        // Intercept SystemNavigationManager::BackRequested so pressing B on the
+        // controller (dodge/back in Bloodborne) never suspends or minimizes the app.
+        try {
+            const auto nav = winrt::Windows::UI::Core::SystemNavigationManager::GetForCurrentView();
+            if (nav) {
+                back_requested_token_ = nav.BackRequested(
+                    [](const auto&, const winrt::Windows::UI::Core::BackRequestedEventArgs& ev) {
+                        ev.Handled(true);
+                    });
+            }
+        } catch (...) {
+        }
 
         closed_token_ = window.Closed(
             [](const auto&, const winrt::Windows::UI::Core::CoreWindowEventArgs&) {
@@ -1879,25 +2128,109 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     static_cast<unsigned>(vis), count);
             });
 
+        // Pause rumble and suppress guest controller input while the Xbox Guide or
+        // another system overlay steals window focus, preventing stuck buttons.
+        activated_token_ = window.Activated(
+            [](const auto&, const winrt::Windows::UI::Core::WindowActivatedEventArgs& ev) {
+                const bool active =
+                    ev.WindowActivationState() !=
+                    winrt::Windows::UI::Core::CoreWindowActivationState::Deactivated;
+                g_window_active.store(active, std::memory_order_release);
+                if (!active) {
+                    bbx::bridge::StopPadRumble();
+                    bbx::bridge::SetGuestInputSuppressed(true);
+                } else {
+                    bbx::bridge::SetGuestInputSuppressed(g_session.quick_menu_open ||
+                                                         g_session.ime_open);
+                }
+            });
+
+        // Dynamically resize the swapchain if CoreWindow bounds, DPI, or HDMI TV mode change.
+        size_changed_token_ = window.SizeChanged(
+            [](const auto&, const winrt::Windows::UI::Core::WindowSizeChangedEventArgs& ev) {
+                const float scale = bbx::platform::CompositionScale();
+                const float phys_w = std::round(ev.Size().Width * scale);
+                const float phys_h = std::round(ev.Size().Height * scale);
+                if (phys_w >= 320.0f && phys_h >= 240.0f) {
+                    g_pending_resize_w.store(static_cast<std::uint32_t>(phys_w),
+                                             std::memory_order_relaxed);
+                    g_pending_resize_h.store(static_cast<std::uint32_t>(phys_h),
+                                             std::memory_order_relaxed);
+                    g_display_resize_pending.store(true, std::memory_order_release);
+                }
+            });
+
+        try {
+            const auto disp = winrt::Windows::Graphics::Display::DisplayInformation::GetForCurrentView();
+            if (disp) {
+                dpi_changed_token_ = disp.DpiChanged([](const auto&, const auto&) {
+                    g_pending_resize_w.store(0, std::memory_order_relaxed);
+                    g_pending_resize_h.store(0, std::memory_order_relaxed);
+                    g_display_resize_pending.store(true, std::memory_order_release);
+                });
+            }
+        } catch (...) {
+        }
+
+        try {
+            const auto hdmi =
+                winrt::Windows::Graphics::Display::Core::HdmiDisplayInformation::GetForCurrentView();
+            if (hdmi) {
+                hdmi_mode_changed_token_ = hdmi.DisplayModeChanged([](const auto&, const auto&) {
+                    g_pending_resize_w.store(0, std::memory_order_relaxed);
+                    g_pending_resize_h.store(0, std::memory_order_relaxed);
+                    g_display_resize_pending.store(true, std::memory_order_release);
+                });
+            }
+        } catch (...) {
+        }
+
+        // Physical USB keyboard character stream for Hunter Name / IME typing.
+        char_received_token_ = window.CharacterReceived(
+            [](const auto&, const winrt::Windows::UI::Core::CharacterReceivedEventArgs& ev) {
+                const std::uint32_t code = ev.KeyCode();
+                if (code >= 32u && code <= 126u) {
+                    std::lock_guard<std::mutex> lk(g_key_mu);
+                    if (g_typed_chars.size() < 64u) {
+                        g_typed_chars.push_back(static_cast<char>(code));
+                    }
+                }
+            });
+
         key_down_token_ = window.KeyDown(
             [](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
-                const auto vk = static_cast<unsigned>(ev.VirtualKey());
-                const unsigned repeat = ev.KeyStatus().WasKeyDown ? 1u : 0u;
-                bbx::platform::LogMirroredMessage(
-                    bbx::platform::Level::kInfo, "view: KeyDown (vk=%u, repeat=%u)", vk, repeat);
+                using winrt::Windows::System::VirtualKey;
+                const VirtualKey vk = ev.VirtualKey();
+                if (vk == VirtualKey::Back) {
+                    g_key_backspace.store(true, std::memory_order_release);
+                } else if (vk == VirtualKey::Enter) {
+                    g_key_enter.store(true, std::memory_order_release);
+                } else if (vk == VirtualKey::Escape) {
+                    g_key_escape.store(true, std::memory_order_release);
+                } else if (vk == VirtualKey::F1) {
+                    g_key_quick_menu.store(true, std::memory_order_release);
+                } else if (vk == VirtualKey::Up) {
+                    g_key_nav_edges.fetch_or(bbx::platform::Bit(Pad::kDpadUp),
+                                             std::memory_order_release);
+                } else if (vk == VirtualKey::Down) {
+                    g_key_nav_edges.fetch_or(bbx::platform::Bit(Pad::kDpadDown),
+                                             std::memory_order_release);
+                } else if (vk == VirtualKey::Left) {
+                    g_key_nav_edges.fetch_or(bbx::platform::Bit(Pad::kDpadLeft),
+                                             std::memory_order_release);
+                } else if (vk == VirtualKey::Right) {
+                    g_key_nav_edges.fetch_or(bbx::platform::Bit(Pad::kDpadRight),
+                                             std::memory_order_release);
+                }
             });
 
         key_up_token_ = window.KeyUp(
-            [](const auto&, const winrt::Windows::UI::Core::KeyEventArgs& ev) {
-                const auto vk = static_cast<unsigned>(ev.VirtualKey());
-                bbx::platform::LogMirroredMessage(
-                    bbx::platform::Level::kInfo, "view: KeyUp (vk=%u)", vk);
-            });
+            [](const auto&, const winrt::Windows::UI::Core::KeyEventArgs&) {});
 
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kInfo,
             "view: SetWindow (stored CoreWindow=%p + agile_ref on tid=%u, initial_visible=%u; "
-            "registered Closed, VisibilityChanged, KeyDown, KeyUp)",
+            "registered BackRequested, Activated, SizeChanged, Dpi/HdmiMode, CharacterReceived, KeyDown)",
             stored_abi, view_tid, static_cast<unsigned>(initial_visible));
     }
 
@@ -2032,6 +2365,20 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         LoadSettings();
         RestoreDump();
         RefreshLauncher();
+        {
+            bool protocol_autoboot = false;
+            {
+                std::lock_guard<std::mutex> lk(g_protocol_mu);
+                protocol_autoboot = g_protocol_args.autoboot;
+            }
+            if (protocol_autoboot && g_session.layout.layout_ok() && !g_session.quit) {
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo,
+                    "protocol: auto-launching Bloodborne from \"%s\"",
+                    g_session.layout.base_path.c_str());
+                g_session.start_requested = true;
+            }
+        }
         DrawFrame();
         const bbx::platform::SelfTestResult self_test = bbx::platform::RunMemorySelfTest(false);
 
@@ -2056,9 +2403,50 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 break;
             }
 
+            // Handle CoreWindow SizeChanged, DPI, or HDMI TV mode changes cleanly on ui-main.
+            if (g_display_resize_pending.exchange(false, std::memory_order_acq_rel) &&
+                g_session.gpu != nullptr) {
+                std::uint32_t rw = g_pending_resize_w.exchange(0, std::memory_order_relaxed);
+                std::uint32_t rh = g_pending_resize_h.exchange(0, std::memory_order_relaxed);
+                if ((rw == 0 || rh == 0) && stored_window) {
+                    try {
+                        const auto bounds = stored_window.Bounds();
+                        const float scale = bbx::platform::CompositionScale();
+                        rw = static_cast<std::uint32_t>(std::round(bounds.Width * scale));
+                        rh = static_cast<std::uint32_t>(std::round(bounds.Height * scale));
+                    } catch (...) {
+                    }
+                }
+                if (rw < 320u || rh < 240u) {
+                    rw = 1920u;
+                    rh = 1080u;
+                }
+                if (g_session.gpu->OnModeChanged(rw, rh) == bbx::d3d12::Status::kOk) {
+                    bbx::bridge::SetDisplayMetrics(static_cast<int>(g_session.gpu->OutputWidth()),
+                                                   static_cast<int>(g_session.gpu->OutputHeight()),
+                                                   g_session.gpu->RefreshHz());
+                }
+            }
+
+            // Drain physical USB keyboard events collected on CoreWindow callbacks.
+            std::vector<char> typed_chars;
+            {
+                std::lock_guard<std::mutex> lk(g_key_mu);
+                while (!g_typed_chars.empty()) {
+                    typed_chars.push_back(g_typed_chars.front());
+                    g_typed_chars.pop_front();
+                }
+            }
+            const bbx::platform::ButtonMask key_nav =
+                g_key_nav_edges.exchange(0, std::memory_order_acq_rel);
+            const bool key_back = g_key_backspace.exchange(false, std::memory_order_acq_rel);
+            const bool key_enter = g_key_enter.exchange(false, std::memory_order_acq_rel);
+            const bool key_esc = g_key_escape.exchange(false, std::memory_order_acq_rel);
+            const bool key_quick_menu = g_key_quick_menu.exchange(false, std::memory_order_acq_rel);
+
             // The pad is WinRT's; there is no SDL event queue on this target.
             const bbx::platform::ButtonMask held = MaskFromPad();
-            const bbx::platform::ButtonMask pressed = held & ~previous;
+            const bbx::platform::ButtonMask pressed = (held & ~previous) | key_nav;
             const bbx::platform::ButtonMask released = previous & ~held;
             previous = held;
 
@@ -2095,12 +2483,19 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 }
 
                 if (g_session.ime_open) {
+                    for (char ch : typed_chars) {
+                        if (g_session.ime_keyboard.Text().size() < g_session.ime_max_chars) {
+                            g_session.ime_keyboard.Append(ch);
+                        }
+                    }
                     if (pressed & bbx::platform::Bit(Pad::kDpadUp)) g_session.ime_keyboard.Move(0, -1);
                     if (pressed & bbx::platform::Bit(Pad::kDpadDown)) g_session.ime_keyboard.Move(0, 1);
                     if (pressed & bbx::platform::Bit(Pad::kDpadLeft)) g_session.ime_keyboard.Move(-1, 0);
                     if (pressed & bbx::platform::Bit(Pad::kDpadRight)) g_session.ime_keyboard.Move(1, 0);
-                    if (pressed & bbx::platform::Bit(Pad::kEast)) g_session.ime_keyboard.Backspace();
-                    if (pressed & bbx::platform::Bit(Pad::kMenu)) {
+                    if ((pressed & bbx::platform::Bit(Pad::kEast)) || key_back) {
+                        g_session.ime_keyboard.Backspace();
+                    }
+                    if ((pressed & bbx::platform::Bit(Pad::kMenu)) || key_enter) {
                         std::string result = g_session.ime_keyboard.Text();
                         if (result.size() > g_session.ime_max_chars) {
                             result.resize(g_session.ime_max_chars);
@@ -2108,7 +2503,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         bbx::bridge::CompleteTextEntry(result, true);
                         g_session.ime_open = false;
                         bbx::bridge::SetGuestInputSuppressed(false);
-                    } else if (pressed & bbx::platform::Bit(Pad::kView)) {
+                    } else if ((pressed & bbx::platform::Bit(Pad::kView)) || key_esc) {
                         bbx::bridge::CompleteTextEntry({}, false);
                         g_session.ime_open = false;
                         bbx::bridge::SetGuestInputSuppressed(false);
@@ -2124,12 +2519,14 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         }
                     }
                 } else {
-                    // Toggle the in-game L3+R3 Quick Menu when both sticks are clicked together.
-                    if ((held & kQuickMenuMask) == kQuickMenuMask && (pressed & kQuickMenuMask) != 0) {
+                    // Toggle the in-game L3+R3 Quick Menu (or F1 on USB keyboard).
+                    if (((held & kQuickMenuMask) == kQuickMenuMask && (pressed & kQuickMenuMask) != 0) ||
+                        key_quick_menu) {
                         g_session.quick_menu_open = !g_session.quick_menu_open;
                         bbx::bridge::SetGuestInputSuppressed(g_session.quick_menu_open);
                     } else if (g_session.quick_menu_open) {
-                        const bool confirm = (pressed & bbx::platform::Bit(Pad::kSouth)) != 0;
+                        const bool confirm =
+                            (pressed & bbx::platform::Bit(Pad::kSouth)) != 0 || key_enter;
                         const bool step_left = (pressed & bbx::platform::Bit(Pad::kDpadLeft)) != 0;
                         const bool step_right = (pressed & bbx::platform::Bit(Pad::kDpadRight)) != 0;
                         if (pressed & bbx::platform::Bit(Pad::kDpadUp)) {
@@ -2138,7 +2535,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         } else if (pressed & bbx::platform::Bit(Pad::kDpadDown)) {
                             g_session.quick_menu_selected =
                                 (g_session.quick_menu_selected + 1) % kQuickMenuCount;
-                        } else if (pressed & bbx::platform::Bit(Pad::kEast)) {
+                        } else if ((pressed & bbx::platform::Bit(Pad::kEast)) || key_esc) {
                             g_session.quick_menu_open = false;
                             bbx::bridge::SetGuestInputSuppressed(false);
                         } else if (confirm || step_left || step_right) {
@@ -2335,9 +2732,34 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 }
             } else {
                 emergency_holding = false;
+                if (g_session.keyboard_open) {
+                    for (char ch : typed_chars) {
+                        g_session.keyboard.Append(ch);
+                    }
+                    if (key_back) g_session.keyboard.Backspace();
+                    if (key_enter) {
+                        std::string name = g_session.keyboard.Text();
+                        if (name.size() > 16u) name.resize(16u);
+                        g_session.model.hunter_name = name;
+                        bbx::platform::LogF("hunter name: \"%s\"", name.c_str());
+                        if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"), name)) {
+                            bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                                      "could not write hunter-name.txt");
+                        }
+                        g_session.keyboard_open = false;
+                        RefreshLauncher();
+                    } else if (key_esc) {
+                        g_session.keyboard_open = false;
+                        RefreshLauncher();
+                    }
+                }
                 bbx::platform::PadEdges edges;
                 edges.held = held;
                 edges.pressed = pressed;
+                if (!g_session.keyboard_open) {
+                    if (key_enter) edges.pressed |= bbx::platform::Bit(Pad::kSouth);
+                    if (key_esc) edges.pressed |= bbx::platform::Bit(Pad::kEast);
+                }
                 edges.released = released;
                 const PadAction action = g_session.chords.Update(edges);
                 if (action != PadAction::kNone) OnAction(action);
@@ -2416,6 +2838,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                     synced ? bbx::platform::Level::kInfo : bbx::platform::Level::kWarn,
                     "usb: exit auto-backup %s (%s)", synced ? "ok" : "skipped", detail.c_str());
             }
+            LaunchReturnFrontendUri();
             // Normal UWP exit runs static destructors and DLL teardown while
             // detached guest threads are still running, hanging the console on
             // the last frame for minutes. Flush logs and terminate cleanly.
@@ -2424,6 +2847,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             bbx::platform::LogClose();
             ::TerminateProcess(::GetCurrentProcess(), 0);
         }
+        LaunchReturnFrontendUri();
         acquire_watch.Stop();
         telemetry.Stop();
         ShutdownDisplay();

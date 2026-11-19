@@ -23,6 +23,8 @@
 #include <winrt/Windows.UI.Core.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cwctype>
 #include <mutex>
@@ -475,6 +477,15 @@ std::vector<std::string> CandidateDumpRoots() {
     return roots;
 }
 
+namespace {
+std::atomic<bool> g_usb_access_denied{false};
+std::atomic<bool> g_usb_hint_logged{false};
+}  // namespace
+
+bool SawUsbAccessDenied() { return g_usb_access_denied.load(std::memory_order_relaxed); }
+
+void ResetUsbAccessDenied() { g_usb_access_denied.store(false, std::memory_order_relaxed); }
+
 DumpFs MakeDumpFs() {
     DumpFs fs;
     fs.exists = [](const std::string& path) { return Exists(path); };
@@ -486,12 +497,20 @@ DumpFs MakeDumpFs() {
             // "could not be read" folded four different failures into one line:
             // missing file, refused open, short read and an unparsable SFO. Say
             // which one it was.
+            const int read_err = bbx::hostfs::LastError();
             bbx::hostfs::FileStat info{};
             const bool stat_ok = bbx::hostfs::Stat(path, &info);
+            const int stat_err = stat_ok ? 0 : bbx::hostfs::LastError();
+            if (read_err == EACCES || stat_err == EACCES) {
+                g_usb_access_denied.store(true, std::memory_order_relaxed);
+                if (!g_usb_hint_logged.exchange(true, std::memory_order_relaxed)) {
+                    LogMessage(Level::kWarn, "storage: %s", UsbPermissionHint());
+                }
+            }
             LogMessage(Level::kWarn, "dump: read failed for %s (stat=%d size=%llu errno=%d)",
                        path.c_str(), stat_ok ? 1 : 0,
                        static_cast<unsigned long long>(stat_ok ? info.size : 0),
-                       bbx::hostfs::LastError());
+                       read_err != 0 ? read_err : stat_err);
             return std::vector<std::uint8_t>{};
         }
         std::uint32_t magic = 0;

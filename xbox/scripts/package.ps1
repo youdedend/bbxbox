@@ -62,7 +62,9 @@ foreach ($name in @("bbxbox.map", "bbxbox.pdb", "SDL3.pdb")) {
     }
 }
 
-foreach ($dll in @("sdl3\bin\SDL3.dll", "libuwp\bin\libuwp.dll")) {
+# libuwp.dll is intentionally not staged: bbxbox queries HdmiDisplayInformation
+# and GetGamingDeviceModelInformation directly without calling libuwp.
+foreach ($dll in @("sdl3\bin\SDL3.dll")) {
     $path = Join-Path $prefix $dll
     if (Test-Path $path) { Copy-Item $path (Join-Path $layout (Split-Path $path -Leaf)) }
 }

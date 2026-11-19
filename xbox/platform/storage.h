@@ -246,6 +246,14 @@ void ReplayStorageResults();
 // The dump, seen through this layer.
 [[nodiscard]] DumpFs MakeDumpFs();
 
+// Set when a USB drive probe or dump read encounters EACCES / ERROR_ACCESS_DENIED,
+// allowing the launcher to display actionable NTFS permission setup steps.
+[[nodiscard]] bool SawUsbAccessDenied();
+void ResetUsbAccessDenied();
+[[nodiscard]] inline const char* UsbPermissionHint() {
+    return "USB access denied: format NTFS, grant ALL APPLICATION PACKAGES Full Control, set drive as Media on Xbox.";
+}
+
 // The cache sync to/from USB: a granted folder, with a manifest so a cache from
 // another console is only accepted when the stamps match.
 struct UsbCacheTarget {

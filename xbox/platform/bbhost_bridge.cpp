@@ -358,68 +358,164 @@ std::uint8_t TriggerFromFloat(double value) {
 PadState host_pad_state() {
     PadState s;
     try {
-        const auto pads = winrt::Windows::Gaming::Input::Gamepad::Gamepads();
-        if (pads.Size() == 0) return s;
-        const winrt::Windows::Gaming::Input::Gamepad pad = pads.GetAt(0);
-        if (!pad) return s;
+        using winrt::Windows::Gaming::Input::GameControllerSwitchPosition;
+        using winrt::Windows::Gaming::Input::Gamepad;
+        using winrt::Windows::Gaming::Input::GamepadButtons;
+        using winrt::Windows::Gaming::Input::GamepadReading;
+        using winrt::Windows::Gaming::Input::RawGameController;
+
+        Gamepad pad{nullptr};
+        RawGameController raw_pad{nullptr};
+        const auto pads = Gamepad::Gamepads();
+        if (pads.Size() > 0) {
+            pad = pads.GetAt(0);
+        } else {
+            const auto raws = RawGameController::RawGameControllers();
+            if (raws.Size() > 0) {
+                raw_pad = raws.GetAt(0);
+                if (raw_pad) {
+                    pad = Gamepad::FromGameController(raw_pad);
+                }
+            }
+        }
+        if (!pad && !raw_pad) return s;
         s.connected = true;
 
-        // While the in-game L3+R3 Quick Menu or Virtual Keyboard IME owns the
-        // controller, report a connected idle pad so overlay navigation never
-        // leaks into Bloodborne (matches PS4 system keyboard behavior).
+        // While the in-game L3+R3 Quick Menu, Virtual Keyboard IME, or Xbox Guide
+        // owns focus, report a connected idle pad so input never leaks into Bloodborne.
         const bool suppressed = g_input_suppressed.load(std::memory_order_relaxed) ||
                                 host_text_entry_open();
         if (!suppressed) {
-            const winrt::Windows::Gaming::Input::GamepadReading reading = pad.GetCurrentReading();
-            const auto buttons = reading.Buttons;
-            const auto held = [buttons](winrt::Windows::Gaming::Input::GamepadButtons flag) {
-                return (buttons & flag) == flag;
-            };
-            using winrt::Windows::Gaming::Input::GamepadButtons;
             const auto bit = [&s](bool down, std::uint32_t value) {
                 if (down) s.buttons |= value;
             };
-            const bool view_down = held(GamepadButtons::View);
-            const bool dpad_left = held(GamepadButtons::DPadLeft);
-            const bool gestures_chord = view_down && dpad_left;
-
-            bit(held(GamepadButtons::A), kCross);
-            bit(held(GamepadButtons::B), kCircle);
-            bit(held(GamepadButtons::X), kSquare);
-            bit(held(GamepadButtons::Y), kTriangle);
-            bit(held(GamepadButtons::LeftShoulder), kL1);
-            bit(held(GamepadButtons::RightShoulder), kR1);
-            bit(held(GamepadButtons::Menu), kOptions);
-            bit(held(GamepadButtons::LeftThumbstick), kL3);
-            bit(held(GamepadButtons::RightThumbstick), kR3);
-            bit(held(GamepadButtons::DPadUp), kUp);
-            bit(held(GamepadButtons::DPadDown), kDown);
-            bit(dpad_left && !gestures_chord, kLeft);
-            bit(held(GamepadButtons::DPadRight), kRight);
-
-            if (view_down) {
-                s.buttons |= kTouchPad;
-                s.touch_count = 1;
-                s.touch[0].x = gestures_chord ? kPadTouchLeftX : kPadTouchRightX;
-                s.touch[0].y = kPadTouchMidY;
-                s.touch[0].id = gestures_chord ? 201 : 202;
-                s.touch[0].down = true;
-            }
-
-            // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
-            // 0 for up and 255 for down; negate both Y axes to match PS4 convention
-            // and apply the player's configurable radial deadzone curve.
             const HostSettings& hs = host_settings_ref();
-            bbx::platform::ApplyRadialStickDeadzone(
-                reading.LeftThumbstickX, -reading.LeftThumbstickY,
-                hs.stick_inner[0], hs.stick_outer[0], &s.lx, &s.ly);
-            bbx::platform::ApplyRadialStickDeadzone(
-                reading.RightThumbstickX, -reading.RightThumbstickY,
-                hs.stick_inner[1], hs.stick_outer[1], &s.rx, &s.ry);
-            s.l2 = TriggerFromFloat(reading.LeftTrigger);
-            s.r2 = TriggerFromFloat(reading.RightTrigger);
-            if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
-            if (s.r2 > 62) s.buttons |= kR2;
+
+            if (pad) {
+                const GamepadReading reading = pad.GetCurrentReading();
+                const auto buttons = reading.Buttons;
+                const auto held = [buttons](GamepadButtons flag) {
+                    return (buttons & flag) == flag;
+                };
+                const bool view_down = held(GamepadButtons::View);
+                const bool dpad_left = held(GamepadButtons::DPadLeft);
+                const bool gestures_chord = view_down && dpad_left;
+
+                bit(held(GamepadButtons::A), kCross);
+                bit(held(GamepadButtons::B), kCircle);
+                bit(held(GamepadButtons::X), kSquare);
+                bit(held(GamepadButtons::Y), kTriangle);
+                bit(held(GamepadButtons::LeftShoulder), kL1);
+                bit(held(GamepadButtons::RightShoulder), kR1);
+                bit(held(GamepadButtons::Menu), kOptions);
+                bit(held(GamepadButtons::LeftThumbstick), kL3);
+                bit(held(GamepadButtons::RightThumbstick), kR3);
+                bit(held(GamepadButtons::DPadUp), kUp);
+                bit(held(GamepadButtons::DPadDown), kDown);
+                bit(dpad_left && !gestures_chord, kLeft);
+                bit(held(GamepadButtons::DPadRight), kRight);
+
+                if (view_down) {
+                    s.buttons |= kTouchPad;
+                    s.touch_count = 1;
+                    s.touch[0].x = gestures_chord ? kPadTouchLeftX : kPadTouchRightX;
+                    s.touch[0].y = kPadTouchMidY;
+                    s.touch[0].id = gestures_chord ? 201 : 202;
+                    s.touch[0].down = true;
+                }
+
+                // Windows.Gaming.Input reports +1.0 for stick-up, while ScePadData uses
+                // 0 for up and 255 for down; negate both Y axes to match PS4 convention
+                // and apply the player's configurable radial deadzone curve.
+                bbx::platform::ApplyRadialStickDeadzone(
+                    reading.LeftThumbstickX, -reading.LeftThumbstickY,
+                    hs.stick_inner[0], hs.stick_outer[0], &s.lx, &s.ly);
+                bbx::platform::ApplyRadialStickDeadzone(
+                    reading.RightThumbstickX, -reading.RightThumbstickY,
+                    hs.stick_inner[1], hs.stick_outer[1], &s.rx, &s.ry);
+                s.l2 = TriggerFromFloat(reading.LeftTrigger);
+                s.r2 = TriggerFromFloat(reading.RightTrigger);
+                if (s.l2 > 62) s.buttons |= kL2;  // 8000 / 128, as the desktop build reads it
+                if (s.r2 > 62) s.buttons |= kR2;
+            } else if (raw_pad) {
+                // Fallback for third-party USB controllers / fightsticks that expose
+                // RawGameController without standard Gamepad mapping.
+                const std::uint32_t btn_count = static_cast<std::uint32_t>(
+                    std::clamp(raw_pad.ButtonCount(), 0, 32));
+                const std::uint32_t sw_count = static_cast<std::uint32_t>(
+                    std::clamp(raw_pad.SwitchCount(), 0, 8));
+                const std::uint32_t ax_count = static_cast<std::uint32_t>(
+                    std::clamp(raw_pad.AxisCount(), 0, 16));
+                bool btns[32]{};
+                GameControllerSwitchPosition sws[8]{};
+                double axs[16]{};
+                (void)raw_pad.GetCurrentReading(
+                    winrt::array_view<bool>(btns, btns + btn_count),
+                    winrt::array_view<GameControllerSwitchPosition>(sws, sws + sw_count),
+                    winrt::array_view<double>(axs, axs + ax_count));
+
+                const auto b = [&btns, btn_count](std::uint32_t idx) {
+                    return idx < btn_count && btns[idx];
+                };
+                bool dpad_up = false, dpad_down = false, dpad_left = false, dpad_right = false;
+                if (sw_count > 0) {
+                    switch (sws[0]) {
+                    case GameControllerSwitchPosition::Up: dpad_up = true; break;
+                    case GameControllerSwitchPosition::UpRight: dpad_up = true; dpad_right = true; break;
+                    case GameControllerSwitchPosition::Right: dpad_right = true; break;
+                    case GameControllerSwitchPosition::DownRight: dpad_down = true; dpad_right = true; break;
+                    case GameControllerSwitchPosition::Down: dpad_down = true; break;
+                    case GameControllerSwitchPosition::DownLeft: dpad_down = true; dpad_left = true; break;
+                    case GameControllerSwitchPosition::Left: dpad_left = true; break;
+                    case GameControllerSwitchPosition::UpLeft: dpad_up = true; dpad_left = true; break;
+                    default: break;
+                    }
+                }
+                const bool view_down = b(6);
+                const bool gestures_chord = view_down && dpad_left;
+
+                bit(b(0), kCross);
+                bit(b(1), kCircle);
+                bit(b(2), kSquare);
+                bit(b(3), kTriangle);
+                bit(b(4), kL1);
+                bit(b(5), kR1);
+                bit(b(7), kOptions);
+                bit(b(8), kL3);
+                bit(b(9), kR3);
+                bit(dpad_up, kUp);
+                bit(dpad_down, kDown);
+                bit(dpad_left && !gestures_chord, kLeft);
+                bit(dpad_right, kRight);
+
+                if (view_down) {
+                    s.buttons |= kTouchPad;
+                    s.touch_count = 1;
+                    s.touch[0].x = gestures_chord ? kPadTouchLeftX : kPadTouchRightX;
+                    s.touch[0].y = kPadTouchMidY;
+                    s.touch[0].id = gestures_chord ? 201 : 202;
+                    s.touch[0].down = true;
+                }
+                if (ax_count >= 2) {
+                    bbx::platform::ApplyRadialStickDeadzone(
+                        axs[0] * 2.0 - 1.0, axs[1] * 2.0 - 1.0,
+                        hs.stick_inner[0], hs.stick_outer[0], &s.lx, &s.ly);
+                }
+                if (ax_count >= 4) {
+                    bbx::platform::ApplyRadialStickDeadzone(
+                        axs[2] * 2.0 - 1.0, axs[3] * 2.0 - 1.0,
+                        hs.stick_inner[1], hs.stick_outer[1], &s.rx, &s.ry);
+                }
+                if (ax_count >= 6) {
+                    s.l2 = TriggerFromFloat(axs[4]);
+                    s.r2 = TriggerFromFloat(axs[5]);
+                } else {
+                    if (b(10)) s.l2 = 255;
+                    if (b(11)) s.r2 = 255;
+                }
+                if (s.l2 > 62) s.buttons |= kL2;
+                if (s.r2 > 62) s.buttons |= kR2;
+            }
         }
 
         // A GamepadReading carries no timestamp of its own; the pad reports
@@ -444,7 +540,8 @@ PadState host_pad_state() {
 
 bool host_pad_present() {
     try {
-        return winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0;
+        if (winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0) return true;
+        return winrt::Windows::Gaming::Input::RawGameController::RawGameControllers().Size() != 0;
     } catch (...) {
         return false;
     }

@@ -149,6 +149,12 @@
             </uap:SupportedFileTypes>
           </uap:FileTypeAssociation>
         </uap:Extension>
+        <!-- URI protocol activation (`bbxbox:?cmd=...&launchOnExit=...`) so Xbox
+             Dev Mode frontends such as LaunchPass and RetroPass can launch
+             Bloodborne directly and resume cleanly on exit. -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="bbxbox" />
+        </uap:Extension>
       </Extensions>
     </Application>
   </Applications>

@@ -17,6 +17,24 @@
 
 namespace bbx::platform {
 
+enum class ConsoleModel : std::uint8_t {
+    kUnknown = 0,
+    kXboxOne,
+    kXboxOneS,
+    kXboxOneX,
+    kXboxSeriesS,
+    kXboxSeriesX,
+};
+
+struct ConsoleCaps {
+    ConsoleModel model = ConsoleModel::kUnknown;
+    const char* name = "Xbox";
+    std::uint32_t max_swap_width = 3840;
+    std::uint32_t max_swap_height = 2160;
+    // Default internal guest render resolution mode (0=1080p, 1=900p, 2=720p).
+    int default_render_res_mode = 0;
+};
+
 struct TvMode {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -32,19 +50,29 @@ struct OutputPlan {
     // What `IDXGISwapChain2::SetMatrixTransform` wants: the inverse scale, plus
     // offset in exchange units (0 here: the picture is centred by the panel).
     float matrix[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-    bool clamped = false;   // the TV mode was larger than 3840x2160
+    bool clamped = false;   // the TV mode exceeded the console's safe swapchain cap
     std::string reason;     // why the plan is what it is, for the log
 
     [[nodiscard]] bool scaled() const { return scale > 1.0f + 1e-3f; }
 };
 
+// Safe per-console swapchain limits (from XboxEmulationHub/XBSX2):
+// Xbox Series S can drive a 4K HDMI signal, but creating a 3840x2160 UWP
+// swapchain crashes the process, so Series S is capped at 2560x1440.
+[[nodiscard]] ConsoleCaps ConsoleCapsFor(ConsoleModel model);
+
 // `window_pixels` is the CoreWindow's size in physical pixels (bounds x
 // composition scale). `match_tv` is the player's "Output resolution: match TV".
+// `max_width`/`max_height` enforce the console's safe swapchain ceiling.
 [[nodiscard]] OutputPlan PlanOutput(std::uint32_t window_width, std::uint32_t window_height,
-                                    const TvMode& tv, bool match_tv);
+                                    const TvMode& tv, bool match_tv,
+                                    std::uint32_t max_width = 3840,
+                                    std::uint32_t max_height = 2160);
 
-// The device-side query. Returns an invalid TvMode off-console.
+// The device-side queries. Return safe defaults off-console.
+[[nodiscard]] ConsoleModel QueryConsoleModel();
 [[nodiscard]] TvMode QueryTvMode();
+[[nodiscard]] float CompositionScale();
 
 // The plan in one log line.
 [[nodiscard]] std::string DescribeOutput(const OutputPlan& plan, const TvMode& tv);

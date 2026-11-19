@@ -40,6 +40,7 @@ sources=(
   "$root"/xbox/platform/launcher.cpp
   "$root"/xbox/platform/ux.cpp
   "$root"/xbox/platform/display.cpp
+  "$root"/xbox/platform/protocol_uri.cpp
   "$root"/xbox/platform/hud.cpp
   "$root"/src/host/d3d12/bbx_psocache.cpp
   "$root"/src/host/d3d12/bbx_tess.cpp
@@ -78,6 +79,7 @@ sources=(
   "$root"/tests/psocache_test.cpp
   "$root"/tests/tess_test.cpp
   "$root"/tests/display_test.cpp
+  "$root"/tests/protocol_uri_test.cpp
   "$root"/tests/hud_test.cpp
   "$root"/tests/self_test.cpp
   "$root"/tests/host_fs_test.cpp

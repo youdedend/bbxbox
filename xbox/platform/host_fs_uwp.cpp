@@ -15,6 +15,7 @@
 #include "xbox/platform/host_fs.h"
 
 #include "xbox/platform/log.h"
+#include "xbox/platform/uwp_handle_access.h"
 
 #include <windows.h>
 
@@ -297,23 +298,66 @@ bool IsRtHandle(int number) {
 
 std::string HstringToUtf8(const winrt::hstring& text) { return winrt::to_string(text); }
 
+std::atomic<bool> g_logged_interop_handle{false};
+
 bool OpenRt(const std::string& path, std::uint64_t* size, int* handle, int* rt_err = nullptr) {
     const std::string win_path = WinPath(path);
     if (win_path.empty()) {
         if (rt_err != nullptr) *rt_err = ENOENT;
         return false;
     }
+    HANDLE direct_handle = INVALID_HANDLE_VALUE;
+    std::uint64_t direct_size = 0;
     std::shared_ptr<RtFile> file;
-    const int err = OnStorageThread([&win_path, &file]() {
+    const int err = OnStorageThread([&win_path, &direct_handle, &direct_size, &file]() {
         const auto item = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
                               winrt::to_hstring(win_path))
                               .get();
+        // Fast path (from XboxEmulationHub/RetroArch): pull a native Win32 HANDLE
+        // from the FutureAccessList StorageFile via IStorageItemHandleAccess so
+        // every subsequent Read/Seek runs directly on ::ReadFile / ::SetFilePointerEx
+        // instead of bouncing through WinRT IRandomAccessStream::ReadAsync.
+        if (auto* unk = static_cast<IUnknown*>(winrt::get_abi(item))) {
+            IStorageItemHandleAccess* handle_access = nullptr;
+            if (SUCCEEDED(unk->QueryInterface(__uuidof(IStorageItemHandleAccess),
+                                              reinterpret_cast<void**>(&handle_access))) &&
+                handle_access != nullptr) {
+                HANDLE raw = INVALID_HANDLE_VALUE;
+                const HRESULT hr = handle_access->Create(
+                    HAO_READ,
+                    static_cast<HANDLE_SHARING_OPTIONS>(HSO_SHARE_READ | HSO_SHARE_WRITE |
+                                                        HSO_SHARE_DELETE),
+                    HO_RANDOM_ACCESS, nullptr, &raw);
+                handle_access->Release();
+                if (SUCCEEDED(hr) && raw != INVALID_HANDLE_VALUE && raw != nullptr) {
+                    LARGE_INTEGER file_size{};
+                    if (::GetFileSizeEx(raw, &file_size) && file_size.QuadPart >= 0) {
+                        direct_size = static_cast<std::uint64_t>(file_size.QuadPart);
+                    }
+                    direct_handle = raw;
+                    if (!g_logged_interop_handle.exchange(true, std::memory_order_relaxed)) {
+                        bbx::platform::LogF(
+                            "hostfs: IStorageItemHandleAccess active for FutureAccessList USB reads (native Win32 HANDLE)");
+                    }
+                    return;
+                }
+            }
+        }
         auto created = std::make_shared<RtFile>();
         created->stream = item.OpenAsync(winrt::Windows::Storage::FileAccessMode::Read).get();
         created->size = created->stream.Size();
         file = created;
     });
     if (rt_err != nullptr) *rt_err = err;
+    if (direct_handle != INVALID_HANDLE_VALUE) {
+        if (size != nullptr) *size = direct_size;
+        if (handle != nullptr) {
+            *handle = Adopt(direct_handle);
+        } else {
+            ::CloseHandle(direct_handle);
+        }
+        return true;
+    }
     if (file == nullptr) return false;
     if (size != nullptr) *size = file->size;
     if (handle != nullptr) *handle = AdoptRt(std::move(file));

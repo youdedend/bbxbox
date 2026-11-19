@@ -17,8 +17,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32) && defined(BBX_UWP)
+#include <windows.h>
+#include <fileapifromapp.h>
+#endif
 
 namespace bbx::guest {
 
@@ -126,6 +132,12 @@ inline bool SpillLoad(Spill& spill, std::uint64_t key, void* out, std::size_t le
     return spill.slot_of.count(key) != 0;
 }
 
+inline constexpr std::uint32_t kSpillSectorAlign = 4096u;
+
+[[nodiscard]] constexpr std::size_t SpillAlignUp(std::size_t bytes) noexcept {
+    return (bytes + kSpillSectorAlign - 1u) & ~static_cast<std::size_t>(kSpillSectorAlign - 1u);
+}
+
 // Evicts down to `keep` resident slots; used when the pager asks for headroom
 // back. Returns how many were dropped.
 inline std::uint32_t SpillTrim(Spill& spill, std::uint32_t keep) {
@@ -133,5 +145,90 @@ inline std::uint32_t SpillTrim(Spill& spill, std::uint32_t keep) {
     while (spill.UsedSlots() > keep && SpillEvictOne(spill)) ++dropped;
     return dropped;
 }
+
+#if defined(_WIN32) && defined(BBX_UWP)
+// Unbuffered pre-allocated UWP spill file (inspired by XboxEmulationHub/xbox-swap's
+// FILE_FLAG_NO_BUFFERING + SetEndOfFile technique, paired with 64 KiB sector-aligned
+// slots so spilled cold data never inflates Xbox's 5,120 MiB OS file-cache memory).
+struct UnbufferedSpillFile {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::uint64_t capacity_bytes = 0;
+    alignas(kSpillSectorAlign) std::uint8_t sector_buf[kSpillSlotBytes]{};
+
+    ~UnbufferedSpillFile() { Close(); }
+
+    void Close() {
+        if (handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+        capacity_bytes = 0;
+    }
+
+    bool Open(const wchar_t* path, std::uint32_t slots) {
+        Close();
+        if (path == nullptr || slots == 0) return false;
+        if (slots > kSpillMaxSlots) slots = kSpillMaxSlots;
+        const std::uint64_t total = static_cast<std::uint64_t>(slots) * kSpillSlotBytes;
+        CREATEFILE2_EXTENDED_PARAMETERS params{};
+        params.dwSize = sizeof(params);
+        params.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        params.dwFileFlags = FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
+        HANDLE h = ::CreateFile2FromAppW(path, GENERIC_READ | GENERIC_WRITE, 0, CREATE_ALWAYS,
+                                         &params);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(total);
+        if (!::SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) || !::SetEndOfFile(h)) {
+            ::CloseHandle(h);
+            return false;
+        }
+        handle = h;
+        capacity_bytes = total;
+        return true;
+    }
+
+    static bool WriteSlot(void* ctx, std::uint64_t offset, const void* bytes, std::size_t len) {
+        auto* self = static_cast<UnbufferedSpillFile*>(ctx);
+        if (self == nullptr || self->handle == INVALID_HANDLE_VALUE || bytes == nullptr ||
+            len == 0 || len > kSpillSlotBytes || (offset % kSpillSectorAlign) != 0) {
+            return false;
+        }
+        const std::size_t aligned = SpillAlignUp(len);
+        if (offset + aligned > self->capacity_bytes) return false;
+        std::memcpy(self->sector_buf, bytes, len);
+        if (aligned > len) std::memset(self->sector_buf + len, 0, aligned - len);
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
+        ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD written = 0;
+        return ::WriteFile(self->handle, self->sector_buf, static_cast<DWORD>(aligned), &written,
+                           &ov) != FALSE &&
+               written == static_cast<DWORD>(aligned);
+    }
+
+    static bool ReadSlot(void* ctx, std::uint64_t offset, void* out, std::size_t len) {
+        auto* self = static_cast<UnbufferedSpillFile*>(ctx);
+        if (self == nullptr || self->handle == INVALID_HANDLE_VALUE || out == nullptr ||
+            len == 0 || len > kSpillSlotBytes || (offset % kSpillSectorAlign) != 0) {
+            return false;
+        }
+        const std::size_t aligned = SpillAlignUp(len);
+        if (offset + aligned > self->capacity_bytes) return false;
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(offset & 0xffffffffull);
+        ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD got = 0;
+        if (!::ReadFile(self->handle, self->sector_buf, static_cast<DWORD>(aligned), &got, &ov) ||
+            got != static_cast<DWORD>(aligned)) {
+            return false;
+        }
+        std::memcpy(out, self->sector_buf, len);
+        return true;
+    }
+
+    [[nodiscard]] SpillIo Io() { return SpillIo{this, &WriteSlot, &ReadSlot}; }
+};
+#endif
 
 }  // namespace bbx::guest

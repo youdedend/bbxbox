@@ -49,6 +49,8 @@ struct D3d12Session::Impl {
     d3d12::Swapchain swapchain;
     d3d12::PipelineSet pipelines;
     d3d12::Replay replay;
+    ConsoleCaps console_caps;
+    float tv_refresh_hz = 60.0f;
     OutputPlan plan;
     Hud hud{1920.0f, 1080.0f};
     GpuReport report;
@@ -300,6 +302,7 @@ struct D3d12Session::Impl {
     void FillReport() {
         report.ready = ready;
         report.uma = device.IsUma();
+        report.console = console_caps.name != nullptr ? console_caps.name : "Xbox";
         report.feature_level = "11_0";
         if (device.Adapter() != nullptr) {
             DXGI_ADAPTER_DESC1 adapter{};
@@ -310,11 +313,13 @@ struct D3d12Session::Impl {
         if (report.adapter.empty()) { report.adapter = "unknown adapter"; }
         report.memory = device.DescribeMemory();
         report.guest = guest_memory_line + " | " + guest_compute.Report() + " | " + guest_graphics.Report();
-        char text[192];
-        std::snprintf(text, sizeof(text), "%ux%u x%u%s%s%s", swapchain.Width(), swapchain.Height(),
-                      swapchain.BufferCount(), device.TearingSupported() ? ", VRR" : "",
+        char text[224];
+        std::snprintf(text, sizeof(text), "%ux%u @ %d Hz x%u (%s%s%s%s)", swapchain.Width(),
+                      swapchain.Height(), static_cast<int>(tv_refresh_hz + 0.5f),
+                      swapchain.BufferCount(), report.console.c_str(),
+                      device.TearingSupported() ? ", VRR" : "",
                       plan.clamped ? ", clamped" : "",
-                      plan.scaled() ? ", scaled by the panel" : "");
+                      plan.scaled() ? ", scaled" : "");
         report.swapchain = text;
     }
 };
@@ -367,10 +372,18 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
         return impl.report.status;
     }
 
-    // The television's mode decides the swapchain's size; the window's pixels only
-    // matter when the mode is unknown (display.h explains the clamp).
-    impl.plan = PlanOutput(window_width, window_height, QueryTvMode(), /*allow_4k=*/true);
-    LogMessage(Level::kInfo, "d3d12: output plan %s", impl.plan.reason.c_str());
+    // Query the console hardware model first so Xbox Series S is capped at
+    // 2560x1440 (a 4K UWP swapchain crashes on Series S even on a 4K TV).
+    impl.console_caps = ConsoleCapsFor(QueryConsoleModel());
+    const TvMode tv = QueryTvMode();
+    impl.tv_refresh_hz = (tv.valid && tv.refresh_hz >= 23.0f && tv.refresh_hz <= 240.0f)
+                             ? tv.refresh_hz
+                             : 60.0f;
+    impl.plan = PlanOutput(window_width, window_height, tv, /*match_tv=*/true,
+                           impl.console_caps.max_swap_width, impl.console_caps.max_swap_height);
+    LogMessage(Level::kInfo, "d3d12: console %s (max swapchain %ux%u); %s",
+               impl.console_caps.name, impl.console_caps.max_swap_width,
+               impl.console_caps.max_swap_height, DescribeOutput(impl.plan, tv).c_str());
 
     impl.report.status =
         impl.swapchain.Create(impl.device, core_window, impl.plan, impl.device.TearingSupported());
@@ -806,11 +819,39 @@ std::uint32_t D3d12Session::OutputHeight() const {
     return impl_->swapchain.Height();
 }
 
+float D3d12Session::RefreshHz() const {
+    if (impl_ == nullptr) { return 60.0f; }
+    return impl_->tv_refresh_hz;
+}
+
+ConsoleCaps D3d12Session::Console() const {
+    if (impl_ == nullptr) { return ConsoleCaps{}; }
+    return impl_->console_caps;
+}
+
 bbx::d3d12::Status D3d12Session::OnModeChanged(std::uint32_t window_width,
                                                std::uint32_t window_height) {
     if (impl_ == nullptr || !impl_->ready) { return d3d12::Status::kUnavailable; }
     Impl& impl = *impl_;
-    const OutputPlan plan = PlanOutput(window_width, window_height, QueryTvMode(), true);
+    const TvMode tv = QueryTvMode();
+    if (tv.valid && tv.refresh_hz >= 23.0f && tv.refresh_hz <= 240.0f) {
+        impl.tv_refresh_hz = tv.refresh_hz;
+    }
+    const OutputPlan plan = PlanOutput(window_width, window_height, tv, true,
+                                       impl.console_caps.max_swap_width,
+                                       impl.console_caps.max_swap_height);
+    if (plan.swap_width == impl.swapchain.Width() &&
+        plan.swap_height == impl.swapchain.Height()) {
+        impl.plan = plan;
+        impl.FillReport();
+        return d3d12::Status::kOk;
+    }
+    // Wait for all pending GPU work before releasing/resizing swapchain buffers.
+    {
+        std::lock_guard<std::mutex> glk(impl.gpu_mutex);
+        impl.FlushAllLocked();
+    }
+    (void)impl.device.WaitIdle();
     const d3d12::Status status = impl.swapchain.Resize(plan);
     if (status != d3d12::Status::kOk) {
         LogMessage(Level::kError, "d3d12: resize failed (%s)", d3d12::StatusName(status));
@@ -820,6 +861,9 @@ bbx::d3d12::Status D3d12Session::OnModeChanged(std::uint32_t window_width,
     impl.hud.Resize(static_cast<float>(impl.swapchain.Width()),
                     static_cast<float>(impl.swapchain.Height()));
     impl.FillReport();
+    LogMessage(Level::kInfo, "d3d12: resized swapchain to %ux%u @ %.2f Hz (%s)",
+               impl.swapchain.Width(), impl.swapchain.Height(), impl.tv_refresh_hz,
+               impl.plan.reason.c_str());
     return status;
 }
 
