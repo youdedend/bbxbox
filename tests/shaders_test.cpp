@@ -394,3 +394,46 @@ TEST(ConsoleDialectLowersVectorSignWithHlsl2021Select) {
     CHECK(r.source.find("select(") != std::string::npos);
 }
 
+TEST(ConsoleDialectEmitsInitializedFunctionLocals) {
+    // Regression guard: PS4 shaders frequently declare function-local
+    // OpVariables with an OpConstantNull initializer; hlsl.cpp must emit
+    // valid HLSL instead of refusing the shader.
+    std::vector<std::uint32_t> m = {0x07230203u, 0x00010500u, 0u, 32u, 0u};
+    auto op = [&](std::uint16_t code, std::initializer_list<std::uint32_t> args) {
+        m.push_back((static_cast<std::uint32_t>(args.size() + 1) << 16) | code);
+        m.insert(m.end(), args);
+    };
+    enum : std::uint32_t {
+        kVoid = 1, kFunc = 2, kFloat = 3, kVec4 = 4, kPtrOut = 5, kPtrFn = 6,
+        kNullVec4 = 7, vOut = 8, vLocal = 9, fMain = 10, lbl = 11, tLoaded = 12
+    };
+    op(17, {1u});
+    op(14, {0u, 1u});
+    op(15, {4u, fMain, 0x6e69616du, 0u, vOut});
+    op(16, {fMain, 7u});
+    op(71, {vOut, 30u, 0u});
+    op(19, {kVoid});
+    op(33, {kFunc, kVoid});
+    op(22, {kFloat, 32u});
+    op(23, {kVec4, kFloat, 4u});
+    op(32, {kPtrOut, 3u, kVec4});
+    op(32, {kPtrFn, 7u, kVec4});  // ScFunction = 7
+    op(46, {kVec4, kNullVec4});    // OpConstantNull
+    op(59, {kPtrOut, vOut, 3u});
+    op(54, {kVoid, fMain, 0u, kFunc});
+    op(248, {lbl});
+    op(59, {kPtrFn, vLocal, 7u, kNullVec4});  // OpVariable ScFunction with initializer
+    op(61, {kVec4, tLoaded, vLocal});
+    op(62, {vOut, tLoaded});
+    op(253, {});
+    op(56, {});
+
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult r = gcn::emit_hlsl(m, options);
+    CHECK(r.ok());
+    CHECK(r.source.find("float4(") != std::string::npos);
+    CHECK(r.source.find("= float4(") != std::string::npos);
+}
+
+

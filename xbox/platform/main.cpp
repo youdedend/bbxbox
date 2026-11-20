@@ -1331,7 +1331,11 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     const std::size_t max_chars = std::max<std::size_t>(
         32u, static_cast<std::size_t>(inner_w / static_cast<float>(bbx::platform::HudFont::kColumns * small_scale)));
 
-    const bool has_status = !g_session.model.status_banner.empty();
+    std::vector<std::string> status_lines;
+    if (!g_session.model.status_banner.empty()) {
+        status_lines = WrapLines(g_session.model.status_banner, max_chars);
+        if (status_lines.size() > 2u) status_lines.resize(2u);
+    }
     std::vector<std::string> hint_lines;
     if (!g_session.baking && !g_session.keyboard_open) {
         if (const bbx::platform::Item* cur = g_session.model.Current(); cur && !cur->hint.empty()) {
@@ -1339,7 +1343,7 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
             if (hint_lines.size() > 2u) hint_lines.resize(2u);
         }
     }
-    const std::size_t footer_rows = (has_status ? 1u : 0u) + hint_lines.size() + 1u;
+    const std::size_t footer_rows = status_lines.size() + hint_lines.size() + 1u;
 
     const float header_h = row_h * 1.45f;
     const float tab_h = (!g_session.baking && !g_session.keyboard_open) ? (row_h * 1.25f) : 0.0f;
@@ -1527,9 +1531,8 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     y += px * 2.5f;
     const float small_line = bbx::platform::Hud::TextHeight(small_scale) + px * 1.8f;
 
-    if (has_status) {
-        const std::vector<std::string> st = WrapLines(g_session.model.status_banner, max_chars);
-        hud.Text(x, y, small_scale, st[0], bbx::platform::HudColor::PalebloodEmber());
+    for (const std::string& sl : status_lines) {
+        hud.Text(x, y, small_scale, sl, bbx::platform::HudColor::PalebloodEmber());
         y += small_line;
     }
     for (const std::string& hl : hint_lines) {

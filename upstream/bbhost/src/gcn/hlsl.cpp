@@ -1469,7 +1469,10 @@ private:
                 handles[in.id] = h;
                 return;
             }
-            if (pt.sc == spv::ScInput || pt.sc == spv::ScOutput) return define(in, global_names.at(p));
+            if (pt.sc == spv::ScInput || pt.sc == spv::ScOutput ||
+                (pt.sc == spv::ScFunction && type(pt.elem).k != TK::Struct)) {
+                return define(in, global_names.at(p));
+            }
             fail("a load of a whole block");
         }
         const auto h = handles.find(p);
@@ -1516,7 +1519,7 @@ private:
         if (in.a.size() > 2 && !physical) fail("a store with memory operands");
         if (var_type.count(p)) {
             const Type& pt = type(var_type.at(p));
-            if (pt.sc != spv::ScOutput) fail("a store to a variable that is no output");
+            if (pt.sc != spv::ScOutput && pt.sc != spv::ScFunction) fail("a store to a variable that is no output");
             if (p == cp_out_var && cp_out_var) fail("a store to the whole output patch");
             if (type(pt.elem).k == TK::Array) {
                 // A whole array (clip distances): element by element.

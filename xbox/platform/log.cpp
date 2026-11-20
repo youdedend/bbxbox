@@ -522,6 +522,7 @@ void InstallLastChanceLogger() {
         std::_Exit(134);
     });
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    std::atexit([] { LogFlush(); });
 }
 
 const char* LastLine() { return g_last_line; }
