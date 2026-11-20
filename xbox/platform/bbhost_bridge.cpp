@@ -1242,8 +1242,14 @@ struct GuestLaunch {
 };
 
 DWORD WINAPI GuestMain(void* p) {
-    ULONG stack_guarantee = 65536;
-    (void)::SetThreadStackGuarantee(&stack_guarantee);
+    using SetStackGuaranteeFn = BOOL(WINAPI*)(PULONG);
+    if (const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
+        if (const auto set_guarantee = reinterpret_cast<SetStackGuaranteeFn>(
+                ::GetProcAddress(k32, "SetThreadStackGuarantee"))) {
+            ULONG stack_guarantee = 65536;
+            (void)set_guarantee(&stack_guarantee);
+        }
+    }
     auto* launch = static_cast<GuestLaunch*>(p);
     void* tcb = hle_thread_enter_guest();
     bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo, "guest: entering _start");
