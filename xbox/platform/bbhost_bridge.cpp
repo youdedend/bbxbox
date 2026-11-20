@@ -1430,29 +1430,11 @@ bool StartGuest(const GuestRequest& req) {
                 "boot: v1.09 .text anchor check did not match (%s)", anchors.detail.c_str());
         }
     }
-    if (!is_109 && !req.modded_eboot_ok) {
-        // Every patch, hook and engine address below is an address in 1.09; a
-        // different build would fail far from the cause, on a pointer read out
-        // of a struct that moved. Refused here, with the digest in the log.
-        const std::string short_sha = raw_sha256.size() > 12 ? raw_sha256.substr(0, 12) : raw_sha256;
-        SetLastStartError("Eboot is not verified v1.09 (sha " + short_sha + "..., anchors " +
-                          std::to_string(anchors.matched) + "/" + std::to_string(anchors.total) +
-                          "). Enable 'Allow modded/alt eboot' in the menu to try anyway.");
-        bbx::platform::LogMessage(bbx::platform::Level::kError,
-                                  "boot: this eboot is not 1.09 (sha256 %s, expected %s; %s); "
-                                  "enable \"Allow modded/alt eboot\" in the launcher to start it anyway",
-                                  raw_sha256.c_str(), kEboot109Sha256, anchors.detail.c_str());
-        g_guest_base.store(nullptr, std::memory_order_release);
-        g_guest_slide.store(0, std::memory_order_relaxed);
-        g_guest_size.store(0, std::memory_order_relaxed);
-        unload_elf(&g_image);
-        return false;
-    }
     if (!is_109) {
         bbx::platform::LogMirroredMessage(
             bbx::platform::Level::kWarn,
-            "boot: starting unverified eboot (sha256 %s, %s); v1.09 address patches skipped",
-            raw_sha256.c_str(), anchors.detail.c_str());
+            "boot: starting unverified eboot (sha256 %s, %s, modded_eboot_ok=%d); v1.09 address patches skipped",
+            raw_sha256.c_str(), anchors.detail.c_str(), req.modded_eboot_ok ? 1 : 0);
     }
 
     // The baked shaders, from the dump or from LocalState\data (produced by the
