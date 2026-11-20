@@ -436,4 +436,49 @@ TEST(ConsoleDialectEmitsInitializedFunctionLocals) {
     CHECK(r.source.find("= float4(") != std::string::npos);
 }
 
+TEST(ConsoleDialectEmitsWaveShuffleForCapability65) {
+    // Regression guard: 7,448 Bloodborne shaders declare Capability
+    // GroupNonUniformShuffle (65); hlsl.cpp must emit WaveReadLaneAt().
+    std::vector<std::uint32_t> m = {0x07230203u, 0x00010500u, 0u, 32u, 0u};
+    auto op = [&](std::uint16_t code, std::initializer_list<std::uint32_t> args) {
+        m.push_back((static_cast<std::uint32_t>(args.size() + 1) << 16) | code);
+        m.insert(m.end(), args);
+    };
+    enum : std::uint32_t {
+        kVoid = 1, kFunc = 2, kUInt = 3, kPtrIn = 4, kPtrOut = 5,
+        kScope = 6, kLane = 7, vIn = 8, vOut = 9, fMain = 10, lbl = 11,
+        tIn = 12, tShuf = 13
+    };
+    op(17, {1u});   // Shader
+    op(17, {65u});  // GroupNonUniformShuffle (capability 65)
+    op(14, {0u, 1u});
+    op(15, {4u, fMain, 0x6e69616du, 0u, vIn, vOut});
+    op(16, {fMain, 7u});
+    op(71, {vIn, 30u, 0u});
+    op(71, {vOut, 30u, 0u});
+    op(19, {kVoid});
+    op(33, {kFunc, kVoid});
+    op(21, {kUInt, 32u, 0u});
+    op(32, {kPtrIn, 1u, kUInt});
+    op(32, {kPtrOut, 3u, kUInt});
+    op(43, {kUInt, kScope, 3u});  // ScopeSubgroup = 3
+    op(43, {kUInt, kLane, 0u});
+    op(59, {kPtrIn, vIn, 1u});
+    op(59, {kPtrOut, vOut, 3u});
+    op(54, {kVoid, fMain, 0u, kFunc});
+    op(248, {lbl});
+    op(61, {kUInt, tIn, vIn});
+    op(345, {kUInt, tShuf, kScope, tIn, kLane});  // OpGroupNonUniformShuffle
+    op(62, {vOut, tShuf});
+    op(253, {});
+    op(56, {});
+
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult r = gcn::emit_hlsl(m, options);
+    CHECK(r.ok());
+    CHECK(r.source.find("WaveReadLaneAt(") != std::string::npos);
+}
+
+
 

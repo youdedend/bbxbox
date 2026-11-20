@@ -776,7 +776,7 @@ private:
             // Ballots, counted (WaveActiveCountBits, WavePrefixCountBits), and
             // WaveReadLaneFirst: the GDS counters stepped a subgroup at a time.
             // A ballot read any other way is not printed (Printer::ballots).
-            case spv::CapGroupNonUniformBallot: break;
+            case spv::CapGroupNonUniformBallot: case spv::CapGroupNonUniformShuffle: break;
             // A lift for a device that rounds halves itself (gcn/half.h
             // native_half_rtz): Float16 comes with the half types DXC is given
             // (-enable-16bit-types), DenormPreserve and RoundingModeRTZ with
@@ -1909,6 +1909,14 @@ private:
         case spv::OpGroupNonUniformBroadcastFirst: {
             subgroup_scope(in.a.at(0));
             return define(in, "WaveReadLaneFirst(" + ref(in.a.at(1)) + ")");
+        }
+        case spv::OpGroupNonUniformShuffle: {
+            subgroup_scope(in.a.at(0));
+            return define(in, "WaveReadLaneAt(" + ref(in.a.at(1)) + ", " + as(in.a.at(2), 'u') + ")");
+        }
+        case spv::OpGroupNonUniformShuffleXor: {
+            subgroup_scope(in.a.at(0));
+            return define(in, "WaveReadLaneAt(" + ref(in.a.at(1)) + ", WaveGetLaneIndex() ^ " + as(in.a.at(2), 'u') + ")");
         }
         case spv::OpGroupNonUniformQuadBroadcast: {
             if (!consts.count(in.a.at(0)) || const_bits(consts.at(in.a[0])) != spv::ScopeSubgroup) fail("a quad operation of another scope");

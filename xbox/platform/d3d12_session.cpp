@@ -556,7 +556,25 @@ Hud D3d12Session::BuildReportHud() const {
     y += line;
     hud.Row(x, y, row_width, s, "FEATURE LEVEL", impl.report.feature_level, HudColor::BoneIvory());
     y += line;
-    hud.Row(x, y, row_width, s, "MEMORY", impl.report.memory, HudColor::BoneIvory());
+    std::string memory_hud = impl.report.memory;
+    if (const std::size_t semi1 = memory_hud.find(';'); semi1 != std::string::npos) {
+        std::string head = memory_hud.substr(0, semi1);
+        const std::size_t semi2 = memory_hud.rfind(';');
+        if (semi2 != std::string::npos && semi2 > semi1) {
+            head += memory_hud.substr(semi2);
+        }
+        memory_hud = std::move(head);
+    }
+    const float max_val_w = std::max(0.0f, row_width - Hud::TextWidth("MEMORY  ", s));
+    while (!memory_hud.empty() && Hud::TextWidth(memory_hud, s) > max_val_w) {
+        if (memory_hud.size() <= 4) {
+            memory_hud.clear();
+            break;
+        }
+        memory_hud.resize(memory_hud.size() - 4);
+        memory_hud += "...";
+    }
+    hud.Row(x, y, row_width, s, "MEMORY", memory_hud, HudColor::BoneIvory());
     y += line;
     hud.Row(x, y, row_width, s, "SWAPCHAIN", impl.report.swapchain, HudColor::BoneIvory());
     y += line;
