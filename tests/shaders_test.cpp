@@ -480,5 +480,46 @@ TEST(ConsoleDialectEmitsWaveShuffleForCapability65) {
     CHECK(r.source.find("WaveReadLaneAt(") != std::string::npos);
 }
 
+TEST(ConsoleDialectEmitsWaveGetLaneIndexForBuiltIn41) {
+    // Regression guard: 7,448 Bloodborne shaders use BuiltIn
+    // SubgroupLocalInvocationId (41); hlsl.cpp must emit WaveGetLaneIndex().
+    std::vector<std::uint32_t> m = {0x07230203u, 0x00010500u, 0u, 32u, 0u};
+    auto op = [&](std::uint16_t code, std::initializer_list<std::uint32_t> args) {
+        m.push_back((static_cast<std::uint32_t>(args.size() + 1) << 16) | code);
+        m.insert(m.end(), args);
+    };
+    enum : std::uint32_t {
+        kVoid = 1, kFunc = 2, kUInt = 3, kPtrIn = 4, kPtrOut = 5,
+        vLane = 6, vOut = 7, fMain = 8, lbl = 9, tLane = 10
+    };
+    op(17, {1u});   // Shader
+    op(17, {65u});  // GroupNonUniformShuffle
+    op(14, {0u, 1u});
+    op(15, {4u, fMain, 0x6e69616du, 0u, vLane, vOut});
+    op(16, {fMain, 7u});
+    op(71, {vLane, 11u, 41u});  // OpDecorate BuiltIn SubgroupLocalInvocationId (41)
+    op(71, {vOut, 30u, 0u});
+    op(19, {kVoid});
+    op(33, {kFunc, kVoid});
+    op(21, {kUInt, 32u, 0u});
+    op(32, {kPtrIn, 1u, kUInt});
+    op(32, {kPtrOut, 3u, kUInt});
+    op(59, {kPtrIn, vLane, 1u});
+    op(59, {kPtrOut, vOut, 3u});
+    op(54, {kVoid, fMain, 0u, kFunc});
+    op(248, {lbl});
+    op(61, {kUInt, tLane, vLane});
+    op(62, {vOut, tLane});
+    op(253, {});
+    op(56, {});
+
+    gcn::HlslOptions options;
+    options.dxil_sm64 = true;
+    const gcn::HlslResult r = gcn::emit_hlsl(m, options);
+    CHECK(r.ok());
+    CHECK(r.source.find("WaveGetLaneIndex()") != std::string::npos);
+}
+
+
 
 

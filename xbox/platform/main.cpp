@@ -923,6 +923,8 @@ void FinishDumpGrant(const std::string& path, const std::string& token, bool for
     if (!g_session.layout.layout_ok()) {
         bbx::platform::LogMessage(bbx::platform::Level::kError, "dump rejected: %s",
                                   g_session.layout.problem.c_str());
+    } else if (!g_session.layout.base_path.empty()) {
+        (void)bbx::platform::LogMirrorToUsb(g_session.layout.base_path);
     }
     SaveLayoutSettings();
     RefreshLauncher(/*probe_storage=*/true);
@@ -3023,6 +3025,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         guest_ever_started = true;
                         g_session.model.status_banner.clear();
                         if (g_session.gpu) g_session.gpu->PrewarmShaders();
+                        bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo,
+                                                          "launcher: guest started and prewarm queued");
                     } else {
                         const std::string err = bbx::bridge::LastStartError();
                         g_session.model.status_banner =

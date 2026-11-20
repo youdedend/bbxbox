@@ -1000,6 +1000,13 @@ private:
                 s.name = unique("gl_TessCoord_");
                 if (dxil) helper_decls.push_back("static float3 " + s.name + ";  // SV_DomainLocation, assigned on entry");
                 else helper_decls.push_back("[[vk::ext_builtin_input(13 /* TessCoord */)]] static const float3 " + s.name + ";");
+            } else if (s.builtin == spv::BiSubgroupLocalInvocationId) {
+                s.name = unique("gl_SubgroupLocalInvocationID_");
+                if (dxil) {
+                    helper_decls.push_back("#define " + s.name + " WaveGetLaneIndex()");
+                } else {
+                    helper_decls.push_back("[[vk::ext_builtin_input(41 /* SubgroupLocalInvocationId */)]] static const uint " + s.name + ";");
+                }
             } else {
                 s.name = unique(base);
             }
@@ -1043,6 +1050,7 @@ private:
         case spv::BiWorkgroupId: return "gl_WorkGroupID_";
         case 28 /* GlobalInvocationId */: return "gl_GlobalInvocationID_";
         case spv::BiLocalInvocationIndex: return "gl_LocalInvocationIndex_";
+        case spv::BiSubgroupLocalInvocationId: return "gl_SubgroupLocalInvocationID_";
         default: fail("built-in " + std::to_string(b));
         }
     }
@@ -2646,6 +2654,7 @@ private:
         if (!local_size[0]) fail("a compute shader without LocalSize");
         std::string s, params, copy;
         for (const StageVar& v : stage_vars) {
+            if (v.builtin == spv::BiSubgroupLocalInvocationId) continue;
             if (!v.input || v.builtin < 0) fail("a compute shader stage variable that is no built-in input");
             const char* sem = nullptr;
             switch (v.builtin) {
@@ -2747,7 +2756,7 @@ private:
         std::string in_struct, out_struct, copy_in, copy_out, cp_struct, pc_struct, params;
         std::uint32_t patch_size = 0;
         for (const StageVar& v : stage_vars) {
-            if (v.builtin == spv::BiHelperInvocation) continue;  // a built-in input of its own (helper_decls)
+            if (v.builtin == spv::BiHelperInvocation || v.builtin == spv::BiSubgroupLocalInvocationId) continue;  // a built-in input of its own (helper_decls)
             if (v.builtin == spv::BiTessCoord) {
                 // SV_DomainLocation is three components of a triangle's and two
                 // of a quad's; the module reads three either way (the lift

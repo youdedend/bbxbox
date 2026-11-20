@@ -1242,8 +1242,11 @@ struct GuestLaunch {
 };
 
 DWORD WINAPI GuestMain(void* p) {
+    ULONG stack_guarantee = 65536;
+    (void)::SetThreadStackGuarantee(&stack_guarantee);
     auto* launch = static_cast<GuestLaunch*>(p);
     void* tcb = hle_thread_enter_guest();
+    bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo, "guest: entering _start");
     launch->fn(launch->argv, nullptr);
     hle_thread_leave_guest(tcb);
     g_running.store(false);
