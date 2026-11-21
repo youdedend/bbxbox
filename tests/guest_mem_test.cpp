@@ -355,6 +355,12 @@ TEST(GuestRoot_HeapLayoutDoesNotOverlap) {
 TEST(GuestRoot_RefusesABindingItDoesNotCarry) {
     const GuestRootLayout layout = GuestRoot(GuestStage::kCompute);
     GuestBindingSlot slot{};
+    // gcn/translate.h assigns samplers at 48+, storage images at 80+, and
+    // storage/constant buffers at 112..127; all must fit inside space 1.
+    CHECK(GuestBinding(layout, GuestRangeKind::kSampler, 64, kGuestParamsSpace, &slot));
+    CHECK(GuestBinding(layout, GuestRangeKind::kUav, 80, kGuestParamsSpace, &slot));
+    CHECK(GuestBinding(layout, GuestRangeKind::kSrv, 112, kGuestParamsSpace, &slot));
+    CHECK(GuestBinding(layout, GuestRangeKind::kUav, 112, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kSrv, kGuestSrvCount, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kUav, kGuestUavCount, kGuestParamsSpace, &slot));
     CHECK(!GuestBinding(layout, GuestRangeKind::kSampler, kGuestSamplerCount, kGuestParamsSpace, &slot));

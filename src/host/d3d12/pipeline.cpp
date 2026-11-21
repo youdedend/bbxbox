@@ -307,7 +307,9 @@ Status CreateGuestRootSignature(Device& device, GuestStage stage, ID3D12RootSign
     desc.pParameters = parameters.data();
     desc.NumStaticSamplers = 0;
     desc.pStaticSamplers = nullptr;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    desc.Flags = stage == GuestStage::kGraphics
+                     ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                     : D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> error;

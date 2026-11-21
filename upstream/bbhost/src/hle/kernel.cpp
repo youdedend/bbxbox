@@ -487,9 +487,41 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
 
 bool host_protect(std::uintptr_t p, std::uint64_t len, int sce_prot) {
 #if defined(BBX_UWP)
-    DWORD old = 0;
     const DWORD prot = static_cast<DWORD>(host_prot(sce_prot));
-    const bool ok = VirtualProtectFromApp(reinterpret_cast<void*>(p), static_cast<std::size_t>(len), prot, &old) != 0;
+    bool ok = true;
+    const std::uintptr_t end = p + static_cast<std::uintptr_t>(len);
+    for (std::uintptr_t cur = p; cur < end;) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQuery(reinterpret_cast<void*>(cur), &m, sizeof(m))) {
+            ok = false;
+            break;
+        }
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+        const std::uintptr_t seg_end = region_end < end ? region_end : end;
+        const SIZE_T seg_len = static_cast<SIZE_T>(seg_end - cur);
+        if (m.State == MEM_RESERVE) {
+            if (prot != PAGE_NOACCESS) {
+                if (!VirtualAlloc2FromApp(GetCurrentProcess(), reinterpret_cast<void*>(cur), seg_len,
+                                          MEM_COMMIT, prot == PAGE_EXECUTE_READ ? PAGE_READWRITE : prot,
+                                          nullptr, 0)) {
+                    ok = false;
+                } else if (prot == PAGE_EXECUTE_READ) {
+                    DWORD old = 0;
+                    if (!VirtualProtectFromApp(reinterpret_cast<void*>(cur), seg_len, prot, &old)) {
+                        ok = false;
+                    }
+                }
+            }
+        } else if (m.State == MEM_COMMIT) {
+            DWORD old = 0;
+            if (!VirtualProtectFromApp(reinterpret_cast<void*>(cur), seg_len, prot, &old)) {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+        cur = seg_end;
+    }
     if (ok && prot == PAGE_EXECUTE_READ) {
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(p), static_cast<SIZE_T>(len));
     }

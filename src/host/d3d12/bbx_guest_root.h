@@ -87,10 +87,10 @@ inline constexpr std::uint32_t kStageParamsBytes = 512;
 // register numbers are held to. A shader that names t64 stops the bake by name
 // (it would read a descriptor the table does not carry), which is the right
 // failure: a bigger table would be a guess about Bloodborne's largest PS.
-inline constexpr std::uint32_t kGuestCbvCount = 63;    // b1..b63 (b0 is the root CBV)
-inline constexpr std::uint32_t kGuestSrvCount = 64;    // t0..t63
-inline constexpr std::uint32_t kGuestUavCount = 64;    // u0..u63
-inline constexpr std::uint32_t kGuestSamplerCount = 64;  // s0..s63
+inline constexpr std::uint32_t kGuestCbvCount = 63;      // b1..b63 (b0 is the root CBV)
+inline constexpr std::uint32_t kGuestSrvCount = 128;     // t0..t127 (images t16+, buffers t112+)
+inline constexpr std::uint32_t kGuestUavCount = 128;     // u0..u127 (storage images u80+, buffers u112+)
+inline constexpr std::uint32_t kGuestSamplerCount = 80;  // s0..s79 (samplers s48..s79)
 
 // What the four rules above make a table's shape: the samplers alone, and the
 // other three classes together.

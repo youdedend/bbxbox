@@ -18,6 +18,12 @@
 
 #if defined(BBHOST_HAVE_SDL3)
 #include <SDL3/SDL.h>
+#if defined(BBX_UWP)
+#ifndef SDL_MAIN_HANDLED
+#define SDL_MAIN_HANDLED
+#endif
+#include <SDL3/SDL_main.h>
+#endif
 #endif
 
 namespace {
@@ -86,6 +92,9 @@ bool ensure_audio() {
     if (g_audio_failed) {
         return false;
     }
+#if defined(BBX_UWP)
+    SDL_SetMainReady();
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         host_log("SDL audio unavailable: %s (mixer runs without output)", SDL_GetError());
         g_audio_failed = true;

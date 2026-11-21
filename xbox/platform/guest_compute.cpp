@@ -69,6 +69,7 @@
 #include "src/host/d3d12/bbx_descriptors.h"
 #include "src/host/d3d12/bbx_guest_root.h"
 #include "src/host/d3d12/bbx_psocache.h"
+#include "src/host/d3d12/bbx_shader_bake.h"
 #include "src/host/d3d12/bbx_shader_cache.h"
 #include "src/host/d3d12/device.h"
 #include "src/host/d3d12/bbx_guest_binding.h"
@@ -313,6 +314,7 @@ struct GuestCompute::Impl {
     std::unique_ptr<d3d12::PsoCache> psos;
     std::uint64_t pso_budget_bytes = 0;
     std::unordered_map<std::uint64_t, ID3D12PipelineState*> pso_objects;
+    std::unordered_set<std::uint64_t> failed_psos;
     std::vector<RetiredPso> retired_psos;
     std::vector<ID3D12PipelineState*> batch_retired_psos;
     std::uint64_t clock = 0;
@@ -1263,6 +1265,7 @@ void GuestCompute::Destroy() {
         if (pso != nullptr) pso->Release();
     }
     impl.pso_objects.clear();
+    impl.failed_psos.clear();
     impl.psos.reset();
     impl.pso_budget_bytes = 0;
     if (impl.srv_ring_budgeted && impl.device != nullptr) {
@@ -1404,6 +1407,9 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
         if (const auto it = impl.pso_objects.find(key); it != impl.pso_objects.end()) {
             pso = it->second;
             impl.psos->Acquire(PsoKey{key, 0}, impl.clock);
+        } else if (impl.failed_psos.find(key) != impl.failed_psos.end()) {
+            ++impl.counts.bad_pso;
+            return false;
         }
     }
     if (pso == nullptr) {
@@ -1426,8 +1432,22 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
             &desc, IID_PPV_ARGS(created.GetAddressOf()));
         if (FAILED(hr)) {
             ++impl.counts.bad_pso;
-            LogMessage(Level::kError, "guest compute: CreateComputePipelineState for key %016llx failed 0x%08lX",
-                       static_cast<unsigned long long>(key), static_cast<unsigned long>(hr));
+            bool log_first = false;
+            {
+                std::lock_guard<std::mutex> lk(impl.pso_mutex);
+                log_first = impl.failed_psos.insert(key).second;
+            }
+            if (log_first) {
+                std::string sign_why;
+                const bool signed_ok = d3d12::IsSignedDxbc(dxil, sign_why);
+                const d3d12::DxilFeatures sfi0 = d3d12::DxilFeatureFlags(dxil);
+                LogMessage(Level::kError,
+                           "guest compute: CreateComputePipelineState for key %016llx failed 0x%08lX "
+                           "(bytes=%zu, signed=%u%s%s, sfi0=%u:0x%x)",
+                           static_cast<unsigned long long>(key), static_cast<unsigned long>(hr),
+                           dxil.size(), signed_ok ? 1u : 0u, signed_ok ? "" : ":",
+                           signed_ok ? "" : sign_why.c_str(), sfi0.present ? 1u : 0u, sfi0.flags);
+            }
             return false;
         }
         std::lock_guard<std::mutex> lk(impl.pso_mutex);
