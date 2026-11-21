@@ -1159,7 +1159,6 @@ private:
         if (const auto c = consts.find(v); c != consts.end()) return const_expr(v);
         if (const auto g = global_names.find(v); g != global_names.end()) return g->second;
         if (handles.count(v)) fail("a handle used as a value");
-        if (ballots.count(v)) fail("a subgroup ballot read otherwise than counted");
         if (parts.count(v)) fail("a struct value used whole");
         use(v);
         return value_name(v);
@@ -1900,7 +1899,7 @@ private:
         case spv::OpGroupNonUniformBallot: {
             subgroup_scope(in.a.at(0));
             ballots[in.id] = in.a.at(1);
-            return;
+            return define(in, "WaveActiveBallot(" + ref(in.a.at(1)) + ")");
         }
         case spv::OpGroupNonUniformBallotBitCount: {
             subgroup_scope(in.a.at(0));

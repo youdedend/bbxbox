@@ -10,6 +10,9 @@
 #include "core/tls_rewrite.h"
 
 #include <pthread.h>  // winpthreads on Windows: the same API
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -336,6 +339,16 @@ int test_thread_start_ms() {
 }
 
 void* thread_tramp(void* p) {
+#if defined(_WIN32)
+    using SetStackGuaranteeFn = BOOL(WINAPI*)(PULONG);
+    if (const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
+        if (const auto set_guarantee = reinterpret_cast<SetStackGuaranteeFn>(
+                ::GetProcAddress(k32, "SetThreadStackGuarantee"))) {
+            ULONG stack_guarantee = 65536;
+            (void)set_guarantee(&stack_guarantee);
+        }
+    }
+#endif
     auto* t = static_cast<gsync::Thread*>(p);
     ThreadBody* b = body(t);
     gsync::set_current_thread(t);
