@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -105,11 +106,85 @@ struct View {
     HANDLE section = nullptr;
     std::uint64_t offset = 0;
     std::uint64_t len = 0;
-    bool owned = false;  // a private section: closed when its last view goes
+    bool owned = false;     // a private section: closed when its last view goes
+    bool noaccess = false;  // mapped with PAGE_NOACCESS; VEH must not commit on fault
 };
 std::mutex g_mu;
 std::map<std::uintptr_t, View> g_views;
 std::vector<std::pair<std::uint64_t, std::uint64_t>> g_reserved_windows;
+
+LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
+    if (ep == nullptr || ep->ExceptionRecord == nullptr ||
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        ep->ExceptionRecord->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const std::uintptr_t addr = static_cast<std::uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
+    std::uintptr_t vb = 0;
+    std::uint64_t vlen = 0;
+    bool noaccess = false;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto it = g_views.upper_bound(addr);
+        if (it != g_views.begin()) {
+            --it;
+            if (addr >= it->first && addr - it->first < it->second.len) {
+                vb = it->first;
+                vlen = it->second.len;
+                noaccess = it->second.noaccess;
+                found = true;
+            }
+        }
+    }
+    if (!found || noaccess) return EXCEPTION_CONTINUE_SEARCH;
+
+    MEMORY_BASIC_INFORMATION m{};
+    if (!VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m))) return EXCEPTION_CONTINUE_SEARCH;
+    if (m.State == MEM_RESERVE) {
+        const std::uintptr_t chunk_lo = std::max(vb, addr & ~static_cast<std::uintptr_t>(kGran - 1));
+        const std::uintptr_t chunk_hi = std::min(vb + static_cast<std::uintptr_t>(vlen),
+                                                 chunk_lo + static_cast<std::uintptr_t>(kGran));
+        if (chunk_hi > chunk_lo &&
+            api().VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(chunk_lo), chunk_hi - chunk_lo,
+                                MEM_COMMIT, PAGE_READWRITE, nullptr, 0) != nullptr) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // Re-check in case another thread committed the same 64 KiB chunk concurrently.
+        if (VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m)) && m.State == MEM_COMMIT &&
+            (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (m.State == MEM_COMMIT && (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+        // Another thread already committed this page between the fault and our lock.
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ensure_commit_veh() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        using PFN_AddVeh = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+        PFN_AddVeh add_veh = nullptr;
+        if (HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
+            add_veh = reinterpret_cast<PFN_AddVeh>(::GetProcAddress(k32, "AddVectoredExceptionHandler"));
+        }
+        if (add_veh == nullptr) {
+            if (HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll")) {
+                add_veh = reinterpret_cast<PFN_AddVeh>(::GetProcAddress(kb, "AddVectoredExceptionHandler"));
+            }
+        }
+        if (add_veh != nullptr) {
+            PVOID h = add_veh(1, sec_reserve_veh);
+            host_log("win-vm: SEC_RESERVE demand-commit VEH %s", h ? "installed" : "failed");
+        } else {
+            host_log("win-vm: AddVectoredExceptionHandler unavailable; large SEC_RESERVE views may fault");
+        }
+    });
+}
 
 #if defined(BBX_UWP)
 // Strict AppContainer W^X: never pass PAGE_EXECUTE_READWRITE to FromApp VM calls.
@@ -422,11 +497,20 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
         if (place == WinVmPlace::Anywhere) VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
         return nullptr;
     }
+    ensure_commit_veh();
+#if defined(BBX_UWP)
+    if (clean_prot != PAGE_NOACCESS && len <= (128ull << 20)) {
+        if (!api().VirtualAlloc2(GetCurrentProcess(), p, len, MEM_COMMIT, view_prot, nullptr, 0)) {
+            host_log("win-vm: eager MEM_COMMIT at %p (0x%llx) failed: error %lu (falling back to demand-commit)",
+                     p, static_cast<unsigned long long>(len), GetLastError());
+        }
+    }
+#endif
     if (clean_prot == PAGE_NOACCESS) {
         DWORD old = 0;
         VmProtect(p, len, PAGE_NOACCESS, &old);
     }
-    g_views[base] = View{section, offset, len, false};
+    g_views[base] = View{section, offset, len, false, clean_prot == PAGE_NOACCESS};
     return p;
 }
 
