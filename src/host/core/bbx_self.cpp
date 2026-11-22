@@ -591,13 +591,17 @@ Eboot109AnchorCheck VerifyBloodborne109CodeAnchors(const void* guest_base, std::
         0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
         0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xa8, 0x0e, 0x00, 0x00};
 
+    // All six addresses in bbhost's engine hooks are Binary Ninja guest VAs
+    // based at kPreferredGuestSlide (0x400000); subtract it to index guest_base
+    // (ELF VA 0x0).
+    constexpr std::uint64_t kPreferredGuestSlide = 0x400000ull;
     static constexpr Anchor kAnchors[] = {
-        {"SoundI::Ctor", 0x11bd0f0ull, kSoundICtor, sizeof(kSoundICtor)},
-        {"FmgLookup", 0x136f340ull, kFmgLookup, sizeof(kFmgLookup)},
-        {"CharaStep", 0x2043ee0ull, kCharaStep, sizeof(kCharaStep)},
-        {"FrameManager", 0x2434770ull, kFrameManager, sizeof(kFrameManager)},
-        {"YebisRecord", 0x25d4860ull, kYebisRecord, sizeof(kYebisRecord)},
-        {"RenderView", 0x269e990ull, kRenderView, sizeof(kRenderView)},
+        {"SoundI::Ctor", 0x11bd0f0ull - kPreferredGuestSlide, kSoundICtor, sizeof(kSoundICtor)},
+        {"FmgLookup", 0x136f340ull - kPreferredGuestSlide, kFmgLookup, sizeof(kFmgLookup)},
+        {"CharaStep", 0x2043ee0ull - kPreferredGuestSlide, kCharaStep, sizeof(kCharaStep)},
+        {"FrameManager", 0x2434770ull - kPreferredGuestSlide, kFrameManager, sizeof(kFrameManager)},
+        {"YebisRecord", 0x25d4860ull - kPreferredGuestSlide, kYebisRecord, sizeof(kYebisRecord)},
+        {"RenderView", 0x269e990ull - kPreferredGuestSlide, kRenderView, sizeof(kRenderView)},
     };
     constexpr std::uint64_t kExpectedEntry = 0xa0ull;
 
