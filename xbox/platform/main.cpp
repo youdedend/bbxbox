@@ -2144,12 +2144,20 @@ void RestoreDump() {
 
     if (found_dumps.empty()) {
         const std::size_t already_checked = candidates.size();
+        const auto is_skipped_dir = [&](const std::string& name) {
+            return name == "." || name == ".." || equals_icase(name, "bbxbox_logs") ||
+                   equals_icase(name, "WindowsApps") || equals_icase(name, "WdpTempWebFolder") ||
+                   equals_icase(name, "apps") || equals_icase(name, "shadercache") ||
+                   equals_icase(name, "crashes") || equals_icase(name, "guestswap") ||
+                   equals_icase(name, "guestfs") || equals_icase(name, "System Volume Information") ||
+                   equals_icase(name, "$RECYCLE.BIN");
+        };
         for (const std::string& root : bbx::platform::CandidateDumpRoots()) {
             add_candidate(root);
             if (fs.list_dirs) {
                 const bool dev_files_root = starts_with_icase(root, "D:\\DevelopmentFiles");
                 for (const std::string& child : fs.list_dirs(root)) {
-                    if (child == "." || child == ".." || child == "bbxbox_logs") continue;
+                    if (is_skipped_dir(child)) continue;
                     const std::string child_path = JoinScanPath(root, child);
                     add_candidate(child_path);
                     // Also inspect common 2-level layouts such as E:\XStation\CUSA00900,
@@ -2159,13 +2167,13 @@ void RestoreDump() {
                         equals_icase(child, "dumps") || equals_icase(child, "games") ||
                         equals_icase(child, "ps4") || starts_with_icase(child, "cusa")) {
                         for (const std::string& grandchild : fs.list_dirs(child_path)) {
-                            if (grandchild == "." || grandchild == ".." || grandchild == "bbxbox_logs") continue;
+                            if (is_skipped_dir(grandchild)) continue;
                             const std::string grand_path = JoinScanPath(child_path, grandchild);
                             add_candidate(grand_path);
                             if (equals_icase(grandchild, "games") ||
                                 starts_with_icase(grandchild, "cusa")) {
                                 for (const std::string& great : fs.list_dirs(grand_path)) {
-                                    if (great == "." || great == ".." || great == "bbxbox_logs") continue;
+                                    if (is_skipped_dir(great)) continue;
                                     add_candidate(JoinScanPath(grand_path, great));
                                 }
                             }

@@ -453,15 +453,19 @@ bool StatImpl(const char* path, FileStat* out) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!::GetFileAttributesExFromAppW(wide.c_str(), GetFileExInfoStandard, &data)) {
         const DWORD code = ::GetLastError();
-        // A granted folder is not on the FromApp list; ask WinRT before failing.
+        // A granted folder on USB returns ERROR_ACCESS_DENIED from FromApp;
+        // missing files/folders return ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+        // immediately without needing two WinRT IPC round-trips.
         int rt_err = 0;
-        if (StatRt(path, out, &rt_err)) {
+        if (code == ERROR_ACCESS_DENIED && StatRt(path, out, &rt_err)) {
             t_error = 0;
             return true;
         }
         const int err = (code == ERROR_ACCESS_DENIED && rt_err != 0) ? rt_err : ErrnoFrom(code);
-        bbx::platform::LogF("hostfs: stat refused %s (win32=%lu, errno=%d)", path,
-                            static_cast<unsigned long>(code), err);
+        if (err != ENOENT) {
+            bbx::platform::LogF("hostfs: stat refused %s (win32=%lu, errno=%d)", path,
+                                static_cast<unsigned long>(code), err);
+        }
         Fail(err);
         return false;
     }
@@ -481,17 +485,8 @@ bool MkDirOne(const std::string& path, bool allow_existing) {
     if (wide.empty()) return false;
     if (::CreateDirectoryFromAppW(wide.c_str(), nullptr)) return true;
     const DWORD err = ::GetLastError();
-    if (allow_existing) {
-        if (err == ERROR_ALREADY_EXISTS) {
-            FileStat st{};
-            if (StatImpl(path.c_str(), &st) && st.is_dir) return true;
-            Fail(EEXIST);
-            return false;
-        }
-        if (err == ERROR_ACCESS_DENIED) {
-            FileStat st{};
-            if (StatImpl(path.c_str(), &st) && st.is_dir) return true;
-        }
+    if (allow_existing && (err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED)) {
+        return true;
     }
     Fail(ErrnoFrom(err));
     return false;
@@ -512,6 +507,15 @@ bool MkDirImpl(const char* path, bool create_parents) {
         if (existing.is_dir) return true;
         Fail(EEXIST);
         return false;
+    }
+    // Fast path: if only the leaf directory is missing (e.g. LocalState/guestfs),
+    // CreateDirectoryFromAppW succeeds immediately without walking Q:/Users/...
+    // which the AppContainer sandbox denies access to.
+    {
+        const std::wstring wide = Widen(full.c_str());
+        if (!wide.empty() && ::CreateDirectoryFromAppW(wide.c_str(), nullptr)) {
+            return true;
+        }
     }
     std::string sofar;
     std::size_t pos = 0;
@@ -550,13 +554,15 @@ bool ListImpl(const char* path, std::vector<DirEntry>* out) {
     if (find == INVALID_HANDLE_VALUE) {
         const DWORD code = ::GetLastError();
         int rt_err = 0;
-        if (ListRt(path != nullptr ? path : "", out, &rt_err)) {
+        if (code == ERROR_ACCESS_DENIED && ListRt(path != nullptr ? path : "", out, &rt_err)) {
             t_error = 0;
             return true;
         }
         const int err = (code == ERROR_ACCESS_DENIED && rt_err != 0) ? rt_err : ErrnoFrom(code);
-        bbx::platform::LogF("hostfs: list refused %s (win32=%lu, errno=%d)", path,
-                            static_cast<unsigned long>(code), err);
+        if (err != ENOENT) {
+            bbx::platform::LogF("hostfs: list refused %s (win32=%lu, errno=%d)", path,
+                                static_cast<unsigned long>(code), err);
+        }
         Fail(err);
         return false;
     }
@@ -613,7 +619,7 @@ int OpenImpl(const char* path, int flags, int mode) {
         // Read-only opens of a granted tree go through WinRT. A write to such a
         // path is still refused, and says so: the dump is read-only by design.
         const bool wants_write = (flags & (kWrite | kCreate | kTruncate | kAppend)) != 0;
-        if ((flags & kDirectory) == 0 && !wants_write) {
+        if (code == ERROR_ACCESS_DENIED && (flags & kDirectory) == 0 && !wants_write) {
             int rt_handle = -1;
             if (OpenRt(path, nullptr, &rt_handle, &rt_err)) {
                 t_error = 0;
@@ -621,8 +627,10 @@ int OpenImpl(const char* path, int flags, int mode) {
             }
         }
         const int err = (code == ERROR_ACCESS_DENIED && rt_err != 0) ? rt_err : ErrnoFrom(code);
-        bbx::platform::LogF("hostfs: open refused %s (win32=%lu, errno=%d, flags=0x%x)", path,
-                            static_cast<unsigned long>(code), err, flags);
+        if (err != ENOENT) {
+            bbx::platform::LogF("hostfs: open refused %s (win32=%lu, errno=%d, flags=0x%x)", path,
+                                static_cast<unsigned long>(code), err, flags);
+        }
         return Fail(err);
     }
     if (is_append && (flags & kAccessMask) == (kRead | kWrite)) {

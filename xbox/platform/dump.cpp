@@ -152,6 +152,7 @@ std::string TryDirectSubdirs(const DumpFs& fs, const std::string& root) {
     };
     for (const char* sub : kKnownSubdirs) {
         const std::string sub_path = Join(root, sub);
+        if (!fs.is_dir(sub_path)) continue;
         if (IsDumpRoot(fs, sub_path)) return sub_path;
         // One level deeper for `<root>\<TitleId>\GameData109` when user picked `E:\XStation`.
         const std::string sub_tag = ReadGameLayoutTag(fs, sub_path);
