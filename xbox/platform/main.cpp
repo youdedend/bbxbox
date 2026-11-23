@@ -736,13 +736,13 @@ void RefreshModsOverlay() {
 
 std::vector<std::string> CacheSearchDirs() {
     std::vector<std::string> dirs;
+    dirs.push_back(bbx::platform::Local("data"));
     if (!g_session.layout.base_path.empty()) {
         const std::string& eboot_dir = g_session.layout.CanRunPatched() ? g_session.layout.patch_path
                                                                         : g_session.layout.base_path;
         if (!eboot_dir.empty()) dirs.push_back(eboot_dir);
         if (g_session.layout.base_path != eboot_dir) dirs.push_back(g_session.layout.base_path);
     }
-    dirs.push_back(bbx::platform::Local("data"));
     dirs.push_back(bbx::platform::Paths().local_state);
     return dirs;
 }

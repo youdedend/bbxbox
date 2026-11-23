@@ -1280,9 +1280,13 @@ void LoadShaderCache(const std::string& eboot, const std::string& data_dir) {
     const std::size_t slash = eboot.find_last_of("\\/");
     if (slash != std::string::npos) dir = eboot.substr(0, slash + 1);
     std::vector<std::string> candidates;
-    if (!dir.empty()) candidates.push_back(dir + "bbx_shaders.cache");
     if (!data_dir.empty()) candidates.push_back(bbx::hostfs::JoinPath(data_dir, "bbx_shaders.cache"));
+    if (!dir.empty()) candidates.push_back(dir + "bbx_shaders.cache");
     candidates.push_back(bbx::platform::Local("bbx_shaders.cache"));
+
+    bool found_best = false;
+    bbx::d3d12::ShaderCache best_cache;
+    std::string best_path;
     for (const std::string& path : candidates) {
         std::vector<std::uint8_t> bytes;
         if (!bbx::hostfs::ReadFileAll(path, &bytes)) continue;
@@ -1295,11 +1299,24 @@ void LoadShaderCache(const std::string& eboot, const std::string& data_dir) {
             continue;
         }
         const std::string stamp_text(reinterpret_cast<const char*>(stamp.data()), stamp.size());
-        const bbx::d3d12::CacheStatus status = g_shader_cache.Load(bytes, stamp_text);
+        bbx::d3d12::ShaderCache probe;
+        const bbx::d3d12::CacheStatus status = probe.Load(bytes, stamp_text);
         bbx::platform::LogF("shader_cache: status=%s entries=%zu bytes=%zu path=%s detail=%s",
-                            bbx::d3d12::CacheStatusName(status), g_shader_cache.entries(), g_shader_cache.bytes(),
-                            path.c_str(), g_shader_cache.detail().c_str());
-        if (status == bbx::d3d12::CacheStatus::kOk) return;
+                            bbx::d3d12::CacheStatusName(status), probe.entries(), probe.bytes(),
+                            path.c_str(), probe.detail().c_str());
+        if (status == bbx::d3d12::CacheStatus::kOk) {
+            if (!found_best || probe.entries() > best_cache.entries()) {
+                best_cache = std::move(probe);
+                best_path = path;
+                found_best = true;
+            }
+        }
+    }
+    if (found_best) {
+        g_shader_cache = std::move(best_cache);
+        bbx::platform::LogF("shader_cache: selected %s (%zu entries, %zu bytes)",
+                            best_path.c_str(), g_shader_cache.entries(), g_shader_cache.bytes());
+        return;
     }
     bbx::platform::LogMessage(bbx::platform::Level::kInfo,
                               "shader_cache: no valid cache in dump or LocalState");

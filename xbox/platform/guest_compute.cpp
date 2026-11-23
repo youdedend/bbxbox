@@ -970,9 +970,12 @@ struct GuestCompute::Impl {
             const std::string d(raw);
             if (std::find(dirs.begin(), dirs.end(), d) == dirs.end()) dirs.push_back(d);
         };
+        // Prefer LocalState\data on ties so a fresh on-console bake wins over an
+        // older copy on USB, while still checking all roots to pick the cache
+        // with the most valid entries.
+        add_dir(hle_fs_data_root());
         add_dir(hle_fs_update_root());
         add_dir(hle_fs_app0_root());
-        add_dir(hle_fs_data_root());
         if (dirs.empty()) {
             cache_line = "shader cache: no dump or data root yet; every guest dispatch is refused until the dump is mounted";
             LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
@@ -980,21 +983,27 @@ struct GuestCompute::Impl {
         }
         cache_tried = true;
         bool saw_any = false;
+        bool found_best = false;
+        d3d12::ShaderCache best_cache;
+        std::string best_dir;
+        std::string best_line;
         for (const std::string& candidate : dirs) {
             const std::string path = Join(candidate, "bbx_shaders.cache");
             if (!bbx::hostfs::Exists(path)) continue;
             saw_any = true;
             bbx::hostfs::FileStat stat{};
             if (!bbx::hostfs::Stat(path, &stat) || stat.size == 0 || stat.size > (256u << 20)) {
-                cache_line = "shader cache: " + path + " is empty or implausible; skipping";
-                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                const std::string msg = "shader cache: " + path + " is empty or implausible; skipping";
+                if (!found_best) cache_line = msg;
+                LogMessage(Level::kWarn, "guest compute: %s", msg.c_str());
                 continue;
             }
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(stat.size));
             const int handle = bbx::hostfs::Open(path, bbx::hostfs::kRead);
             if (handle < 0) {
-                cache_line = "shader cache: " + path + " would not open";
-                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                const std::string msg = "shader cache: " + path + " would not open";
+                if (!found_best) cache_line = msg;
+                LogMessage(Level::kWarn, "guest compute: %s", msg.c_str());
                 continue;
             }
             std::size_t read = 0;
@@ -1005,8 +1014,9 @@ struct GuestCompute::Impl {
             }
             (void)bbx::hostfs::Close(handle);
             if (read != bytes.size()) {
-                cache_line = "shader cache: " + path + " read short";
-                LogMessage(Level::kWarn, "guest compute: %s", cache_line.c_str());
+                const std::string msg = "shader cache: " + path + " read short";
+                if (!found_best) cache_line = msg;
+                LogMessage(Level::kWarn, "guest compute: %s", msg.c_str());
                 continue;
             }
             // The stamp beside it: `<cache>.stamp.txt`, with legacy fallback `bbx_shaders.stamp`.
@@ -1033,16 +1043,29 @@ struct GuestCompute::Impl {
                     }
                 }
             }
-            const d3d12::CacheStatus status = cache.Load(bytes, stamp);
-            cache_line = "shader cache: " + path + ", " + cache.Report();
+            d3d12::ShaderCache probe_cache;
+            const d3d12::CacheStatus status = probe_cache.Load(bytes, stamp);
+            const std::string probe_line = "shader cache: " + path + ", " + probe_cache.Report();
             if (status == d3d12::CacheStatus::kOk) {
-                cache_dir = candidate;
-                LogMessage(Level::kInfo, "guest compute: %s", cache_line.c_str());
-                StartPrewarm();
-                return;
+                if (!found_best || probe_cache.entries() > best_cache.entries()) {
+                    best_cache = std::move(probe_cache);
+                    best_dir = candidate;
+                    best_line = probe_line;
+                    found_best = true;
+                }
+                continue;
             }
+            if (!found_best) cache_line = probe_line;
             LogMessage(Level::kWarn, "guest compute: %s (%s); checking next location",
-                       cache_line.c_str(), d3d12::CacheStatusName(status));
+                       probe_line.c_str(), d3d12::CacheStatusName(status));
+        }
+        if (found_best) {
+            cache = std::move(best_cache);
+            cache_dir = std::move(best_dir);
+            cache_line = std::move(best_line);
+            LogMessage(Level::kInfo, "guest compute: %s", cache_line.c_str());
+            StartPrewarm();
+            return;
         }
         if (!saw_any) {
             cache_line = "shader cache: bbx_shaders.cache is missing under " + dirs.front() +
@@ -1070,7 +1093,7 @@ struct GuestCompute::Impl {
         const std::string path = Join(dir, "bbx_shaders.paths");
         bbx::hostfs::FileStat stat{};
         if (!bbx::hostfs::Exists(path) || !bbx::hostfs::Stat(path, &stat) || stat.size == 0 ||
-            stat.size > (1u << 20)) {
+            stat.size > (64u << 20)) {
             paths_line = "binding table: " + path +
                          " is missing or implausible; every space-1 slot stays a null descriptor (rerun the bake)";
             LogMessage(Level::kWarn, "guest compute: %s", paths_line.c_str());

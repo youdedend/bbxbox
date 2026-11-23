@@ -592,6 +592,8 @@ bool AnalyseContainer(const RawContainerItem& item, AnalysedProgram& program, st
     paths_options.stage = TranslateStage(stage_kind);
     paths_options.rsrc1 = stage.key.rsrc1;
     paths_options.rsrc2 = stage.key.rsrc2;
+    paths_options.vs_out_cntl = stage_kind == Stage::kVertex ? stage.key.mask : 0;
+    paths_options.ps_input_ena = stage_kind == Stage::kPixel ? stage.key.mask : 0;
     const gcn::TranslateResult paths = gcn::translate(prog, paths_options);
     if (!paths.errors.empty()) {
         reason = "translate: " + paths.errors.front();
@@ -858,19 +860,31 @@ bool CopyTreeRecursive(const std::string& src_dir, const std::string& dst_dir,
 
 bool HasValidConsoleCache(const std::vector<std::string>& search_dirs, std::string* found_dir,
                           std::string* report, std::size_t* out_stages, std::string* out_stamp) {
+    bool found_any = false;
+    std::string best_dir;
+    std::string best_report;
+    std::size_t best_stages = 0;
+    std::string best_stamp;
     for (const std::string& dir : search_dirs) {
         std::string local_report;
         std::size_t local_stages = 0;
         std::string local_stamp;
         if (ValidateCacheDir(dir, &local_report, &local_stages, &local_stamp)) {
-            if (found_dir != nullptr) *found_dir = dir;
-            if (report != nullptr) *report = local_report;
-            if (out_stages != nullptr) *out_stages = local_stages;
-            if (out_stamp != nullptr) *out_stamp = local_stamp;
-            return true;
+            if (!found_any || local_stages > best_stages) {
+                found_any = true;
+                best_dir = dir;
+                best_report = std::move(local_report);
+                best_stages = local_stages;
+                best_stamp = std::move(local_stamp);
+            }
         }
     }
-    return false;
+    if (!found_any) return false;
+    if (found_dir != nullptr) *found_dir = std::move(best_dir);
+    if (report != nullptr) *report = std::move(best_report);
+    if (out_stages != nullptr) *out_stages = best_stages;
+    if (out_stamp != nullptr) *out_stamp = std::move(best_stamp);
+    return true;
 }
 
 BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progress) {

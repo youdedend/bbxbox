@@ -6133,7 +6133,9 @@ GUEST_ABI std::uint64_t gx_hook(std::uint64_t id, const std::uint64_t* f) {
     }
     if (id >= kCreateShader156 && id <= kCreateComputeShader) {
         note_shader_created(static_cast<int>(id - kCreateShader156), f[3], static_cast<std::uint32_t>(f[2]));
-        gx_objects_watch_creator(const_cast<std::uint64_t*>(f));  // the object gets an id at the return
+        if (g_trace || g_backend) {
+            gx_objects_watch_creator(const_cast<std::uint64_t*>(f));  // the object gets an id at the return
+        }
         return 0;
     }
     if (id == kUpdateSubresource) {
@@ -6826,7 +6828,74 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     g_native = n ? std::atoi(n) : g_backend == 1 ? 2 : 0;
     const char* y = std::getenv("BBHOST_GX_NATIVE_YEBIS");
     g_native_yebis = y ? std::atoi(y) : g_backend == 1 ? 5 : 0;
-    if (!g_trace && !g_backend) return;
+    if (!g_trace && !g_backend) {
+#if defined(BBX_UWP)
+        // Local change, marked BBX_UWP: in packet-path mode (g_backend == 0),
+        // the D3D12 graphics backend still needs the four GX shader creators
+        // hooked so GuestGraphics::NoteShaderCreated receives each Sony Shdr
+        // container (preserving vertex element tables for exact cache keys).
+        g_slide = mem->slide;
+        g_image_size = mem->size;
+        void* host = thunk_wrap(reinterpret_cast<void*>(&gx_hook));
+        void* page = host_page_alloc(0x1000, true);
+        if (!page) {
+            host_log("gx: shader-creator stub page allocation failed");
+            return;
+        }
+        struct PendingHook {
+            std::uint64_t id;
+            std::uint64_t va;
+            std::uint8_t* p;
+            std::uint8_t n;
+            const std::uint8_t* stub;
+        };
+        PendingHook pending[4]{};
+        int pending_count = 0;
+        auto* c = static_cast<std::uint8_t*>(page);
+        for (std::uint64_t id = kCreateShader156; id <= kCreateComputeShader; ++id) {
+            const Hook& h = kHooks[id];
+            const std::uint64_t va = g_slide + (h.va - kPreferredGuestSlide);
+            if (va < mem->slide || va + h.n > mem->slide + mem->size) continue;
+            auto* p = static_cast<std::uint8_t*>(guest_ptr(*mem, va));
+            if (std::memcmp(p, h.bytes, h.n) != 0) {
+                host_log("gx: %s at 0x%llx does not start with the expected prologue; not hooked", kKindName[id],
+                         static_cast<ull>(h.va));
+                continue;
+            }
+            const std::uint8_t* stub = c;
+            c = emit_stub(c, id, host, va + h.n, h);
+            pending[pending_count++] = PendingHook{id, va, p, h.n, stub};
+        }
+        if (pending_count == 0) {
+            host_page_free(page, 0x1000);
+            return;
+        }
+        if (!host_page_make_executable(page, 0x1000)) {
+            host_log("gx: cannot mark shader-creator stub page executable; shader-creator hooks disabled");
+            host_page_free(page, 0x1000);
+            return;
+        }
+        int hooked = 0;
+        for (int i = 0; i < pending_count; ++i) {
+            const PendingHook& ph = pending[i];
+            const std::uint64_t lo = ph.va & ~0xfffull, hi = (ph.va + ph.n + 0xfff) & ~0xfffull;
+            if (!guest_protect_rwx(mem, lo, hi - lo)) {
+                host_log("gx: cannot unprotect 0x%llx", static_cast<ull>(kHooks[ph.id].va));
+                continue;
+            }
+            const std::uint64_t dest = reinterpret_cast<std::uint64_t>(ph.stub);
+            ph.p[0] = 0xff;
+            ph.p[1] = 0x25;  // jmp [rip+0]
+            std::memset(ph.p + 2, 0, 4);
+            std::memcpy(ph.p + 6, &dest, 8);
+            std::memset(ph.p + 14, 0xcc, ph.n - 14u);
+            guest_protect_rx(mem, lo, hi - lo);
+            ++hooked;
+        }
+        host_log("gx: armed %d shader-creator hooks for packet-path key tracking", hooked);
+#endif
+        return;
+    }
     if (const char* comma = g_trace ? std::strchr(e, ',') : nullptr) {
         g_first = std::strtoull(e, nullptr, 10);
         g_last = std::strtoull(comma + 1, nullptr, 10);

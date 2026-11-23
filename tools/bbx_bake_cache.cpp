@@ -631,6 +631,8 @@ Analysed Analyse(const Item& item) {
     paths_options.stage = TranslateStage(out.stage);
     paths_options.rsrc1 = stage.key.rsrc1;
     paths_options.rsrc2 = stage.key.rsrc2;
+    paths_options.vs_out_cntl = out.stage == Stage::kVertex ? stage.key.mask : 0;
+    paths_options.ps_input_ena = out.stage == Stage::kPixel ? stage.key.mask : 0;
     const gcn::TranslateResult paths = gcn::translate(prog, paths_options);
     if (!paths.errors.empty()) {
         out.reason = "translation: " + paths.errors.front();

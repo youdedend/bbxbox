@@ -1150,6 +1150,8 @@ struct GuestGraphics::Impl {
         opts.stage = stage == 0 ? gcn::Stage::Vertex : gcn::Stage::Pixel;
         opts.rsrc1 = rsrc1;
         opts.rsrc2 = rsrc2;
+        opts.vs_out_cntl = stage == 0 ? id.vs_out_cntl : 0;
+        opts.ps_input_ena = stage == 1 ? id.ps_input_ena : 0;
         const gcn::TranslateResult tr = gcn::translate(decoded, opts);
         if (!tr.errors.empty()) {
             fallback_keys.emplace(cache_id, 0);
@@ -1554,15 +1556,27 @@ void GuestGraphics::Destroy() {
 
 bool GuestGraphics::Ready() const { return impl_ != nullptr && impl_->root != nullptr; }
 
-void GuestGraphics::NoteShaderCreated(int stage, const std::uint8_t* container, std::size_t size) {
+void GuestGraphics::NoteShaderCreated(int /*creator*/, const std::uint8_t* container, std::size_t size) {
     if (impl_ == nullptr || container == nullptr || size < 16) return;
-    if (stage != 0 && stage != 1) return;  // 0 = VS, 1 = PS
     Impl& impl = *impl_;
 
-    const std::uint8_t expected_type = stage == 0 ? 1u : 2u;
+    // gx_trace passes `creator = id - kCreateShader156`:
+    //   0 = kCreateShader156 (types 1, 5, 6), 1 = kCreateShader15 (types 1, 5),
+    //   2 = kCreatePixelShader (type 2), 3 = kCreateComputeShader (type 4).
+    // Determine the graphics stage directly from the container's parsed type
+    // so pixel shaders (creator 2) and kCreateShader15 vertex shaders (creator
+    // 1) are both indexed alongside kCreateShader156 vertex shaders.
     std::vector<std::uint8_t> buf(container, container + size);
     gcn::ShaderCode code;
-    if (!gcn::shader_code(buf, code) || code.type != expected_type || code.words.empty()) return;
+    if (!gcn::shader_code(buf, code) || code.words.empty()) return;
+    int norm_stage = -1;
+    if (code.type == 1u) {
+        norm_stage = 0;  // VS
+    } else if (code.type == 2u) {
+        norm_stage = 1;  // PS
+    } else {
+        return;
+    }
 
     const ConsoleContainerStage cs = d3d12::ReadConsoleContainerStage(buf, code.type);
     if (!cs.ok) return;
@@ -1573,15 +1587,17 @@ void GuestGraphics::NoteShaderCreated(int stage, const std::uint8_t* container, 
     const std::uint64_t prog_hash = bbx::Fnv1a64(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(words.data()), words.size() * sizeof(std::uint32_t)));
 
-    const NotedKey hash_key{stage, prog_hash};
+    const NotedKey hash_key{norm_stage, prog_hash};
     if (impl.noted_by_hash.find(hash_key) != impl.noted_by_hash.end()) return;
 
     const gcn::Program decoded = gcn::decode(words.data(), words.size());
     if (!decoded.errors.empty()) return;
     gcn::TranslateOptions opts;
-    opts.stage = stage == 0 ? gcn::Stage::Vertex : gcn::Stage::Pixel;
+    opts.stage = norm_stage == 0 ? gcn::Stage::Vertex : gcn::Stage::Pixel;
     opts.rsrc1 = cs.key.rsrc1;
     opts.rsrc2 = cs.key.rsrc2;
+    opts.vs_out_cntl = norm_stage == 0 ? cs.key.mask : 0;
+    opts.ps_input_ena = norm_stage == 1 ? cs.key.mask : 0;
     const gcn::TranslateResult tr = gcn::translate(decoded, opts);
     if (!tr.errors.empty()) return;
 
@@ -1590,7 +1606,7 @@ void GuestGraphics::NoteShaderCreated(int stage, const std::uint8_t* container, 
         key.dims.push_back((p.dim << 1) | (p.arrayed ? 1u : 0u));
     }
     key.sampler_modes.assign(tr.samplers.size(), 0);
-    if (stage == 1) {
+    if (norm_stage == 1) {
         std::string why;
         if (!d3d12::ConsolePsInputMap(cs, tr.ps_inputs, key.input_map, key.flat_mask, why)) return;
         key.early_fragment_tests = false;
@@ -1598,7 +1614,7 @@ void GuestGraphics::NoteShaderCreated(int stage, const std::uint8_t* container, 
 
     const std::uint64_t stage_key = d3d12::ConsoleStageKeyOf(words, key);
     NotedShader noted{};
-    noted.stage = stage;
+    noted.stage = norm_stage;
     noted.key = stage_key;
     noted.element_count = static_cast<std::uint32_t>(key.elements.size());
     noted.formats_from_params = key.formats_from_params;
