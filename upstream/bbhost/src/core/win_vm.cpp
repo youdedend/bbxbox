@@ -119,6 +119,8 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
         ep->ExceptionRecord->NumberParameters < 2) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    const ULONG_PTR access = ep->ExceptionRecord->ExceptionInformation[0];
+    if (access == 8) return EXCEPTION_CONTINUE_SEARCH;  // never treat DEP/execute as demand-commit
     const std::uintptr_t addr = static_cast<std::uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
     std::uintptr_t vb = 0;
     std::uint64_t vlen = 0;
@@ -139,6 +141,17 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
     }
     if (!found || noaccess) return EXCEPTION_CONTINUE_SEARCH;
 
+    auto page_allows = [access](DWORD prot) {
+        if ((prot & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        const DWORD base = prot & 0xffu;
+        if (access == 1) {
+            return base == PAGE_READWRITE || base == PAGE_WRITECOPY || base == PAGE_EXECUTE_READWRITE ||
+                   base == PAGE_EXECUTE_WRITECOPY;
+        }
+        return base == PAGE_READONLY || base == PAGE_READWRITE || base == PAGE_WRITECOPY ||
+               base == PAGE_EXECUTE_READ || base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
+    };
+
     MEMORY_BASIC_INFORMATION m{};
     if (!VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m))) return EXCEPTION_CONTINUE_SEARCH;
     if (m.State == MEM_RESERVE) {
@@ -152,12 +165,12 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
         }
         // Re-check in case another thread committed the same 64 KiB chunk concurrently.
         if (VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m)) && m.State == MEM_COMMIT &&
-            (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+            page_allows(m.Protect)) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (m.State == MEM_COMMIT && (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+    if (m.State == MEM_COMMIT && page_allows(m.Protect)) {
         // Another thread already committed this page between the fault and our lock.
         return EXCEPTION_CONTINUE_EXECUTION;
     }

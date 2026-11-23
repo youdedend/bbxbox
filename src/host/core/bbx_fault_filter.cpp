@@ -41,6 +41,22 @@ bool FaultGate::Enter() {
 
 void FaultGate::Leave() { guard_.store(0, std::memory_order_release); }
 
+FaultAction FaultGate::EnterAndAdmit(std::uint32_t code) {
+    if (!Enter()) return FaultAction::kPass;
+    const FaultAction action = DecideFault(code, count_.load(std::memory_order_relaxed), false);
+    if (action == FaultAction::kLog) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        return action;
+    }
+    if (action == FaultAction::kSuppressed) {
+        if (!suppressed_.exchange(true, std::memory_order_relaxed)) {
+            return FaultAction::kSuppressed;
+        }
+    }
+    Leave();
+    return FaultAction::kPass;
+}
+
 FaultAction FaultGate::Admit(std::uint32_t code) {
     const FaultAction action = DecideFault(code, count_.load(std::memory_order_relaxed),
                                            guard_.load(std::memory_order_relaxed) != 0);

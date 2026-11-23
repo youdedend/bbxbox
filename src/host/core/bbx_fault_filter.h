@@ -44,6 +44,11 @@ public:
     // on the same or another thread while the guard is held gets false.
     [[nodiscard]] bool Enter();
     void Leave();
+    // Atomically acquires the re-entry guard and evaluates `code`. When the
+    // returned action is kPass the guard is already released (or was held by an
+    // outer invocation); when it is kLog or kSuppressed the caller owns the
+    // guard and must call Leave() after writing.
+    [[nodiscard]] FaultAction EnterAndAdmit(std::uint32_t code);
     // The action for `code`, counting the fault when it is one to log.
     [[nodiscard]] FaultAction Admit(std::uint32_t code);
     [[nodiscard]] std::uint32_t logged() const { return count_.load(std::memory_order_relaxed); }

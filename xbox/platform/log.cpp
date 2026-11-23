@@ -284,10 +284,8 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
     static bbx::core::FaultGate gate;
     const auto* record = info != nullptr ? info->ExceptionRecord : nullptr;
     const std::uint32_t code = record != nullptr ? record->ExceptionCode : 0u;
-    if (!gate.Enter()) return EXCEPTION_CONTINUE_SEARCH;  // re-entered: never log
-    const bbx::core::FaultAction action = gate.Admit(code);
+    const bbx::core::FaultAction action = gate.EnterAndAdmit(code);
     if (action == bbx::core::FaultAction::kPass) {
-        gate.Leave();
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (action == bbx::core::FaultAction::kSuppressed) {

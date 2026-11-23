@@ -65,3 +65,19 @@ TEST(FaultFilter_TheGateAdmitsOneLinePerFaultUpToTheCap) {
     CHECK(gate.Admit(0x40010006u) == FaultAction::kPass);
     CHECK_EQ(gate.logged(), 32u);
 }
+
+TEST(FaultFilter_EnterAndAdmitLogsFirstFaultAndBlocksReentry) {
+    FaultGate gate;
+    CHECK(gate.EnterAndAdmit(0x40010006u) == FaultAction::kPass);
+    CHECK(!gate.reentered());  // noise releases the guard immediately
+    CHECK(gate.EnterAndAdmit(0xc0000005u) == FaultAction::kLog);
+    CHECK(gate.reentered());
+    // A nested fault while logging is suppressed without consuming budget.
+    CHECK(gate.EnterAndAdmit(0xc0000005u) == FaultAction::kPass);
+    CHECK_EQ(gate.logged(), 1u);
+    gate.Leave();
+    CHECK(!gate.reentered());
+    CHECK(gate.EnterAndAdmit(0xc00000fdu) == FaultAction::kLog);
+    CHECK_EQ(gate.logged(), 2u);
+    gate.Leave();
+}

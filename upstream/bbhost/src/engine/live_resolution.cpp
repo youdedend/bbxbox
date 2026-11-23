@@ -568,7 +568,17 @@ std::atomic<std::uint64_t>* g_rect_size = nullptr;      // the stubs': h << 32 |
 bool install_display_rect_stubs() {
     for (const RectSite& s : kRectSites)
         if (std::memcmp(guest_ptr(g_image->mem, guest(s.at)), s.bytes, s.n) != 0) return false;
-    auto* page = static_cast<std::uint8_t*>(host_page_alloc(0x1000, true));
+#if defined(BBX_UWP)
+    // Local change, marked BBX_UWP: AppContainer enforces strict W^X, so page 0
+    // holds the live-mutated display rect atomics (PAGE_READWRITE) while page 1
+    // holds the executable stubs (flipped to PAGE_EXECUTE_READ below).
+    constexpr std::size_t kAllocSize = 0x2000;
+    constexpr std::size_t kCodeOffset = 0x1000;
+#else
+    constexpr std::size_t kAllocSize = 0x1000;
+    constexpr std::size_t kCodeOffset = 0x40;
+#endif
+    auto* page = static_cast<std::uint8_t*>(host_page_alloc(kAllocSize, true));
     if (!page) return false;
     const auto addr = [](const std::uint8_t* p) { return reinterpret_cast<std::uint64_t>(p); };
     const auto rip32 = [&](std::uint8_t* at, const std::uint8_t* end, const std::uint8_t* target) {
@@ -577,7 +587,7 @@ bool install_display_rect_stubs() {
     };
     std::uint8_t* const res_slot = page;
     std::uint8_t* const size_slot = page + 8;
-    std::uint8_t* c = page + 0x40;
+    std::uint8_t* c = page + kCodeOffset;
     static const std::uint8_t jmp_abs[6] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};  // jmp [rip+0]
     struct Jump {
         std::uint64_t at, stub;
@@ -603,6 +613,12 @@ bool install_display_rect_stubs() {
         c += (16 - addr(c) % 16) % 16;
         jumps.push_back({s.at, addr(stub), s.n});
     }
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(page + kCodeOffset, 0x1000)) {
+        host_page_free(page, kAllocSize);
+        return false;
+    }
+#endif
     g_rect_resource = reinterpret_cast<std::atomic<std::uint64_t>*>(res_slot);
     g_rect_size = reinterpret_cast<std::atomic<std::uint64_t>*>(size_slot);
     for (const Jump& j : jumps) {

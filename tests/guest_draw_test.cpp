@@ -39,8 +39,8 @@ struct Registers {
     std::vector<std::uint32_t> uconfig = std::vector<std::uint32_t>(kUconfig, 0);
 
     void Program(std::uint32_t at, std::uint64_t va, std::uint32_t rsrc1, std::uint32_t rsrc2) {
-        sh[at + 0] = static_cast<std::uint32_t>((va >> 40) & 0xffu);  // PGM_LO's low byte carries bits 39:32
-        sh[at + 1] = static_cast<std::uint32_t>(va >> 8);             // PGM_HI
+        sh[at + 0] = static_cast<std::uint32_t>(va >> 8);             // PGM_LO carries bits 39:8
+        sh[at + 1] = static_cast<std::uint32_t>((va >> 40) & 0xffu);  // PGM_HI's low byte carries bits 47:40
         sh[at + 2] = rsrc1;
         sh[at + 3] = rsrc2;
     }
@@ -101,8 +101,8 @@ TEST(GuestDraw_DecodesBothProgramsFromTheRegisterFile) {
 }
 
 TEST(GuestDraw_TheProgramAddressIsTheComputeStageFormOfLoAndHi) {
-    // A guest VA above 4 GiB keeps its top eight bits in PGM_LO's low byte, which
-    // is the rule the compute stage's COMPUTE_PGM_LO/HI pair is read with.
+    // A guest VA above 4 GiB keeps bits 39:8 in PGM_LO and its top eight bits
+    // (47:40) in PGM_HI's low byte, matching GCN hardware and gnm_exec.cpp.
     Registers r = OneDraw();
     r.Program(0x48, 0x01'2345'6800ull, 0, 0);
     const DrawIdentity id = DecodeDraw(r.sh.data(), r.ctx.data(), r.uconfig.data());

@@ -801,9 +801,18 @@ void sf_text_layout_install(ElfImage* image) {
             std::memset(page + n + 2, 0, 4);
             const std::uint64_t back = at + n;
             std::memcpy(page + n + 6, &back, 8);
-            g_hud_trampoline = page;
-            locked = hook(image, kHudUpdate, kHudUpdatePrologue, n, reinterpret_cast<void*>(&hud_update_hook),
-                          "the HUD's update");
+#if defined(BBX_UWP)
+            if (!host_page_make_executable(page, 0x1000)) {
+                host_page_free(page, 0x1000);
+                host_log("sf lock: the HUD's update (0x%llx) NOT hooked (cannot mark trampoline executable)",
+                         static_cast<unsigned long long>(kHudUpdate));
+            } else
+#endif
+            {
+                g_hud_trampoline = page;
+                locked = hook(image, kHudUpdate, kHudUpdatePrologue, n, reinterpret_cast<void*>(&hud_update_hook),
+                              "the HUD's update");
+            }
         } else {
             host_log("sf lock: the HUD's update (0x%llx) NOT hooked (%s)", static_cast<unsigned long long>(kHudUpdate),
                      page ? "unexpected bytes" : "no page for its trampoline");

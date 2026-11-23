@@ -3,6 +3,7 @@
 
 #include "core/elf.h"
 #include "core/memory.h"
+#include "core/portable.h"
 #include "core/thunk.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
@@ -111,6 +112,12 @@ void frame_tick_install(ElfImage* image) {
         std::memset(page + n + 2, 0, 4);
         const std::uint64_t back = at + n;
         std::memcpy(page + n + 6, &back, 8);
+#if defined(BBX_UWP)
+        if (!host_page_make_executable(page, 0x1000)) {
+            host_page_free(page, 0x1000);
+            continue;
+        }
+#endif
         auto* site = new TickSite;
         site->at = at;
         site->trampoline = page;

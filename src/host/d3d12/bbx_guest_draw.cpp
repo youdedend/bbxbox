@@ -56,11 +56,11 @@ float BitsToFloat(std::uint32_t bits) {
     return value;
 }
 
-// The address a stage's LO/HI pair names: bits 8..39 in HI, the top eight bits of
-// the 40-bit guest space in LO's low byte - the same rule the compute stage's
-// COMPUTE_PGM_LO/HI pair is read with (platform/guest_compute.cpp).
+// The address a stage's LO/HI pair names: bits 8..39 in LO, the top eight bits of
+// the 48-bit guest space in HI's low byte - matching GCN hardware and
+// gnm_exec.cpp's `(sh[0x49] & 0xff) << 40 | (sh[0x48] << 8)`.
 std::uint64_t CodeAddress(std::uint32_t lo, std::uint32_t hi) {
-    return (static_cast<std::uint64_t>(lo & 0xffu) << 40) | (static_cast<std::uint64_t>(hi) << 8);
+    return (static_cast<std::uint64_t>(hi & 0xffu) << 40) | (static_cast<std::uint64_t>(lo) << 8);
 }
 
 void DecodeProgram(const std::uint32_t* words, const std::uint32_t* user, DrawProgram* out) {

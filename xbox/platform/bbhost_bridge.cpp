@@ -555,10 +555,19 @@ std::atomic<std::uint8_t*> g_guest_base{nullptr};
 std::atomic<std::uint64_t> g_guest_slide{0};
 std::atomic<std::uint64_t> g_guest_size{0};
 
-// The guest's scanout range, as this process can read it: false when the address
-// (or the frame it addresses) is not inside the mapped arena.
+// The guest's scanout range, as this process can read it: Bloodborne's display
+// buffers live in mapped DirectMemory (e.g. 0x14D408000), not inside the ELF
+// image (0x400000..0x5ED4000). Check mapped kernel memory first, then the ELF
+// arena as a fallback.
 bool GuestScanoutPixels(std::uint64_t va, std::uint64_t bytes, const std::uint8_t** pixels) {
     if (pixels != nullptr) *pixels = nullptr;
+    if (va == 0 || bytes == 0) return false;
+    if (hle_kernel_va_mapped(va, static_cast<std::size_t>(bytes))) {
+        if (pixels != nullptr) {
+            *pixels = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va));
+        }
+        return true;
+    }
     const std::uint8_t* const base = g_guest_base.load(std::memory_order_acquire);
     const std::uint64_t slide = g_guest_slide.load(std::memory_order_relaxed);
     const std::uint64_t size = g_guest_size.load(std::memory_order_relaxed);
@@ -630,13 +639,11 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
         }
         return;
     }
-    // The scanout buffer, as this process can read it: the guest arena is mapped
-    // in-process, so a guest virtual address is a pointer here - once the range is
-    // known to be inside the image. sceVideoOutRegisterBuffers can be handed an
-    // address the image no longer covers (a mode change, a title that reuses a
-    // buffer after freeing it), and a flip must not fault the guest.
+    // Resolve CPU-readable pixels if mapped, but always hand display_va to
+    // SubmitGuestFrame so zero-copy direct GPU scanout can present rendered
+    // targets directly without touching CPU memory.
     const std::uint8_t* pixels = nullptr;
-    if (!GuestScanoutPixels(display_va, state.bytes, &pixels)) { return; }
+    (void)GuestScanoutPixels(display_va, state.bytes, &pixels);
     bbx::platform::GuestFrame frame;
     frame.display_va = display_va;
     frame.pixels = pixels;

@@ -6814,7 +6814,14 @@ void hle_gx_trace_arm(GuestMemory* mem) {
     // objects, and immediate draws in its subset run from host-draw tokens
     // without their Gnm packets. BBHOST_GX_BACKEND=0 or BBHOST_GX_NATIVE=0 goes
     // back to the packet path.
+#if defined(BBX_UWP)
+    // Local change, marked BBX_UWP: the console D3D12 backend decodes draws
+    // from the PM4 register file (src/host/d3d12/host_gpu_d3d12.cpp), so keep
+    // packet-path execution by default unless BBHOST_GX_BACKEND is set.
+    g_backend = b ? std::atoi(b) : 0;
+#else
     g_backend = b ? std::atoi(b) : 1;
+#endif
     const char* n = std::getenv("BBHOST_GX_NATIVE");
     g_native = n ? std::atoi(n) : g_backend == 1 ? 2 : 0;
     const char* y = std::getenv("BBHOST_GX_NATIVE_YEBIS");
@@ -6945,6 +6952,11 @@ void hle_gx_trace_arm(GuestMemory* mem) {
         host_log("gx: BBHOST_CP_WRITERS: %d of %zu packet writers hooked for the census (callers in the exit report)", census,
                  kCensusWriterCount + kDeadWriterCount);
     }
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(page, 0x10000)) {
+        host_log("gx: cannot mark hook stub page executable");
+    }
+#endif
     // BBHOST_CP_DEAD_PACKETS: what the dead writers - ours, on the decomp list
     // (decomp/gx/dead_packets.cpp) - write. Nothing only while every draw is a
     // token (BBHOST_GX_BACKEND=1), and for the context registers only while

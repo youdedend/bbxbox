@@ -4,6 +4,7 @@
 #include "core/legacy_cpu.h"
 #include "core/legacy_cpu_code.h"
 #include "core/memory.h"
+#include "core/portable.h"
 #include "core/thunk.h"
 #include "decomp/insn.h"
 #include "decomp/name_lines.h"
@@ -182,12 +183,21 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
         host_log("decomp: %s refused, no executable page within reach of the image", fn.name);
         return false;
     }
+#if defined(BBX_UWP)
+    if (g_page_used > 0 && !host_page_make_writable(g_page, kPage)) {
+        host_log("decomp: %s refused, cannot unprotect trampoline page", fn.name);
+        return false;
+    }
+#endif
     // An instruction the processor lacks (core/legacy_cpu.h) runs as its routine there.
     const std::size_t moved = legacy_cpu_on() ? legacy_relocate(fn.entry, fn.entry_len, at, t, reinterpret_cast<std::uint64_t>(t), kMoved)
                                               : x86_relocate(fn.entry, fn.entry_len, at, t, reinterpret_cast<std::uint64_t>(t), kMoved);
     std::uint8_t* back = t + moved;
     std::uint8_t* leg = back + 5;
     if (!moved || !rel32_reaches(back, at + fn.entry_len) || !rel32_reaches(p, reinterpret_cast<std::uint64_t>(leg))) {
+#if defined(BBX_UWP)
+        if (g_page_used > 0) (void)host_page_make_executable(g_page, kPage);
+#endif
         host_log("decomp: %s refused, the first %zu bytes at 0x%llx cannot run from a trampoline (decomp/insn.h)", fn.name,
                  fn.entry_len, static_cast<ull>(fn.bn));
         return false;
@@ -203,6 +213,12 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
     std::memset(leg + 2, 0, 4);
     std::memcpy(leg + 6, &d, 8);
     carve_commit(moved + 5 + 14);
+#if defined(BBX_UWP)
+    if (!host_page_make_executable(g_page, kPage)) {
+        host_log("decomp: %s refused, cannot mark trampoline page executable", fn.name);
+        return false;
+    }
+#endif
     const std::uint64_t lo = at & ~0xfffull, hi = (at + fn.entry_len + 0xfff) & ~0xfffull;
 #if defined(BBX_UWP)
     // Strict W^X, and no guest thread is running yet: read-write to patch, then
