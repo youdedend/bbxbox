@@ -128,7 +128,7 @@ GUEST_ABI int hle_audio_volume(int h, int flags, const int* vol) {
         unsigned n = 0;
         for (unsigned c = 0; c < channels && c < 8; ++c) {
             if (flags & (1 << c)) {
-                sum += static_cast<float>(vol[c]) / 32768.0f;
+                sum += static_cast<float>(vol[n]) / 32768.0f;
                 ++n;
             }
         }
@@ -177,7 +177,7 @@ GUEST_ABI int hle_audio_output(int handle, const void* data) {
             it->second.next_us = now_us() + dur;
         }
     }
-    return 0;
+    return static_cast<int>(p.len);
 }
 // SceAudioOutPortState { u16 output; u8 channel; u8 reserved; u16 volume; u16 rerouteCounter; u64 flag; u64 reserved[2] }
 GUEST_ABI int hle_audio_state(int h, std::uint8_t* st) {

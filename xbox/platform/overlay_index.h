@@ -127,13 +127,19 @@ static const char *bb_overlay_rel(const BbOverlayIndex *index, const char *path,
                                   size_t cap) {
     const char *rest;
     size_t root_len, i = 0;
+    int root_has_sep;
     if (!index || !index->count || !path || !rel || cap < 2) return NULL;
     root_len = strlen(index->base);
-    if (strlen(path) <= root_len + 1) return NULL;
+    root_has_sep = root_len > 0 &&
+                   (index->base[root_len - 1] == '\\' || index->base[root_len - 1] == '/');
+    if (strlen(path) <= root_len + (root_has_sep ? 0u : 1u)) return NULL;
     if (!bb_overlay_prefix_eq(path, index->base, root_len)) return NULL;
     rest = path + root_len;
-    if (*rest != '\\' && *rest != '/') return NULL;
-    ++rest;
+    if (!root_has_sep) {
+        if (*rest != '\\' && *rest != '/') return NULL;
+        ++rest;
+    }
+    if (*rest == '\0') return NULL;
     for (; *rest && i + 1 < cap; ++rest) {
         rel[i++] = (*rest == '/') ? '\\' : *rest;
     }
@@ -152,8 +158,12 @@ static int bb_overlay_listed(const BbOverlayIndex *index, const char *rel) {
 static int bb_overlay_maps_path(const BbOverlayIndex *index, const char *path, char *out,
                                 size_t cap) {
     char rel[BB_OVERLAY_MAX_REL];
+    size_t plen;
+    const char *sep;
     if (!bb_overlay_rel(index, path, rel, sizeof(rel)) || !bb_overlay_listed(index, rel)) return 0;
-    if ((size_t)snprintf(out, cap, "%s\\%s", index->patch, rel) >= cap) return 0;
+    plen = strlen(index->patch);
+    sep = (plen > 0 && (index->patch[plen - 1] == '\\' || index->patch[plen - 1] == '/')) ? "" : "\\";
+    if ((size_t)snprintf(out, cap, "%s%s%s", index->patch, sep, rel) >= cap) return 0;
     return 1;
 }
 
@@ -163,7 +173,11 @@ static int bb_overlay_maps_path(const BbOverlayIndex *index, const char *path, c
 static int bb_overlay_maps_dir(const BbOverlayIndex *index, const char *path, char *out,
                                size_t cap) {
     char rel[BB_OVERLAY_MAX_REL];
+    size_t plen;
+    const char *sep;
     if (!bb_overlay_rel(index, path, rel, sizeof(rel))) return 0;
-    if ((size_t)snprintf(out, cap, "%s\\%s", index->patch, rel) >= cap) return 0;
+    plen = strlen(index->patch);
+    sep = (plen > 0 && (index->patch[plen - 1] == '\\' || index->patch[plen - 1] == '/')) ? "" : "\\";
+    if ((size_t)snprintf(out, cap, "%s%s%s", index->patch, sep, rel) >= cap) return 0;
     return 1;
 }

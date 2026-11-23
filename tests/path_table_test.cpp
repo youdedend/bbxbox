@@ -108,8 +108,8 @@ TEST(PathTable_ALineThisFormatDidNotWriteIsRefused) {
     // A key that is not hexadecimal.
     CHECK(table.Load(File(digest, "bind xyz 2 0 srv user=0;imm=0;fin=0;finv=0;loads=\n"), digest) ==
           PathTableStatus::kCorrupt);
-    // A binding outside t0..t63.
-    CHECK(table.Load(File(digest, "bind 0000000000000001 2 64 srv user=0;imm=0;fin=0;finv=0;loads=\n"), digest) ==
+    // A binding outside t0..t127.
+    CHECK(table.Load(File(digest, "bind 0000000000000001 2 128 srv user=0;imm=0;fin=0;finv=0;loads=\n"), digest) ==
           PathTableStatus::kCorrupt);
     // A kind that is neither srv nor uav.
     CHECK(table.Load(File(digest, "bind 0000000000000001 2 0 cbv user=0;imm=0;fin=0;finv=0;loads=\n"), digest) ==

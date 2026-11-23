@@ -37,8 +37,9 @@ groupshared uint sTile[THREADS];
 // same arithmetic on the CPU side, and tests/untile_test.cpp asserts the round
 // trip there; this must stay the same permutation.
 uint SwizzledIndex(uint x, uint y) {
-    // index = (y & 7) * 8 + (x & 7) for the thin modes.
-    return (y & 7u) * 8u + (x & 7u);
+    // x0 y0 x1 y1 x2 y2 (matching MicroTileIndex in src/host/d3d12/bbx_untile.cpp)
+    return (x & 1u) | ((y & 1u) << 1u) | ((x & 2u) << 1u) | ((y & 2u) << 2u) | ((x & 4u) << 2u) |
+           ((y & 4u) << 3u);
 }
 
 [numthreads(THREADS, 1, 1)]

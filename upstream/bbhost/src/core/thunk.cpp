@@ -334,6 +334,27 @@ extern "C" GUEST_ABI void hle_host_stack_leave() {
     }
     hle_fs_guest();
 }
+
+void hle_host_stack_reset() {
+    if (t_host_stack_depth > 0) {
+        auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+        tib->StackBase = t_guest_stack_base;
+        tib->StackLimit = t_guest_stack_limit;
+        t_host_stack_depth = 0;
+    }
+}
+
+bool hle_host_guest_stack_limits(std::uint64_t* lo, std::uint64_t* hi) {
+    if (t_host_stack_depth > 0 && t_guest_stack_limit && t_guest_stack_base > t_guest_stack_limit) {
+        *lo = reinterpret_cast<std::uint64_t>(t_guest_stack_limit);
+        *hi = reinterpret_cast<std::uint64_t>(t_guest_stack_base);
+        return true;
+    }
+    return false;
+}
+#else
+void hle_host_stack_reset() {}
+bool hle_host_guest_stack_limits(std::uint64_t*, std::uint64_t*) { return false; }
 #endif
 
 // The save area of the last HLE call made from guest code on this thread
@@ -960,8 +981,7 @@ void* thunk_wrap(void* fn) {
         c += 8;
         *c++ = 0x41;
         *c++ = 0xff;
-        *c++ = 0xe2;  // jmp r10
-        g_stub_used += 8;  // 23 bytes; keep 16-byte spacing plus slack
+        *c++ = 0xe2;  // jmp r10 (23 bytes total, fits inside kStub = 32)
     } else {
         std::int32_t r32 = static_cast<std::int32_t>(rel);
         std::memcpy(c, &r32, 4);

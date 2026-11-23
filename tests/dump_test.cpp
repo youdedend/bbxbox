@@ -123,11 +123,11 @@ struct FakeDump {
 
 TEST(SfoParsesItsFields) {
     const std::vector<std::uint8_t> bytes =
-        MakeSfo("01.09", "gp", "CUSA03173", "UP9000-CUSA03173_00-BLOODBORNE0000000-A0109-V0100");
+        MakeSfo("01.09", "gd", "CUSA03173", "UP9000-CUSA03173_00-BLOODBORNE0000000-A0109-V0100");
     const std::optional<SfoInfo> info = ParseParamSfo(bytes);
     CHECK(info.has_value());
     CHECK(info->app_ver == "01.09");
-    CHECK(info->app_type == "gp");
+    CHECK(info->app_type == "gd");
     CHECK(info->TitleId() == "CUSA03173");
     CHECK(info->Version() == "01.09");
     CHECK(!info->IsPatchContainer());
@@ -183,7 +183,7 @@ TEST(SfoAcceptsABaseDumpWhoseContentIdHasNoVersionGroup) {
     // The disc dump's CONTENT_ID is UP9000-CUSA03173_00-BLOODBORNE0000000: there
     // is no -A0100-V0100 group, so a version parsed only from CONTENT_ID is
     // empty and the whole dump used to be refused.
-    const auto bytes = MakeSfo("", "gp", "CUSA03173", "UP9000-CUSA03173_00-BLOODBORNE0000000");
+    const auto bytes = MakeSfo("", "gd", "CUSA03173", "UP9000-CUSA03173_00-BLOODBORNE0000000");
     const auto info = ParseParamSfo(bytes);
     CHECK(info.has_value());
     if (info) {
@@ -204,17 +204,17 @@ TEST(PatchSfoStillNeedsItsOwnVersion) {
 TEST(SfoRejectsGarbageRatherThanGuessing) {
     CHECK(!ParseParamSfo({}).has_value());
     CHECK(!ParseParamSfo({0, 0, 0, 0, 1, 2, 3, 4}).has_value());
-    std::vector<std::uint8_t> truncated = MakeSfo("01.09", "gp", "CUSA03173", "");
+    std::vector<std::uint8_t> truncated = MakeSfo("01.09", "gd", "CUSA03173", "");
     truncated.resize(24);
     CHECK(!ParseParamSfo(truncated).has_value());
     // Valid header, no APP_VER and no CONTENT_ID: no version, no answer.
-    std::vector<std::uint8_t> no_version = MakeSfo("", "gp", "CUSA03173", "");
+    std::vector<std::uint8_t> no_version = MakeSfo("", "gd", "CUSA03173", "");
     CHECK(!ParseParamSfo(no_version).has_value());
 }
 
 TEST(MergedLayoutRunsDirectly) {
     FakeDump dump;
-    dump.AddDump("D:\\dumps\\Bloodborne", "01.09", "gp");
+    dump.AddDump("D:\\dumps\\Bloodborne", "01.09", "gd");
     const DumpLayout layout =
         DetectLayout(dump.Fs(), "D:\\dumps\\Bloodborne", "", true, false);
     CHECK(layout.kind == LayoutKind::kMerged);
@@ -227,8 +227,8 @@ TEST(MergedLayoutRunsDirectly) {
 
 TEST(SplitLayoutFindsTheUpdate) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
-    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.09", "patch");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
+    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.09", "gp");
     const DumpLayout layout =
         DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne", "", true, false);
     CHECK(layout.kind == LayoutKind::kSplit);
@@ -240,8 +240,8 @@ TEST(SplitLayoutFindsTheUpdate) {
 
 TEST(SplitCanBeTurnedOff) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
-    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.09", "patch");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
+    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.09", "gp");
     const DumpLayout layout =
         DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne", "", false, false);
     CHECK(layout.kind == LayoutKind::kSplit);
@@ -252,18 +252,18 @@ TEST(SplitCanBeTurnedOff) {
 
 TEST(PickingTheUpdateFolderFindsTheBase) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
-    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.09", "patch");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
+    dump.AddDump("E:\\dumps\\Bloodborne-UPDATE", "01.09", "gp");
     const DumpLayout layout =
-        DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne-patch", "", true, false);
+        DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne-UPDATE", "", true, false);
     CHECK(layout.kind == LayoutKind::kSplit);
     CHECK(layout.base_path == "E:\\dumps\\Bloodborne");
-    CHECK(layout.patch_path == "E:\\dumps\\Bloodborne-patch");
+    CHECK(layout.patch_path == "E:\\dumps\\Bloodborne-UPDATE");
 }
 
 TEST(BaseOnlyIsFlagged) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
     const DumpLayout layout =
         DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne", "", true, false);
     CHECK(layout.kind == LayoutKind::kBaseOnly);
@@ -273,9 +273,9 @@ TEST(BaseOnlyIsFlagged) {
 
 TEST(CandidatesAreRejectedWithAReason) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
     // A "patch" that is the same version is not an update.
-    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.00", "patch");
+    dump.AddDump("E:\\dumps\\Bloodborne-patch", "01.00", "gp");
     DumpLayout layout = DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne", "", true, false);
     CHECK(layout.kind == LayoutKind::kBaseOnly);
     CHECK(layout.patch_path.empty());
@@ -283,10 +283,10 @@ TEST(CandidatesAreRejectedWithAReason) {
 
     // A patch for another title is rejected too.
     FakeDump other;
-    other.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
+    other.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
     other.files["E:\\dumps\\Bloodborne-patch\\eboot.bin"] = {0x7f};
     other.files["E:\\dumps\\Bloodborne-patch\\sce_sys\\param.sfo"] =
-        MakeSfo("01.09", "patch", "CUSA00900", "");
+        MakeSfo("01.09", "gp", "CUSA00900", "");
     other.dirs["E:\\dumps\\Bloodborne-patch"] = {"sce_sys", "dvdroot_ps4"};
     other.dirs["E:\\dumps\\Bloodborne-patch\\dvdroot_ps4"] = {};
     other.dirs["E:\\dumps\\Bloodborne-patch\\sce_sys"] = {};
@@ -306,8 +306,8 @@ TEST(NotADumpIsRefused) {
 
 TEST(PreferredPatchIsHonoured) {
     FakeDump dump;
-    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gp");
-    dump.AddDump("F:\\updates\\BB109", "01.09", "patch");
+    dump.AddDump("E:\\dumps\\Bloodborne", "01.00", "gd");
+    dump.AddDump("F:\\updates\\BB109", "01.09", "gp");
     const DumpLayout layout =
         DetectLayout(dump.Fs(), "E:\\dumps\\Bloodborne", "F:\\updates\\BB109", true, false);
     CHECK(layout.kind == LayoutKind::kSplit);

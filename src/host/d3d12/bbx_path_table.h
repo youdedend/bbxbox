@@ -80,10 +80,22 @@ public:
     [[nodiscard]] static std::string FormatStamp(const StampDigest& digest);
 
 private:
-    // (key, binding) -> plan, with the pair folded into one integer. A duplicate is
-    // refused by the loader rather than silently keeping the last one: two plans for
-    // one binding is a bake that disagreed with itself.
-    std::unordered_map<std::uint64_t, BindingPlan> plans_;
+    struct PlanSlotKey {
+        std::uint64_t key = 0;
+        std::uint32_t binding = 0;
+        bool operator==(const PlanSlotKey& o) const noexcept {
+            return key == o.key && binding == o.binding;
+        }
+    };
+    struct PlanSlotHash {
+        std::size_t operator()(const PlanSlotKey& k) const noexcept {
+            return static_cast<std::size_t>(k.key ^ (static_cast<std::uint64_t>(k.binding) * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    // (key, binding) -> plan. A duplicate is refused by the loader rather than
+    // silently keeping the last one: two plans for one binding is a bake that
+    // disagreed with itself.
+    std::unordered_map<PlanSlotKey, BindingPlan, PlanSlotHash> plans_;
     std::unordered_set<std::uint64_t> program_keys_;
     std::size_t programs_ = 0;
     PathTableStatus status_ = PathTableStatus::kMissing;

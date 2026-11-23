@@ -225,8 +225,15 @@ bool WriteBinary(const std::string& path, std::span<const std::uint8_t> bytes) {
         ::DeleteFileFromAppW(temporary.c_str());
         return false;
     }
-    ::DeleteFileFromAppW(wide.c_str());
-    return ::MoveFileFromAppW(temporary.c_str(), wide.c_str()) != 0;
+    if (::ReplaceFileFromAppW(wide.c_str(), temporary.c_str(), nullptr,
+                              REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != 0) {
+        return true;
+    }
+    if (::GetLastError() == ERROR_FILE_NOT_FOUND) {
+        return ::MoveFileFromAppW(temporary.c_str(), wide.c_str()) != 0;
+    }
+    ::DeleteFileFromAppW(temporary.c_str());
+    return false;
 }
 
 bool WriteText(const std::string& path, const std::string& text) {
@@ -373,19 +380,32 @@ bool PickFolderGrant(std::string& path_out, std::string& token_out) {
 
 bool ResolveGrant(const std::string& token, std::string& path_out) {
     if (token.empty()) return false;
-    try {
-        using namespace winrt::Windows::Storage::AccessCache;
-        if (!StorageApplicationPermissions::FutureAccessList().ContainsItem(winrt::to_hstring(token))) {
-            return false;
+    // Blocking on WinRT IAsyncOperation::get() on the CoreWindow ASTA thread
+    // throws E_ILLEGAL_METHOD_CALL (0x8000000E). Always resolve FutureAccessList
+    // grants on a short-lived MTA worker thread so ui-main startup succeeds.
+    std::string resolved;
+    bool ok = false;
+    std::thread worker([&token, &resolved, &ok]() {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        try {
+            using namespace winrt::Windows::Storage::AccessCache;
+            const auto wide_token = winrt::to_hstring(token);
+            if (StorageApplicationPermissions::FutureAccessList().ContainsItem(wide_token)) {
+                const auto item =
+                    StorageApplicationPermissions::FutureAccessList().GetFolderAsync(wide_token).get();
+                if (item) {
+                    resolved = winrt::to_string(item.Path());
+                    ok = !resolved.empty();
+                }
+            }
+        } catch (const winrt::hresult_error&) {
         }
-        const auto item = StorageApplicationPermissions::FutureAccessList().GetFolderAsync(
-            winrt::to_hstring(token)).get();
-        if (!item) return false;
-        path_out = winrt::to_string(item.Path());
-        return !path_out.empty();
-    } catch (const winrt::hresult_error&) {
-        return false;
-    }
+        winrt::uninit_apartment();
+    });
+    worker.join();
+    if (!ok) return false;
+    path_out = std::move(resolved);
+    return true;
 }
 
 bool ReleaseGrant(const std::string& token) {

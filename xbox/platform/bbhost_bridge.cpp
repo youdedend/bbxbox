@@ -242,8 +242,8 @@ ConsoleSettings GetConsoleSettings() {
 void ApplyConsoleSettings(const ConsoleSettings& settings) {
     ConsoleSettings clean = settings;
     clean.fps_cap = clean.fps_cap >= 60 ? 60 : 30;
-    clean.render_width = std::clamp(clean.render_width, 1280, 1920);
-    clean.render_height = std::clamp(clean.render_height, 720, 1080);
+    clean.render_width = std::clamp(clean.render_width, 960, 1920);
+    clean.render_height = std::clamp(clean.render_height, 540, 1080);
     clean.shadow_resolution = std::clamp(clean.shadow_resolution, 0, 3);
     clean.lod_bias = std::clamp(clean.lod_bias, -2, 2);
     clean.fov_scale = std::clamp(clean.fov_scale, 1.0f, 1.25f);
@@ -785,7 +785,7 @@ bool host_gpu_upload_region(std::uint64_t base, const std::uint32_t* tsharp, std
 }
 std::uint32_t host_gpu_vendor_id() { return {}; }
 const char* host_gpu_vs_why_name(int why) { return {}; }
-void host_gpu_wait_work_submitted(std::uint64_t need) { (void)host_gpu_wait_completed(need, 1000); }
+void host_gpu_wait_work_submitted(std::uint64_t need) { (void)host_gpu_wait_completed(need, 1000000000ull); }
 void host_gpu_watch_display(std::uint64_t display_va) {  }
 const char* host_present_step(double& seconds) { return {}; }
 
@@ -1411,7 +1411,8 @@ bool StartGuest(const GuestRequest& req) {
     bbx::platform::LogCrumb("boot:roots");
     hle_fs_set_roots(req.app0.c_str(), req.data.empty() ? nullptr : req.data.c_str(),
                      req.tmp.empty() ? nullptr : req.tmp.c_str(), g_eboot_path.c_str(),
-                     req.mods.empty() ? nullptr : req.mods.c_str());
+                     req.mods.empty() ? nullptr : req.mods.c_str(),
+                     req.update.empty() ? nullptr : req.update.c_str(), req.explicit_update);
     // The import table: every sce* the guest can call, bound to the HLE.
     bbx::platform::LogCrumb("boot:register_hle");
     register_hle();
@@ -1502,8 +1503,11 @@ bool StartGuest(const GuestRequest& req) {
     bbx::platform::LogF("guest: calling _start 0x%llx on an %zu MiB stack",
                         static_cast<unsigned long long>(g_image.entry), kGuestStack >> 20);
     g_running.store(true);
-    const HANDLE thread = CreateThread(nullptr, kGuestStack, GuestMain, &launch,
-                                       STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    // Commit 2 MiB of the 8 MiB stack upfront (flags = 0 -> dwStackSize is
+    // initial commit while PE /STACK:8388608 sets reserve) so Bloodborne's
+    // unprobed PS4 frames (>4 KiB) cannot leap past Windows' guard page.
+    constexpr std::size_t kGuestInitialCommit = 2u << 20;
+    const HANDLE thread = CreateThread(nullptr, kGuestInitialCommit, GuestMain, &launch, 0, nullptr);
     if (thread == nullptr) {
         g_running.store(false);
         const DWORD err = GetLastError();

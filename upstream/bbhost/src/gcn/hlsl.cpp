@@ -2798,6 +2798,7 @@ private:
             if (v.location >= 0) {
                 attr = "[[vk::location(" + std::to_string(v.location) + ")]] ";
                 if (!v.input && exec_model == spv::EmFragment) sem = "SV_Target" + std::to_string(v.location);
+                else if (dxil && v.input && exec_model == spv::EmFragment) sem = "OUT" + std::to_string(v.location);
                 else sem = std::string(v.input ? "IN" : "OUT") + std::to_string(v.location);
             } else {
                 switch (v.builtin) {
@@ -2933,7 +2934,8 @@ std::vector<std::string> dxil_split_args(const std::string& in) {
 // b for the lift's constant buffers. Space comes from the descriptor set.
 char dxil_register_class(const std::string& decl) {
     if (dxil_starts(decl, "ConstantBuffer<")) return 'b';
-    if (dxil_starts(decl, "RWByteAddressBuffer") || dxil_starts(decl, "RWTexture")) return 'u';
+    if (dxil_starts(decl, "RWByteAddressBuffer") || dxil_starts(decl, "RWTexture") || dxil_starts(decl, "RWBuffer<"))
+        return 'u';
     if (dxil_starts(decl, "ByteAddressBuffer")) return 't';
     if (dxil_starts(decl, "SamplerState") || dxil_starts(decl, "SamplerComparisonState")) return 's';
     if (dxil_starts(decl, "Texture") || dxil_starts(decl, "Buffer<")) return 't';
@@ -3048,8 +3050,9 @@ std::string dxil_helper_body(const std::string& name, const std::string& ret, co
                "((uint(a0) >> a1) & bits);";
     }
     if (name == "spv_bitfield_sextract" && n == 3) {
-        return "    if (a2 >= 32u) return " + r + "(int(a0) >> a1);\n    if (a2 == 0u) return " + r +
-               "(uint(a0) << a1);\n    return " + r + "(int(uint(a0) << (32u - a1 - a2)) >> (32u - a2));";
+        return "    if (a2 == 0u) return (" + r + ")0;\n    if (a2 >= 32u || a1 + a2 >= 32u) return " + r +
+               "(int(a0) >> min(a1, 31u));\n    return " + r +
+               "(int(uint(a0) << (32u - a1 - a2)) >> (32u - a2));";
     }
     if (name == "spv_bitfield_insert" && n == 4) {
         return "    if (a3 == 0u) return a0;\n    const uint bits = a3 >= 32u ? 0xffffffffu : (1u << a3) - 1u;\n    const uint mask = bits << a2;\n"

@@ -232,6 +232,7 @@ struct D3d12Session::Impl {
         std::lock_guard<std::mutex> lk(impl.gpu_mutex);
         impl.FlushComputeLocked();
         impl.FlushGraphicsLocked();
+        impl.guest_compute.InvalidatePrograms(lo, hi);
         impl.guest_graphics.ForgetRegion(lo, hi);
     }
     static void TextureWritten(void* user, std::uint64_t va, std::size_t bytes) {
@@ -244,6 +245,7 @@ struct D3d12Session::Impl {
                 impl.guest_plan.table, va,
                 reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), bytes);
         }
+        impl.guest_compute.InvalidatePrograms(va, va + bytes);
         impl.guest_graphics.InvalidatePrograms(va, va + bytes);
     }
     static bool MemoryGlance(void* user, GpuMemoryGlance* out) {
@@ -702,7 +704,10 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
     } else {
         status = impl.replay.DrawPresent(0.02f, 0.02f, 0.03f, 0.0f);
     }
-    if (status != d3d12::Status::kOk) { return status; }
+    if (status != d3d12::Status::kOk) {
+        (void)impl.replay.EndFrame(vsync);
+        return status;
+    }
     LogCrumb("replay: overlay");
     impl.replay.ResetOverlay();
     for (const HudQuad& quad : hud.Quads()) {
@@ -713,7 +718,10 @@ bbx::d3d12::Status D3d12Session::Present(const Hud& hud, bool vsync, bool sharp_
                                   quad.u1, quad.v1, rgba);
     }
     status = impl.replay.DrawOverlay();
-    if (status != d3d12::Status::kOk) { return status; }
+    if (status != d3d12::Status::kOk) {
+        (void)impl.replay.EndFrame(vsync);
+        return status;
+    }
     const d3d12::Status presented = impl.replay.EndFrame(vsync);
     if (present_direct_rt != nullptr) {
         impl.retired_present_targets.push_back(

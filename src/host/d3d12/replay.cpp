@@ -72,9 +72,9 @@ Status Replay::Create(Device& device, Swapchain& swapchain, PipelineSet& pipelin
     pipelines_ = &pipelines;
     frame_width_ = swapchain.Width();
     frame_height_ = swapchain.Height();
-    // A freshly gotten swapchain buffer is in RENDER_TARGET; every EndFrame moves
-    // the buffer it presented to PRESENT.
-    buffer_state_.fill(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // A freshly created DXGI swapchain buffer starts in PRESENT (COMMON);
+    // BeginFrame transitions it to RENDER_TARGET and EndFrame returns it to PRESENT.
+    buffer_state_.fill(D3D12_RESOURCE_STATE_PRESENT);
 
     // One command list: bbhost builds the frame on the CPU and submits once, so a
     // second list would only add a sync point. (P3's draw path keeps this.)

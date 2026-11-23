@@ -11,6 +11,10 @@
 #include <zlib.h>
 #endif
 
+#if defined(BBX_UWP)
+#include "xbox/platform/hostfs_extra.h"
+#endif
+
 namespace bbx::core {
 namespace {
 
@@ -337,6 +341,7 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
         bool compressed = false;
         bool blocked = false;
         bool placed = false;
+        bool covered_by_outer = false;
     };
     std::vector<Placement> placements;
     std::vector<bool> entry_used(entries.size(), false);
@@ -421,9 +426,15 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
         const ElfProgramHeader& phdr = placement.phdr;
         for (const Placement& outer : placements) {
             if (!outer.placed || outer.phdr.filesz == 0) { continue; }
-            if (outer.compressed) { continue; }
             if (phdr.offset >= outer.phdr.offset &&
                 phdr.offset + phdr.filesz <= outer.phdr.offset + outer.phdr.filesz) {
+                if (outer.compressed) {
+                    // Inflating `outer` already populates every byte of this
+                    // sub-segment; do not overwrite it with unrelated raw bytes.
+                    placement.covered_by_outer = true;
+                    placement.placed = true;
+                    break;
+                }
                 placement.src = outer.src + static_cast<std::size_t>(phdr.offset - outer.phdr.offset);
                 placement.stored = static_cast<std::size_t>(phdr.filesz);
                 placement.placed = true;
@@ -492,6 +503,7 @@ FselfResult UnwrapOrbisImage(std::span<const std::uint8_t> data) {
     std::memcpy(image.data(), data.data() + elf_base, header_bytes);
 
     for (const Placement& placement : placements) {
+        if (placement.covered_by_outer) { continue; }
         std::uint8_t* dst = image.data() + placement.phdr.offset;
         const std::uint8_t* src = data.data() + placement.src;
         const std::size_t want = static_cast<std::size_t>(placement.phdr.filesz);
@@ -535,6 +547,14 @@ FselfResult UnwrapOrbisFile(const char* path) {
         result.why = "no path";
         return result;
     }
+    std::vector<std::uint8_t> data;
+#if defined(BBX_UWP)
+    if (!bbx::hostfs::ReadFileAll(path, &data) || data.empty()) {
+        result.error = FselfError::kTooSmall;
+        result.why = std::string("cannot read ") + path;
+        return result;
+    }
+#else
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         result.error = FselfError::kTooSmall;
@@ -549,13 +569,14 @@ FselfResult UnwrapOrbisFile(const char* path) {
         return result;
     }
     in.seekg(0);
-    std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+    data.resize(static_cast<std::size_t>(size));
     in.read(reinterpret_cast<char*>(data.data()), size);
     if (!in) {
         result.error = FselfError::kTooSmall;
         result.why = std::string("read failed: ") + path;
         return result;
     }
+#endif
     result = UnwrapOrbisImage(data);
     if (!result.ok()) {
         result.why = std::string(path) + ": " + result.why;

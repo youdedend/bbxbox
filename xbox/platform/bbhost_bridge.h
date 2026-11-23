@@ -19,6 +19,8 @@ namespace bbx::bridge {
 // writable temporary directory, and the mods overlay.
 struct GuestRequest {
     std::string app0;
+    std::string update;
+    bool explicit_update = true;
     std::string data;
     std::string tmp;
     std::string eboot;

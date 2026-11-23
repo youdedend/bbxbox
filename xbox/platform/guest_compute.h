@@ -78,6 +78,7 @@ public:
     // Flushes any batched compute dispatches to the GPU queue.
     void Flush();
     [[nodiscard]] bool HasPending() const;
+    void InvalidatePrograms(std::uint64_t lo, std::uint64_t hi);
 
     // Shared baked cache, binding table, null descriptor template, and GPU-side
     // SRV snapshot ring used by GuestGraphics so the console loads

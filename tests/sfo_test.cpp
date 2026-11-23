@@ -41,10 +41,11 @@ TEST(ContentIdYieldsTheUpdateVersion) {
 TEST(AppTypeClassification) {
     CHECK(IsPatchAppType("patch"));
     CHECK(IsPatchAppType("PATCH"));
-    CHECK(IsPatchAppType("gd"));
-    CHECK(IsPatchAppType("gde"));
-    CHECK(IsPatchAppType("gdp"));
-    CHECK(!IsPatchAppType("gp"));
+    CHECK(IsPatchAppType("gp"));
+    CHECK(IsPatchAppType("GP"));
+    CHECK(!IsPatchAppType("gd"));
+    CHECK(!IsPatchAppType("gde"));
+    CHECK(!IsPatchAppType("gdp"));
     // Anything unknown is a base game, never a patch: an unknown dump must not
     // silently count as an update.
     CHECK(!IsPatchAppType(""));

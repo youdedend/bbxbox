@@ -318,7 +318,7 @@ void GuestMemory::Destroy() {
     upload_slice_fence_.fill(0);
     batch_open_ = false;
     batch_ops_ = 0;
-    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     slab_batch_dirty_mask_ = 0;
     slabs_resident_ = 0;
     committed_bytes_ = 0;
@@ -342,7 +342,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     device_ = device.Get();
     budget_ = &budget;
     table_ = plan.table;
-    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     D3D12_HEAP_PROPERTIES default_heap{};
     default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -373,7 +373,7 @@ Status GuestMemory::Create(Device& device, Budget& budget, const GuestPlan& plan
     // every slab not yet resident point at it, so all 32 descriptors are valid
     // from the first dispatch while an untouched table costs 64 KiB, not 8 GiB.
     const D3D12_RESOURCE_DESC guard_desc = RawBuffer(kGuardBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (FAILED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &guard_desc, D3D12_RESOURCE_STATE_COMMON,
+    if (FAILED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &guard_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                                 nullptr, IID_PPV_ARGS(guard_.GetAddressOf())))) {
         return Status::kOutOfMemory;
     }
@@ -474,7 +474,7 @@ Status GuestMemory::EnsureSlab(std::uint32_t slab) {
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     ComPtr<ID3D12Resource> buffer;
     const D3D12_RESOURCE_DESC desc = RawBuffer(kGuestSlabBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                 IID_PPV_ARGS(buffer.GetAddressOf())))) {
         budget_->Free(Owner::kGuest, kGuestSlabBytes);
         return Status::kOutOfMemory;
@@ -601,7 +601,7 @@ Status GuestMemory::BeginBatch() {
         }
     }
     active_allocator_ = std::move(allocator);
-    slab_batch_state_.fill(D3D12_RESOURCE_STATE_COMMON);
+    slab_batch_state_.fill(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     slab_batch_dirty_mask_ = 0;
     batch_open_ = true;
     batch_ops_ = 0;
@@ -617,7 +617,7 @@ void GuestMemory::TransitionSlab(std::uint32_t slab, D3D12_RESOURCE_STATES targe
     const D3D12_RESOURCE_BARRIER b = Transition(target, current, target_state);
     active_list_->ResourceBarrier(1, &b);
     slab_batch_state_[slab] = target_state;
-    if (target_state == D3D12_RESOURCE_STATE_COMMON) {
+    if (target_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
         slab_batch_dirty_mask_ &= ~(1u << slab);
     } else {
         slab_batch_dirty_mask_ |= (1u << slab);
@@ -632,10 +632,11 @@ Status GuestMemory::Flush() {
     for (std::uint32_t slab = 0; mask != 0 && slab < kGuestSlabCount; ++slab, mask >>= 1u) {
         if ((mask & 1u) == 0u) continue;
         ID3D12Resource* res = SlabBuffer(slab);
-        if (res != nullptr && slab_batch_state_[slab] != D3D12_RESOURCE_STATE_COMMON) {
-            barriers[barrier_count++] = Transition(res, slab_batch_state_[slab], D3D12_RESOURCE_STATE_COMMON);
+        if (res != nullptr && slab_batch_state_[slab] != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+            barriers[barrier_count++] =
+                Transition(res, slab_batch_state_[slab], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        slab_batch_state_[slab] = D3D12_RESOURCE_STATE_COMMON;
+        slab_batch_state_[slab] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
     slab_batch_dirty_mask_ = 0;
     if (barrier_count > 0) {

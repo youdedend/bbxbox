@@ -9,7 +9,7 @@ namespace bbx::d3d12 {
 namespace {
 
 constexpr char kHeaderPrefix[] = "# bbx_shaders.paths v1";
-constexpr std::uint32_t kMaxBindingsPerProgram = 64;  // t0..t63 / u0..u63
+constexpr std::uint32_t kMaxBindingsPerProgram = 128;  // t0..t127 / u0..u127
 
 std::string HexOf(const StampDigest& digest) {
     static const char* kDigits = "0123456789abcdef";
@@ -173,7 +173,7 @@ PathTableStatus PathTable::Load(std::string_view text, const StampDigest& expect
             detail_ = "line " + std::to_string(line_number) + ": the path is not one this reader writes";
             return status_;
         }
-        const std::uint64_t slot = (key << 6) | plan.binding;
+        const PlanSlotKey slot{key, plan.binding};
         if (plans_.find(slot) != plans_.end()) {
             status_ = PathTableStatus::kCorrupt;
             char why[128] = {};
@@ -202,7 +202,7 @@ PathTableStatus PathTable::Load(std::string_view text, const StampDigest& expect
 
 const BindingPlan* PathTable::Find(std::uint64_t key, std::uint32_t binding) const {
     if (binding >= kMaxBindingsPerProgram) return nullptr;
-    const auto it = plans_.find((key << 6) | binding);
+    const auto it = plans_.find(PlanSlotKey{key, binding});
     if (it == plans_.end()) return nullptr;
     return &it->second;
 }

@@ -103,7 +103,7 @@ bool ExtractProgram(std::uint64_t code_va, ExtractedProgram* out) {
     std::size_t limit = 0;
     while (limit < (1u << 20) && hle_kernel_va_mapped(code_va + limit, 4096)) limit += 4096;
     if (limit == 0) return false;
-    for (std::size_t i = 0; i + 32 <= limit; i += 4) {
+    for (std::size_t i = 0; i + 28 <= limit; i += 4) {
         if (std::memcmp(p + i, "OrbShdr", 7) != 0) continue;
         std::uint32_t lenfield = 0;
         std::memcpy(&lenfield, p + i + 8, 4);
@@ -137,7 +137,7 @@ bool ExtractProgram(std::uint64_t code_va, ExtractedProgram* out) {
 }
 
 std::string FindOrbShdrName(const std::vector<std::uint8_t>& container) {
-    for (std::size_t i = 0; i + 32 <= container.size(); i += 4) {
+    for (std::size_t i = 0; i + 20 <= container.size(); ++i) {
         if (std::memcmp(container.data() + i, "OrbShdr", 7) != 0) continue;
         std::uint32_t h0 = 0;
         std::memcpy(&h0, container.data() + i + 16, 4);
@@ -391,6 +391,7 @@ struct GuestGraphics::Impl {
     // so guest draws never collide with the swapchain's own RTV slots.
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> dsv_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE null_rtv_cpu{};
 
     // StageParams 4-slice upload ring (512 B per stage, 2 slots consumed per draw).
     ComPtr<ID3D12Resource> params;
@@ -465,6 +466,7 @@ struct GuestGraphics::Impl {
     };
     std::unique_ptr<d3d12::PsoCache> psos;
     std::unordered_map<PsoMapKey, ID3D12PipelineState*, PsoMapKeyHash> pso_objects;
+    std::unordered_set<PsoMapKey, PsoMapKeyHash> failed_psos;
     std::vector<RetiredPso> retired_psos;
     std::uint64_t clock = 0;
 
@@ -859,13 +861,13 @@ struct GuestGraphics::Impl {
         ID3D12Resource* slab = memory->SlabBuffer(write.slab);
         if (slab == nullptr) return false;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-        uav.Format = DXGI_FORMAT_R32_UINT;
+        uav.Format = DXGI_FORMAT_R32_TYPELESS;
         uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         uav.Buffer.FirstElement = static_cast<UINT>(write.offset / 4ull);
         uav.Buffer.NumElements = write.dwords;
         uav.Buffer.StructureByteStride = 0;
         uav.Buffer.CounterOffsetInBytes = 0;
-        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device->Get()->CreateUnorderedAccessView(slab, nullptr, &uav, VisibleCpu(stage_base + slot));
         return true;
     }
@@ -881,13 +883,13 @@ struct GuestGraphics::Impl {
             return false;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R32_UINT;
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Buffer.FirstElement = static_cast<UINT>(ring_offset / 4ull);
         srv.Buffer.NumElements = write.dwords;
         srv.Buffer.StructureByteStride = 0;
-        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         device->Get()->CreateShaderResourceView(compute->SrvSnapshotRing(), &srv, VisibleCpu(stage_base + slot));
         out_copy->slab = write.slab;
         out_copy->src_offset = write.offset;
@@ -1215,13 +1217,58 @@ struct GuestGraphics::Impl {
         desc.InputLayout.pInputElementDescs = elem_count > 0 ? input_elements.data() : nullptr;
         desc.InputLayout.NumElements = elem_count;
 
+        // MRT formats (preserve slot indices; gaps remain DXGI_FORMAT_UNKNOWN).
+        for (std::uint32_t i = 0; i < 8; ++i) desc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+        std::uint32_t num_rtvs = 0;
+        for (std::uint32_t i = 0; i < id.target_count && i < 8; ++i) {
+            const DrawTarget& t = id.targets[i];
+            if (t.index < 8) {
+                desc.RTVFormats[t.index] = static_cast<DXGI_FORMAT>(t.format);
+                if (t.index + 1 > num_rtvs) num_rtvs = t.index + 1;
+            }
+        }
+        desc.NumRenderTargets = num_rtvs;
+        desc.DSVFormat = id.depth_format != 0 ? static_cast<DXGI_FORMAT>(id.depth_format) : DXGI_FORMAT_UNKNOWN;
+
+        const auto is_integer_format = [](DXGI_FORMAT fmt) noexcept {
+            switch (static_cast<bbx::d3d12::DxgiFormat>(fmt)) {
+                case bbx::d3d12::DxgiFormat::kR32G32B32A32Uint:
+                case bbx::d3d12::DxgiFormat::kR32G32B32A32Sint:
+                case bbx::d3d12::DxgiFormat::kR32G32B32Uint:
+                case bbx::d3d12::DxgiFormat::kR32G32B32Sint:
+                case bbx::d3d12::DxgiFormat::kR16G16B16A16Uint:
+                case bbx::d3d12::DxgiFormat::kR16G16B16A16Sint:
+                case bbx::d3d12::DxgiFormat::kR32G32Uint:
+                case bbx::d3d12::DxgiFormat::kR32G32Sint:
+                case bbx::d3d12::DxgiFormat::kR10G10B10A2Uint:
+                case bbx::d3d12::DxgiFormat::kR8G8B8A8Uint:
+                case bbx::d3d12::DxgiFormat::kR8G8B8A8Sint:
+                case bbx::d3d12::DxgiFormat::kR16G16Uint:
+                case bbx::d3d12::DxgiFormat::kR16G16Sint:
+                case bbx::d3d12::DxgiFormat::kR32Uint:
+                case bbx::d3d12::DxgiFormat::kR32Sint:
+                case bbx::d3d12::DxgiFormat::kR8G8Uint:
+                case bbx::d3d12::DxgiFormat::kR8G8Sint:
+                case bbx::d3d12::DxgiFormat::kR16Uint:
+                case bbx::d3d12::DxgiFormat::kR16Sint:
+                case bbx::d3d12::DxgiFormat::kR8Uint:
+                case bbx::d3d12::DxgiFormat::kR8Sint:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+
         // Blend state (Guard G4 compliant: DrawBlendFactor excludes constant factors).
+        // D3D12 forbids BlendEnable == TRUE on UNKNOWN or integer RTV formats.
         desc.BlendState.AlphaToCoverageEnable = FALSE;
         bool independent_blend = false;
         for (std::uint32_t i = 0; i < 8; ++i) {
             const auto& b = id.blend[i];
             auto& rt = desc.BlendState.RenderTarget[i];
-            rt.BlendEnable = b.enable ? TRUE : FALSE;
+            const bool can_blend =
+                desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN && !is_integer_format(desc.RTVFormats[i]);
+            rt.BlendEnable = (b.enable && can_blend) ? TRUE : FALSE;
             rt.LogicOpEnable = FALSE;
             rt.SrcBlend = ToD3d12Blend(b.src_color);
             rt.DestBlend = ToD3d12Blend(b.dst_color);
@@ -1256,7 +1303,10 @@ struct GuestGraphics::Impl {
         desc.RasterizerState.FrontCounterClockwise = id.raster.front_cw ? FALSE : TRUE;
         desc.RasterizerState.DepthClipEnable = id.raster.depth_clip ? TRUE : FALSE;
 
-        // Depth-stencil state.
+        // Depth-stencil state (only enable stencil if DSVFormat carries a stencil plane).
+        const bool has_stencil_plane =
+            id.depth_format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD24UnormS8Uint) ||
+            id.depth_format == static_cast<std::uint32_t>(bbx::d3d12::DxgiFormat::kD32FloatS8X24Uint);
         desc.DepthStencilState.DepthEnable =
             (id.depth_format != 0 && id.depth_stencil.depth_test) ? TRUE : FALSE;
         desc.DepthStencilState.DepthWriteMask =
@@ -1264,25 +1314,13 @@ struct GuestGraphics::Impl {
                                                                           : D3D12_DEPTH_WRITE_MASK_ZERO;
         desc.DepthStencilState.DepthFunc = ToD3d12Compare(id.depth_stencil.depth_func);
         desc.DepthStencilState.StencilEnable =
-            (id.depth_format != 0 && id.depth_stencil.stencil_enable) ? TRUE : FALSE;
+            (has_stencil_plane && id.depth_stencil.stencil_enable) ? TRUE : FALSE;
         desc.DepthStencilState.StencilReadMask = id.depth_stencil.stencil_read_mask;
         desc.DepthStencilState.StencilWriteMask = id.depth_stencil.stencil_write_mask;
         desc.DepthStencilState.FrontFace = ToD3d12StencilFace(id.depth_stencil.front);
         desc.DepthStencilState.BackFace = ToD3d12StencilFace(
             id.depth_stencil.backface_enable ? id.depth_stencil.back : id.depth_stencil.front);
 
-        // MRT formats (preserve slot indices; gaps remain DXGI_FORMAT_UNKNOWN).
-        for (std::uint32_t i = 0; i < 8; ++i) desc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
-        std::uint32_t num_rtvs = 0;
-        for (std::uint32_t i = 0; i < id.target_count && i < 8; ++i) {
-            const DrawTarget& t = id.targets[i];
-            if (t.index < 8) {
-                desc.RTVFormats[t.index] = static_cast<DXGI_FORMAT>(t.format);
-                if (t.index + 1 > num_rtvs) num_rtvs = t.index + 1;
-            }
-        }
-        desc.NumRenderTargets = num_rtvs;
-        desc.DSVFormat = id.depth_format != 0 ? static_cast<DXGI_FORMAT>(id.depth_format) : DXGI_FORMAT_UNKNOWN;
         desc.PrimitiveTopologyType = ToD3d12TopologyType(topo.type);
         desc.SampleMask = 0xFFFFFFFFu;
         desc.SampleDesc.Count = 1;
@@ -1292,6 +1330,7 @@ struct GuestGraphics::Impl {
         const HRESULT hr = device->Get()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
         if (FAILED(hr) || pso == nullptr) {
             ++counts.bad_pso;
+            failed_psos.insert(map_key);
             if (logged_pso_failures.insert(pso_key.lo ^ pso_key.hi).second) {
                 LogMessage(Level::kError, "guest graphics: CreateGraphicsPipelineState failed (hr=0x%08lx) for %016llx",
                            static_cast<unsigned long>(hr), static_cast<unsigned long long>(pso_key.lo));
@@ -1346,14 +1385,22 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
     }
 
     // Private RTV and DSV descriptor heaps for guest draw targets.
+    // Slot 0 of rtv_heap is reserved for a null RTV descriptor so MRT slot gaps
+    // never pass a zero CPU descriptor handle to OMSetRenderTargets.
     D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
     rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtv_desc.NumDescriptors = Impl::kMaxRtvs;
+    rtv_desc.NumDescriptors = Impl::kMaxRtvs + 1;
     rtv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device.Get()->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(impl.rtv_heap.GetAddressOf())))) {
         LogMessage(Level::kError, "guest graphics: RTV descriptor heap creation failed");
         return d3d12::Status::kOutOfMemory;
     }
+    D3D12_RENDER_TARGET_VIEW_DESC null_rtv_view{};
+    null_rtv_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    null_rtv_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    impl.null_rtv_cpu = impl.RtvCpu(0);
+    device.Get()->CreateRenderTargetView(nullptr, &null_rtv_view, impl.null_rtv_cpu);
+
     D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{};
     dsv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     dsv_desc.NumDescriptors = Impl::kMaxDsvs;
@@ -1363,7 +1410,7 @@ d3d12::Status GuestGraphics::Create(d3d12::Device& device, d3d12::PipelineSet& p
         return d3d12::Status::kOutOfMemory;
     }
     impl.free_rtv_slots.clear();
-    for (std::uint32_t i = Impl::kMaxRtvs; i > 0; --i) impl.free_rtv_slots.push_back(i - 1);
+    for (std::uint32_t i = Impl::kMaxRtvs; i > 0; --i) impl.free_rtv_slots.push_back(i);
     impl.free_dsv_slots.clear();
     for (std::uint32_t i = Impl::kMaxDsvs; i > 0; --i) impl.free_dsv_slots.push_back(i - 1);
 
@@ -1468,6 +1515,7 @@ void GuestGraphics::Destroy() {
         if (pso != nullptr) pso->Release();
     }
     impl.pso_objects.clear();
+    impl.failed_psos.clear();
     impl.psos.reset();
 
     for (Impl::RetiredTarget& r : impl.retired_targets) {
@@ -1539,6 +1587,7 @@ void GuestGraphics::Destroy() {
 
     impl.rtv_heap.Reset();
     impl.dsv_heap.Reset();
+    impl.null_rtv_cpu = {};
     impl.noted_by_hash.clear();
     impl.programs.clear();
     impl.fallback_keys.clear();
@@ -1680,6 +1729,9 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     if (const auto it = impl.pso_objects.find(pso_map_key); it != impl.pso_objects.end()) {
         (void)impl.psos->Acquire(pso_key, ++impl.clock);
         pso = it->second;
+    } else if (impl.failed_psos.find(pso_map_key) != impl.failed_psos.end()) {
+        ++impl.counts.bad_pso;
+        return false;
     } else {
         d3d12::BakedBlob vs_blob{}, ps_blob{};
         if (!impl.compute->Cache().Lookup(vs_key, &vs_blob)) {
@@ -1709,8 +1761,10 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     }
 
     // Ensure native 2D render targets (marking them GPU-rendered for zero-copy
-    // direct scanout) and optional depth-stencil target.
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[8] = {};
+    // direct scanout) and optional depth-stencil target. Initialize all 8 slots
+    // with the null RTV descriptor so MRT slot gaps never pass a zero handle.
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handles[8];
+    for (std::uint32_t i = 0; i < 8; ++i) rtv_handles[i] = impl.null_rtv_cpu;
     std::uint32_t num_rtvs = 0;
     std::uint32_t primary_w = 0, primary_h = 0;
     for (std::uint32_t i = 0; i < id.target_count && i < 8; ++i) {
@@ -1735,9 +1789,11 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     if (id.depth_format != 0) {
         const std::uint32_t dw = id.depth_stencil.depth_width != 0 ? id.depth_stencil.depth_width : primary_w;
         const std::uint32_t dh = id.depth_stencil.depth_height != 0 ? id.depth_stencil.depth_height : primary_h;
-        if (impl.EnsureDepthTarget(id.depth_stencil.depth_base, id.depth_format, dw, dh, &dsv_handle)) {
-            has_dsv = true;
+        if (!impl.EnsureDepthTarget(id.depth_stencil.depth_base, id.depth_format, dw, dh, &dsv_handle)) {
+            ++impl.counts.bad_target;
+            return false;
         }
+        has_dsv = true;
     }
 
     // Resolve indexed and indirect draw buffers before recording.
@@ -1748,6 +1804,7 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     std::uint64_t ib_staged_off = 0;
     std::uint64_t ib_bytes = 0;
     bool ib_from_slab = false;
+    bool ib_from_upload = false;
     D3D12_INDEX_BUFFER_VIEW ibv{};
     if (indexed) {
         const std::uint32_t idx_stride = d.index_type == 1 ? 4u : 2u;
@@ -1772,6 +1829,7 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
             std::memcpy(static_cast<std::uint8_t*>(impl.index_upload_mapped) + ib_staged_off,
                         reinterpret_cast<const void*>(static_cast<std::uintptr_t>(d.index_va)),
                         static_cast<std::size_t>(ib_bytes));
+            ib_from_upload = true;
             ibv.BufferLocation = impl.index_upload->GetGPUVirtualAddress() + ib_staged_off;
             ibv.SizeInBytes = static_cast<UINT>(ib_bytes);
             ibv.Format = d.index_type == 1 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
@@ -1820,18 +1878,38 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     const std::uint32_t vs_table_off = impl.BindStageResources(0, vs_key, id.vs.user);
     const std::uint32_t ps_table_off = impl.BindStageResources(1, ps_key, id.ps.user);
 
-    // Ensure any SRV ring slices used by VS or PS are marked pending for this batch
-    // (even if PS binding caused an intermediate flush).
-    const auto& vs_copies = impl.stage_state[0].srv_copies;
-    const auto& ps_copies = impl.stage_state[1].srv_copies;
-    for (const Impl::SrvCopy& copy : vs_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
-    for (const Impl::SrvCopy& copy : ps_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
-
-    // Open or reuse the active batched command list.
+    // Open or reuse the active batched command list, and re-mark all ring slices
+    // used by this draw as pending in case BindStageResources flushed an intermediate batch.
     if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
     }
+    impl.param_slices_pending_mask |=
+        (1u << ((vs_slot / Impl::kParamSlotsPerSlice) % Impl::kParamSlices));
+    if (ib_from_slab) {
+        const std::uint32_t first_slice = static_cast<std::uint32_t>(ib_staged_off / Impl::kIndexSliceBytes);
+        const std::uint32_t last_slice =
+            static_cast<std::uint32_t>((ib_staged_off + ib_bytes - 1ull) / Impl::kIndexSliceBytes);
+        for (std::uint32_t s = first_slice; s <= last_slice && s < Impl::kIndexSlices; ++s) {
+            impl.idx_slices_pending_mask |= (1u << s);
+        }
+    }
+    if (ib_from_upload) {
+        const std::uint32_t first_slice = static_cast<std::uint32_t>(ib_staged_off / Impl::kIndexUploadSliceBytes);
+        const std::uint32_t last_slice =
+            static_cast<std::uint32_t>((ib_staged_off + ib_bytes - 1ull) / Impl::kIndexUploadSliceBytes);
+        for (std::uint32_t s = first_slice; s <= last_slice && s < Impl::kIndexUploadSlices; ++s) {
+            impl.idx_up_slices_pending_mask |= (1u << s);
+        }
+    }
+    if (indirect) {
+        impl.indirect_slices_pending_mask |=
+            (1u << ((indirect_dst_off / Impl::kIndirectSliceBytes) % Impl::kIndirectSlices));
+    }
+    const auto& vs_copies = impl.stage_state[0].srv_copies;
+    const auto& ps_copies = impl.stage_state[1].srv_copies;
+    for (const Impl::SrvCopy& copy : vs_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
+    for (const Impl::SrvCopy& copy : ps_copies) impl.compute->TouchSrvSnapshotOffset(copy.dst_offset);
     ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
 
     // Pre-draw copies from space-3 slabs into SRV snapshot ring, IB staging, and
@@ -1854,6 +1932,7 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     if (ib_from_slab) add_slab(ib_slab);
     if (indirect) add_slab(indirect_slab);
 
+    bool srv_ring_transitioned = false;
     if (copy_slab_count != 0) {
         D3D12_RESOURCE_BARRIER pre[34];
         for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
@@ -1892,6 +1971,7 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
         if (has_srv_copies) {
             post[post_count++] = TransitionBarrier(impl.compute->SrvSnapshotRing(), D3D12_RESOURCE_STATE_COPY_DEST,
                                                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            srv_ring_transitioned = true;
         }
         if (ib_from_slab) {
             post[post_count++] = TransitionBarrier(impl.index_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -2036,7 +2116,7 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     // Restore transient staging buffers back to COPY_DEST (stack array, zero alloc).
     D3D12_RESOURCE_BARRIER epilogue[3];
     std::uint32_t epilogue_count = 0;
-    if (has_srv_copies) {
+    if (srv_ring_transitioned) {
         epilogue[epilogue_count++] = TransitionBarrier(impl.compute->SrvSnapshotRing(),
                                                        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                                                        D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2363,8 +2443,9 @@ bool GuestGraphics::HasPending() const {
 bool GuestGraphics::HasRenderedTarget(std::uint64_t va, std::uint32_t width, std::uint32_t height) const {
     if (impl_ == nullptr || va == 0 || width == 0 || height == 0) return false;
     const Impl& impl = *impl_;
+    const std::uint32_t max_h = (height + 63u) & ~63u;
     for (const auto& [key, entry] : impl.rtv_pool) {
-        if (key.va == va && key.width == width && key.height == height &&
+        if (key.va == va && key.width == width && key.height >= height && key.height <= max_h &&
             entry.gpu_rendered && entry.resource != nullptr && IsDirectPresentFormat(key.format)) {
             return true;
         }
@@ -2380,12 +2461,21 @@ bool GuestGraphics::TryAcquirePresentTarget(std::uint64_t va, std::uint32_t widt
         return false;
     }
     const Impl& impl = *impl_;
+    const std::uint32_t max_h = (height + 63u) & ~63u;
     auto best = impl.rtv_pool.end();
     for (auto it = impl.rtv_pool.begin(); it != impl.rtv_pool.end(); ++it) {
-        if (it->first.va == va && it->first.width == width && it->first.height == height &&
+        if (it->first.va == va && it->first.width == width &&
+            it->first.height >= height && it->first.height <= max_h &&
             it->second.gpu_rendered && it->second.resource != nullptr && IsDirectPresentFormat(it->first.format)) {
-            if (best == impl.rtv_pool.end() || it->second.last_used_seq > best->second.last_used_seq) {
+            if (best == impl.rtv_pool.end()) {
                 best = it;
+            } else {
+                const bool exact_it = it->first.height == height;
+                const bool exact_best = best->first.height == height;
+                if ((exact_it && !exact_best) ||
+                    (exact_it == exact_best && it->second.last_used_seq > best->second.last_used_seq)) {
+                    best = it;
+                }
             }
         }
     }

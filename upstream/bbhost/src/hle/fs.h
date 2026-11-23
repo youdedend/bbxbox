@@ -7,7 +7,8 @@
 // /app0 reads, so a modified asset never has to be written into the dump. It
 // defaults to <data>/mods and is ignored when that directory does not exist.
 void hle_fs_set_roots(const char* app0, const char* data, const char* tmp, const char* eboot_path,
-                      const char* mods);
+                      const char* mods, const char* explicit_update = nullptr,
+                      bool has_explicit_update = false);
 const char* hle_fs_data_root();  // host path of the data root; empty when none is set
 const char* hle_fs_mods_root();  // host path of the asset overlay; empty when there is none
 const char* hle_fs_app0_root();  // host path of the dump; empty when none is set

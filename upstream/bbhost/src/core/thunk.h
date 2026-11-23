@@ -58,6 +58,11 @@ std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* code, std::uint64_t id, voi
 void* guest_thread_enter();
 // Restores host FS and frees the TLS block.
 void guest_thread_leave(void* tcb);
+// Restores NT_TIB stack limits after a longjmp (scePthreadExit) that bypassed
+// hle_host_stack_leave().
+void hle_host_stack_reset();
+// Returns the saved guest stack limits when currently running on t_host_stack.
+bool hle_host_guest_stack_limits(std::uint64_t* lo, std::uint64_t* hi);
 
 // Everything here is asm written for SysV registers, or is called from that
 // asm, so each carries GUEST_ABI: a Windows caller must not use the MS

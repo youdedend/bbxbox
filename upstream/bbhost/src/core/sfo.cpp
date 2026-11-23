@@ -4,17 +4,28 @@
 #include <cstring>
 #include <vector>
 
+#if defined(BBX_UWP)
+#include "xbox/platform/hostfs_extra.h"
+#endif
+
 bool sfo_read(const std::string& path, std::map<std::string, SfoValue>* out, std::string* error) {
     out->clear();
-    std::FILE* f = path.empty() ? nullptr : std::fopen(path.c_str(), "rb");
-    if (!f) {
-        *error = "not found";
+    std::vector<std::uint8_t> b;
+#if defined(BBX_UWP)
+    if (path.empty() || !bbx::hostfs::ReadFileAll(path, &b)) {
+        if (error) *error = "not found";
         return false;
     }
-    std::vector<std::uint8_t> b;
+#else
+    std::FILE* f = path.empty() ? nullptr : std::fopen(path.c_str(), "rb");
+    if (!f) {
+        if (error) *error = "not found";
+        return false;
+    }
     std::uint8_t buf[4096];
     for (std::size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) b.insert(b.end(), buf, buf + n);
     std::fclose(f);
+#endif
     auto u16 = [&](std::size_t o) -> std::uint32_t { return o + 2 <= b.size() ? b[o] | (b[o + 1] << 8) : 0; };
     auto u32 = [&](std::size_t o) {
         std::uint32_t v = 0;

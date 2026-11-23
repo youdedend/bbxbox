@@ -366,19 +366,19 @@ TEST(ConsoleContainerStageReadsThePixelTable) {
     std::vector<std::uint8_t> map;
     std::uint32_t flat = 0xffffffffu;
     std::string why;
-    CHECK(ConsolePsInputMap(stage, std::vector<std::uint32_t>{0}, map, flat, why));
+    CHECK(ConsolePsInputMap(stage, std::vector<std::uint32_t>{}, map, flat, why));
     CHECK(map.empty());
     CHECK_EQ(flat, 0u);
 
     // Both read: register 0, then register 3, and input 0 interpolates flat.
-    CHECK(ConsolePsInputMap(stage, std::vector<std::uint32_t>{0x3}, map, flat, why));
+    CHECK(ConsolePsInputMap(stage, std::vector<std::uint32_t>{0, 1}, map, flat, why));
     CHECK_EQ(map.size(), static_cast<std::size_t>(2));
     CHECK_EQ(static_cast<int>(map[0]), 0);
     CHECK_EQ(static_cast<int>(map[1]), 3);
     CHECK_EQ(flat, 1u);
 
     // An input the table does not declare is refused by name, not guessed.
-    CHECK(!ConsolePsInputMap(stage, std::vector<std::uint32_t>{0x4}, map, flat, why));
+    CHECK(!ConsolePsInputMap(stage, std::vector<std::uint32_t>{2}, map, flat, why));
     CHECK(!why.empty());
 }
 

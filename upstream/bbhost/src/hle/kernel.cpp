@@ -1268,8 +1268,13 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
             p = host_place_dmem(len, prot, phys, align, &view, &view_len);
             placed = p != nullptr;
         }
+#if defined(_WIN32)
+    } else if (fix == Fix::None && align > 0x10000) {
+#else
     } else if (fix == Fix::None && align > 0x1000) {
-        // Over-allocate and trim to honour the alignment.
+#endif
+        // Over-allocate and trim to honour the alignment (Windows views are
+        // already 64 KiB aligned, so 16 KiB flex allocations need no padding).
         void* raw = host_map_anon(nullptr, len + align, prot, Fix::None);
         if (raw) {
             const auto r = reinterpret_cast<std::uintptr_t>(raw);
@@ -1369,7 +1374,9 @@ GUEST_ABI int hle_release_direct(std::int64_t phys, std::uint64_t len) {
     if (phys < 0 || len == 0 || static_cast<std::uint64_t>(phys) + len > g_dmem_size) {
         return sce_err(EINVAL);
     }
-    // Any CPU mapping of the released range goes away with it.
+    // Any CPU mapping of the released range goes away BEFORE the physical
+    // interval is returned to the allocator, preventing a concurrent allocator
+    // from reusing the same identity VA only to have unmap_range tear it down.
     std::vector<MappedRegion> victims;
     {
         std::lock_guard<std::mutex> lock(g_dmem_mu);
@@ -1389,10 +1396,13 @@ GUEST_ABI int hle_release_direct(std::int64_t phys, std::uint64_t len) {
                 }
             }
         }
-        dmem_release_locked(static_cast<std::uint64_t>(phys), len);
     }
     for (const auto& v : victims) {
         unmap_range(v.start, v.len);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_dmem_mu);
+        dmem_release_locked(static_cast<std::uint64_t>(phys), len);
     }
     host_log("ReleaseDirectMemory phys=0x%llx len=0x%llx", static_cast<unsigned long long>(phys),
              static_cast<unsigned long long>(len));
@@ -1471,6 +1481,7 @@ struct HostSema {
     int waiters = 0;
     int multi_waiters = 0;  // waiters that want more than one token
     bool dead = false;
+    std::uint64_t cancel_gen = 0;
 };
 std::atomic<std::uint64_t> g_sema_sleeps{0}, g_sema_wakes{0}, g_eq_sleeps{0};
 
@@ -1528,10 +1539,11 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
     }
     ++h->waiters;
     if (need > 1) ++h->multi_waiters;
+    const std::uint64_t gen = h->cancel_gen;
     g_sema_sleeps.fetch_add(1, std::memory_order_relaxed);
     bool ok = true;
     const auto start = std::chrono::steady_clock::now();
-    auto ready = [&] { return h->dead || h->count >= need; };
+    auto ready = [&] { return h->dead || h->cancel_gen != gen || h->count >= need; };
     if (timeout) {
         ok = h->cv.wait_for(lk, std::chrono::microseconds(*timeout), ready);
     } else {
@@ -1552,6 +1564,9 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
                                std::chrono::steady_clock::now() - start)
                                .count();
         *timeout = spent >= *timeout ? 0u : *timeout - static_cast<std::uint32_t>(spent);
+    }
+    if (h->cancel_gen != gen) {
+        return sce_err(ECANCELED);
     }
     if (!ok) {
         return sce_err(ETIMEDOUT);
@@ -1606,6 +1621,7 @@ GUEST_ABI int hle_cancel_sema(HostSema* h, int set_count, int* num_waiters) {
     if (set_count >= 0 && set_count <= h->max) {
         h->count = set_count;
     }
+    ++h->cancel_gen;
     h->cv.notify_all();
     return 0;
 }
@@ -1745,12 +1761,12 @@ GUEST_ABI int hle_delete_equeue(HostEqueue* eq) {
     }
     hle_video_detach_equeue(eq);
     hle_gnm_detach_equeue(eq);
-    {
-        std::lock_guard<std::mutex> lock(g_eq_mu);
-        g_eqs.erase(eq);
-    }
     bool free_now = false;
     {
+        std::lock_guard<std::mutex> qlock(g_eq_mu);
+        if (g_eqs.erase(eq) == 0) {
+            return sce_err(EBADF);
+        }
         std::lock_guard<HostLock> lock(eq->mu);
         eq->dead = true;
         free_now = eq->waiters == 0;
@@ -1764,13 +1780,20 @@ GUEST_ABI int hle_delete_equeue(HostEqueue* eq) {
 
 GUEST_ABI int hle_wait_equeue(HostEqueue* eq, HostEvent* ev, int num, int* out, std::uint32_t* timeout) {
     MainThreadWait timed(0);
-    if (!eq || !equeue_live(eq) || num <= 0) {
+    if (!eq || num <= 0) {
         return sce_err(EINVAL);
     }
-    std::unique_lock<HostLock> lk(eq->mu);
+    std::unique_lock<HostLock> lk;
+    {
+        std::lock_guard<std::mutex> qlock(g_eq_mu);
+        if (g_eqs.find(eq) == g_eqs.end()) {
+            return sce_err(EINVAL);
+        }
+        lk = std::unique_lock<HostLock>(eq->mu);
+        ++eq->waiters;
+    }
     auto ready = [&] { return eq->dead || !eq->q.empty(); };
     bool ok = true;
-    ++eq->waiters;
     if (!ready() && !(timeout && *timeout == 0)) g_eq_sleeps.fetch_add(1, std::memory_order_relaxed);
     if (timeout == nullptr) {
         eq->cv.wait(lk, ready);

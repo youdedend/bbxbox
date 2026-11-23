@@ -212,20 +212,27 @@ GUEST_ABI std::int64_t hle_fios_fh_read_sync(const void*, int fh, void* buf, std
     if (!buf || len < 0) {
         return kFiosErrBadArg;
     }
+    if (len == 0) return 0;
     // The kernel writes this buffer, so a page the texture cache has
     // write-protected fails the read rather than faulting: release first, and
     // again if an upload protected one in the meantime.
     write_watch_release(buf, static_cast<std::size_t>(len));
-    const std::int64_t n = hostfs::Read(fd, buf, static_cast<std::uint64_t>(len));
-    if (n < 0) {
-        const int err = hostfs::LastError();
-        if (err == EFAULT && write_watch_release(buf, static_cast<std::size_t>(len))) {
-            const std::int64_t retry = hostfs::Read(fd, buf, static_cast<std::uint64_t>(len));
-            return retry < 0 ? kFiosErrAccess : retry;
+    auto* dst = static_cast<std::uint8_t*>(buf);
+    std::int64_t total = 0;
+    while (total < len) {
+        const std::uint64_t rem = static_cast<std::uint64_t>(len - total);
+        std::int64_t n = hostfs::Read(fd, dst + total, rem);
+        if (n < 0) {
+            const int err = hostfs::LastError();
+            if (err == EFAULT && write_watch_release(dst + total, static_cast<std::size_t>(rem))) {
+                n = hostfs::Read(fd, dst + total, rem);
+            }
+            if (n < 0) return total > 0 ? total : kFiosErrAccess;
         }
-        return kFiosErrAccess;
+        if (n == 0) break;  // EOF
+        total += n;
     }
-    return n;
+    return total;
 }
 
 GUEST_ABI std::int64_t hle_fios_fh_write_sync(const void*, int fh, const void* buf, std::int64_t len) {
@@ -236,8 +243,16 @@ GUEST_ABI std::int64_t hle_fios_fh_write_sync(const void*, int fh, const void* b
     if (!buf || len < 0) {
         return kFiosErrBadArg;
     }
-    const std::int64_t n = hostfs::Write(fd, buf, static_cast<std::uint64_t>(len));
-    return n < 0 ? kFiosErrAccess : n;
+    if (len == 0) return 0;
+    const auto* src = static_cast<const std::uint8_t*>(buf);
+    std::int64_t total = 0;
+    while (total < len) {
+        const std::int64_t n = hostfs::Write(fd, src + total, static_cast<std::uint64_t>(len - total));
+        if (n < 0) return total > 0 ? total : kFiosErrAccess;
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
 }
 
 // SceFiosOffset sceFiosFHSeek(fh, offset, whence)  whence: 0 set, 1 cur, 2 end

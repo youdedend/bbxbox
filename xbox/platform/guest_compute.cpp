@@ -144,7 +144,7 @@ bool ExtractProgram(std::uint64_t code_va, Program* out) {
     std::size_t limit = 0;
     while (limit < (1u << 20) && hle_kernel_va_mapped(code_va + limit, 4096)) limit += 4096;
     if (limit == 0) return false;
-    for (std::size_t i = 0; i + 32 <= limit; i += 4) {
+    for (std::size_t i = 0; i + 28 <= limit; i += 4) {
         if (std::memcmp(p + i, "OrbShdr", 7) != 0) continue;
         std::uint32_t lenfield = 0;
         std::memcpy(&lenfield, p + i + 8, 4);
@@ -629,9 +629,10 @@ struct GuestCompute::Impl {
     void WriteNullSlotToHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::uint32_t slot) {
         if (slot >= GuestHeapLayout::kUavOffset) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-            uav.Format = DXGI_FORMAT_R32_UINT;
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
             uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
             uav.Buffer.NumElements = 0;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
             device->Get()->CreateUnorderedAccessView(nullptr, nullptr, &uav, handle);
         } else if (slot >= GuestHeapLayout::kCbvOffset && slot < GuestHeapLayout::kSrvOffset) {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
@@ -640,10 +641,11 @@ struct GuestCompute::Impl {
             device->Get()->CreateConstantBufferView(&cbv, handle);
         } else {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = DXGI_FORMAT_R32_UINT;
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Buffer.NumElements = 0;
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
             device->Get()->CreateShaderResourceView(nullptr, &srv, handle);
         }
     }
@@ -698,13 +700,13 @@ struct GuestCompute::Impl {
         ID3D12Resource* slab = memory->SlabBuffer(write.slab);
         if (slab == nullptr) return false;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-        uav.Format = DXGI_FORMAT_R32_UINT;
+        uav.Format = DXGI_FORMAT_R32_TYPELESS;
         uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         uav.Buffer.FirstElement = write.offset / 4;
         uav.Buffer.NumElements = write.dwords;
         uav.Buffer.StructureByteStride = 0;
         uav.Buffer.CounterOffsetInBytes = 0;
-        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device->Get()->CreateUnorderedAccessView(slab, nullptr, &uav, SlotHandleAt(table_offset + slot));
         return true;
     }
@@ -720,13 +722,13 @@ struct GuestCompute::Impl {
         std::uint64_t ring_offset = 0;
         if (!ReserveSrvSlice(bytes, &ring_offset, nullptr, nullptr)) return false;
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R32_UINT;
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Buffer.FirstElement = static_cast<UINT>(ring_offset / 4ull);
         srv.Buffer.NumElements = write.dwords;
         srv.Buffer.StructureByteStride = 0;
-        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         device->Get()->CreateShaderResourceView(srv_ring.Get(), &srv, SlotHandleAt(table_offset + slot));
         out_copy->slab = write.slab;
         out_copy->src_offset = write.offset;
@@ -929,7 +931,7 @@ struct GuestCompute::Impl {
                     std::lock_guard<std::mutex> lk(pso_mutex);
                     if (prewarm_stop.load(std::memory_order_relaxed)) break;
                     if (pso_objects.find(key) != pso_objects.end()) continue;
-                    if (psos->Stats().live >= 1024 ||
+                    if (psos->Stats().live >= 768 ||
                         (byte_cap != 0 && psos->Stats().live_bytes + dxil.size() > byte_cap)) {
                         break;
                     }
@@ -940,7 +942,11 @@ struct GuestCompute::Impl {
                         const std::uint64_t retire_fence = device->SubmittedValue() + 1;
                         for (const PsoKey& ev : evicted) {
                             if (const auto it = pso_objects.find(ev.lo); it != pso_objects.end()) {
-                                retired_psos.push_back({it->second, retire_fence});
+                                if (batch_open) {
+                                    batch_retired_psos.push_back(it->second);
+                                } else {
+                                    retired_psos.push_back({it->second, retire_fence});
+                                }
                                 pso_objects.erase(it);
                             }
                         }
@@ -1513,7 +1519,7 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     if (indirect) {
         impl.scratch_runs.clear();
         if (!d3d12::SlabRuns(impl.memory->Table(), d.indirect_va, 3 * sizeof(std::uint32_t), &impl.scratch_runs) ||
-            impl.scratch_runs.empty()) {
+            impl.scratch_runs.size() != 1 || impl.scratch_runs.front().bytes < 3 * sizeof(std::uint32_t)) {
             ++impl.counts.no_indirect;
             return false;
         }
@@ -1544,10 +1550,20 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     // Ring-buffered space-1 slots for this dispatch (may flush if a ring wraps).
     const std::uint32_t space1_offset = impl.BindResources(key, d);
 
-    // Ensure a batch command list is open.
+    // Ensure a batch command list is open, and re-mark this dispatch's ring
+    // slices pending in case BindResources flushed the previous batch.
     if (!impl.BeginBatch()) {
         ++impl.counts.record_failed;
         return false;
+    }
+    impl.param_slices_pending_mask |=
+        (1u << ((slot / Impl::kParamSlotsPerSlice) % Impl::kParamSlices));
+    if (indirect) {
+        impl.indirect_slices_pending_mask |=
+            (1u << ((indirect_dst_offset / Impl::kIndirectSliceBytes) % Impl::kIndirectSlices));
+    }
+    for (const Impl::SrvCopy& copy : impl.bound_srv_copies) {
+        impl.TouchSrvOffset(copy.dst_offset);
     }
     ID3D12GraphicsCommandList* list = impl.active_cmd.list.Get();
 
@@ -1582,6 +1598,7 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     }
     if (indirect) add_copy_slab(indirect_slab);
 
+    bool srv_ring_transitioned = false;
     if (copy_slab_count != 0) {
         D3D12_RESOURCE_BARRIER pre[33];
         for (std::uint32_t i = 0; i < copy_slab_count; ++i) {
@@ -1610,6 +1627,7 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
         if (has_srv_copies) {
             post[post_count++] = transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            srv_ring_transitioned = true;
         }
         if (indirect) {
             post[post_count++] = transition(impl.indirect_staging.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1665,7 +1683,7 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
     // next dispatch/draw sees everything this dispatch wrote.
     D3D12_RESOURCE_BARRIER epilogue[3];
     std::uint32_t epilogue_count = 0;
-    if (has_srv_copies) {
+    if (srv_ring_transitioned) {
         epilogue[epilogue_count++] = transition(impl.srv_ring.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                                                 D3D12_RESOURCE_STATE_COPY_DEST);
     }
@@ -1696,6 +1714,33 @@ void GuestCompute::Flush() {
 
 bool GuestCompute::HasPending() const {
     return impl_ != nullptr && impl_->batch_open;
+}
+
+void GuestCompute::InvalidatePrograms(std::uint64_t lo, std::uint64_t hi) {
+    if (impl_ == nullptr || lo >= hi) return;
+    Impl& impl = *impl_;
+    bool any = false;
+    for (auto it = impl.programs.begin(); it != impl.programs.end();) {
+        const std::uint64_t prog_lo = it->first;
+        const std::uint64_t prog_hi =
+            prog_lo + static_cast<std::uint64_t>(it->second.words.size()) * sizeof(std::uint32_t);
+        if (prog_lo < hi && prog_hi > lo) {
+            it = impl.programs.erase(it);
+            any = true;
+        } else {
+            ++it;
+        }
+    }
+    if (any) {
+        for (auto it = impl.keys.begin(); it != impl.keys.end();) {
+            if (impl.programs.find(it->first.code_va) == impl.programs.end()) {
+                it = impl.keys.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        impl.bound_valid = false;
+    }
 }
 
 void GuestCompute::EnsureCacheLoaded() {

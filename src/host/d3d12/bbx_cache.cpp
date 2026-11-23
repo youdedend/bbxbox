@@ -75,8 +75,9 @@ CacheStamp CacheStamp::Parse(std::string_view text) {
     CacheStamp stamp;
     while (!text.empty()) {
         const std::size_t nl = text.find('\n');
-        const std::string_view line = text.substr(0, nl);
+        std::string_view line = text.substr(0, nl);
         text.remove_prefix(nl == std::string_view::npos ? text.size() : nl + 1);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         const std::size_t eq = line.find('=');
         if (eq == std::string_view::npos) continue;
         const std::string_view key = line.substr(0, eq);

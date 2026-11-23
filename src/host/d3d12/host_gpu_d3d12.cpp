@@ -250,39 +250,55 @@ const memory_policy::Policy& host_gpu_memory_policy() {
 }
 
 // ---- the timeline fence ------------------------------------------------------------
-// gnm_exec's EOP waits and video.cpp's flip-after-GPU ask these three questions,
-// and the answers are the device's own fence: what was signalled, what the GPU
-// has finished, and how much is in flight.
+// gnm_exec's EOP waits and video.cpp's flip-after-GPU ask these questions, and
+// the answers are the device's monotonic fence values.
 std::uint64_t host_gpu_work_needs() {
-    const GuestGpuBinding* gpu = GuestGpu();
-    if (!gpu || !gpu->fence_submitted || !gpu->fence_completed) return 0;
-    const std::uint64_t submitted = gpu->fence_submitted(gpu->user);
-    const std::uint64_t completed = gpu->fence_completed(gpu->user);
-    return submitted > completed ? submitted - completed : 0;
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
+    if (!gpu || !gpu->fence_submitted) return 0;
+    return gpu->fence_submitted(gpu->user);
 }
 
 std::uint64_t host_gpu_submissions_completed() {
-    const GuestGpuBinding* gpu = GuestGpu();
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
     if (!gpu || !gpu->fence_completed) return 0;  // nothing has ever been submitted
     return gpu->fence_completed(gpu->user);
 }
 
-bool host_gpu_wait_completed(std::uint64_t value, std::uint64_t timeout_ms) {
-    const GuestGpuBinding* gpu = GuestGpu();
-    if (!gpu || !gpu->fence_wait) return false;
-    if (gpu->fence_completed && gpu->fence_completed(gpu->user) >= value) return true;
-    return gpu->fence_wait(gpu->user, value, timeout_ms);
+bool host_gpu_wait_completed(std::uint64_t value, std::uint64_t timeout_ns) {
+    GuestGpuBinding snap{};
+    {
+        std::lock_guard<std::mutex> lock(mutex());
+        if (!g_bound || !g_bound->fence_wait) return false;
+        snap = *g_bound;
+    }
+    if (snap.fence_completed && snap.fence_completed(snap.user) >= value) return true;
+    const std::uint64_t timeout_ms =
+        timeout_ns == 0 ? 0ull
+                        : std::min<std::uint64_t>(0xffffffffull, (timeout_ns + 999999ull) / 1000000ull);
+    return snap.fence_wait(snap.user, value, timeout_ms);
 }
 
 void host_gpu_submit() {
-    const GuestGpuBinding* gpu = GuestGpu();
+    std::lock_guard<std::mutex> lock(mutex());
+    const GuestGpuBinding* gpu = g_bound;
     if (gpu && gpu->fence_signal) gpu->fence_signal(gpu->user);
 }
 
 void host_gpu_flush() {
-    // Flush is submit: the port has one queue and one fence, and a guest flush
-    // is a promise that the work is on the GPU, which a signal is.
-    host_gpu_submit();
+    GuestGpuBinding snap{};
+    std::uint64_t target = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex());
+        if (!g_bound) return;
+        snap = *g_bound;
+        if (snap.fence_signal) snap.fence_signal(snap.user);
+        if (snap.fence_submitted) target = snap.fence_submitted(snap.user);
+    }
+    if (target > 0 && snap.fence_wait) {
+        (void)snap.fence_wait(snap.user, target, 2000ull);
+    }
 }
 
 // ---- guest memory ----------------------------------------------------------------
@@ -426,7 +442,8 @@ bool host_gpu_draw(const GpuDraw& d) {
     // rather than dropped by a counter.
     // The stage list is the session's answer (`GpuDrawInputs::stages`, i.e.
     // VGT_SHADER_STAGES_EN); with no GX inputs there is nothing to say it, so 0.
-    const std::uint32_t stages = d.gx != nullptr ? d.gx->stages : 0;
+    const std::uint32_t stages =
+        d.gx != nullptr ? d.gx->stages : (d.ctx != nullptr ? d.ctx[0x2d5] : 0u);
     const DrawIdentity identity = DecodeDraw(d.sh, d.ctx, d.uconfig, stages);
     const std::uint64_t fingerprint = DrawFingerprint(identity);
     if (identity.verdict != DrawVerdict::kOk) {

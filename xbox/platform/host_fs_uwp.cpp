@@ -164,22 +164,34 @@ std::string Narrow(const wchar_t* text) {
 }
 
 // --- handles ---------------------------------------------------------------
+struct WinFile {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool append = false;
+    std::mutex mu;
+    ~WinFile() {
+        if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+    }
+};
+
 std::mutex g_handle_mu;
-std::unordered_map<int, HANDLE> g_handles;
+std::unordered_map<int, std::shared_ptr<WinFile>> g_handles;
 std::atomic<int> g_next_handle{1};  // 0 and negatives are "no handle"
 
-int Adopt(HANDLE file) {
+int Adopt(HANDLE file, bool append = false) {
+    auto entry = std::make_shared<WinFile>();
+    entry->handle = file;
+    entry->append = append;
     const int number = g_next_handle.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_handle_mu);
-    g_handles.emplace(number, file);
+    g_handles.emplace(number, std::move(entry));
     return number;
 }
 
-HANDLE Lookup(int number, bool take) {
+std::shared_ptr<WinFile> Lookup(int number, bool take) {
     std::lock_guard<std::mutex> lock(g_handle_mu);
     auto it = g_handles.find(number);
-    if (it == g_handles.end()) return INVALID_HANDLE_VALUE;
-    HANDLE file = it->second;
+    if (it == g_handles.end()) return nullptr;
+    std::shared_ptr<WinFile> file = it->second;
     if (take) g_handles.erase(it);
     return file;
 }
@@ -464,27 +476,41 @@ bool StatImpl(const char* path, FileStat* out) {
     return true;
 }
 
-bool MkDirOne(const std::string& path) {
+bool MkDirOne(const std::string& path, bool allow_existing) {
     const std::wstring wide = Widen(path.c_str());
     if (wide.empty()) return false;
     if (::CreateDirectoryFromAppW(wide.c_str(), nullptr)) return true;
-    // EXISTS is what "make sure this directory is there" means; anything else
-    // fails, and the error is kept for the caller's log line.
-    if (::GetLastError() == ERROR_ALREADY_EXISTS) return true;
-    FailWin32();
+    const DWORD err = ::GetLastError();
+    if (allow_existing) {
+        if (err == ERROR_ALREADY_EXISTS) {
+            FileStat st{};
+            if (StatImpl(path.c_str(), &st) && st.is_dir) return true;
+            Fail(EEXIST);
+            return false;
+        }
+        if (err == ERROR_ACCESS_DENIED) {
+            FileStat st{};
+            if (StatImpl(path.c_str(), &st) && st.is_dir) return true;
+        }
+    }
+    Fail(ErrnoFrom(err));
     return false;
 }
 
 bool MkDirImpl(const char* path, bool create_parents) {
     std::string full = Slashify(path != nullptr ? path : "");
-    while (!full.empty() && full.back() == '/') full.pop_back();
+    while (full.size() > 1 && full.back() == '/') full.pop_back();
     if (full.empty()) {
         Fail(EINVAL);
         return false;
     }
     if (!create_parents) {
-        if (MkDirOne(full)) return true;
-        FailWin32();
+        return MkDirOne(full, /*allow_existing=*/false);
+    }
+    FileStat existing{};
+    if (StatImpl(full.c_str(), &existing)) {
+        if (existing.is_dir) return true;
+        Fail(EEXIST);
         return false;
     }
     std::string sofar;
@@ -498,8 +524,7 @@ bool MkDirImpl(const char* path, bool create_parents) {
         const std::string part = full.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
         if (!part.empty()) {
             sofar = sofar.empty() ? part : (sofar.back() == '/' ? sofar + part : sofar + '/' + part);
-            if (!MkDirOne(sofar)) {
-                FailWin32();
+            if (!MkDirOne(sofar, /*allow_existing=*/true)) {
                 return false;
             }
         }
@@ -556,20 +581,20 @@ int OpenImpl(const char* path, int flags, int mode) {
     const std::wstring wide = Widen(path);
     if (wide.empty()) return Fail(ENOENT);
 
+    const bool is_append = (flags & kAppend) != 0;
     DWORD access = 0;
     switch (flags & kAccessMask) {
         case kRead: access = GENERIC_READ; break;
-        case kWrite: access = GENERIC_WRITE; break;
+        case kWrite: access = is_append ? (FILE_APPEND_DATA | SYNCHRONIZE) : GENERIC_WRITE; break;
         case kRead | kWrite: access = GENERIC_READ | GENERIC_WRITE; break;
         default: access = GENERIC_READ; break;
     }
-    if ((flags & kAppend) != 0) access |= FILE_APPEND_DATA;
 
     DWORD disposition = OPEN_EXISTING;
     if ((flags & kCreate) != 0) {
-        disposition = (flags & kTruncate) != 0 ? CREATE_ALWAYS
-                      : (flags & kExclusive) != 0 ? CREATE_NEW
-                                                  : OPEN_ALWAYS;
+        disposition = (flags & kExclusive) != 0 ? CREATE_NEW
+                      : (flags & kTruncate) != 0 ? CREATE_ALWAYS
+                                                 : OPEN_ALWAYS;
     } else if ((flags & kTruncate) != 0) {
         disposition = TRUNCATE_EXISTING;
     }
@@ -600,7 +625,11 @@ int OpenImpl(const char* path, int flags, int mode) {
                             static_cast<unsigned long>(code), err, flags);
         return Fail(err);
     }
-    return Adopt(file);
+    if (is_append && (flags & kAccessMask) == (kRead | kWrite)) {
+        LARGE_INTEGER zero{};
+        (void)::SetFilePointerEx(file, zero, nullptr, FILE_END);
+    }
+    return Adopt(file, is_append);
 }
 
 std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
@@ -630,8 +659,8 @@ std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
         if (err != 0 || got < 0) return Fail(err != 0 ? err : EIO);
         return got;
     }
-    HANDLE file = Lookup(handle, false);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, false);
+    if (!file) {
         Fail(EBADF);
         return -1;
     }
@@ -639,7 +668,7 @@ std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
     // clamp keeps a wild count from wrapping.
     DWORD want = count > 0x40000000ull ? 0x40000000u : static_cast<DWORD>(count);
     DWORD got = 0;
-    if (!::ReadFile(file, buffer, want, &got, nullptr)) {
+    if (!::ReadFile(file->handle, buffer, want, &got, nullptr)) {
         FailWin32();
         return -1;
     }
@@ -648,14 +677,24 @@ std::int64_t ReadImpl(int handle, void* buffer, std::uint64_t count) {
 
 std::int64_t WriteImpl(int handle, const void* buffer, std::uint64_t count) {
     if (IsRtHandle(handle)) return Fail(EACCES);  // the dump is read-only
-    HANDLE file = Lookup(handle, false);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, false);
+    if (!file) {
         Fail(EBADF);
         return -1;
     }
     DWORD want = count > 0x40000000ull ? 0x40000000u : static_cast<DWORD>(count);
     DWORD put = 0;
-    if (!::WriteFile(file, buffer, want, &put, nullptr)) {
+    if (file->append) {
+        std::lock_guard<std::mutex> lock(file->mu);
+        LARGE_INTEGER zero{};
+        (void)::SetFilePointerEx(file->handle, zero, nullptr, FILE_END);
+        if (!::WriteFile(file->handle, buffer, want, &put, nullptr)) {
+            FailWin32();
+            return -1;
+        }
+        return static_cast<std::int64_t>(put);
+    }
+    if (!::WriteFile(file->handle, buffer, want, &put, nullptr)) {
         FailWin32();
         return -1;
     }
@@ -686,8 +725,8 @@ std::int64_t SeekImpl(int handle, std::int64_t offset, int whence) {
         if (err != 0 || target < 0) return Fail(err != 0 ? err : EIO);
         return target;
     }
-    HANDLE file = Lookup(handle, false);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, false);
+    if (!file) {
         Fail(EBADF);
         return -1;
     }
@@ -697,7 +736,7 @@ std::int64_t SeekImpl(int handle, std::int64_t offset, int whence) {
     LARGE_INTEGER distance{};
     distance.QuadPart = offset;
     LARGE_INTEGER placed{};
-    if (!::SetFilePointerEx(file, distance, &placed, move)) {
+    if (!::SetFilePointerEx(file->handle, distance, &placed, move)) {
         FailWin32();
         return -1;
     }
@@ -709,15 +748,15 @@ bool TruncateImpl(int handle, std::int64_t length) {
         Fail(EACCES);
         return false;
     }
-    HANDLE file = Lookup(handle, false);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, false);
+    if (!file) {
         Fail(EBADF);
         return false;
     }
     const std::int64_t at = SeekImpl(handle, 0, kSeekCur);
     if (at < 0) return false;
     if (SeekImpl(handle, length, kSeekSet) < 0) return false;
-    const bool ok = ::SetEndOfFile(file) != FALSE;
+    const bool ok = ::SetEndOfFile(file->handle) != FALSE;
     if (!ok) FailWin32();
     if (SeekImpl(handle, at < length ? at : length, kSeekSet) < 0) return false;
     return ok;
@@ -725,12 +764,12 @@ bool TruncateImpl(int handle, std::int64_t length) {
 
 bool FlushImpl(int handle) {
     if (IsRtHandle(handle)) return true;  // nothing buffered on the WinRT side
-    HANDLE file = Lookup(handle, false);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, false);
+    if (!file) {
         Fail(EBADF);
         return false;
     }
-    if (!::FlushFileBuffers(file)) {
+    if (!::FlushFileBuffers(file->handle)) {
         FailWin32();
         return false;
     }
@@ -742,13 +781,9 @@ bool CloseImpl(int handle) {
         (void)rt;
         return true;
     }
-    HANDLE file = Lookup(handle, true);
-    if (file == INVALID_HANDLE_VALUE) {
+    const auto file = Lookup(handle, true);
+    if (!file) {
         Fail(EBADF);
-        return false;
-    }
-    if (!::CloseHandle(file)) {
-        FailWin32();
         return false;
     }
     return true;
@@ -788,16 +823,18 @@ bool RenameImpl(const char* from, const char* to, bool replace) {
         return false;
     }
     if (replace) {
-        // ReplaceFileFromApp replaces an existing file, and does so atomically.
-        // It fails when the destination does not exist, which is the common
-        // case for a first save, so the plain move is the fallback - and the
-        // plain move is also what "no replace" wants.
-        if (::ReplaceFileFromAppW(b.c_str(), a.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
-            return true;
-        }
-        if (::GetLastError() != ERROR_FILE_NOT_FOUND) {
-            FailWin32();
-            return false;
+        FileStat src_stat{};
+        const bool is_dir = StatImpl(from, &src_stat) && src_stat.is_dir;
+        if (!is_dir) {
+            if (::ReplaceFileFromAppW(b.c_str(), a.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+                return true;
+            }
+            if (::GetLastError() != ERROR_FILE_NOT_FOUND) {
+                FailWin32();
+                return false;
+            }
+        } else {
+            (void)::RemoveDirectoryFromAppW(b.c_str());
         }
     }
     if (!::MoveFileFromAppW(a.c_str(), b.c_str())) {
@@ -831,7 +868,10 @@ bool CanonicalImpl(const char* path, std::string* out) {
         }
         t_error = 0;
     }
-    while (text.size() > 1 && text.back() == '/') text.pop_back();
+    while (text.size() > 1 && text.back() == '/') {
+        if (text.size() == 3 && text[1] == ':') break;
+        text.pop_back();
+    }
     *out = text;
     return true;
 }

@@ -254,7 +254,7 @@ int write_ls(std::uint32_t* cmd, unsigned n, const LsStageRegs* r, std::uint32_t
     // The modifier replaces RSRC1's VGPR-component and user-SGPR fields.
     const std::uint32_t mask = (modifier & 0xfffffc3fu) == 0 ? 0xfffffc3fu : 0xfcfffc3fu;
     const std::uint32_t rsrc[2] = {modifier ? ((r->rsrc1 & mask) | modifier) : r->rsrc1, r->rsrc2};
-    const std::uint32_t pgm[2] = {r->pgm_lo, 0};
+    const std::uint32_t pgm[2] = {r->pgm_lo, r->pgm_hi};
     PacketWriter w{cmd, cmd + 23};
     w.sh(0x2D48, pgm, 2);         // SPI_SHADER_PGM_LO/HI_LS
     w.sh(0x2D4B, &r->rsrc2, 1);   // SPI_SHADER_PGM_RSRC2_LS
@@ -264,7 +264,7 @@ int write_ls(std::uint32_t* cmd, unsigned n, const LsStageRegs* r, std::uint32_t
 }
 int write_hs(std::uint32_t* cmd, unsigned n, const HsStageRegs* r, std::uint32_t ls_hs_config) {
     if (!cmd || n < 30 || !r) return static_cast<int>(0x80D10001);
-    const std::uint32_t pgm[2] = {r->pgm_lo, 0};
+    const std::uint32_t pgm[2] = {r->pgm_lo, r->pgm_hi};
     PacketWriter w{cmd, cmd + 30};
     w.sh(0x2D08, pgm, 2);                          // SPI_SHADER_PGM_LO/HI_HS
     w.sh(0x2D0A, &r->rsrc1, 2);                    // SPI_SHADER_PGM_RSRC1/RSRC2_HS
@@ -277,7 +277,7 @@ int write_hs(std::uint32_t* cmd, unsigned n, const HsStageRegs* r, std::uint32_t
 int write_es(std::uint32_t* cmd, unsigned n, const EsStageRegs* r, std::uint32_t modifier) {
     if (!cmd || n < 20 || !r) return static_cast<int>(0x80D10001);
     const std::uint32_t rsrc[2] = {modifier ? ((r->rsrc1 & 0xfcfffc3fu) | modifier) : r->rsrc1, r->rsrc2};
-    const std::uint32_t pgm[2] = {r->pgm_lo, 0};
+    const std::uint32_t pgm[2] = {r->pgm_lo, r->pgm_hi};
     PacketWriter w{cmd, cmd + 20};
     w.sh(0x2CC8, pgm, 2);   // SPI_SHADER_PGM_LO/HI_ES
     w.sh(0x2CCA, rsrc, 2);  // SPI_SHADER_PGM_RSRC1/RSRC2_ES
@@ -286,7 +286,7 @@ int write_es(std::uint32_t* cmd, unsigned n, const EsStageRegs* r, std::uint32_t
 }
 int write_gs(std::uint32_t* cmd, unsigned n, const GsStageRegs* r) {
     if (!cmd || n < 29 || !r) return static_cast<int>(0x80D10001);
-    const std::uint32_t pgm[2] = {r->pgm_lo, 0};
+    const std::uint32_t pgm[2] = {r->pgm_lo, r->pgm_hi};
     PacketWriter w{cmd, cmd + 29};
     w.sh(0x2C88, pgm, 2);                       // SPI_SHADER_PGM_LO/HI_GS
     w.sh(0x2C8A, &r->rsrc1, 2);                 // SPI_SHADER_PGM_RSRC1/RSRC2_GS
@@ -347,15 +347,20 @@ GUEST_ABI int hle_gnm_push_color_marker(std::uint32_t* cmd, unsigned size, const
 GUEST_ABI int hle_gnm_pop_marker(std::uint32_t* cmd, unsigned size) {
     return write_marker(cmd, size, kMarkerPop, nullptr, nullptr, 0);
 }
-GUEST_ABI int hle_gnm_wait_flip(void* cmd, const void* dwords, int handle, int buffer) {
+GUEST_ABI int hle_gnm_wait_flip(void* cmd, unsigned dwords, int handle, int buffer) {
     static std::atomic<std::uint64_t> calls{0};
     const std::uint64_t n = calls.fetch_add(1);
+    auto* p = static_cast<std::uint32_t*>(cmd);
     if (n < 8 || (n & (n + 1)) == 0) {
-        const auto* p = static_cast<const std::uint32_t*>(cmd);
-        host_log("gnm: sceGnmInsertWaitFlipDone #%llu cmd=%p dwords=%llu handle=%d buffer=%d: %08x %08x %08x %08x %08x %08x %08x (flip %llu)",
-                 static_cast<unsigned long long>(n + 1), cmd, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(dwords)), handle,
-                 buffer, p ? p[0] : 0u, p ? p[1] : 0u, p ? p[2] : 0u, p ? p[3] : 0u, p ? p[4] : 0u, p ? p[5] : 0u, p ? p[6] : 0u,
+        auto rd = [&](unsigned i) -> std::uint32_t { return (p && i < dwords) ? p[i] : 0u; };
+        host_log("gnm: sceGnmInsertWaitFlipDone #%llu cmd=%p dwords=%u handle=%d buffer=%d: %08x %08x %08x %08x %08x %08x %08x (flip %llu)",
+                 static_cast<unsigned long long>(n + 1), cmd, dwords, handle, buffer,
+                 rd(0), rd(1), rd(2), rd(3), rd(4), rd(5), rd(6),
                  static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    if (p && dwords > 0 && dwords <= 64) {
+        PacketWriter w{p, p + dwords};
+        w.nop_fill();
     }
     return 0;
 }

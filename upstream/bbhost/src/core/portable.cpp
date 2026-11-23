@@ -1,4 +1,5 @@
 #include "core/portable.h"
+#include "core/thunk.h"
 #include "log.h"
 
 #include <pthread.h>
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(BBHOST_HAVE_SDL3)
+#if defined(BBHOST_HAVE_SDL3) && !defined(BBX_UWP)
 #include <SDL3/SDL.h>
 #endif
 
@@ -22,6 +24,7 @@
 // The container's calls are `*FromApp`, and there is no `<timeapi.h>` (winmm
 // is a desktop partition DLL) and no `_mkdir` on a path that arrives from a
 // `FutureAccessList` token: the file system is the port's host-fs seam.
+#include "host/window.h"
 #include "xbox/platform/host_fs.h"
 #include <malloc.h>
 #include <windows.h>
@@ -156,6 +159,8 @@ void host_read_safe_recover() {
 #endif
 
 bool host_read_safe(const void* addr, void* out, std::size_t len) {
+    if (len == 0) return true;
+    if (!addr || !out) return false;
 #if defined(BBX_UWP)
     // `ReadProcessMemory` on our own process is a desktop convenience the
     // container does not offer - and the question it answers is "is this range
@@ -164,6 +169,7 @@ bool host_read_safe(const void* addr, void* out, std::size_t len) {
     // same call to prove the dmem window's state).
     const auto base = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = base + len;
+    if (end < base) return false;
     std::uintptr_t at = base;
     while (at < end) {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -206,6 +212,12 @@ bool host_read_safe(const void* addr, void* out, std::size_t len) {
 }
 
 bool host_thread_stack(std::uint64_t* lo, std::uint64_t* hi) {
+#if defined(_WIN32)
+    // While inside an HLE call, NT_TIB points at t_host_stack; return the
+    // saved guest stack bounds when active so callers checking guest pointers
+    // see the real guest stack.
+    if (hle_host_guest_stack_limits(lo, hi)) return true;
+#endif
     // Asked once a thread: the bounds do not move, and pthread_getattr_np
     // reads /proc/self/maps for the main thread.
     static thread_local std::uint64_t l = 0, h = 0;
@@ -393,7 +405,9 @@ std::atomic<bool> g_headless{false};
 void host_set_headless(bool headless) { g_headless.store(headless); }
 
 bool host_desktop_max_size(int* w, int* h) {
-#if defined(_WIN32) && !defined(BBX_UWP)
+#if defined(BBX_UWP)
+    return !g_headless.load() && host_window_desktop_size(w, h);
+#elif defined(_WIN32)
     // EnumDisplaySettings gives each display's mode in physical pixels,
     // whatever the process's DPI awareness (the monitor rectangles would be
     // scaled for a process that is not aware).
@@ -448,7 +462,9 @@ bool host_desktop_max_size(int* w, int* h) {
 }
 
 bool host_desktop_primary_size(int* w, int* h) {
-#if defined(_WIN32) && !defined(BBX_UWP)
+#if defined(BBX_UWP)
+    return !g_headless.load() && host_window_desktop_size(w, h);
+#elif defined(_WIN32)
     // The primary display's mode in physical pixels (EnumDisplaySettings with
     // no device name: the primary one, whatever the DPI awareness).
     DEVMODEW dm{};
@@ -499,7 +515,9 @@ float host_test_refresh_hz() {
 
 float host_desktop_refresh_hz() {
     if (const float t = host_test_refresh_hz(); t > 0.0f) return t;
-#if defined(BBHOST_HAVE_SDL3)
+#if defined(BBX_UWP)
+    return g_headless.load() ? 0.0f : host_window_refresh_hz();
+#elif defined(BBHOST_HAVE_SDL3)
     // The primary display, where SDL makes a window it is given no position
     // for (host_window_start), and its desktop mode's rate, which SDL keeps as
     // the display's ratio - Windows' DEVMODE rounds 59.94 down to 59. The
@@ -513,7 +531,7 @@ float host_desktop_refresh_hz() {
     }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
     return hz;
-#elif defined(_WIN32) && !defined(BBX_UWP)
+#elif defined(_WIN32)
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
     if (g_headless.load() || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1) return 0.0f;
@@ -525,34 +543,40 @@ float host_desktop_refresh_hz() {
 
 void host_sleep_us(std::uint64_t usec) {
 #if defined(_WIN32)
-    static thread_local HANDLE timer = [] {
-        static const bool period = [] {
+    struct ThreadTimer {
+        HANDLE h = nullptr;
+        ThreadTimer() {
+            static const bool period = [] {
 #if !defined(BBX_UWP)
-            timeBeginPeriod(1);  // for Sleep and the waits that fall back to the tick
+                timeBeginPeriod(1);  // for Sleep and the waits that fall back to the tick
 #endif
-            // The AppContainer has no winmm; `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`
-            // below is the whole of the timer surface here, and it does not need
-            // the period raised.
-            return true;
-        }();
-        (void)period;
-        HANDLE h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!h) h = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
-        return h;
-    }();
+                return true;
+            }();
+            (void)period;
+            h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!h) h = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        }
+        ~ThreadTimer() {
+            if (h) CloseHandle(h);
+        }
+    };
+    static thread_local ThreadTimer timer;
     if (usec == 0) {
         Sleep(0);
         return;
     }
-    if (timer) {
+    if (timer.h) {
+        constexpr std::uint64_t kMaxUsec = static_cast<std::uint64_t>(LLONG_MAX) / 10ull;
+        const std::uint64_t clamped = usec > kMaxUsec ? kMaxUsec : usec;
         LARGE_INTEGER due;
-        due.QuadPart = -static_cast<LONGLONG>(usec * 10);  // 100 ns units, relative
-        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-            WaitForSingleObject(timer, INFINITE);
+        due.QuadPart = -static_cast<LONGLONG>(clamped * 10ull);  // 100 ns units, relative
+        if (SetWaitableTimer(timer.h, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer.h, INFINITE);
             return;
         }
     }
-    Sleep(static_cast<DWORD>((usec + 999) / 1000));
+    const std::uint64_t ms = (usec + 999ull) / 1000ull;
+    Sleep(ms > 0xffffffffull ? 0xffffffffu : static_cast<DWORD>(ms));
 #else
     usleep(static_cast<useconds_t>(usec));
 #endif

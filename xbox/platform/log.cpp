@@ -131,6 +131,19 @@ bool PlausibleStack(std::uint64_t rsp) {
     return rsp >= 0x10000ull && (rsp & 0x7ull) == 0 && rsp < (1ull << 47);
 }
 
+bool SafeReadU64(std::uint64_t addr, std::uint64_t* out) {
+    if (!PlausibleStack(addr) || out == nullptr) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD p = mbi.Protect & 0xFFu;
+    if (p == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD) != 0) return false;
+    const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (addr + sizeof(std::uint64_t) > end) return false;
+    *out = *reinterpret_cast<const std::uint64_t*>(addr);
+    return true;
+}
+
 // Up to `max` frames as module+offset, unwound with the image's own unwind
 // data (RtlVirtualUnwind): the .pdata the linker emitted is what the console
 // uses for its own crashes, so a stack here resolves the same way.
@@ -148,16 +161,16 @@ int AppendFrames(const CONTEXT& context, char* out, std::size_t cap, std::size_t
         const PRUNTIME_FUNCTION entry = ::RtlLookupFunctionEntry(frame.Rip, &image_base, nullptr);
         if (entry == nullptr) {
             // A leaf function has no unwind data: its caller's address is at
-            // the top of the stack, and the stack is only read when it looks
-            // like a real one.
-            if (!PlausibleStack(frame.Rsp)) break;
-            const auto next = *reinterpret_cast<const std::uint64_t*>(frame.Rsp);
-            if (next == 0) break;
+            // the top of the stack, verified readable via VirtualQuery so a
+            // corrupted Rsp never faults inside the crash reporter.
+            std::uint64_t next = 0;
+            if (!SafeReadU64(frame.Rsp, &next) || next == 0) break;
             frame.Rip = next;
             frame.Rsp += 8;
             continue;
         }
-        if (!PlausibleStack(frame.Rsp)) break;
+        std::uint64_t probe = 0;
+        if (!SafeReadU64(frame.Rsp, &probe)) break;
         PVOID handler = nullptr;
         DWORD64 establisher = 0;
         KNONVOLATILE_CONTEXT_POINTERS volatile_ctx = {};
@@ -288,10 +301,13 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
     if (action == bbx::core::FaultAction::kPass) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    struct GateLeave {
+        bbx::core::FaultGate& g;
+        ~GateLeave() { g.Leave(); }
+    } leave{gate};
     if (action == bbx::core::FaultAction::kSuppressed) {
         WriteRaw("\n! further faults suppressed (only the first 32 are logged)\n", true,
                  /*to_debugger=*/false);
-        gate.Leave();
         return EXCEPTION_CONTINUE_SEARCH;
     }
     ReportFault(info, "fault");
@@ -303,7 +319,6 @@ LONG CALLBACK LastChance(EXCEPTION_POINTERS* info) {
             (void)hostfs::Flush(g_crash);
         }
     }
-    gate.Leave();
     return EXCEPTION_CONTINUE_SEARCH;  // a caught fault never ends the process
 }
 
@@ -314,6 +329,13 @@ void OnTerminate() {
 
 void FormatAndWrite(Level level, bool mirror_to_errors, const char* format, std::va_list args) {
     if (level < g_level) return;
+    thread_local bool in_log = false;
+    if (in_log) return;
+    struct LogGuard {
+        bool& flag;
+        ~LogGuard() { flag = false; }
+    } guard{in_log};
+    in_log = true;
     char message[1024];
     std::vsnprintf(message, sizeof(message), format, args);
     char line[1200];
@@ -340,26 +362,40 @@ void FormatAndWrite(Level level, bool mirror_to_errors, const char* format, std:
 }  // namespace
 
 bool LogOpen(const std::string& local_state) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    // Idempotent, and it has to be: wWinMain opens the log before anything that
-    // can fail, and the framework view opens it again when the platform enters
-    // it. Rotating twice would move the lines written between the two into
-    // `loader.prev.log` - exactly the lines a launch that died needs to keep.
-    if (g_file >= 0) return true;
-    g_start = ::GetTickCount64();
-    g_recent_next = 0;
-    g_recent_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        // Idempotent, and it has to be: wWinMain opens the log before anything that
+        // can fail, and the framework view opens it again when the platform enters
+        // it. Rotating twice would move the lines written between the two into
+        // `loader.prev.log` - exactly the lines a launch that died needs to keep.
+        if (g_file >= 0) return true;
+    }
+    // Perform hostfs operations outside g_mutex so an OpenImpl failure logging
+    // via LogF cannot self-deadlock on g_mutex.
     const std::string current = local_state + "\\loader.log";
     const std::string previous = local_state + "\\loader.prev.log";
     (void)hostfs::Unlink(previous);
     (void)hostfs::Rename(current, previous, true);
-    g_file = hostfs::Open(current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+    const int opened_file = hostfs::Open(current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
 
     const std::string errors_current = local_state + "\\errors.log";
     const std::string errors_previous = local_state + "\\errors.prev.log";
     (void)hostfs::Unlink(errors_previous);
     (void)hostfs::Rename(errors_current, errors_previous, true);
-    g_errors = hostfs::Open(errors_current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+    const int opened_errors =
+        hostfs::Open(errors_current, hostfs::kWrite | hostfs::kCreate | hostfs::kTruncate);
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_file >= 0) {
+        if (opened_file >= 0) (void)hostfs::Close(opened_file);
+        if (opened_errors >= 0) (void)hostfs::Close(opened_errors);
+        return true;
+    }
+    g_start = ::GetTickCount64();
+    g_recent_next = 0;
+    g_recent_count = 0;
+    g_file = opened_file;
+    g_errors = opened_errors;
     return g_file >= 0;
 }
 
@@ -443,15 +479,30 @@ bool LogMirrorToUsb(const std::string& dump_root) {
     bool opened = false;
     int open_err = 0;
     {
+        static std::string g_mirror_dir;
         std::lock_guard<std::mutex> lock(g_mirror_mu);
-        if (g_mirror >= 0) {  // already mirroring: the folder did not change
+        if (g_mirror >= 0 && g_mirror_dir == dir) {  // already mirroring this folder
             return true;
         }
+        if (g_mirror >= 0) {
+            (void)hostfs::Close(g_mirror);
+            g_mirror = -1;
+        }
+        if (g_mirror_errors >= 0) {
+            (void)hostfs::Close(g_mirror_errors);
+            g_mirror_errors = -1;
+        }
+        if (g_crash >= 0) {
+            (void)hostfs::Close(g_crash);
+            g_crash = -1;
+        }
+        g_mirror_dir.clear();
         g_mirror = hostfs::Open(live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
         if (g_mirror < 0) {
             open_err = MirrorError();
         } else {
             opened = true;
+            g_mirror_dir = dir;
             g_mirror_errors =
                 hostfs::Open(errors_live, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
             g_crash = hostfs::Open(crash, hostfs::kWrite | hostfs::kCreate | hostfs::kAppend);
@@ -474,7 +525,10 @@ bool LogMirrorToUsb(const std::string& dump_root) {
     return true;
 }
 
-bool LogMirrorActive() { return g_mirror >= 0; }
+bool LogMirrorActive() {
+    std::lock_guard<std::mutex> lock(g_mirror_mu);
+    return g_mirror >= 0;
+}
 
 void InstallLastChanceLogger() {
     if (g_installed.exchange(true)) return;

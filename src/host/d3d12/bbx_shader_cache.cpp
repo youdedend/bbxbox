@@ -236,7 +236,17 @@ bool ConsolePsInputMap(const ConsoleContainerStage& stage, std::span<const std::
         error = stage.error;
         return false;
     }
-    const std::uint32_t read = read_inputs.empty() ? 0u : read_inputs[0];
+    // gcn::TranslateResult::ps_inputs is a list of input indices read by the PS
+    // (empty when none are read).
+    std::uint32_t read = 0;
+    for (const std::uint32_t k : read_inputs) {
+        if (k >= 32 || k >= stage.declared_inputs || k >= stage.input_words.size()) {
+            error = "an input outside the container's table (input " + std::to_string(k) + " of " +
+                    std::to_string(stage.declared_inputs) + ")";
+            return false;
+        }
+        read |= (1u << k);
+    }
     for (std::uint32_t k = 0; k < 32; ++k) {
         if (((read >> k) & 1u) == 0) continue;
         if (k >= stage.declared_inputs || k >= stage.input_words.size()) {

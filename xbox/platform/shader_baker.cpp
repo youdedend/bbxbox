@@ -499,7 +499,10 @@ void AddBundleContainers(const std::string& path, std::vector<RawContainerItem>&
         const std::string name = bbx::d3d12::ContainerName(span);
         const int type = bbx::d3d12::ContainerType(span);
         if (name.empty() || (type != 1 && type != 2 && type != 4)) continue;
-        if (!seen.emplace(name, true).second) continue;
+        const std::uint64_t raw_hash = bbx::Fnv1a64(span);
+        const std::string dedup_key =
+            name + ":" + std::to_string(type) + ":" + std::to_string(raw_hash);
+        if (!seen.emplace(dedup_key, true).second) continue;
         RawContainerItem item;
         item.name = name;
         item.type = static_cast<std::uint8_t>(type);
@@ -524,7 +527,11 @@ void AddEbootContainers(const std::string& eboot_path, std::vector<RawContainerI
     }
     const std::vector<EmbeddedContainerSpan> spans = bbx::d3d12::ScanEbootForContainers(elf);
     for (const EmbeddedContainerSpan& s : spans) {
-        if (!seen.emplace(s.name, true).second) continue;
+        const std::span<const std::uint8_t> span(elf.data() + s.offset, s.size);
+        const std::uint64_t raw_hash = bbx::Fnv1a64(span);
+        const std::string dedup_key =
+            s.name + ":" + std::to_string(s.type) + ":" + std::to_string(raw_hash);
+        if (!seen.emplace(dedup_key, true).second) continue;
         RawContainerItem item;
         item.name = s.name;
         item.type = s.type;
@@ -920,15 +927,19 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     Quarantine quarantine = Quarantine::Parse(ReadTextFile(quarantine_path));
     bool recovered_crash = false;
     if (bbx::hostfs::Exists(inflight_path)) {
+        recovered_crash = true;
         const std::string inflight_text = ReadTextFile(inflight_path);
         const bbx::d3d12::CrashRecovery recovery =
             bbx::d3d12::RecoverFromInflight(inflight_text, quarantine);
         if (recovery.found) {
-            recovered_crash = true;
             LogMessage(Level::kWarn, "shader_baker: %s", recovery.message.c_str());
             if (recovery.promoted) {
                 (void)WriteTextAtomic(quarantine_path, quarantine.Serialize());
             }
+        } else {
+            LogMessage(Level::kWarn,
+                       "shader_baker: previous multi-threaded bake did not finish cleanly; "
+                       "retrying in single-thread isolation mode");
         }
         (void)bbx::hostfs::Unlink(inflight_path);
     }
@@ -1205,6 +1216,10 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                                     : unique_programs[pending_indices.front()].name);
     }
 
+    if (workers > 1u && !pending_indices.empty()) {
+        (void)WriteTextFile(inflight_path, "1\nmode=multithread\n");
+    }
+
     auto worker_fn = [&]() {
         for (;;) {
             if (progress.CancelRequested()) break;
@@ -1213,9 +1228,9 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
             const std::size_t prog_idx = pending_indices[slot];
             const AnalysedProgram& program = unique_programs[prog_idx];
 
-            // Record crash breadcrumb (deterministic when single-threaded; best-effort
-            // poison tracking when multi-threaded).
-            if (workers == 1u || (slot & 7u) == 0u) {
+            // Record per-shader crash breadcrumb only when single-threaded so a
+            // multi-threaded crash never quarantines an innocent concurrent shader.
+            if (workers == 1u) {
                 Unit unit;
                 unit.hash = program.key;
                 unit.kind = ShaderKindOfStage(program.stage);

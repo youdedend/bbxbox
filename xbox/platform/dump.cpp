@@ -95,7 +95,8 @@ std::optional<SfoInfo> ParseParamSfo(const std::vector<std::uint8_t>& bytes) {
         value = TrimNulls(value);
 
         if (key == "APP_VER") info.app_ver = value;
-        else if (key == "APP_TYPE") info.app_type = value;
+        else if (key == "CATEGORY") info.app_type = value;
+        else if (key == "APP_TYPE" && info.app_type.empty()) info.app_type = value;
         else if (key == "TITLE_ID") info.title_id = value;
         else if (key == "CONTENT_ID") info.content_id = value;
         else if (key == "TITLE") info.title = value;
@@ -139,31 +140,38 @@ std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path,
 std::vector<std::string> PatchCandidates(const DumpFs& fs, const std::string& base,
                                          const std::string& preferred) {
     std::vector<std::string> out;
-    if (!preferred.empty()) out.push_back(preferred);
+    const auto push_unique = [&out](const std::string& p) {
+        if (p.empty()) return;
+        if (std::find(out.begin(), out.end(), p) == out.end()) out.push_back(p);
+    };
+    push_unique(preferred);
     const std::string parent = ParentPath(base);
     const std::string name = BaseName(base);
+    const std::string name_lower = BbPrepare::ToLower(name);
     if (!parent.empty() && !name.empty()) {
-        for (const char* suffix : {"-patch", "-update", " patch", "_patch", "-p"}) {
-            out.push_back(Join(parent, name + suffix));
+        for (const char* suffix :
+             {"-patch", "-PATCH", "-update", "-UPDATE", " patch", " update", "_patch", "_update", "-p"}) {
+            push_unique(Join(parent, name + suffix));
             // And the inverse: the player picked the update folder, so the base
-            // is its sibling with the suffix removed.
-            const std::string tail{suffix};
-            if (name.size() > tail.size() &&
-                name.compare(name.size() - tail.size(), tail.size(), tail) == 0) {
-                out.push_back(Join(parent, name.substr(0, name.size() - tail.size())));
+            // is its sibling with the suffix removed (case-insensitive).
+            const std::string tail = BbPrepare::ToLower(suffix);
+            if (name_lower.size() > tail.size() &&
+                name_lower.compare(name_lower.size() - tail.size(), tail.size(), tail) == 0) {
+                push_unique(Join(parent, name.substr(0, name.size() - tail.size())));
             }
         }
         if (fs.list_dirs) {
-            for (const std::string& child : fs.list_dirs(parent)) {
-                if (child == name) continue;
-                // A sibling that starts with the base's name is worth looking
-                // at; the version/title checks reject it if it is not an update.
-                if (child.rfind(name, 0) == 0) out.push_back(Join(parent, child));
+            std::vector<std::string> children = fs.list_dirs(parent);
+            std::sort(children.begin(), children.end());
+            for (const std::string& child : children) {
+                const std::string child_lower = BbPrepare::ToLower(child);
+                if (child_lower == name_lower) continue;
+                // A sibling that starts with the base's name (case-insensitive)
+                // is worth checking; the version/title checks filter it.
+                if (child_lower.rfind(name_lower, 0) == 0) push_unique(Join(parent, child));
             }
         }
     }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
 
@@ -216,33 +224,50 @@ DumpLayout DetectLayout(const DumpFs& fs, const std::string& picked,
     layout.base_path = base_path;
     layout.base = *base_info;
 
-    // The update: the picked one, else the saved one, else siblings.
+    // The update: the picked one, else the saved one (only if valid for this
+    // title and newer than base so a stale saved patch for another title never
+    // blocks discovering a real sibling update), else the highest-version valid
+    // sibling.
     if (!picked_patch.empty()) {
         layout.patch_path = picked_patch;
     } else if (!preferred_patch.empty()) {
         const std::optional<SfoInfo> info = ReadDumpInfo(fs, preferred_patch);
-        if (info && IsDumpRoot(fs, preferred_patch)) layout.patch_path = preferred_patch;
+        if (info && IsDumpRoot(fs, preferred_patch) &&
+            info->TitleId() == layout.base.TitleId() &&
+            BbPrepare::CompareVersions(info->Version(), layout.base.Version()) > 0) {
+            layout.patch_path = preferred_patch;
+        }
     }
     if (layout.patch_path.empty()) {
+        std::string best_path;
+        std::string best_ver;
         for (const std::string& candidate : PatchCandidates(fs, base_path, {})) {
             if (candidate == base_path) continue;
             const std::optional<SfoInfo> info = ReadDumpInfo(fs, candidate);
             if (!info || !IsDumpRoot(fs, candidate)) continue;
             if (info->TitleId() != layout.base.TitleId()) {
-                // Worth saying out loud: a folder that looks like an update but
-                // is another title is a common mistake when copying dumps.
-                layout.problem = "ignored " + candidate + ": another title (" +
-                                 info->TitleId() + " vs " + layout.base.TitleId() + ")";
+                if (best_path.empty()) {
+                    layout.problem = "ignored " + candidate + ": another title (" +
+                                     info->TitleId() + " vs " + layout.base.TitleId() + ")";
+                }
                 continue;
             }
             if (BbPrepare::CompareVersions(info->Version(), layout.base.Version()) <= 0) {
-                layout.problem = "ignored " + candidate + ": not newer than " +
-                                 layout.base.Version();
+                if (best_path.empty()) {
+                    layout.problem = "ignored " + candidate + ": not newer than " +
+                                     layout.base.Version();
+                }
                 continue;
             }
-            layout.patch_path = candidate;
+            if (best_path.empty() ||
+                BbPrepare::CompareVersions(info->Version(), best_ver) > 0) {
+                best_path = candidate;
+                best_ver = info->Version();
+            }
+        }
+        if (!best_path.empty()) {
+            layout.patch_path = std::move(best_path);
             layout.problem.clear();
-            break;
         }
     }
 

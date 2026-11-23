@@ -67,7 +67,7 @@ FormatInfo FromGcnFormat(std::uint32_t dfmt, std::uint32_t nfmt, std::uint32_t c
                  comp_swap == 1);
     case 10:  // 8_8_8_8
         if (comp_swap == 1 || comp_swap == 3) {
-            return srgb ? F(DxgiFormat::kB8G8R8A8Unorm, FormatClass::kUnorm, 4, 1, 1, true)
+            return srgb ? F(DxgiFormat::kB8G8R8A8UnormSrgb, FormatClass::kUnorm, 4, 1, 1, true)
                         : F(DxgiFormat::kB8G8R8A8Unorm, FormatClass::kUnorm, 4);
         }
         if (srgb) return F(DxgiFormat::kR8G8B8A8UnormSrgb, FormatClass::kUnorm, 4, 1, 1, true);

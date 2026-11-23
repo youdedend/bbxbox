@@ -373,7 +373,10 @@ void* thread_tramp(void* p) {
         b->can_exit = false;
         guest_thread_leave(tcb);
     } else {
-        // Arrived via hle_pthread_exit. Host FS is installed already.
+        // Arrived via hle_pthread_exit. Host FS is installed already, but the
+        // longjmp bypassed hle_host_stack_leave: restore NT_TIB stack limits
+        // before guest_thread_leave frees t_host_stack.
+        hle_host_stack_reset();
         b->can_exit = false;
         guest_thread_leave(b->tcb);
     }
@@ -404,7 +407,8 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     b->entry = entry;
     b->arg = arg;
     b->prio = ga ? ga->prio : 700;
-    b->detached = ga && ga->detach;
+    const bool detached = ga && ga->detach;
+    b->detached = detached;
     if (name) {
         std::strncpy(b->name, name, sizeof(b->name) - 1);
     }
@@ -413,7 +417,7 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     if (stack >= 16384) {
         pthread_attr_setstacksize(&ha, stack);
     }
-    if (b->detached) {
+    if (detached) {
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     }
     static int logs = 0;
@@ -437,10 +441,11 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
         gsync::thread_free(t);
         return to_freebsd(e);
     }
-    // The child also stores pthread_self() into b->pt, but the guest may
-    // scePthreadDetach/Join the new handle before the child has run; libc
-    // dereferences a null pthread_t.
-    b->pt = pt;
+    // Only write b->pt for joinable threads: a detached child may already have
+    // exited and called gsync::thread_free(t) before pthread_create returns.
+    if (!detached) {
+        b->pt = pt;
+    }
     return 0;
 }
 

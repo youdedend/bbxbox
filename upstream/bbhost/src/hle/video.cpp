@@ -208,7 +208,7 @@ void finish_flip_locked(VideoPort& p, int buffer, std::int64_t arg) {
     p.current_buffer = buffer;
     p.flip_arg = arg;
     p.submit_tsc = rdtsc_now();
-    p.pending = 0;
+    p.pending = static_cast<int>(p.flip_queue.size());
     p.flip_count += 1;
     post_flip_event(p);
 }
@@ -981,8 +981,9 @@ GUEST_ABI int hle_video_flip_rate(int handle, int rate) {
     if (!p) {
         return static_cast<int>(0x80290001);
     }
+    if (rate < 0) rate = 0;
     p->flip_rate = rate;
-    host_log("sceVideoOutSetFlipRate handle=%d rate=%d (%d fps)", handle, rate, rate >= 0 ? 60 / (rate + 1) : 60);
+    host_log("sceVideoOutSetFlipRate handle=%d rate=%d (%d fps)", handle, rate, 60 / (rate + 1));
     return 0;
 }
 

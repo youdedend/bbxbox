@@ -55,6 +55,7 @@ struct Rec {
     void* retval = nullptr;
     std::atomic<long> refs{0};
     std::atomic<bool> done{false};
+    std::atomic<bool> detached{false};
     char name[64] = {};
     std::size_t stack = 0;
 };
@@ -94,6 +95,31 @@ void finish(Rec* r, void* retval) {
     t_self = nullptr;
 }
 
+// Bloodborne's Orbis/PS4 binary was compiled without Windows __chkstk probes
+// and enters frames larger than 4 KiB (e.g., 46 KiB), which jump straight over
+// Windows' single 4 KiB PAGE_GUARD page into MEM_RESERVE unless those pages
+// have already been committed. Touching 4 KiB steps downward once on thread
+// entry commits a safe working depth while preserving lazy reservation beyond.
+__declspec(noinline) void PrecommitStackDepth(std::size_t bytes) {
+    if (bytes < 8192u) return;
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    volatile std::uint8_t anchor = 0;
+    const std::uintptr_t sp = reinterpret_cast<std::uintptr_t>(&anchor);
+    if (low == 0 || sp <= low + 65536u) return;
+    const std::size_t avail = static_cast<std::size_t>(sp - (low + 65536u));
+    const std::size_t probe = bytes < avail ? bytes : avail;
+    // Touch one byte per 4 KiB page using a local array bounded at 256 KiB.
+    constexpr std::size_t kMaxProbe = 256u * 1024u;
+    const std::size_t want = probe < kMaxProbe ? probe : kMaxProbe;
+    volatile std::uint8_t buf[kMaxProbe];
+    for (std::size_t off = kMaxProbe; off > kMaxProbe - want; off -= 4096u) {
+        buf[off - 1u] = 0;
+        if (off <= 4096u) break;
+    }
+    (void)buf[kMaxProbe - 1u];
+}
+
 struct Start {
     Rec* rec;
     void* (*fn)(void*);
@@ -104,6 +130,7 @@ DWORD WINAPI tramp(LPVOID param) {
     Start start = *static_cast<Start*>(param);
     delete static_cast<Start*>(param);
     t_self = start.rec;
+    PrecommitStackDepth(start.rec->stack != 0 ? start.rec->stack / 2u : 256u * 1024u);
     if (start.rec->name[0] != '\0') {
         const int wide = MultiByteToWideChar(CP_UTF8, 0, start.rec->name, -1, nullptr, 0);
         if (wide > 0 && wide < 64) {
@@ -226,6 +253,7 @@ int pthread_create_name_np(pthread_t* thread, const pthread_attr_t* attr, void* 
     rec->handle = h;
     *thread = reinterpret_cast<pthread_t>(rec);
     if (attr != nullptr && attr->detachstate == PTHREAD_CREATE_DETACHED) {
+        rec->detached.store(true, std::memory_order_relaxed);
         release(rec);  // the creator is not going to join it
     }
     ResumeThread(h);
@@ -245,6 +273,7 @@ int pthread_join(pthread_t thread, void** retval) {
 int pthread_detach(pthread_t thread) {
     Rec* rec = reinterpret_cast<Rec*>(thread);
     if (rec == nullptr) return EINVAL;
+    if (rec->detached.exchange(true, std::memory_order_acq_rel)) return EINVAL;
     // The caller gives up its join; the thread's own reference keeps the
     // record alive until it exits. Swap handle atomically so a concurrent
     // thread exit in release() can never double-close it.
@@ -371,8 +400,9 @@ int pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* attr) 
     Mutex* m = new (std::nothrow) Mutex();
     if (m == nullptr) return EAGAIN;
     if (attr != nullptr) m->type = attr->type;
-    Mutex* old = reinterpret_cast<Mutex*>(InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(mutex), m));
-    delete old;  // re-initialising a live mutex leaks waiters; nobody does it
+    // POSIX callers pass uninitialized stack/heap storage to *_init; never
+    // interpret or delete whatever garbage previously lived in *mutex.
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(mutex), m);
     return 0;
 }
 
@@ -468,8 +498,9 @@ int pthread_cond_init(pthread_cond_t* cond, const void* attr) {
     if (cond == nullptr) return EINVAL;
     Cond* c = new (std::nothrow) Cond();
     if (c == nullptr) return EAGAIN;
-    Cond* old = reinterpret_cast<Cond*>(InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(cond), c));
-    delete old;
+    // POSIX callers pass uninitialized stack/heap storage to *_init; never
+    // interpret or delete whatever garbage previously lived in *cond.
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(cond), c);
     return 0;
 }
 

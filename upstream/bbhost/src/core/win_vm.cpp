@@ -108,6 +108,7 @@ struct View {
     std::uint64_t len = 0;
     bool owned = false;     // a private section: closed when its last view goes
     bool noaccess = false;  // mapped with PAGE_NOACCESS; VEH must not commit on fault
+    DWORD prot = PAGE_READWRITE;
 };
 std::mutex g_mu;
 std::map<std::uintptr_t, View> g_views;
@@ -125,9 +126,12 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
     std::uintptr_t vb = 0;
     std::uint64_t vlen = 0;
     bool noaccess = false;
+    DWORD vprot = PAGE_READWRITE;
     bool found = false;
     {
-        std::lock_guard<std::mutex> lk(g_mu);
+        // Never deadlock if a fault occurs on a thread already holding g_mu.
+        std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
+        if (!lk.owns_lock()) return EXCEPTION_CONTINUE_SEARCH;
         auto it = g_views.upper_bound(addr);
         if (it != g_views.begin()) {
             --it;
@@ -135,6 +139,7 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
                 vb = it->first;
                 vlen = it->second.len;
                 noaccess = it->second.noaccess;
+                vprot = it->second.prot;
                 found = true;
             }
         }
@@ -151,6 +156,7 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
         return base == PAGE_READONLY || base == PAGE_READWRITE || base == PAGE_WRITECOPY ||
                base == PAGE_EXECUTE_READ || base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
     };
+    if (!page_allows(vprot)) return EXCEPTION_CONTINUE_SEARCH;
 
     MEMORY_BASIC_INFORMATION m{};
     if (!VirtualQuery(reinterpret_cast<void*>(addr), &m, sizeof(m))) return EXCEPTION_CONTINUE_SEARCH;
@@ -160,7 +166,7 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
                                                  chunk_lo + static_cast<std::uintptr_t>(kGran));
         if (chunk_hi > chunk_lo &&
             api().VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(chunk_lo), chunk_hi - chunk_lo,
-                                MEM_COMMIT, PAGE_READWRITE, nullptr, 0) != nullptr) {
+                                MEM_COMMIT, vprot, nullptr, 0) != nullptr) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Re-check in case another thread committed the same 64 KiB chunk concurrently.
@@ -297,7 +303,8 @@ bool unmap_view_part_locked(std::uintptr_t vb, const View& v, std::uintptr_t at,
             host_log("win-vm: remapping the kept part at %p (0x%llx) failed: error %lu",
                      reinterpret_cast<void*>(run_base), static_cast<unsigned long long>(run_len), GetLastError());
         } else {
-            g_views[run_base] = View{copy.section, copy.offset + (run_base - vb), run_len, copy.owned};
+            g_views[run_base] = View{copy.section, copy.offset + (run_base - vb), run_len, copy.owned, copy.noaccess,
+                                     copy.prot};
             for (const Part& k : kept) {
                 const DWORD target_prot = sanitize_prot(k.protect);
                 if (k.base >= run_base && k.base < run_base + run_len && target_prot != kRemapProt) {
@@ -460,8 +467,8 @@ bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
     return true;
 }
 
-void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offset, unsigned long protect,
-                 WinVmPlace place, std::uint64_t limit, std::uint64_t align) {
+static void* win_vm_map_impl(void* section, void* at, std::uint64_t len, std::uint64_t offset, unsigned long protect,
+                             WinVmPlace place, std::uint64_t limit, std::uint64_t align, bool owned) {
     if (!len || !aligned(offset)) {
         host_log("win-vm: view offset 0x%llx is not 64 KiB aligned", static_cast<unsigned long long>(offset));
         return nullptr;
@@ -523,8 +530,13 @@ void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offse
         DWORD old = 0;
         VmProtect(p, len, PAGE_NOACCESS, &old);
     }
-    g_views[base] = View{section, offset, len, false, clean_prot == PAGE_NOACCESS};
+    g_views[base] = View{section, offset, len, owned, clean_prot == PAGE_NOACCESS, view_prot};
     return p;
+}
+
+void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offset, unsigned long protect,
+                 WinVmPlace place, std::uint64_t limit, std::uint64_t align) {
+    return win_vm_map_impl(section, at, len, offset, protect, place, limit, align, false);
 }
 
 void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlace place, std::uint64_t limit) {
@@ -547,13 +559,11 @@ void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlac
                  GetLastError());
         return nullptr;
     }
-    void* p = win_vm_map(s, at, len, 0, clean_prot, place, limit);
+    void* p = win_vm_map_impl(s, at, len, 0, clean_prot, place, limit, kGran, true);
     if (!p) {
         CloseHandle(s);
         return nullptr;
     }
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_views[reinterpret_cast<std::uintptr_t>(p)].owned = true;
     return p;
 }
 

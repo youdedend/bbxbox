@@ -704,7 +704,7 @@ std::string canonical_dir(const std::string& p) {
 }
 
 void set_roots(const char* app0, const char* data, const char* tmp, const char* eboot,
-               const char* mods) {
+               const char* mods, const char* explicit_update, bool has_explicit_update) {
     std::string work = dirname_of(eboot ? eboot : ".");
     std::string data_dir = data ? data : join_path(work, "data");
     std::string tmp_dir = tmp ? tmp : join_path(work, "tmp");
@@ -715,7 +715,16 @@ void set_roots(const char* app0, const char* data, const char* tmp, const char* 
     mkdir_confined(data_dir);
     mkdir_confined(tmp_dir);
     // The game folder and, beside it, the update's (app0 may name either).
-    const GameFolders game = config_game_folders(app0 ? app0 : "");
+    // When the caller explicitly resolved the split layout (e.g. the Xbox
+    // launcher's DumpLayout), honor its update path (including empty when
+    // use_patch is off) instead of guessing sibling suffixes.
+    GameFolders game;
+    if (has_explicit_update) {
+        game.base = app0 ? std::string(app0) : std::string();
+        game.update = explicit_update && explicit_update[0] ? std::string(explicit_update) : std::string();
+    } else {
+        game = config_game_folders(app0 ? app0 : "");
+    }
     g_allowed_roots.clear();
     for (const std::string& r : {game.base, game.update, data_dir, tmp_dir, mods_dir}) {
         std::string c = canonical_dir(r);
@@ -1174,8 +1183,8 @@ GUEST_ABI int hle_kernel_ftruncate(int fd, std::int64_t len) {
 }  // namespace
 
 void hle_fs_set_roots(const char* app0, const char* data, const char* tmp, const char* eboot_path,
-                      const char* mods) {
-    set_roots(app0, data, tmp, eboot_path, mods);
+                      const char* mods, const char* explicit_update, bool has_explicit_update) {
+    set_roots(app0, data, tmp, eboot_path, mods, explicit_update, has_explicit_update);
 }
 
 const char* hle_fs_mods_root() { return g_mods.c_str(); }

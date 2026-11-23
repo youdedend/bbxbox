@@ -655,6 +655,8 @@ void LoadHunterName() {
 }
 
 void SaveLayoutSettings() {
+    static std::mutex save_mu;
+    std::lock_guard<std::mutex> lock(save_mu);
     const std::string path = bbx::platform::Local("bbxbox.ini");
     // IniSet returns false when a key's value is unchanged; never short-circuit
     // across keys with && or later toggled settings will be skipped.
@@ -1053,6 +1055,22 @@ void OnAction(PadAction action) {
                 RefreshLauncher();
             }
             return;
+        case PadAction::kMenu: {
+            std::string name = g_session.keyboard.Text();
+            if (name.size() > 16u) name.resize(16u);
+            g_session.model.hunter_name = name;
+            bbx::platform::LogF("hunter name: \"%s\"", name.c_str());
+            if (!bbx::platform::WriteText(bbx::platform::Local("hunter-name.txt"), name)) {
+                bbx::platform::LogMessage(bbx::platform::Level::kWarn, "could not write hunter-name.txt");
+            }
+            g_session.keyboard_open = false;
+            RefreshLauncher();
+            return;
+        }
+        case PadAction::kPersonalEffects:
+            g_session.keyboard_open = false;
+            RefreshLauncher();
+            return;
         case PadAction::kCancel:
             g_session.keyboard.Backspace();
             return;
@@ -1385,8 +1403,8 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
     if (!g_session.layout.base_path.empty()) {
         const std::string ver = g_session.layout.EffectiveVersion();
         badge = ver.empty() ? "DUMP READY" : ("V" + ver);
-        if (g_session.model.pipelines > 0) {
-            badge += "  |  " + std::to_string(g_session.model.pipelines) + " SHADERS";
+        if (g_session.model.stages > 0) {
+            badge += "  |  " + std::to_string(g_session.model.stages) + " SHADERS";
         }
         badge_col = bbx::platform::HudColor::TarnishedGold();
     }
@@ -1472,12 +1490,22 @@ void AppendLauncherToHud(bbx::platform::Hud& hud) {
                  bbx::platform::HudColor::TarnishedGold());
         y += row_h;
         for (std::size_t row = 0; row < g_session.keyboard.RowCount(); ++row) {
-            std::string label = g_session.keyboard.Row(row);
-            if (row == g_session.keyboard.CursorRow()) {
-                const std::size_t column = g_session.keyboard.CursorColumn() * 2;
-                if (column < label.size()) label[column] = '>';
+            const std::string raw = g_session.keyboard.Row(row);
+            std::string label;
+            if (row < 8) {
+                for (std::size_t col = 0; col < raw.size(); ++col) {
+                    const bool cur =
+                        (row == g_session.keyboard.CursorRow() && col == g_session.keyboard.CursorColumn());
+                    label.push_back(cur ? '[' : ' ');
+                    label.push_back(raw[col]);
+                    label.push_back(cur ? ']' : ' ');
+                }
+            } else {
+                label = (row == g_session.keyboard.CursorRow() ? "> " : "  ") + raw;
             }
-            hud.Text(x + px * 3.0f, y, scale, label, bbx::platform::HudColor::BoneIvory());
+            hud.Text(x + px * 3.0f, y, scale, label,
+                     row == g_session.keyboard.CursorRow() ? bbx::platform::HudColor::TarnishedGold()
+                                                           : bbx::platform::HudColor::BoneIvory());
             y += row_h;
         }
     } else {
@@ -2045,10 +2073,12 @@ void RestoreDump() {
     const std::string token = bbx::platform::IniGet(g_session.ini, "dump.token", "");
     std::string path = bbx::platform::IniGet(g_session.ini, "dump.path", "");
     if (!token.empty()) {
+        // Keep the saved token even if the USB drive is temporarily unplugged
+        // so SaveLayoutSettings never wipes a valid FutureAccessList grant.
+        g_session.usb_token = token;
         std::string granted;
         if (bbx::platform::ResolveGrant(token, granted)) {
             path = granted;
-            g_session.usb_token = token;
         }
     }
     std::string protocol_dump_path;
@@ -2268,7 +2298,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 if (g_settings_loaded.load(std::memory_order_acquire)) {
                     SaveLayoutSettings();
                 }
-                Steps().Shutdown("suspend event");
+                Steps().LogCallback("Suspending");
                 bbx::platform::LogFlush();
                 if (deferral) {
                     try {
@@ -2579,7 +2609,7 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
         (void)pthread_setname_np(pthread_self(), "ui-main");
         LoadSettings();
         RestoreDump();
-        RefreshLauncher();
+        RefreshLauncher(/*probe_storage=*/true);
         {
             bool protocol_autoboot = false;
             {
@@ -2659,11 +2689,16 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
             const bool key_esc = g_key_escape.exchange(false, std::memory_order_acq_rel);
             const bool key_quick_menu = g_key_quick_menu.exchange(false, std::memory_order_acq_rel);
 
-            // The pad is WinRT's; there is no SDL event queue on this target.
-            const bbx::platform::ButtonMask held = MaskFromPad();
-            const bbx::platform::ButtonMask pressed = (held & ~previous) | key_nav;
-            const bbx::platform::ButtonMask released = previous & ~held;
+            // The pad is WinRT's; ignore buttons while Xbox Guide or FolderPicker has focus.
+            const bool active_win = g_window_active.load(std::memory_order_acquire);
+            const bbx::platform::ButtonMask held = active_win ? MaskFromPad() : 0u;
+            const bbx::platform::ButtonMask pressed = active_win ? ((held & ~previous) | key_nav) : 0u;
+            const bbx::platform::ButtonMask released = active_win ? (previous & ~held) : 0u;
             previous = held;
+            if (!active_win) {
+                emergency_holding = false;
+                g_session.chords.Reset();
+            }
 
             if (bbx::bridge::Running()) {
                 // Keep the 3-second View+Menu emergency exit chord active at all times.
@@ -2933,7 +2968,9 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                         g_session.bake_result.ok ? "ok" : "incomplete",
                         g_session.bake_result.summary.c_str());
                     RefreshLauncher(/*probe_storage=*/true);
-                    if (g_session.start_after_bake && !g_session.bake_result.cancelled) {
+                    if (g_session.start_after_bake && g_session.bake_result.ok &&
+                        !g_session.bake_result.cancelled) {
+                        g_session.start_after_bake = false;
                         SyncBridgeSettings();
                         if (bbx::bridge::StartGuest(g_session.pending_guest_req)) {
                             guest_ever_started = true;
@@ -2948,6 +2985,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                                 bbx::platform::Level::kError,
                                 "launcher: the guest did not start after baking; staying in the launcher");
                         }
+                    } else {
+                        g_session.start_after_bake = false;
                     }
                 }
             } else {
@@ -3000,6 +3039,8 @@ struct LauncherView : winrt::implements<LauncherView, winrt::Windows::Applicatio
                 // that presents it is this one (platform/bbhost_bridge.cpp).
                 bbx::bridge::GuestRequest req;
                 req.app0 = g_session.layout.base_path;
+                req.update = g_session.layout.CanRunPatched() ? g_session.layout.patch_path : "";
+                req.explicit_update = true;
                 req.data = bbx::platform::Local("data");
                 req.tmp = bbx::platform::Local("tmp");
                 (void)bbx::hostfs::MkDir(req.data, true);

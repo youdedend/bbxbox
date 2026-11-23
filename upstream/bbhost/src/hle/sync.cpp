@@ -152,6 +152,7 @@ struct Cond {
     int signals;
     int waiters;
     bool dead;
+    std::uint64_t broadcast_gen;
 };
 
 // A reader-preferring rwlock whose state is one word: bit 31 a writer holds
@@ -598,9 +599,10 @@ int cond_wait(void** cond_slot, void** mutex_slot, const Deadline* dl) {
         saved_count = m->count;
         mutex_release(m);
     }
+    const std::uint64_t bgen = c->broadcast_gen;
     g_cond_waits.fetch_add(1, std::memory_order_relaxed);
-    bool ok = wait_until(c->cv, ck, dl, [&] { return c->signals > 0 || c->dead; });
-    if (ok && c->signals > 0) {
+    bool ok = wait_until(c->cv, ck, dl, [&] { return c->broadcast_gen != bgen || c->signals > 0 || c->dead; });
+    if (ok && c->broadcast_gen == bgen && c->signals > 0) {
         --c->signals;
     }
     --c->waiters;
@@ -631,7 +633,8 @@ int cond_signal(void** slot, bool all) {
     }
     g_cond_signals.fetch_add(1, std::memory_order_relaxed);
     if (all) {
-        c->signals = c->waiters;
+        ++c->broadcast_gen;
+        c->signals = 0;
         c->cv.notify_all();
     } else {
         if (c->signals < c->waiters) {

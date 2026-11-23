@@ -26,12 +26,13 @@ inline std::string ToLower(std::string_view text) {
     return out;
 }
 
-/// True for APP_TYPE values that mark an update/patch container rather than a base game.
-/// PSN uses "gp" for a base game and "patch" (some dumps: "gd", "gde") for an update; anything
-/// else is treated as a base game so an unknown dump never silently counts as a patch.
+/// True for SFO CATEGORY / APP_TYPE values that mark an update/patch container rather than a base
+/// game. Real PS4 param.sfo files use CATEGORY="gd" (Game Digital) for base games and
+/// CATEGORY="gp" (Game Patch) for updates; anything else defaults to a base game so an unknown
+/// dump never silently counts as a patch.
 inline bool IsPatchAppType(std::string_view app_type) {
     const std::string type = ToLower(app_type);
-    return type == "patch" || type == "gd" || type == "gde" || type == "gdp";
+    return type == "gp" || type == "patch";
 }
 
 /// The update version encoded in a CONTENT_ID, e.g.
