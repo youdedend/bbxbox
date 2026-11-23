@@ -80,10 +80,10 @@ enum class CacheStatus : std::uint8_t {
 // the build's; the compiler and signer versions are whoever ran the bake, which
 // the stamp beside the cache supplies.
 inline constexpr char kConsoleDxilTarget[] = "dxil-6.4";      // SM 6.4 is the console's ceiling
-inline constexpr char kConsoleRootSignature[] = "rs-1.0";     // root signature 1.0, 64 DWORDs
+inline constexpr char kConsoleRootSignature[] = "rs-1.1";     // root signature 1.0, 64 DWORDs, space-1 t0..t127 / u0..u127 / s0..s79
 inline constexpr char kConsoleBindless[] = "tables";          // descriptor tables (tier 3)
 inline constexpr char kConsoleFeatureLevel[] = "11_0";
-inline constexpr char kConsoleHlslEmitter[] = "bbhost-hlsl-dxil64-1";
+inline constexpr char kConsoleHlslEmitter[] = "bbhost-hlsl-dxil64-3";
 inline constexpr char kConsolePsoLibrary[] = "none";          // no pipeline library: it removes the device on a console
 [[nodiscard]] CacheStamp ExpectedConsoleStamp(const CacheStamp& recorded = {});
 

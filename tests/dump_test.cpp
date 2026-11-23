@@ -313,3 +313,42 @@ TEST(PreferredPatchIsHonoured) {
     CHECK(layout.kind == LayoutKind::kSplit);
     CHECK(layout.patch_path == "F:\\updates\\BB109");
 }
+
+TEST(MergedDumpWithPatchCategoryRunsDirectlyWhenNoSeparateBaseExists) {
+    // A 1.09 dump already merged or prepared by XStation-UWP carries the 1.09
+    // update's param.sfo (CATEGORY/APP_TYPE = "gp") and has no separate 1.00
+    // base folder beside it.
+    FakeDump dump;
+    dump.AddDump("E:\\XStation\\CUSA00900\\GameData109", "01.09", "gp");
+    const DumpLayout layout =
+        DetectLayout(dump.Fs(), "E:\\XStation\\CUSA00900\\GameData109", "", true, false);
+    CHECK(layout.kind == LayoutKind::kMerged);
+    CHECK(layout.base_path == "E:\\XStation\\CUSA00900\\GameData109");
+    CHECK(layout.patch_path.empty());
+    CHECK(layout.effective_ver == "01.09");
+    CHECK(layout.Patched());
+    CHECK(VersionSupported(layout.EffectiveVersion()));
+}
+
+TEST(XStationParentFolderResolvesToGameDataSubfolderViaGameLayoutTxt) {
+    // Picking E:\XStation\CUSA00900 (which contains game-layout.txt = "109" and
+    // GameData109\eboot.bin) automatically resolves to E:\XStation\CUSA00900\GameData109.
+    FakeDump dump;
+    dump.dirs["E:\\XStation"] = {"CUSA00900"};
+    dump.dirs["E:\\XStation\\CUSA00900"] = {"GameData109"};
+    dump.files["E:\\XStation\\CUSA00900\\game-layout.txt"] = {'1', '0', '9', '\n'};
+    dump.AddDump("E:\\XStation\\CUSA00900\\GameData109", "01.09", "gp");
+
+    CHECK_EQ(ResolveDumpRoot(dump.Fs(), "E:\\XStation\\CUSA00900"),
+             std::string("E:\\XStation\\CUSA00900\\GameData109"));
+    CHECK_EQ(ResolveDumpRoot(dump.Fs(), "E:\\XStation"),
+             std::string("E:\\XStation\\CUSA00900\\GameData109"));
+
+    const DumpLayout layout =
+        DetectLayout(dump.Fs(), "E:\\XStation\\CUSA00900", "", true, false);
+    CHECK(layout.kind == LayoutKind::kMerged);
+    CHECK(layout.base_path == "E:\\XStation\\CUSA00900\\GameData109");
+    CHECK(layout.effective_ver == "01.09");
+    CHECK(layout.Patched());
+}
+

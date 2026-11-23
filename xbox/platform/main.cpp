@@ -2122,11 +2122,15 @@ void RestoreDump() {
     // so launches with an already-configured dump skip the ~3s multi-drive crawl.
     std::vector<std::string> found_dumps;
     const auto probe_dump_candidate = [&](const std::string& candidate) -> bool {
-        if (!bbx::platform::IsDumpRoot(fs, candidate)) return false;
+        const std::string resolved = bbx::platform::ResolveDumpRoot(fs, candidate);
+        if (!bbx::platform::IsDumpRoot(fs, resolved)) return false;
         const std::optional<bbx::platform::SfoInfo> info =
-            bbx::platform::ReadDumpInfo(fs, candidate);
-        if (info && !info->IsPatchContainer()) {
-            found_dumps.push_back(candidate);
+            bbx::platform::ReadDumpInfo(fs, resolved);
+        if (info && info->Valid()) {
+            const std::string norm = NormalizeScanPath(resolved);
+            if (std::find(found_dumps.begin(), found_dumps.end(), norm) == found_dumps.end()) {
+                found_dumps.push_back(norm);
+            }
             return true;
         }
         return false;
@@ -2148,13 +2152,23 @@ void RestoreDump() {
                     if (child == "." || child == ".." || child == "bbxbox_logs") continue;
                     const std::string child_path = JoinScanPath(root, child);
                     add_candidate(child_path);
-                    // Also inspect common 2-level layouts such as E:\dumps\Bloodborne or
-                    // D:\DevelopmentFiles\Games\Bloodborne without walking the whole disk.
-                    if (dev_files_root || equals_icase(child, "dumps") ||
-                        equals_icase(child, "games") || equals_icase(child, "ps4")) {
+                    // Also inspect common 2-level layouts such as E:\XStation\CUSA00900,
+                    // E:\dumps\Bloodborne, or D:\DevelopmentFiles\XStation\Games\CUSA00900
+                    // without walking the whole disk.
+                    if (dev_files_root || equals_icase(child, "xstation") ||
+                        equals_icase(child, "dumps") || equals_icase(child, "games") ||
+                        equals_icase(child, "ps4") || starts_with_icase(child, "cusa")) {
                         for (const std::string& grandchild : fs.list_dirs(child_path)) {
                             if (grandchild == "." || grandchild == ".." || grandchild == "bbxbox_logs") continue;
-                            add_candidate(JoinScanPath(child_path, grandchild));
+                            const std::string grand_path = JoinScanPath(child_path, grandchild);
+                            add_candidate(grand_path);
+                            if (equals_icase(grandchild, "games") ||
+                                starts_with_icase(grandchild, "cusa")) {
+                                for (const std::string& great : fs.list_dirs(grand_path)) {
+                                    if (great == "." || great == ".." || great == "bbxbox_logs") continue;
+                                    add_candidate(JoinScanPath(grand_path, great));
+                                }
+                            }
                         }
                     }
                 }

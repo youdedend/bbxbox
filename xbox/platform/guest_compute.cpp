@@ -293,6 +293,8 @@ struct GuestCompute::Impl {
     };
     std::uint64_t bound_key = 0;
     std::array<std::uint32_t, 16> bound_user_data{};
+    std::array<std::uint32_t, 16> bound_cb_stride{};
+    std::array<std::uint32_t, 16> bound_cb_w3{};
     d3d12::DescriptorSlice bound_slice{};
     std::uint64_t bound_srv_ring_gen = 0;
     bool bound_valid = false;
@@ -1549,6 +1551,8 @@ bool GuestCompute::Run(std::uint64_t key, const GpuDispatch& d) {
 
     // Ring-buffered space-1 slots for this dispatch (may flush if a ring wraps).
     const std::uint32_t space1_offset = impl.BindResources(key, d);
+    std::memcpy(params + 160, impl.bound_cb_stride.data(), 64);
+    std::memcpy(params + 224, impl.bound_cb_w3.data(), 64);
 
     // Ensure a batch command list is open, and re-mark this dispatch's ring
     // slices pending in case BindResources flushed the previous batch.

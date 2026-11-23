@@ -152,7 +152,7 @@ struct ConsoleStageOptions {
     // against the device rather than guess:
     static constexpr std::uint32_t kDescriptorSet = 1;
     static constexpr bool kBindless = false;        // Native16Bit/ResourceDescriptorHeap are off on the console
-    static constexpr bool kCbSsbo = false;          // constant buffers stay constant buffers
+    static constexpr bool kCbSsbo = true;           // constant and storage buffers bind to space-1 ByteAddressBuffer t112..t127 / u112..u127
     static constexpr bool kNativeHalfRtz = false;   // no float16_t at SM 6.4 without Native16BitShaderOps
     // A program the translator would have to approximate is refused by the
     // bake and counted, never baked as something the console cannot run.

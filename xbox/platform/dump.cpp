@@ -106,10 +106,108 @@ std::optional<SfoInfo> ParseParamSfo(const std::vector<std::uint8_t>& bytes) {
 }
 
 bool IsDumpRoot(const DumpFs& fs, const std::string& path) {
-    if (!fs.exists || !fs.is_dir) return false;
+    if (!fs.exists || !fs.is_dir || path.empty()) return false;
     if (!fs.is_dir(path)) return false;
     return fs.exists(Join(path, "eboot.bin")) && fs.exists(Join(path, "sce_sys\\param.sfo")) &&
            fs.is_dir(Join(path, "dvdroot_ps4"));
+}
+
+namespace {
+
+std::string ReadGameLayoutTag(const DumpFs& fs, const std::string& dir) {
+    if (!fs.exists || !fs.read) return {};
+    const std::string layout_file = Join(dir, "game-layout.txt");
+    if (!fs.exists(layout_file)) return {};
+    const std::vector<std::uint8_t> bytes = fs.read(layout_file, 256);
+    std::string tag;
+    for (const std::uint8_t b : bytes) {
+        const char c = static_cast<char>(b);
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            tag.push_back(c);
+        } else if (c == '\n' || c == '\r') {
+            if (!tag.empty()) break;
+        }
+    }
+    return tag;
+}
+
+std::string TryDirectSubdirs(const DumpFs& fs, const std::string& root) {
+    if (root.empty()) return {};
+    if (IsDumpRoot(fs, root)) return root;
+
+    // 1. XStation-UWP `game-layout.txt` (e.g. "109" -> `GameData109`).
+    const std::string tag = ReadGameLayoutTag(fs, root);
+    if (!tag.empty()) {
+        const std::string tagged = Join(root, "GameData" + tag);
+        if (IsDumpRoot(fs, tagged)) return tagged;
+    }
+
+    // 2. Well-known XStation-UWP and prepared subdirectories.
+    static constexpr const char* kKnownSubdirs[] = {
+        "GameData109",      "GameData",   "GameData100", "Prepared\\overlay",
+        "overlay",          "app0",       "Bloodborne",  "CUSA00900",
+        "CUSA03173",        "CUSA00207",  "CUSA00208",   "CUSA00299",
+        "CUSA01363",        "CUSA03014",  "CUSA03023",   "CUSA03179",
+        "CUSA00900-app0",   "CUSA03173-app0",
+    };
+    for (const char* sub : kKnownSubdirs) {
+        const std::string sub_path = Join(root, sub);
+        if (IsDumpRoot(fs, sub_path)) return sub_path;
+        // One level deeper for `<root>\<TitleId>\GameData109` when user picked `E:\XStation`.
+        const std::string sub_tag = ReadGameLayoutTag(fs, sub_path);
+        if (!sub_tag.empty()) {
+            const std::string sub_tagged = Join(sub_path, "GameData" + sub_tag);
+            if (IsDumpRoot(fs, sub_tagged)) return sub_tagged;
+        }
+        for (const char* gd : {"GameData109", "GameData", "GameData100", "Prepared\\overlay", "overlay", "app0"}) {
+            const std::string deep = Join(sub_path, gd);
+            if (IsDumpRoot(fs, deep)) return deep;
+        }
+    }
+
+    // 3. Dynamic child directory enumeration (preferring the highest SFO version).
+    if (fs.list_dirs && fs.is_dir && fs.is_dir(root)) {
+        std::vector<std::string> children = fs.list_dirs(root);
+        std::sort(children.begin(), children.end());
+        std::string best_path;
+        std::string best_ver;
+        for (const std::string& child : children) {
+            if (child == "." || child == ".." || child == "bbxbox_logs") continue;
+            const std::string child_path = Join(root, child);
+            std::string candidate;
+            if (IsDumpRoot(fs, child_path)) {
+                candidate = child_path;
+            } else {
+                const std::string ctag = ReadGameLayoutTag(fs, child_path);
+                if (!ctag.empty() && IsDumpRoot(fs, Join(child_path, "GameData" + ctag))) {
+                    candidate = Join(child_path, "GameData" + ctag);
+                } else if (IsDumpRoot(fs, Join(child_path, "GameData109"))) {
+                    candidate = Join(child_path, "GameData109");
+                } else if (IsDumpRoot(fs, Join(child_path, "GameData"))) {
+                    candidate = Join(child_path, "GameData");
+                } else if (IsDumpRoot(fs, Join(child_path, "GameData100"))) {
+                    candidate = Join(child_path, "GameData100");
+                }
+            }
+            if (candidate.empty()) continue;
+            const std::optional<SfoInfo> info = ReadDumpInfo(fs, candidate);
+            const std::string ver = info ? info->Version() : std::string();
+            if (best_path.empty() || (!ver.empty() && BbPrepare::CompareVersions(ver, best_ver) > 0)) {
+                best_path = candidate;
+                best_ver = ver;
+            }
+        }
+        if (!best_path.empty()) return best_path;
+    }
+    return {};
+}
+
+}  // namespace
+
+std::string ResolveDumpRoot(const DumpFs& fs, const std::string& picked) {
+    if (picked.empty()) return {};
+    const std::string resolved = TryDirectSubdirs(fs, picked);
+    return resolved.empty() ? picked : resolved;
 }
 
 std::optional<SfoInfo> ReadDumpInfo(const DumpFs& fs, const std::string& path,
@@ -160,6 +258,13 @@ std::vector<std::string> PatchCandidates(const DumpFs& fs, const std::string& ba
                 push_unique(Join(parent, name.substr(0, name.size() - tail.size())));
             }
         }
+        // XStation-UWP sibling directories inside the title container
+        // (e.g. `E:\XStation\CUSA00900\GameData109` obok `GameData100` or `GamePatch`).
+        for (const char* xs_sibling : {"GameData109", "GamePatch", "GameData", "GameData100"}) {
+            if (BbPrepare::ToLower(xs_sibling) != name_lower) {
+                push_unique(Join(parent, xs_sibling));
+            }
+        }
         if (fs.list_dirs) {
             std::vector<std::string> children = fs.list_dirs(parent);
             std::sort(children.begin(), children.end());
@@ -186,27 +291,32 @@ DumpLayout DetectLayout(const DumpFs& fs, const std::string& picked,
         return layout;
     }
 
-    // The player may have picked the update folder itself: then the sibling
-    // base supplies what the update does not carry.
-    std::string base_path = picked;
-    std::optional<SfoInfo> picked_info = IsDumpRoot(fs, picked) ? ReadDumpInfo(fs, picked)
-                                                                 : std::nullopt;
+    const std::string resolved_picked = ResolveDumpRoot(fs, picked);
+    const std::string resolved_preferred =
+        preferred_patch.empty() ? std::string() : ResolveDumpRoot(fs, preferred_patch);
+
+    // The player may have picked an update container or a merged/XStation-UWP
+    // dump whose `sce_sys\param.sfo` came from the 1.09 update (`CATEGORY = "gp"`).
+    // Search for a lower-version base dump beside it; if none exists, run the
+    // self-contained merged/XStation dump directly.
+    std::string base_path = resolved_picked;
+    std::optional<SfoInfo> picked_info =
+        IsDumpRoot(fs, resolved_picked) ? ReadDumpInfo(fs, resolved_picked) : std::nullopt;
     std::string picked_patch;
     if (picked_info && picked_info->IsPatchContainer()) {
-        picked_patch = picked;
-        base_path.clear();
-        for (const std::string& candidate : PatchCandidates(fs, picked, preferred_patch)) {
+        std::string found_base;
+        for (const std::string& candidate : PatchCandidates(fs, resolved_picked, resolved_preferred)) {
+            if (candidate == resolved_picked || !IsDumpRoot(fs, candidate)) continue;
             const std::optional<SfoInfo> info = ReadDumpInfo(fs, candidate);
             if (info && info->TitleId() == picked_info->TitleId() &&
-                BbPrepare::CompareVersions(info->Version(), picked_info->Version()) < 0 &&
-                IsDumpRoot(fs, candidate)) {
-                base_path = candidate;
+                BbPrepare::CompareVersions(info->Version(), picked_info->Version()) < 0) {
+                found_base = candidate;
                 break;
             }
         }
-        if (base_path.empty()) {
-            layout.problem = "the chosen folder is an update, and no base dump was found beside it";
-            return layout;
+        if (!found_base.empty()) {
+            picked_patch = resolved_picked;
+            base_path = found_base;
         }
     }
     if (!IsDumpRoot(fs, base_path)) {
@@ -230,21 +340,21 @@ DumpLayout DetectLayout(const DumpFs& fs, const std::string& picked,
     // sibling.
     if (!picked_patch.empty()) {
         layout.patch_path = picked_patch;
-    } else if (!preferred_patch.empty()) {
-        const std::optional<SfoInfo> info = ReadDumpInfo(fs, preferred_patch);
-        if (info && IsDumpRoot(fs, preferred_patch) &&
-            info->TitleId() == layout.base.TitleId() &&
+    } else if (!resolved_preferred.empty() && resolved_preferred != base_path &&
+               IsDumpRoot(fs, resolved_preferred)) {
+        const std::optional<SfoInfo> info = ReadDumpInfo(fs, resolved_preferred);
+        if (info && info->TitleId() == layout.base.TitleId() &&
             BbPrepare::CompareVersions(info->Version(), layout.base.Version()) > 0) {
-            layout.patch_path = preferred_patch;
+            layout.patch_path = resolved_preferred;
         }
     }
     if (layout.patch_path.empty()) {
         std::string best_path;
         std::string best_ver;
         for (const std::string& candidate : PatchCandidates(fs, base_path, {})) {
-            if (candidate == base_path) continue;
+            if (candidate == base_path || !IsDumpRoot(fs, candidate)) continue;
             const std::optional<SfoInfo> info = ReadDumpInfo(fs, candidate);
-            if (!info || !IsDumpRoot(fs, candidate)) continue;
+            if (!info) continue;
             if (info->TitleId() != layout.base.TitleId()) {
                 if (best_path.empty()) {
                     layout.problem = "ignored " + candidate + ": another title (" +

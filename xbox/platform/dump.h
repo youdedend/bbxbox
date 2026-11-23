@@ -104,6 +104,12 @@ struct DumpLayout {
 // dvdroot_ps4 all present.
 [[nodiscard]] bool IsDumpRoot(const DumpFs& fs, const std::string& path);
 
+// Resolves a user-picked or auto-discovered folder into its actual dump root:
+// supports XStation-UWP folders (`game-layout.txt` + `GameData109` / `GameData`),
+// prepared overlay roots (`Prepared\overlay`, `overlay`, `app0`), and parent
+// containers holding a title directory (`CUSA00900\GameData109`, etc.).
+[[nodiscard]] std::string ResolveDumpRoot(const DumpFs& fs, const std::string& picked);
+
 // Reads and validates one dump folder's metadata.
 // `why`, when given, receives a sentence naming what was wrong: a read failure,
 // an SFO that does not parse, or the fields that made it unusable.

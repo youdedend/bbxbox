@@ -506,6 +506,8 @@ struct GuestGraphics::Impl {
     struct StageBindState {
         std::uint64_t key = 0;
         std::array<std::uint32_t, 16> user_data{};
+        std::array<std::uint32_t, 16> cb_stride{};
+        std::array<std::uint32_t, 16> cb_w3{};
         d3d12::DescriptorSlice slice{};
         std::uint64_t srv_ring_gen = 0;
         bool valid = false;
@@ -931,6 +933,8 @@ struct GuestGraphics::Impl {
             st.slice = {};
         }
         st.srv_copies.clear();
+        st.cb_stride.fill(0);
+        st.cb_w3.fill(0);
         st.key = stage_key;
         std::memcpy(st.user_data.data(), user_data, sizeof(st.user_data));
 
@@ -963,6 +967,12 @@ struct GuestGraphics::Impl {
                 ++counts.bindings_null;
                 break;
             case d3d12::BindingVerdict::kWrite:
+                if (binding >= gcn::kBindingStorageBuffer0 &&
+                    binding < gcn::kBindingStorageBuffer0 + gcn::kMaxBuffers) {
+                    const std::uint32_t buf_idx = binding - gcn::kBindingStorageBuffer0;
+                    st.cb_stride[buf_idx] = write.view.stride != 0 ? write.view.stride : write.dwords;
+                    st.cb_w3[buf_idx] = write.view.word3;
+                }
                 if (write.kind == d3d12::BindingKind::kUav) {
                     if (WriteBufferUav(new_slice.offset, slot.index, write)) {
                         ++counts.bindings_written;
@@ -1877,6 +1887,10 @@ bool GuestGraphics::Draw(const GpuDraw& d, const DrawIdentity& id) {
     // Ring-buffered VS (stage 0) and PS (stage 1) space-1 descriptor tables.
     const std::uint32_t vs_table_off = impl.BindStageResources(0, vs_key, id.vs.user);
     const std::uint32_t ps_table_off = impl.BindStageResources(1, ps_key, id.ps.user);
+    std::memcpy(vs_params + 160, impl.stage_state[0].cb_stride.data(), 64);
+    std::memcpy(vs_params + 224, impl.stage_state[0].cb_w3.data(), 64);
+    std::memcpy(ps_params + 160, impl.stage_state[1].cb_stride.data(), 64);
+    std::memcpy(ps_params + 224, impl.stage_state[1].cb_w3.data(), 64);
 
     // Open or reuse the active batched command list, and re-mark all ring slices
     // used by this draw as pending in case BindStageResources flushed an intermediate batch.
