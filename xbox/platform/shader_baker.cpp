@@ -294,7 +294,16 @@ public:
                 error = "unsupported console shader stage";
                 return false;
         }
-        const dxc_com::WChar* args[] = {L"-T", profile, L"-E", L"main", L"-HV", L"2021", L"-O3"};
+        const std::uint32_t opt_level = bbx::d3d12::ChooseDxcOptimizationLevel(source);
+        const wchar_t* opt_flag = L"-O3";
+        if (opt_level == 0u) {
+            opt_flag = L"-O0";
+        } else if (opt_level == 1u) {
+            opt_flag = L"-O1";
+        } else if (opt_level == 2u) {
+            opt_flag = L"-O2";
+        }
+        const dxc_com::WChar* args[] = {L"-T", profile, L"-E", L"main", L"-HV", L"2021", opt_flag};
         ComRef<dxc_com::Compiler3> compiler;
         if (dxc_create_(dxc_com::kClsidCompiler, dxc_com::kIidCompiler3, compiler.out()) != 0 ||
             compiler.p == nullptr) {
@@ -758,12 +767,17 @@ CompiledProgramOutput CompileOneProgram(const PackagedDxcCompiler& compiler,
             break;
     }
     out.lifted = lifted.ok();
-    const std::vector<std::uint32_t>& spv = out.lifted ? lifted.spirv : translated.spirv;
+    if (!out.lifted) {
+        out.reason = "lift: " + (lifted.rejections.empty()
+                                     ? std::string("not liftable to HLSL")
+                                     : FirstLineTrimmed(lifted.rejections.front()));
+        return out;
+    }
 
     gcn::HlslOptions hlsl_opts;
     hlsl_opts.title = program.name;
     hlsl_opts.dxil_sm64 = true;
-    const gcn::HlslResult hlsl = gcn::emit_hlsl(spv, hlsl_opts);
+    const gcn::HlslResult hlsl = gcn::emit_hlsl(lifted.spirv, hlsl_opts);
     if (!hlsl.ok()) {
         out.reason = "hlsl: " + (hlsl.errors.empty() ? std::string("failed") : hlsl.errors.front());
         return out;
@@ -927,7 +941,6 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     Quarantine quarantine = Quarantine::Parse(ReadTextFile(quarantine_path));
     bool recovered_crash = false;
     if (bbx::hostfs::Exists(inflight_path)) {
-        recovered_crash = true;
         const std::string inflight_text = ReadTextFile(inflight_path);
         const bbx::d3d12::CrashRecovery recovery =
             bbx::d3d12::RecoverFromInflight(inflight_text, quarantine);
@@ -937,9 +950,26 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                 (void)WriteTextAtomic(quarantine_path, quarantine.Serialize());
             }
         } else {
-            LogMessage(Level::kWarn,
-                       "shader_baker: previous multi-threaded bake did not finish cleanly; "
-                       "retrying in single-thread isolation mode");
+            const std::vector<bbx::d3d12::WorkerInflightSlot> multi_slots =
+                bbx::d3d12::ParseMultiWorkerInflight(inflight_text);
+            if (!multi_slots.empty()) {
+                for (const bbx::d3d12::WorkerInflightSlot& slot : multi_slots) {
+                    if (slot.active && slot.hash != 0) {
+                        quarantine.Add(slot.hash);
+                        LogMessage(Level::kWarn,
+                                   "shader_baker: quarantined %016llx (%s/%s, item %u/%u) from interrupted worker %u",
+                                   static_cast<unsigned long long>(slot.hash),
+                                   slot.bundle.c_str(), slot.entry.c_str(),
+                                   slot.index, slot.total, slot.worker_id);
+                    }
+                }
+                (void)WriteTextAtomic(quarantine_path, quarantine.Serialize());
+            } else {
+                recovered_crash = true;
+                LogMessage(Level::kWarn,
+                           "shader_baker: previous multi-threaded bake did not finish cleanly; "
+                           "retrying in single-thread isolation mode");
+            }
         }
         (void)bbx::hostfs::Unlink(inflight_path);
     }
@@ -1183,6 +1213,11 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     std::mutex merge_mu;
     std::atomic<std::size_t> next_work{0};
     std::uint32_t newly_signed_since_checkpoint = 0;
+    std::uint32_t newly_processed_since_checkpoint = 0;
+    std::vector<bbx::d3d12::WorkerInflightSlot> worker_slots(std::max<std::uint32_t>(1u, workers));
+    for (std::uint32_t w = 0; w < worker_slots.size(); ++w) {
+        worker_slots[w].worker_id = w;
+    }
 
     const auto save_checkpoint_locked = [&]() {
         if (entries.empty()) return;
@@ -1190,8 +1225,9 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
             bake_stamp, entries, blobs, bindings_text);
         if (WriteBytesAtomic(checkpoint_path, cp_bytes)) {
             LogMessage(Level::kInfo,
-                       "shader_baker: checkpoint saved (%zu shaders, %.1f MiB)",
-                       entries.size(), static_cast<double>(cp_bytes.size()) / 1048576.0);
+                       "shader_baker: checkpoint saved (%zu shaders, %u/%zu done, %.1f MiB)",
+                       entries.size(), completed_total, unique_programs.size(),
+                       static_cast<double>(cp_bytes.size()) / 1048576.0);
         }
     };
 
@@ -1216,11 +1252,7 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                                     : unique_programs[pending_indices.front()].name);
     }
 
-    if (workers > 1u && !pending_indices.empty()) {
-        (void)WriteTextFile(inflight_path, "1\nmode=multithread\n");
-    }
-
-    auto worker_fn = [&]() {
+    auto worker_fn = [&](std::uint32_t worker_id) {
         for (;;) {
             if (progress.CancelRequested()) break;
             const std::size_t slot = next_work.fetch_add(1, std::memory_order_relaxed);
@@ -1228,25 +1260,56 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
             const std::size_t prog_idx = pending_indices[slot];
             const AnalysedProgram& program = unique_programs[prog_idx];
 
-            // Record per-shader crash breadcrumb only when single-threaded so a
-            // multi-threaded crash never quarantines an innocent concurrent shader.
-            if (workers == 1u) {
-                Unit unit;
-                unit.hash = program.key;
-                unit.kind = ShaderKindOfStage(program.stage);
-                unit.bundle = program.bundle;
-                unit.entry = program.entry;
+            {
                 std::lock_guard<std::mutex> lock(merge_mu);
-                (void)WriteTextFile(
-                    inflight_path,
-                    bbx::d3d12::SerializeInflight(unit, static_cast<std::uint32_t>(prog_idx + 1),
-                                                  static_cast<std::uint32_t>(unique_programs.size())));
+                if (worker_id < worker_slots.size()) {
+                    bbx::d3d12::WorkerInflightSlot& ws = worker_slots[worker_id];
+                    ws.active = true;
+                    ws.hash = program.key;
+                    ws.stage = program.stage;
+                    ws.index = static_cast<std::uint32_t>(prog_idx + 1);
+                    ws.total = static_cast<std::uint32_t>(unique_programs.size());
+                    ws.name = program.name;
+                    ws.bundle = program.bundle;
+                    ws.entry = program.entry;
+                }
+                if (workers == 1u) {
+                    Unit unit;
+                    unit.hash = program.key;
+                    unit.kind = ShaderKindOfStage(program.stage);
+                    unit.bundle = program.bundle;
+                    unit.entry = program.entry;
+                    (void)WriteTextFile(
+                        inflight_path,
+                        bbx::d3d12::SerializeInflight(
+                            unit, static_cast<std::uint32_t>(prog_idx + 1),
+                            static_cast<std::uint32_t>(unique_programs.size())));
+                } else {
+                    (void)WriteTextFile(inflight_path,
+                                        bbx::d3d12::SerializeMultiWorkerInflight(worker_slots));
+                }
             }
 
+            const auto t_shader_start = std::chrono::steady_clock::now();
             CompiledProgramOutput compiled = CompileOneProgram(compiler, program);
+            const auto shader_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t_shader_start)
+                                       .count();
 
             std::lock_guard<std::mutex> lock(merge_mu);
+            if (worker_id < worker_slots.size()) {
+                worker_slots[worker_id].active = false;
+            }
+            if (shader_ms >= 1500) {
+                LogMessage(Level::kInfo,
+                           "shader_baker: slow shader %s (%s/%s, key %016llx, %zu words) took %lld ms (%s)",
+                           program.name.c_str(), program.bundle.c_str(), program.entry.c_str(),
+                           static_cast<unsigned long long>(program.key), program.words.size(),
+                           static_cast<long long>(shader_ms),
+                           compiled.ok ? "signed" : compiled.reason.c_str());
+            }
             ++completed_total;
+            ++newly_processed_since_checkpoint;
             const int st = StageSlot(program.stage);
             if (compiled.lifted) ++stage_stats[st].lifted;
             if (compiled.ok) {
@@ -1259,10 +1322,6 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                 ++signed_count;
                 ++stage_stats[st].signed_ok;
                 ++newly_signed_since_checkpoint;
-                if (newly_signed_since_checkpoint >= kCheckpointInterval) {
-                    newly_signed_since_checkpoint = 0;
-                    save_checkpoint_locked();
-                }
             } else {
                 ++compile_refused;
                 ++stage_stats[st].refused;
@@ -1272,6 +1331,13 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
                                              : FirstLineTrimmed(compiled.reason));
                 ++refusal_reasons[key];
             }
+            if (newly_signed_since_checkpoint >= kCheckpointInterval ||
+                (newly_processed_since_checkpoint >= kCheckpointInterval &&
+                 newly_signed_since_checkpoint > 0u)) {
+                newly_signed_since_checkpoint = 0;
+                newly_processed_since_checkpoint = 0;
+                save_checkpoint_locked();
+            }
             if ((completed_total & 3u) == 0u || completed_total == unique_programs.size()) {
                 publish_progress_locked(program.name);
             }
@@ -1279,12 +1345,12 @@ BakeResult BakeConsoleShaders(const BakeRequest& req, BakeProgressState& progres
     };
 
     if (workers <= 1u || pending_indices.size() < 4u) {
-        worker_fn();
+        worker_fn(0u);
     } else {
         std::vector<std::thread> pool;
         pool.reserve(workers);
         for (std::uint32_t t = 0; t < workers; ++t) {
-            pool.emplace_back(worker_fn);
+            pool.emplace_back(worker_fn, t);
         }
         for (std::thread& th : pool) {
             if (th.joinable()) th.join();

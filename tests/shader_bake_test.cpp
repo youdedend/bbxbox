@@ -196,4 +196,69 @@ TEST(shader_bake_checkpoint_roundtrip_and_integrity) {
     CHECK(!ParseBakeCheckpoint(corrupted, stamp, &out));
 }
 
+TEST(shader_bake_adaptive_dxc_optimization_level) {
+    CHECK_EQ(ChooseDxcOptimizationLevel("float4 main() : SV_Target { return 0; }\n"), 3u);
+
+    std::string medium_hlsl;
+    medium_hlsl.reserve(28000);
+    for (int i = 0; i < 650; ++i) {
+        medium_hlsl += "    v = v * 1.5f + 0.25f;\n";
+    }
+    CHECK_EQ(ChooseDxcOptimizationLevel(medium_hlsl), 1u);
+
+    std::string huge_hlsl(50000, 'x');
+    CHECK_EQ(ChooseDxcOptimizationLevel(huge_hlsl), 0u);
+
+    std::string loop_heavy;
+    for (int i = 0; i < 14; ++i) {
+        loop_heavy += "for (uint k = 0; k < 4; ++k) { x += k; }\n";
+    }
+    CHECK_EQ(ChooseDxcOptimizationLevel(loop_heavy), 0u);
+}
+
+TEST(shader_bake_multi_worker_inflight_roundtrip) {
+    std::vector<WorkerInflightSlot> slots(3);
+    slots[0].worker_id = 0;
+    slots[0].active = true;
+    slots[0].hash = 0x1122334455667788ull;
+    slots[0].stage = Stage::kPixel;
+    slots[0].index = 2501;
+    slots[0].total = 8590;
+    slots[0].name = "deadbeef";
+    slots[0].bundle = "GXShader.shaderbnd.dcx";
+    slots[0].entry = "GXFlver.ppo";
+
+    slots[1].worker_id = 1;
+    slots[1].active = false;
+    slots[1].hash = 0x9999ull;
+
+    slots[2].worker_id = 2;
+    slots[2].active = true;
+    slots[2].hash = 0xaabbccddeeff0011ull;
+    slots[2].stage = Stage::kVertex;
+    slots[2].index = 2502;
+    slots[2].total = 8590;
+    slots[2].name = "cafebabe";
+    slots[2].bundle = "eboot.bin";
+    slots[2].entry = "cafebabe";
+
+    const std::string text = SerializeMultiWorkerInflight(slots);
+    const std::vector<WorkerInflightSlot> parsed = ParseMultiWorkerInflight(text);
+    CHECK_EQ(parsed.size(), 2u);
+    CHECK_EQ(parsed[0].worker_id, 0u);
+    CHECK_EQ(parsed[0].hash, 0x1122334455667788ull);
+    CHECK(parsed[0].stage == Stage::kPixel);
+    CHECK_EQ(parsed[0].index, 2501u);
+    CHECK_EQ(parsed[0].total, 8590u);
+    CHECK_EQ(parsed[0].name, std::string("deadbeef"));
+    CHECK_EQ(parsed[0].bundle, std::string("GXShader.shaderbnd.dcx"));
+    CHECK_EQ(parsed[1].worker_id, 2u);
+    CHECK_EQ(parsed[1].hash, 0xaabbccddeeff0011ull);
+    CHECK(parsed[1].stage == Stage::kVertex);
+
+    // Header-only legacy multithread file parses as empty.
+    CHECK(ParseMultiWorkerInflight("1\nmode=multithread\n").empty());
+}
+
 }  // namespace
+

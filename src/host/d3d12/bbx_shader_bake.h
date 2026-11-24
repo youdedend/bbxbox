@@ -78,6 +78,33 @@ struct EmbeddedContainerSpan {
                                                   std::uint32_t requested_max,
                                                   bool force_single_thread) noexcept;
 
+// Chooses the DXC optimization level (0..3 -> -O0..-O3) for a generated HLSL
+// shader so huge lifted shaders (>32 KiB or >256 branches/loops) skip DXC's
+// quadratic SSA/GVN/inlining passes on Xbox Zen 2 cores and never hang workers.
+[[nodiscard]] std::uint32_t ChooseDxcOptimizationLevel(std::string_view hlsl) noexcept;
+
+// Formats and parses a multi-worker inflight breadcrumb (`1\nmode=multithread\n`
+// followed by `worker=<id> kind=<vs|ps|cs> hash=<16hex> index=<n> total=<m> bundle=<b> entry=<e>`)
+// so a hang or crash during multi-threaded baking identifies the exact active
+// shader(s) across all workers and quarantines them automatically on the next run.
+struct WorkerInflightSlot {
+    std::uint32_t worker_id = 0;
+    bool active = false;
+    std::uint64_t hash = 0;
+    Stage stage = Stage::kPixel;
+    std::uint32_t index = 0;
+    std::uint32_t total = 0;
+    std::string name;
+    std::string bundle;
+    std::string entry;
+};
+
+[[nodiscard]] std::string SerializeMultiWorkerInflight(
+    std::span<const WorkerInflightSlot> slots);
+
+[[nodiscard]] std::vector<WorkerInflightSlot> ParseMultiWorkerInflight(
+    std::string_view text);
+
 // Self-contained incremental checkpoint written periodically during baking so
 // cancelling or suspending on Xbox resumes from the last saved batch instead of
 // restarting at 0%.
@@ -127,3 +154,4 @@ struct BakeProgressSnapshot {
 [[nodiscard]] std::string FormatBakeHudLine(const BakeProgressSnapshot& snap);
 
 }  // namespace bbx::d3d12
+

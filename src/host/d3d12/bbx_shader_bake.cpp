@@ -185,6 +185,145 @@ std::uint32_t ChooseBakeWorkerCount(std::uint32_t hardware_threads,
     return chosen;
 }
 
+std::uint32_t ChooseDxcOptimizationLevel(std::string_view hlsl) noexcept {
+    const std::size_t bytes = hlsl.size();
+    if (bytes >= 49152u) return 0u;  // >= 48 KiB HLSL: -O0 avoids quadratic DXC SSA/GVN passes
+
+    std::size_t lines = 0;
+    std::size_t loops = 0;
+    std::size_t branches = 0;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        const char c = hlsl[i];
+        if (c == '\n') {
+            ++lines;
+        } else if (c == 'f' && i + 5 < bytes && std::memcmp(hlsl.data() + i, "for (", 5) == 0) {
+            ++loops;
+        } else if (c == 'i' && i + 4 < bytes && std::memcmp(hlsl.data() + i, "if (", 4) == 0) {
+            ++branches;
+        }
+    }
+    if (lines >= 1200u || loops >= 12u || branches >= 160u) return 0u;
+    if (bytes >= 24576u || lines >= 600u || loops >= 6u || branches >= 80u) return 1u;
+    return 3u;
+}
+
+namespace {
+
+const char* StageToken(Stage s) noexcept {
+    switch (s) {
+        case Stage::kVertex: return "vs";
+        case Stage::kPixel: return "ps";
+        case Stage::kCompute: return "cs";
+        default: return "ps";
+    }
+}
+
+Stage StageFromToken(std::string_view tok) noexcept {
+    if (tok == "vs") return Stage::kVertex;
+    if (tok == "cs") return Stage::kCompute;
+    return Stage::kPixel;
+}
+
+bool ParseHex64(std::string_view s, std::uint64_t* out) noexcept {
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s.remove_prefix(2);
+    if (s.empty() || s.size() > 16) return false;
+    std::uint64_t v = 0;
+    for (const char c : s) {
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= static_cast<std::uint64_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= static_cast<std::uint64_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= static_cast<std::uint64_t>(c - 'A' + 10);
+        else return false;
+    }
+    *out = v;
+    return v != 0;
+}
+
+std::uint32_t ParseDec32(std::string_view s) noexcept {
+    std::uint32_t v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') break;
+        v = v * 10u + static_cast<std::uint32_t>(c - '0');
+    }
+    return v;
+}
+
+}  // namespace
+
+std::string SerializeMultiWorkerInflight(std::span<const WorkerInflightSlot> slots) {
+    std::string out = "1\nmode=multithread\n";
+    for (const WorkerInflightSlot& s : slots) {
+        if (!s.active || s.hash == 0) continue;
+        char line[384] = {};
+        std::snprintf(
+            line, sizeof(line),
+            "worker=%u kind=%s hash=%016llx index=%u total=%u name=%s bundle=%s entry=%s\n",
+            s.worker_id, StageToken(s.stage), static_cast<unsigned long long>(s.hash),
+            s.index, s.total,
+            s.name.empty() ? "?" : s.name.c_str(),
+            s.bundle.empty() ? "?" : s.bundle.c_str(),
+            s.entry.empty() ? "?" : s.entry.c_str());
+        out += line;
+    }
+    return out;
+}
+
+std::vector<WorkerInflightSlot> ParseMultiWorkerInflight(std::string_view text) {
+    std::vector<WorkerInflightSlot> out;
+    std::size_t pos = 0;
+    bool version_ok = false;
+    std::size_t line_idx = 0;
+    while (pos < text.size()) {
+        const std::size_t nl = text.find('\n', pos);
+        std::string_view line = (nl == std::string_view::npos) ? text.substr(pos)
+                                                               : text.substr(pos, nl - pos);
+        pos = (nl == std::string_view::npos) ? text.size() : (nl + 1);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+            line.remove_suffix(1);
+        }
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+            line.remove_prefix(1);
+        }
+        if (line.empty()) continue;
+        if (line_idx == 0) {
+            ++line_idx;
+            if (line != "1") return out;
+            version_ok = true;
+            continue;
+        }
+        ++line_idx;
+        if (!version_ok || line == "mode=multithread") continue;
+
+        WorkerInflightSlot slot;
+        std::size_t p = 0;
+        while (p < line.size()) {
+            while (p < line.size() && line[p] == ' ') ++p;
+            const std::size_t eq = line.find('=', p);
+            if (eq == std::string_view::npos) break;
+            const std::size_t sp = line.find(' ', eq + 1);
+            const std::string_view k = line.substr(p, eq - p);
+            const std::string_view v = (sp == std::string_view::npos)
+                                           ? line.substr(eq + 1)
+                                           : line.substr(eq + 1, sp - eq - 1);
+            if (k == "worker") slot.worker_id = ParseDec32(v);
+            else if (k == "kind") slot.stage = StageFromToken(v);
+            else if (k == "hash") (void)ParseHex64(v, &slot.hash);
+            else if (k == "index") slot.index = ParseDec32(v);
+            else if (k == "total") slot.total = ParseDec32(v);
+            else if (k == "name") slot.name = std::string(v);
+            else if (k == "bundle") slot.bundle = std::string(v);
+            else if (k == "entry") slot.entry = std::string(v);
+            if (sp == std::string_view::npos) break;
+            p = sp + 1;
+        }
+        if (slot.hash != 0) {
+            slot.active = true;
+            out.push_back(std::move(slot));
+        }
+    }
+    return out;
+}
+
 std::vector<std::uint8_t> SerializeBakeCheckpoint(
     const CacheStamp& stamp,
     const std::vector<CacheEntry>& entries,
