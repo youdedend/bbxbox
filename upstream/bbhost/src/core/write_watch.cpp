@@ -79,6 +79,9 @@ std::atomic<std::int64_t> g_ns0{0};
 #endif
 #endif
 const bool g_enabled = [] {
+#if defined(BBX_UWP)
+    return false;
+#else
     const char* e = std::getenv("BBHOST_WRITE_WATCH");
 #ifdef WRITE_WATCH_UNDER_TSAN
     const bool on = e && e[0] == '1';
@@ -86,6 +89,7 @@ const bool g_enabled = [] {
     return on;
 #else
     return !e || e[0] != '0';
+#endif
 #endif
 }();
 // BBHOST_WATCH_AHEAD=0: a write fault releases its own page only.
@@ -99,7 +103,11 @@ constexpr std::uint32_t kRecentSeqs = 256;  // "a moment ago", in sequence numbe
 // Each protected range splits a mapping, and the kernel caps mappings per
 // process (vm.max_map_count, 65530 on many systems). Arming stops well short of
 // the cap, so the single-page unprotects faults make always have room.
+#if defined(BBX_UWP)
+std::atomic<bool> g_arming_off{true};
+#else
 std::atomic<bool> g_arming_off{false};
+#endif
 std::uint64_t g_ops_since_count = 0;  // under the kernel's map lock, like arming
 
 // Windows itself has no cap on a process's mappings, but wine's
@@ -536,7 +544,6 @@ bool write_watch_install() {
     // A packaged title does not run write_watch_veh; disable arming cleanly so
     // any caller that checks g_enabled/g_arming_off sees the watch is inactive.
     g_arming_off.store(true, std::memory_order_release);
-    g_enabled = false;
     return false;
 #else
     static PVOID h = AddVectoredExceptionHandler(1, write_watch_veh);

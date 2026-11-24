@@ -1515,12 +1515,12 @@ bool StartGuest(const GuestRequest& req) {
         constexpr std::size_t kTrampCap = bbx::core::kRedZoneTrampolineCapacity;
         const std::uint64_t lo_va = (g_image.mem.slide + g_image.mem.size + 0xffffull) & ~0xffffull;
         const std::uint64_t hi_va = (g_image.mem.slide + 0x70000000ull - 1ull) | 0xffffull;
-        MEM_ADDRESS_REQUIREMENTS req{};
-        req.LowestStartingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(lo_va));
-        req.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(hi_va));
+        MEM_ADDRESS_REQUIREMENTS addr_req{};
+        addr_req.LowestStartingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(lo_va));
+        addr_req.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(hi_va));
         MEM_EXTENDED_PARAMETER ext{};
         ext.Type = MemExtendedParameterAddressRequirements;
-        ext.Pointer = &req;
+        ext.Pointer = &addr_req;
         void* tramp = VirtualAlloc2FromApp(GetCurrentProcess(), nullptr, kTrampCap,
                                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &ext, 1);
         if (tramp != nullptr) {
