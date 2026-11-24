@@ -203,6 +203,44 @@ GuestPlan PlanGuestMemory(std::uint64_t ram_bytes, std::uint64_t alias_bytes) {
     return plan;
 }
 
+GuestPlan PlanConsoleGuestMemory() {
+    GuestPlan plan;
+    const auto refuse = [&plan](const std::string& why) {
+        plan.refused = why;
+        return plan;
+    };
+    // Direct memory identity window [0x100000000, 0x240000000) -> slabs 1..20 (5 GiB).
+    constexpr std::uint64_t kDmemBase = 0x100000000ull;
+    for (std::uint64_t at = 0; at < kGuestRamBytes; at += kL1RegionBytes) {
+        const std::uint64_t va = kDmemBase + at;
+        const std::uint64_t bytes = std::min(kGuestRamBytes - at, kL1RegionBytes);
+        const GuestSlot first = SlotForPage(at / kPageBytes);
+        if (!plan.table.MapLinear(va, bytes, at / kPageBytes)) {
+            return refuse("dmem does not map at 0x" + std::to_string(va >> 20) + " MiB");
+        }
+        plan.windows.push_back(
+            GuestWindow{va, bytes, first.slab, first.offset, false, at ? "dmem above 8 GiB" : "dmem"});
+    }
+    // GPU alias window [0xff00000000, 0xff00000000 + 4 GiB) mirrors the first 4 GiB of dmem (slabs 1..16).
+    if (!plan.table.MapAlias(kGuestGpuAliasBase, kDmemBase, kGuestGpuAliasBytes)) {
+        return refuse("the GPU alias does not mirror the first 4 GiB of dmem");
+    }
+    plan.windows.push_back(
+        GuestWindow{kGuestGpuAliasBase, kGuestGpuAliasBytes, SlotForPage(0).slab, SlotForPage(0).offset, true, "gpu alias"});
+    // Low window [0, 2.75 GiB) -> slabs 21..31 (11 slabs) for eboot / flexible mappings below 4 GiB.
+    constexpr std::uint64_t kLowFirstPage = kGuestRamBytes / kPageBytes;
+    constexpr std::uint64_t kLowBytes = kGuestAddressableBytes - kGuestRamBytes;
+    if (kLowBytes != 0) {
+        const GuestSlot low_first = SlotForPage(kLowFirstPage);
+        if (!plan.table.MapLinear(0, kLowBytes, kLowFirstPage)) {
+            return refuse("low guest window does not map at 0x0");
+        }
+        plan.windows.push_back(GuestWindow{0, kLowBytes, low_first.slab, low_first.offset, false, "low window"});
+    }
+    plan.slabs_resident = kGuestSlabCount;
+    return plan;
+}
+
 std::string GuestPlan::Report() const {
     std::ostringstream out;
     if (!ok()) return "guest memory: refused: " + refused;

@@ -423,7 +423,7 @@ bbx::d3d12::Status D3d12Session::Create(IUnknown* core_window, std::uint32_t win
     // 4 GiB alias over it) in 256 MiB slabs, and the two tables the shaders walk
     // (bbx_guest_mem.h). A plan that does not fit is a boot report line, not a
     // failed device: the rest of the port still runs.
-    impl.guest_plan = d3d12::PlanGuestMemory();
+    impl.guest_plan = d3d12::PlanConsoleGuestMemory();
     impl.guest_memory_line = impl.guest_plan.Report();
     // The guest arena's descriptors first: space 3 (the page table and 32 slabs)
     // and one region per stage, out of the device's single shader-visible heap

@@ -35,6 +35,8 @@
 // The FromApp surface: its own header, and declared only when NTDDI_VERSION is
 // at least NTDDI_WIN10_RS3 (xbox/CMakeLists.txt sets it).
 #include <fileapifromapp.h>
+#include <fcntl.h>
+#include <io.h>
 
 #include <algorithm>
 #include <atomic>
@@ -908,5 +910,102 @@ const Ops kOps = {
 }  // namespace
 
 const Ops& Table() { return kOps; }
+
+std::FILE* OpenStream(const char* path, const char* mode) {
+    t_error = 0;
+    if (path == nullptr || mode == nullptr || mode[0] == '\0') {
+        Fail(EINVAL);
+        return nullptr;
+    }
+    const bool plus = std::strchr(mode, '+') != nullptr;
+    const bool is_read = mode[0] == 'r';
+    const bool is_write = mode[0] == 'w';
+    const bool is_append = mode[0] == 'a';
+    const bool is_binary = std::strchr(mode, 'b') != nullptr;
+    if (!is_read && !is_write && !is_append) {
+        Fail(EINVAL);
+        return nullptr;
+    }
+
+    DWORD access = GENERIC_READ;
+    DWORD disposition = OPEN_EXISTING;
+    int crt_flags = is_binary ? _O_BINARY : _O_TEXT;
+    if (plus) {
+        access = GENERIC_READ | GENERIC_WRITE;
+        crt_flags |= _O_RDWR;
+    } else if (is_read) {
+        access = GENERIC_READ;
+        crt_flags |= _O_RDONLY;
+    } else {
+        access = GENERIC_WRITE;
+        crt_flags |= _O_WRONLY;
+    }
+    if (is_write) {
+        disposition = CREATE_ALWAYS;
+    } else if (is_append) {
+        disposition = OPEN_ALWAYS;
+        crt_flags |= _O_APPEND;
+    }
+
+    HANDLE h = INVALID_HANDLE_VALUE;
+    const std::wstring wide = Widen(path);
+    if (!wide.empty()) {
+        h = ::CreateFile2FromAppW(wide.c_str(), access,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  disposition, nullptr);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD code = wide.empty() ? ERROR_FILE_NOT_FOUND : ::GetLastError();
+        if (code == ERROR_ACCESS_DENIED && is_read && !plus) {
+            const std::string win_path = WinPath(path);
+            if (!win_path.empty()) {
+                OnStorageThread([&win_path, &h]() {
+                    const auto item = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
+                                          winrt::to_hstring(win_path))
+                                          .get();
+                    if (auto* unk = static_cast<IUnknown*>(winrt::get_abi(item))) {
+                        IStorageItemHandleAccess* handle_access = nullptr;
+                        if (SUCCEEDED(unk->QueryInterface(__uuidof(IStorageItemHandleAccess),
+                                                          reinterpret_cast<void**>(&handle_access))) &&
+                            handle_access != nullptr) {
+                            HANDLE raw = INVALID_HANDLE_VALUE;
+                            const HRESULT hr = handle_access->Create(
+                                HAO_READ,
+                                static_cast<HANDLE_SHARING_OPTIONS>(HSO_SHARE_READ | HSO_SHARE_WRITE |
+                                                                    HSO_SHARE_DELETE),
+                                HO_RANDOM_ACCESS, nullptr, &raw);
+                            handle_access->Release();
+                            if (SUCCEEDED(hr) && raw != INVALID_HANDLE_VALUE && raw != nullptr) {
+                                h = raw;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        if (h == INVALID_HANDLE_VALUE) {
+            Fail(ErrnoFrom(code));
+            return nullptr;
+        }
+    }
+    if (is_append) {
+        LARGE_INTEGER zero{};
+        (void)::SetFilePointerEx(h, zero, nullptr, FILE_END);
+    }
+    const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(h), crt_flags);
+    if (fd < 0) {
+        ::CloseHandle(h);
+        Fail(errno != 0 ? errno : EMFILE);
+        return nullptr;
+    }
+    std::FILE* f = ::_fdopen(fd, mode);
+    if (f == nullptr) {
+        const int err = errno != 0 ? errno : ENOMEM;
+        ::_close(fd);
+        Fail(err);
+        return nullptr;
+    }
+    return f;
+}
 
 }  // namespace bbx::hostfs

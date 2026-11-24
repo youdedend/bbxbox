@@ -542,7 +542,10 @@ void InstallLastChanceLogger() {
                                   : reinterpret_cast<AddVectoredFn>(
                                         ::GetProcAddress(kernel, "AddVectoredExceptionHandler"));
     if (add_vectored != nullptr) {
-        add_vectored(1, &LastChance);
+        // Register LAST (First=0) so demand-commit handlers such as
+        // win_vm's sec_reserve_veh (registered with First=1) resolve benign
+        // SEC_RESERVE page faults before LastChance logs anything.
+        add_vectored(0, &LastChance);
     } else {
         LogMessage(Level::kWarn, "log: no vectored exception handler; first-chance faults unseen");
     }

@@ -78,6 +78,7 @@ add_library(bbx_d3d12_core STATIC
     src/host/d3d12/bbx_tess.cpp
     src/host/core/bbx_self.cpp
     src/host/core/bbx_fault_filter.cpp
+    src/host/core/bbx_redzone.cpp
 )
 target_include_directories(bbx_d3d12_core PUBLIC src "${CMAKE_CURRENT_SOURCE_DIR}")
 if(TARGET bbx_zlib)
@@ -154,6 +155,7 @@ if(BBX_BUILD_TESTS)
         tests/guest_binding_test.cpp
         tests/guest_draw_test.cpp
         tests/fault_filter_test.cpp
+        tests/redzone_test.cpp
         tests/precompile_test.cpp
         tests/barriers_test.cpp
         tests/sfo_test.cpp

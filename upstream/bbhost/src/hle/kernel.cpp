@@ -3,6 +3,7 @@
 #include "core/dmem_place.h"
 #include "core/futex.h"
 #include "core/host_clock.h"
+#include "core/portable.h"
 #include "core/tls_rewrite.h"
 #include "host/frame_stats.h"
 #include "engine/gx_resources.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <new>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -58,7 +60,14 @@ std::mutex g_dmem_mu;
 // 6 GiB, more when the render-target heap is grown past what fits in it
 // (hle_kernel_set_dmem_size, engine/live_resolution.cpp), up to what the
 // window reserved for it holds - it ends below the image's fallback base.
+#if defined(BBX_UWP)
+// Retail PS4 reports 5,056 MiB of direct memory; matching it under Xbox Dev Mode
+// prevents Bloodborne from scaling its proportional heaps up for 6 GiB while still
+// accommodating every boot direct-memory allocation (~4,589 MiB virtual, demand-committed).
+constexpr std::uint64_t kDmemBaseSize = 0x13C000000ull;
+#else
 constexpr std::uint64_t kDmemBaseSize = 0x180000000ull;
+#endif
 constexpr std::uint64_t kDmemMaxSize = 0x1f0000000ull;
 std::uint64_t g_dmem_size = kDmemBaseSize;  // fixed once the backing exists
 // Gnm addresses are 40-bit. Place CPU dmem below 2^40 so (va >> 8) << 8 is identity.
@@ -488,6 +497,7 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
 bool host_protect(std::uintptr_t p, std::uint64_t len, int sce_prot) {
 #if defined(BBX_UWP)
     const DWORD prot = static_cast<DWORD>(host_prot(sce_prot));
+    win_vm_set_view_prot(reinterpret_cast<void*>(p), len, prot);
     bool ok = true;
     const std::uintptr_t end = p + static_cast<std::uintptr_t>(len);
     for (std::uintptr_t cur = p; cur < end;) {
@@ -500,22 +510,22 @@ bool host_protect(std::uintptr_t p, std::uint64_t len, int sce_prot) {
         const std::uintptr_t seg_end = region_end < end ? region_end : end;
         const SIZE_T seg_len = static_cast<SIZE_T>(seg_end - cur);
         if (m.State == MEM_RESERVE) {
-            if (prot != PAGE_NOACCESS) {
-                if (!VirtualAlloc2FromApp(GetCurrentProcess(), reinterpret_cast<void*>(cur), seg_len,
-                                          MEM_COMMIT, prot == PAGE_EXECUTE_READ ? PAGE_READWRITE : prot,
-                                          nullptr, 0)) {
-                    ok = false;
-                } else if (prot == PAGE_EXECUTE_READ) {
-                    DWORD old = 0;
-                    if (!VirtualProtectFromApp(reinterpret_cast<void*>(cur), seg_len, prot, &old)) {
-                        ok = false;
-                    }
-                }
-            }
+            // Leave reserved pages uncommitted so SEC_RESERVE demand-commit
+            // applies the updated view protection on first access without
+            // eagerly committing multi-hundred-MiB pools.
         } else if (m.State == MEM_COMMIT) {
             DWORD old = 0;
             if (!VirtualProtectFromApp(reinterpret_cast<void*>(cur), seg_len, prot, &old)) {
-                ok = false;
+                // Direct/flex sections are created PAGE_READWRITE | SEC_RESERVE
+                // (non-executable under W^X); fall back to PAGE_READWRITE if
+                // RX was requested on a data section.
+                if (prot == PAGE_EXECUTE_READ && GetLastError() == ERROR_ACCESS_DENIED) {
+                    if (!VirtualProtectFromApp(reinterpret_cast<void*>(cur), seg_len, PAGE_READWRITE, &old)) {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
+                }
             }
         } else {
             ok = false;
@@ -1485,11 +1495,28 @@ struct HostSema {
 };
 std::atomic<std::uint64_t> g_sema_sleeps{0}, g_sema_wakes{0}, g_eq_sleeps{0};
 
+template <typename T>
+T* low_new() {
+    void* mem = host_guest_memalign(alignof(T) > 16 ? alignof(T) : 16, sizeof(T));
+    if (!mem) return nullptr;
+    return new (mem) T();
+}
+
+template <typename T>
+void low_delete(T* p) {
+    if (!p) return;
+    p->~T();
+    host_guest_free(p);
+}
+
 GUEST_ABI int hle_create_sema(HostSema** out, const char* name, unsigned attr, int init, int max, void*) {
     if (!out || init < 0 || max <= 0 || init > max) {
         return sce_err(EINVAL);
     }
-    auto* h = new HostSema();
+    auto* h = low_new<HostSema>();
+    if (!h) {
+        return sce_err(ENOMEM);
+    }
     h->count = init;
     h->max = max;
     *out = h;
@@ -1514,7 +1541,7 @@ GUEST_ABI int hle_delete_sema(HostSema* h) {
         h->cv.notify_all();
     }
     if (free_now) {
-        delete h;
+        low_delete(h);
     }
     return 0;
 }
@@ -1555,7 +1582,7 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
         const bool last = h->waiters == 0;
         lk.unlock();
         if (last) {
-            delete h;
+            low_delete(h);
         }
         return sce_err(EINVAL);
     }
@@ -1742,7 +1769,10 @@ GUEST_ABI int hle_create_equeue(HostEqueue** out, const char* name) {
     if (!out) {
         return sce_err(EINVAL);
     }
-    auto* eq = new HostEqueue();
+    auto* eq = low_new<HostEqueue>();
+    if (!eq) {
+        return sce_err(ENOMEM);
+    }
     if (name) {
         eq->name = name;
     }
@@ -1773,7 +1803,7 @@ GUEST_ABI int hle_delete_equeue(HostEqueue* eq) {
         eq->cv.notify_all();
     }
     if (free_now) {
-        delete eq;
+        low_delete(eq);
     }
     return 0;
 }
@@ -1807,7 +1837,7 @@ GUEST_ABI int hle_wait_equeue(HostEqueue* eq, HostEvent* ev, int num, int* out, 
         const bool last = eq->waiters == 0;
         lk.unlock();
         if (last) {
-            delete eq;
+            low_delete(eq);
         }
         return sce_err(EBADF);
     }

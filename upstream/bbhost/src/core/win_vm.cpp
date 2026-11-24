@@ -110,7 +110,29 @@ struct View {
     bool noaccess = false;  // mapped with PAGE_NOACCESS; VEH must not commit on fault
     DWORD prot = PAGE_READWRITE;
 };
-std::mutex g_mu;
+SRWLOCK g_srw = SRWLOCK_INIT;
+thread_local int t_vm_lock_depth = 0;
+
+struct ExclusiveLock {
+    ExclusiveLock() {
+        AcquireSRWLockExclusive(&g_srw);
+        ++t_vm_lock_depth;
+    }
+    ~ExclusiveLock() {
+        --t_vm_lock_depth;
+        ReleaseSRWLockExclusive(&g_srw);
+    }
+    ExclusiveLock(const ExclusiveLock&) = delete;
+    ExclusiveLock& operator=(const ExclusiveLock&) = delete;
+};
+
+struct SharedLock {
+    SharedLock() { AcquireSRWLockShared(&g_srw); }
+    ~SharedLock() { ReleaseSRWLockShared(&g_srw); }
+    SharedLock(const SharedLock&) = delete;
+    SharedLock& operator=(const SharedLock&) = delete;
+};
+
 std::map<std::uintptr_t, View> g_views;
 std::vector<std::pair<std::uint64_t, std::uint64_t>> g_reserved_windows;
 
@@ -122,6 +144,8 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
     }
     const ULONG_PTR access = ep->ExceptionRecord->ExceptionInformation[0];
     if (access == 8) return EXCEPTION_CONTINUE_SEARCH;  // never treat DEP/execute as demand-commit
+    // Never deadlock if a fault occurs on the same thread already holding g_srw exclusively.
+    if (t_vm_lock_depth > 0) return EXCEPTION_CONTINUE_SEARCH;
     const std::uintptr_t addr = static_cast<std::uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
     std::uintptr_t vb = 0;
     std::uint64_t vlen = 0;
@@ -129,9 +153,9 @@ LONG CALLBACK sec_reserve_veh(EXCEPTION_POINTERS* ep) {
     DWORD vprot = PAGE_READWRITE;
     bool found = false;
     {
-        // Never deadlock if a fault occurs on a thread already holding g_mu.
-        std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
-        if (!lk.owns_lock()) return EXCEPTION_CONTINUE_SEARCH;
+        // Block on shared lock so concurrent guest threads faulting while
+        // another thread maps/unmaps wait cleanly instead of crashing with AV.
+        SharedLock lk;
         auto it = g_views.upper_bound(addr);
         if (it != g_views.begin()) {
             --it;
@@ -439,7 +463,7 @@ bool win_vm_available() { return api().ok; }
 bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
     if (!api().ok) return false;
     {
-        std::lock_guard<std::mutex> lk(g_mu);
+        SharedLock lk;
         for (const auto& r : g_reserved_windows) {
             if (base >= r.first && len <= r.second && base - r.first <= r.second - len) {
                 MEMORY_BASIC_INFORMATION m{};
@@ -461,7 +485,7 @@ bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
         return false;
     }
     {
-        std::lock_guard<std::mutex> lk(g_mu);
+        ExclusiveLock lk;
         g_reserved_windows.emplace_back(base, len);
     }
     return true;
@@ -484,7 +508,7 @@ static void* win_vm_map_impl(void* section, void* at, std::uint64_t len, std::ui
                                static_cast<DWORD>(offset), len, place == WinVmPlace::Anywhere ? nullptr : at);
     }
 #endif
-    std::lock_guard<std::mutex> lk(g_mu);
+    ExclusiveLock lk;
     std::uintptr_t base;
     if (place == WinVmPlace::Anywhere) {
         void* p = place_anywhere_locked(len, limit, align);
@@ -518,14 +542,9 @@ static void* win_vm_map_impl(void* section, void* at, std::uint64_t len, std::ui
         return nullptr;
     }
     ensure_commit_veh();
-#if defined(BBX_UWP)
-    if (clean_prot != PAGE_NOACCESS && len <= (128ull << 20)) {
-        if (!api().VirtualAlloc2(GetCurrentProcess(), p, len, MEM_COMMIT, view_prot, nullptr, 0)) {
-            host_log("win-vm: eager MEM_COMMIT at %p (0x%llx) failed: error %lu (falling back to demand-commit)",
-                     p, static_cast<unsigned long long>(len), GetLastError());
-        }
-    }
-#endif
+    // Under BBX_UWP, SEC_RESERVE views are demand-committed in 64 KiB chunks by
+    // sec_reserve_veh on first access so unused guest memory never counts
+    // against the console's 5,120 MiB Game Mode cap.
     if (clean_prot == PAGE_NOACCESS) {
         DWORD old = 0;
         VmProtect(p, len, PAGE_NOACCESS, &old);
@@ -570,7 +589,7 @@ void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlac
 void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uint64_t limit) {
     const DWORD clean_prot = sanitize_prot(static_cast<DWORD>(protect));
     if (!api().ok) return VmAlloc(at, len, MEM_RESERVE | MEM_COMMIT, clean_prot);
-    std::lock_guard<std::mutex> lk(g_mu);
+    ExclusiveLock lk;
     if (at) {
         if (!carve_locked(reinterpret_cast<std::uintptr_t>(at), len, true)) return nullptr;
     } else {
@@ -585,13 +604,13 @@ void* win_vm_commit(void* at, std::uint64_t len, unsigned long protect, std::uin
 
 void* win_vm_place(void* at, std::uint64_t len, WinVmPlace place, std::uint64_t limit) {
     if (!api().ok) return VmAlloc(place == WinVmPlace::Anywhere ? nullptr : at, len, MEM_RESERVE, PAGE_NOACCESS);
-    std::lock_guard<std::mutex> lk(g_mu);
+    ExclusiveLock lk;
     if (place == WinVmPlace::Anywhere) return place_anywhere_locked(len, limit);
     return carve_locked(reinterpret_cast<std::uintptr_t>(at), len, place == WinVmPlace::Exact) ? at : nullptr;
 }
 
 void win_vm_dump_views() {
-    std::lock_guard<std::mutex> lk(g_mu);
+    SharedLock lk;
     int overlaps = 0;
     for (const auto& [b, v] : g_views) {
         host_log("win-vm view: base 0x%llx len 0x%llx section %p offset 0x%llx%s", static_cast<unsigned long long>(b),
@@ -614,16 +633,8 @@ void win_vm_dump_views() {
 
 bool win_vm_unmap(void* at, std::uint64_t len) {
 #if defined(BBX_UWP)
-    // `api()` is never short of its three calls in a packaged title (they are
-    // `VirtualAlloc2FromApp`, `MapViewOfFile3FromApp` and `UnmapViewOfFile2`,
-    // each declared for the app partition), so the fallback below cannot run -
-    // and taking a view's address out of it is not worth an import: the SDK's
-    // app-partition import library supplies `UnmapViewOfFile` in the same member
-    // as `MapViewOfFile`, and the audit refuses the second (see check-imports.ps1
-    // and the ten `<filesystem>` sites). The view is still unmapped, through the
-    // same placeholder path the rest of the layer uses.
     if (at == nullptr) return false;
-    std::lock_guard<std::mutex> lk(g_mu);
+    ExclusiveLock lk;
     return unmap_locked(reinterpret_cast<std::uintptr_t>(at), len);
 #else
     if (!api().ok) {
@@ -631,9 +642,33 @@ bool win_vm_unmap(void* at, std::uint64_t len) {
         VirtualQuery(at, &m, sizeof(m));
         return m.Type == MEM_MAPPED ? UnmapViewOfFile(at) != 0 : VirtualFree(at, 0, MEM_RELEASE) != 0;
     }
-    std::lock_guard<std::mutex> lk(g_mu);
+    ExclusiveLock lk;
     return unmap_locked(reinterpret_cast<std::uintptr_t>(at), len);
 #endif
+}
+
+void win_vm_set_view_prot(void* at, std::uint64_t len, unsigned long protect) {
+    if (at == nullptr || len == 0) return;
+    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(at);
+    const std::uintptr_t hi = lo + static_cast<std::uintptr_t>(len);
+    const DWORD clean_prot = sanitize_prot(static_cast<DWORD>(protect));
+    const bool noaccess = clean_prot == PAGE_NOACCESS;
+    const DWORD view_prot = noaccess ? PAGE_READWRITE : clean_prot;
+    ExclusiveLock lk;
+    for (auto& [vb, v] : g_views) {
+        if (vb + v.len <= lo) continue;
+        if (vb >= hi) break;
+        v.noaccess = noaccess;
+        if (!noaccess) {
+#if defined(BBX_UWP)
+            // Data sections are PAGE_READWRITE | SEC_RESERVE, so demand-commit
+            // uses PAGE_READWRITE rather than execute protections.
+            v.prot = is_exec_prot(view_prot) ? PAGE_READWRITE : view_prot;
+#else
+            v.prot = view_prot;
+#endif
+        }
+    }
 }
 
 #endif

@@ -10,6 +10,10 @@
 #include "hle/libc_errno.h"
 #include "hle/sysv_va.h"
 
+#if defined(BBX_UWP)
+#include "xbox/platform/host_fs.h"
+#endif
+
 namespace bb::libc {
 
 inline constexpr unsigned read_access = 1, write_access = 2;
@@ -63,11 +67,24 @@ inline FILE* opened_file(FILE* file, const char* mode) {
     return file;
 }
 inline FILE* open_file(const char* path, const char* mode) {
+#if defined(BBX_UWP)
+    FILE* f = bbx::hostfs::OpenStream(path, mode);
+    if (!f) errno = bbx::hostfs::LastError();
+    return opened_file(f, mode);
+#else
     return opened_file(std::fopen(path, mode), mode);
+#endif
 }
 inline FILE* reopen_file(const char* path, const char* mode, FILE* file) {
     forget_file(file);
+#if defined(BBX_UWP)
+    if (file != nullptr) std::fclose(file);
+    FILE* f = bbx::hostfs::OpenStream(path, mode);
+    if (!f) errno = bbx::hostfs::LastError();
+    return opened_file(f, mode);
+#else
     return opened_file(std::freopen(path, mode, file), mode);
+#endif
 }
 inline int close_file(FILE* file) {
     forget_file(file);

@@ -66,8 +66,12 @@ SlotDecision DecideSlot(const std::uint32_t words[4], std::uint64_t base_limit) 
         decision.verdict = SlotVerdict::kUnaligned;
         return decision;
     }
-    // The guest's window, first: an address above it is not a range question.
-    if (view.base >= base_limit || decision.end > base_limit) {
+    // The guest's window, first: either inside [0, base_limit) or inside the
+    // GPU's 4 GiB alias window [kGuestGpuAliasBase, kGuestGpuAliasBase + kGuestGpuAliasBytes).
+    const bool in_primary = view.base < base_limit && decision.end <= base_limit;
+    const bool in_alias = view.base >= kGuestGpuAliasBase &&
+                          decision.end <= kGuestGpuAliasBase + kGuestGpuAliasBytes;
+    if (!in_primary && !in_alias) {
         decision.verdict = SlotVerdict::kOutsideGuest;
         return decision;
     }

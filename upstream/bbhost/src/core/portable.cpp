@@ -599,6 +599,286 @@ const void* host_memmem(const void* hay, std::size_t hay_len, const void* needle
     return nullptr;
 }
 
+#if defined(BBX_UWP)
+namespace {
+
+constexpr std::uint64_t kLowMin = 0x0800000000ull;  // 32 GiB: clear of ELF, dmem (4..12 GiB), and fallback
+constexpr std::uint64_t kLowMax = 0x7FFFFFFFFFull;  // 512 GiB - 1: clear of gsync (0xE000000000) and GPU alias (0xFF00000000)
+constexpr std::size_t kLowGran = 65536;
+constexpr std::uint64_t kLowMagic = 0x4242584c4f574d31ull;
+
+struct LowBlock {
+    std::uint64_t magic;
+    std::size_t bin;        // 0..10 for slab bins (64..65536? 64..32768), 11 for large direct mapping
+    std::size_t req_size;   // user-visible capacity in bytes
+    std::size_t map_bytes;  // non-zero for large direct mappings
+    LowBlock* next;
+    void* raw_base;         // actual base of LowBlock (handles alignments > 64)
+    std::uint64_t pad[2];
+};
+static_assert(sizeof(LowBlock) == 64, "LowBlock must keep 64-byte payload alignment");
+
+std::mutex g_low_mu;
+std::uint64_t g_low_cursor = kLowMin;
+LowBlock* g_low_bins[10] = {};
+
+struct LowStackEntry {
+    void* base;
+    std::size_t size;
+};
+LowStackEntry g_low_stack_pool[128] = {};
+std::size_t g_low_stack_count = 0;
+
+std::size_t align_up_sz(std::size_t n, std::size_t a) { return (n + a - 1) & ~(a - 1); }
+
+void* low_alloc_pages_locked(std::size_t bytes) {
+    bytes = align_up_sz(bytes ? bytes : kLowGran, kLowGran);
+    // Prefer VirtualAlloc2FromApp with explicit [kLowMin, kLowMax] address requirements.
+    MEM_ADDRESS_REQUIREMENTS req{};
+    req.LowestStartingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(kLowMin));
+    req.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(kLowMax));
+    MEM_EXTENDED_PARAMETER ext{};
+    ext.Type = MemExtendedParameterAddressRequirements;
+    ext.Pointer = &req;
+    void* p = VirtualAlloc2FromApp(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT,
+                                   PAGE_READWRITE, &ext, 1);
+    if (p != nullptr) return p;
+    // Fallback probe walk (identical strategy to Test-project/src/runtime_memory.c).
+    while (g_low_cursor + bytes <= kLowMax) {
+        p = VirtualAllocFromApp(reinterpret_cast<void*>(static_cast<std::uintptr_t>(g_low_cursor)), bytes,
+                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        g_low_cursor += bytes + kLowGran;
+        if (p != nullptr) return p;
+    }
+    // Wrap scan once if cursor reached the top.
+    g_low_cursor = kLowMin;
+    while (g_low_cursor + bytes <= kLowMax) {
+        p = VirtualAllocFromApp(reinterpret_cast<void*>(static_cast<std::uintptr_t>(g_low_cursor)), bytes,
+                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        g_low_cursor += bytes + kLowGran;
+        if (p != nullptr) return p;
+    }
+    return nullptr;
+}
+
+void* low_heap_alloc(std::size_t align, std::size_t n) {
+    if (n == 0) n = 1;
+    if (align < 16) align = 16;
+    if ((align & (align - 1)) != 0) {
+        std::size_t p2 = 16;
+        while (p2 < align && p2 < (std::size_t{1} << 20)) p2 <<= 1;
+        align = p2;
+    }
+    const std::size_t extra = align > 64 ? (align - 64) : 0;
+    const std::size_t need = n + extra;
+    std::size_t bin = 0;
+    std::size_t cap = 64;
+    while (bin < 10 && cap < need) {
+        cap <<= 1;
+        ++bin;
+    }
+    LowBlock* blk = nullptr;
+    if (bin >= 10) {
+        const std::size_t total = align_up_sz(sizeof(LowBlock) + need, kLowGran);
+        std::lock_guard<std::mutex> lk(g_low_mu);
+        blk = static_cast<LowBlock*>(low_alloc_pages_locked(total));
+        if (!blk) return nullptr;
+        blk->magic = kLowMagic;
+        blk->bin = 10;
+        blk->req_size = total - sizeof(LowBlock);
+        blk->map_bytes = total;
+        blk->next = nullptr;
+        blk->raw_base = blk;
+    } else {
+        std::lock_guard<std::mutex> lk(g_low_mu);
+        if (!g_low_bins[bin]) {
+            constexpr std::size_t kSlab = 65536;
+            auto* slab = static_cast<std::uint8_t*>(low_alloc_pages_locked(kSlab));
+            if (slab) {
+                const std::size_t stride = sizeof(LowBlock) + cap;
+                for (std::size_t off = 0; off + stride <= kSlab; off += stride) {
+                    auto* b = reinterpret_cast<LowBlock*>(slab + off);
+                    b->magic = kLowMagic;
+                    b->bin = bin;
+                    b->req_size = cap;
+                    b->map_bytes = 0;
+                    b->next = g_low_bins[bin];
+                    b->raw_base = b;
+                    g_low_bins[bin] = b;
+                }
+            }
+        }
+        blk = g_low_bins[bin];
+        if (blk) {
+            g_low_bins[bin] = blk->next;
+            blk->next = nullptr;
+            blk->raw_base = blk;
+        }
+    }
+    if (!blk) return nullptr;
+    if (extra == 0) {
+        return reinterpret_cast<void*>(blk + 1);
+    }
+    const std::uintptr_t raw_payload = reinterpret_cast<std::uintptr_t>(blk + 1);
+    const std::uintptr_t aligned_payload = (raw_payload + align - 1) & ~(static_cast<std::uintptr_t>(align) - 1);
+    if (aligned_payload == raw_payload) {
+        return reinterpret_cast<void*>(aligned_payload);
+    }
+    // Store an alias header immediately preceding the aligned payload pointing back to blk.
+    auto* alias = reinterpret_cast<LowBlock*>(aligned_payload) - 1;
+    alias->magic = kLowMagic;
+    alias->bin = blk->bin;
+    alias->req_size = (reinterpret_cast<std::uintptr_t>(blk + 1) + blk->req_size) - aligned_payload;
+    alias->map_bytes = blk->map_bytes;
+    alias->next = nullptr;
+    alias->raw_base = blk;
+    return reinterpret_cast<void*>(aligned_payload);
+}
+
+void low_heap_free(void* p) {
+    if (!p) return;
+    auto* hdr = reinterpret_cast<LowBlock*>(p) - 1;
+    if (hdr->magic != kLowMagic || hdr->raw_base == nullptr) {
+        // Fallback if a pointer somehow came from CRT.
+        _aligned_free(p);
+        return;
+    }
+    auto* blk = static_cast<LowBlock*>(hdr->raw_base);
+    if (blk->bin >= 10) {
+        VirtualFree(blk, 0, MEM_RELEASE);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_low_mu);
+    blk->next = g_low_bins[blk->bin];
+    g_low_bins[blk->bin] = blk;
+}
+
+std::size_t low_heap_size(void* p) {
+    if (!p) return 0;
+    auto* hdr = reinterpret_cast<LowBlock*>(p) - 1;
+    if (hdr->magic != kLowMagic) return 0;
+    return hdr->req_size;
+}
+
+extern "C" void* bbx_switch_rsp_and_call(void* (*fn)(void*), void* arg, void* new_rsp);
+asm(R"(
+    .att_syntax prefix
+    .text
+    .globl bbx_switch_rsp_and_call
+bbx_switch_rsp_and_call:
+    push %rbp
+    push %rbx
+    mov %rsp, %rbx
+    and $-16, %r8
+    sub $32, %r8
+    mov %r8, %rsp
+    xor %ebp, %ebp
+    mov %rcx, %rax
+    mov %rdx, %rcx
+    call *%rax
+    mov %rbx, %rsp
+    pop %rbx
+    pop %rbp
+    ret
+)");
+
+}  // namespace
+
+void* host_low_map(std::size_t size) {
+    std::lock_guard<std::mutex> lk(g_low_mu);
+    return low_alloc_pages_locked(size);
+}
+
+void host_low_free(void* p, std::size_t) {
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+
+void* host_low_stack_alloc(std::size_t size) {
+    const std::size_t bytes = align_up_sz(size ? size : (2u << 20), kLowGran);
+    std::lock_guard<std::mutex> lk(g_low_mu);
+    for (std::size_t i = 0; i < g_low_stack_count; ++i) {
+        if (g_low_stack_pool[i].size == bytes) {
+            void* base = g_low_stack_pool[i].base;
+            g_low_stack_pool[i] = g_low_stack_pool[--g_low_stack_count];
+            return base;
+        }
+    }
+    return low_alloc_pages_locked(bytes);
+}
+
+void host_low_stack_free(void* p, std::size_t size) {
+    if (!p) return;
+    const std::size_t bytes = align_up_sz(size ? size : (2u << 20), kLowGran);
+    std::lock_guard<std::mutex> lk(g_low_mu);
+    if (g_low_stack_count < sizeof(g_low_stack_pool) / sizeof(g_low_stack_pool[0])) {
+        g_low_stack_pool[g_low_stack_count++] = LowStackEntry{p, bytes};
+        return;
+    }
+    VirtualFree(p, 0, MEM_RELEASE);
+}
+
+void* host_call_on_low_stack(void* (*fn)(void*), void* arg, void* stack_base, std::size_t stack_size) {
+    if (!stack_base || stack_size < 65536) return fn(arg);
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    PVOID old_base = tib->StackBase;
+    PVOID old_limit = tib->StackLimit;
+    auto* top = static_cast<std::uint8_t*>(stack_base) + stack_size;
+    tib->StackBase = top;
+    tib->StackLimit = stack_base;
+    void* ret = bbx_switch_rsp_and_call(fn, arg, top - 64);
+    tib->StackBase = old_base;
+    tib->StackLimit = old_limit;
+    return ret;
+}
+
+void* host_guest_malloc(std::size_t n) { return low_heap_alloc(16, n); }
+
+void* host_guest_calloc(std::size_t n, std::size_t size) {
+    if (n != 0 && size > (static_cast<std::size_t>(-1) / n)) return nullptr;
+    const std::size_t total = n * size;
+    void* p = low_heap_alloc(16, total);
+    if (p && total) std::memset(p, 0, total);
+    return p;
+}
+
+void* host_guest_realloc(void* p, std::size_t n) {
+    if (!p) return low_heap_alloc(16, n);
+    if (n == 0) {
+        low_heap_free(p);
+        return nullptr;
+    }
+    const std::size_t old_sz = low_heap_size(p);
+    if (old_sz >= n) return p;
+    void* fresh = low_heap_alloc(16, n);
+    if (!fresh) return nullptr;
+    if (old_sz > 0) std::memcpy(fresh, p, old_sz < n ? old_sz : n);
+    low_heap_free(p);
+    return fresh;
+}
+
+void* host_guest_memalign(std::size_t align, std::size_t n) {
+    const std::size_t size = n ? n : 1;
+    void* p = low_heap_alloc(align < 16 ? 16 : align, size);
+    if (p) std::memset(p, 0, size);
+    return p;
+}
+
+void host_guest_free(void* p) { low_heap_free(p); }
+
+#else  // !BBX_UWP
+
+void* host_low_map(std::size_t size) {
+    return host_page_alloc(size ? size : 65536, false);
+}
+
+void host_low_free(void* p, std::size_t size) {
+    if (p) host_page_free(p, size);
+}
+
+void* host_low_stack_alloc(std::size_t size) { return host_low_map(size); }
+void host_low_stack_free(void* p, std::size_t size) { host_low_free(p, size); }
+void* host_call_on_low_stack(void* (*fn)(void*), void* arg, void*, std::size_t) { return fn(arg); }
+
 void* host_guest_malloc(std::size_t n) {
 #if defined(_WIN32)
     return _aligned_malloc(n ? n : 1, 16);
@@ -645,6 +925,8 @@ void host_guest_free(void* p) {
     std::free(p);
 #endif
 }
+
+#endif  // BBX_UWP
 
 void* host_page_alloc(std::size_t size, bool exec) {
 #if defined(BBX_UWP)

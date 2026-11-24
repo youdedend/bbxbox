@@ -1248,6 +1248,15 @@ struct GuestLaunch {
     void* argv = nullptr;
 };
 
+void* GuestRunOnLowStack(void* p) {
+    auto* launch = static_cast<GuestLaunch*>(p);
+    void* tcb = hle_thread_enter_guest();
+    bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo, "guest: entering _start (tcb=%p)", tcb);
+    launch->fn(launch->argv, nullptr);
+    hle_thread_leave_guest(tcb);
+    return nullptr;
+}
+
 DWORD WINAPI GuestMain(void* p) {
     using SetStackGuaranteeFn = BOOL(WINAPI*)(PULONG);
     if (const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
@@ -1257,11 +1266,18 @@ DWORD WINAPI GuestMain(void* p) {
             (void)set_guarantee(&stack_guarantee);
         }
     }
-    auto* launch = static_cast<GuestLaunch*>(p);
-    void* tcb = hle_thread_enter_guest();
-    bbx::platform::LogMirroredMessage(bbx::platform::Level::kInfo, "guest: entering _start");
-    launch->fn(launch->argv, nullptr);
-    hle_thread_leave_guest(tcb);
+    constexpr std::size_t kLowMainStack = 4ull * 1024 * 1024;
+    void* low_stack = host_low_stack_alloc(kLowMainStack);
+    if (low_stack != nullptr) {
+        bbx::platform::LogF("guest: main thread switched to <1 TiB stack [%p, +%zu MiB)", low_stack,
+                            kLowMainStack >> 20);
+        host_call_on_low_stack(GuestRunOnLowStack, p, low_stack, kLowMainStack);
+        host_low_stack_free(low_stack, kLowMainStack);
+    } else {
+        bbx::platform::LogMessage(bbx::platform::Level::kWarn,
+                                  "guest: <1 TiB main stack allocation failed; running on OS thread stack");
+        GuestRunOnLowStack(p);
+    }
     g_running.store(false);
     bbx::platform::LogF("guest: _start returned");
     return 0;
@@ -1490,18 +1506,78 @@ bool StartGuest(const GuestRequest& req) {
     debug_menu_install(&g_image);
     legacy_cpu_verify("before the guest starts");
 
-    // The guest sees no host flags: argc = 1, argv[0] = the eboot's path, and
-    // the 16-byte alignment the SysV ABI's prologues assume.
-    g_argv[0] = 1;
-    g_argv[1] = reinterpret_cast<std::uint64_t>(g_eboot_path.c_str());
-    g_argv[2] = 0;
+    // Windows x64 VEH dispatch (including every SEC_RESERVE demand-commit fault)
+    // writes EXCEPTION_RECORD/CONTEXT into [rsp-128..rsp-1]. Patch Bloodborne
+    // v1.09's SysV leaf red-zone sites with strict-W^X trampolines before any
+    // guest thread executes.
+    if (is_109) {
+        bbx::platform::LogCrumb("boot:redzone");
+        constexpr std::size_t kTrampCap = bbx::core::kRedZoneTrampolineCapacity;
+        const std::uint64_t lo_va = (g_image.mem.slide + g_image.mem.size + 0xffffull) & ~0xffffull;
+        const std::uint64_t hi_va = (g_image.mem.slide + 0x70000000ull - 1ull) | 0xffffull;
+        MEM_ADDRESS_REQUIREMENTS req{};
+        req.LowestStartingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(lo_va));
+        req.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(hi_va));
+        MEM_EXTENDED_PARAMETER ext{};
+        ext.Type = MemExtendedParameterAddressRequirements;
+        ext.Pointer = &req;
+        void* tramp = VirtualAlloc2FromApp(GetCurrentProcess(), nullptr, kTrampCap,
+                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &ext, 1);
+        if (tramp != nullptr) {
+            const auto tramp_va = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(tramp));
+            const auto rz = bbx::core::ApplyBloodborne109RedZoneTrampolines(
+                g_image.mem.base, g_image.mem.size, g_image.mem.slide, tramp, tramp_va, kTrampCap,
+                [](std::uint64_t va, const void* bytes, std::size_t len) {
+                    const std::uint64_t page_lo = va & ~0xfffull;
+                    const std::uint64_t page_hi = (va + len + 0xfffull) & ~0xfffull;
+                    guest_protect_rwx(&g_image.mem, page_lo, static_cast<std::size_t>(page_hi - page_lo));
+                    std::memcpy(guest_ptr(g_image.mem, va), bytes, len);
+                    guest_protect_rx(&g_image.mem, page_lo, static_cast<std::size_t>(page_hi - page_lo));
+                });
+            DWORD old_prot = 0;
+            if (VirtualProtectFromApp(tramp, kTrampCap, PAGE_EXECUTE_READ, &old_prot)) {
+                FlushInstructionCache(GetCurrentProcess(), tramp, kTrampCap);
+                FlushInstructionCache(GetCurrentProcess(), g_image.mem.base, g_image.mem.size);
+                bbx::platform::LogMirroredMessage(
+                    bbx::platform::Level::kInfo,
+                    "redzone: applied %zu/%zu trampolines (%zu KiB RX at 0x%llx; skipped=%zu mismatch, %zu range)",
+                    rz.applied, rz.total_sites, (rz.trampoline_bytes + 1023u) >> 10,
+                    static_cast<unsigned long long>(tramp_va), rz.skipped_mismatch, rz.skipped_range);
+            } else {
+                bbx::platform::LogMessage(
+                    bbx::platform::Level::kError,
+                    "redzone: VirtualProtectFromApp(RX) failed (error %lu)",
+                    static_cast<unsigned long>(GetLastError()));
+            }
+        } else {
+            bbx::platform::LogMessage(
+                bbx::platform::Level::kWarn,
+                "redzone: VirtualAlloc2FromApp near 0x%llx failed (error %lu); red-zone trampolines skipped",
+                static_cast<unsigned long long>(lo_va), static_cast<unsigned long>(GetLastError()));
+        }
+    }
+
+    // The guest sees no host flags: argc = 1, argv[0] = the eboot's path, placed
+    // below 1 TiB so 40-bit guest pointer packing never truncates argv or argv[0].
+    void* low_argv_mem = host_guest_memalign(16, 4 * sizeof(std::uint64_t));
+    char* low_eboot_str = static_cast<char*>(host_guest_malloc(g_eboot_path.size() + 1));
+    std::uint64_t* argv_ptr = low_argv_mem != nullptr ? static_cast<std::uint64_t*>(low_argv_mem) : g_argv;
+    if (low_eboot_str != nullptr) {
+        std::memcpy(low_eboot_str, g_eboot_path.c_str(), g_eboot_path.size() + 1);
+    }
+    argv_ptr[0] = 1;
+    argv_ptr[1] = reinterpret_cast<std::uint64_t>(low_eboot_str != nullptr ? low_eboot_str : g_eboot_path.c_str());
+    argv_ptr[2] = 0;
+    argv_ptr[3] = 0;
 
     static GuestLaunch launch;
     launch.fn = reinterpret_cast<GuestStart>(g_image.entry);
-    launch.argv = g_argv;
+    launch.argv = argv_ptr;
+    thunk_mark_guest_live();
     bbx::platform::LogCrumb("boot:guest_start");
-    bbx::platform::LogF("guest: calling _start 0x%llx on an %zu MiB stack",
-                        static_cast<unsigned long long>(g_image.entry), kGuestStack >> 20);
+    bbx::platform::LogF("guest: calling _start 0x%llx (argv=%p, argv0=0x%llx)",
+                        static_cast<unsigned long long>(g_image.entry), static_cast<void*>(argv_ptr),
+                        static_cast<unsigned long long>(argv_ptr[1]));
     g_running.store(true);
     // Commit 2 MiB of the 8 MiB stack upfront (flags = 0 -> dwStackSize is
     // initial commit while PE /STACK:8388608 sets reserve) so Bloodborne's

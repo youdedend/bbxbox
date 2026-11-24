@@ -928,39 +928,58 @@ namespace {
 std::mutex g_stub_mu;
 std::uint8_t* g_stub_page = nullptr;
 std::size_t g_stub_used = 0;
+std::atomic<bool> g_guest_live{false};
 constexpr std::size_t g_stub_page_size = 0x40000;
 constexpr std::size_t kStub = 32;  // 23 bytes used
 
 // A stub is written into a page that already holds executable stubs, and the
-// console's container is strict W^X: the page is made writable, the bytes go
-// in, and it is made executable again with the instruction cache flushed
-// (`host_page_make_*`, which is a no-op pair on Linux, where the page is RWX).
-// The span covers a stub that straddles a page boundary.
+// console's container is strict W^X: before guest threads start, all boot stubs
+// pack densely into g_stub_page. Once guest threads are live, a fresh isolated
+// page is allocated per stub and sealed RX once so no live RX stub page is ever
+// flipped back to RW while another thread executes from it.
 void stub_write_begin(std::uint8_t* p) { host_page_make_writable(p, 2 * kStub); }
 void stub_write_end(std::uint8_t* p) { host_page_make_executable(p, 2 * kStub); }
 
+std::uint8_t* alloc_stub_slot_locked(bool* isolated_out) {
+#if defined(BBX_UWP)
+    if (g_guest_live.load(std::memory_order_acquire)) {
+        void* m = host_page_alloc(4096, true);
+        if (!m) return nullptr;
+        *isolated_out = true;
+        return static_cast<std::uint8_t*>(m);
+    }
+#endif
+    *isolated_out = false;
+    if (!g_stub_page) {
+        void* m = host_page_alloc(g_stub_page_size, true);
+        if (!m) {
+            host_log("thunk page alloc failed; HLE runs unthunked");
+            return nullptr;
+        }
+        g_stub_page = static_cast<std::uint8_t*>(m);
+    }
+    if (g_stub_used + kStub > g_stub_page_size) {
+        host_log("thunk page full; HLE runs unthunked");
+        return nullptr;
+    }
+    std::uint8_t* p = g_stub_page + g_stub_used;
+    g_stub_used += kStub;
+    return p;
+}
+
 }  // namespace
+
+void thunk_mark_guest_live() { g_guest_live.store(true, std::memory_order_release); }
 
 void* thunk_wrap(void* fn) {
     if (!fn) {
         return fn;
     }
     std::lock_guard<std::mutex> lock(g_stub_mu);
-    if (!g_stub_page) {
-        void* m = host_page_alloc(g_stub_page_size, true);
-        if (!m) {
-            host_log("thunk page alloc failed; HLE runs unthunked");
-            return fn;
-        }
-        g_stub_page = static_cast<std::uint8_t*>(m);
-    }
-    if (g_stub_used + kStub > g_stub_page_size) {
-        host_log("thunk page full; HLE runs unthunked");
-        return fn;
-    }
-    std::uint8_t* p = g_stub_page + g_stub_used;
-    g_stub_used += kStub;
-    stub_write_begin(p);
+    bool isolated = false;
+    std::uint8_t* p = alloc_stub_slot_locked(&isolated);
+    if (!p) return fn;
+    if (!isolated) stub_write_begin(p);
     std::uint8_t* c = p;
     *c++ = 0x49;
     *c++ = 0xbb;  // movabs r11, fn
@@ -986,7 +1005,8 @@ void* thunk_wrap(void* fn) {
         std::int32_t r32 = static_cast<std::int32_t>(rel);
         std::memcpy(c, &r32, 4);
     }
-    stub_write_end(p);
+    if (isolated) host_page_make_executable(p, 4096);
+    else stub_write_end(p);
     return p;
 }
 
@@ -1002,13 +1022,13 @@ void* thunk_wrap_capture_frame(void* fn) {
         return inner;
     }
     std::lock_guard<std::mutex> lock(g_stub_mu);
-    if (g_stub_used + kStub > g_stub_page_size) {
+    bool isolated = false;
+    std::uint8_t* p = alloc_stub_slot_locked(&isolated);
+    if (!p) {
         host_log("thunk page full; the frame capture is skipped");
         return inner;
     }
-    std::uint8_t* p = g_stub_page + g_stub_used;
-    g_stub_used += kStub;
-    stub_write_begin(p);
+    if (!isolated) stub_write_begin(p);
     std::uint8_t* c = p;
     static const std::uint8_t kHead[] = {0x48, 0x89, 0xe1,   // mov %rsp, %rcx
                                          0x49, 0x89, 0xe8,   // mov %rbp, %r8
@@ -1021,7 +1041,8 @@ void* thunk_wrap_capture_frame(void* fn) {
     *c++ = 0x41;
     *c++ = 0xff;
     *c++ = 0xe2;  // jmp *%r10
-    stub_write_end(p);
+    if (isolated) host_page_make_executable(p, 4096);
+    else stub_write_end(p);
     return p;
 }
 
@@ -1062,7 +1083,7 @@ void* guest_thread_enter() {
         }
     }
 #endif
-    auto* block = new unsigned char[kGuestTls + sizeof(GuestTcb) + 32]();
+    auto* block = static_cast<unsigned char*>(host_guest_memalign(64, kGuestTls + sizeof(GuestTcb) + 32));
     auto* tcb = reinterpret_cast<GuestTcb*>(block + kGuestTls);
     tcb->self = tcb;
     tcb->magic = kTcbMagic;
@@ -1130,6 +1151,6 @@ void guest_thread_leave(void* tcb_v) {
     t_guest_fs = nullptr;
     host_stack_free();
     if (tcb) {
-        delete[] (reinterpret_cast<unsigned char*>(tcb) - kGuestTls);
+        host_guest_free(reinterpret_cast<unsigned char*>(tcb) - kGuestTls);
     }
 }

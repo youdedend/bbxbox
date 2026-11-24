@@ -608,7 +608,14 @@ GUEST_ABI int hle_mkdir(const char* p, int mode) {
         set_guest_errno_host(ENOENT);
         return -1;
     }
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    (void)mode;
+    if (!bbx::hostfs::MkDir(host, false)) {
+        set_guest_errno_host(bbx::hostfs::LastError());
+        return -1;
+    }
+    return 0;
+#elif defined(_WIN32)
     (void)mode;
     return libc_result(_mkdir(host.c_str()));
 #else
@@ -621,7 +628,13 @@ GUEST_ABI int hle_rmdir(const char* p) {
         set_guest_errno_host(ENOENT);
         return -1;
     }
-#if defined(_WIN32)
+#if defined(BBX_UWP)
+    if (!bbx::hostfs::RmDir(host)) {
+        set_guest_errno_host(bbx::hostfs::LastError());
+        return -1;
+    }
+    return 0;
+#elif defined(_WIN32)
     return libc_result(_rmdir(host.c_str()));
 #else
     return libc_result(::rmdir(host.c_str()));
@@ -633,7 +646,22 @@ GUEST_ABI int hle_remove(const char* p) {
         set_guest_errno_host(ENOENT);
         return -1;
     }
+#if defined(BBX_UWP)
+    if (bbx::hostfs::IsDir(host)) {
+        if (!bbx::hostfs::RmDir(host)) {
+            set_guest_errno_host(bbx::hostfs::LastError());
+            return -1;
+        }
+        return 0;
+    }
+    if (!bbx::hostfs::Unlink(host)) {
+        set_guest_errno_host(bbx::hostfs::LastError());
+        return -1;
+    }
+    return 0;
+#else
     return libc_result(std::remove(host.c_str()));
+#endif
 }
 GUEST_ABI int hle_rename(const char* a, const char* b) {
     std::string ha = hle_fs_map_path(a);
@@ -642,7 +670,15 @@ GUEST_ABI int hle_rename(const char* a, const char* b) {
         set_guest_errno_host(ENOENT);
         return -1;
     }
+#if defined(BBX_UWP)
+    if (!bbx::hostfs::Rename(ha, hb, true)) {
+        set_guest_errno_host(bbx::hostfs::LastError());
+        return -1;
+    }
+    return 0;
+#else
     return libc_result(std::rename(ha.c_str(), hb.c_str()));
+#endif
 }
 GUEST_ABI int hle_stat(const char* p, void* sb) {
     int r = hle_fs_stat_path(p, sb);

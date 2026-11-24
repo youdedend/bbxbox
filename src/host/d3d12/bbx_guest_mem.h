@@ -177,6 +177,13 @@ struct GuestPlan {
 // `alias_bytes` bytes. SlotFor() places page n at slab 1 + n / kSlabPages.
 GuestPlan PlanGuestMemory(std::uint64_t ram_bytes = kGuestRamBytes, std::uint64_t alias_bytes = kGuestGpuAliasBytes);
 
+// The console runtime's layout: physical direct memory mapped at its identity
+// CPU window [0x100000000, 0x100000000 + ram_bytes) into slabs 1..20 (covering
+// up to 5 GiB of dmem up to 0x240000000), mirrored in the GPU alias window
+// [0xff00000000, 0xff00000000 + 4 GiB), plus [0, 2.75 GiB) in slabs 21..31 so
+// eboot/flexible-memory buffers below 4 GiB also resolve to valid slabs.
+GuestPlan PlanConsoleGuestMemory();
+
 // ---- slab runs, for host_gpu_mem_write / fill / copy -----------------------------
 
 // A guest range, cut where it moves to another slab: one buffer, one offset,

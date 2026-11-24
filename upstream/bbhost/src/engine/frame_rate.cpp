@@ -1762,6 +1762,16 @@ std::uint64_t rate_va(std::uint32_t bn) { return g_image->mem.slide + (bn - kPre
 // One write into the image at a BN address, its pages opened and closed again.
 void rate_write(std::uint32_t bn, const void* src, std::size_t n) {
     const std::uint64_t at = rate_va(bn), lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
+#if defined(BBX_UWP)
+    // Under strict AppContainer W^X, flipping a live executable .text page to
+    // PAGE_READWRITE while guest threads are running triggers a fatal DEP fault
+    // on any thread executing on that 4 KiB page. Skip runtime .text rewrites
+    // once guest threads are live (boot-time patches still apply before _start).
+    extern std::uint64_t hle_threads_made();
+    if (bn < kCodeEnd && hle_threads_made() > 0) {
+        return;
+    }
+#endif
     guest_protect_rwx(&g_image->mem, lo, hi - lo);
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), src, n);
     if (bn < kCodeEnd) guest_protect_rx(&g_image->mem, lo, hi - lo);

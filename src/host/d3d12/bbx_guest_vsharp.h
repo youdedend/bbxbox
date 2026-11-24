@@ -72,10 +72,10 @@ struct SlotDecision {
     std::uint64_t end = 0;  // base + bytes, saturating
 };
 
-// The guest's addressable window: the slabs this port maps, not the 1 TiB the
-// guest's own pointers may use (the GPU's window is the aliased part of RAM, and
-// that is what a V# in a dispatch can name).
-inline constexpr std::uint64_t kGuestWindowBytes = kGuestAddressableBytes;
+// The guest's addressable primary window: direct memory sits at [0x100000000, 0x240000000)
+// (up to 5 GiB starting at 4 GiB = 9 GiB ceiling), while the GPU alias window
+// [0xff00000000, +4 GiB) is checked alongside it in DecideSlot.
+inline constexpr std::uint64_t kGuestWindowBytes = (4ull << 30) + kGuestRamBytes;
 
 // `base_limit` is one past the highest address a slot may name. Passed in rather
 // than read from the header so a test can pin a smaller window.

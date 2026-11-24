@@ -52,7 +52,7 @@ void* tf_ring() {
     if (!g_tf_ring) {
         g_tf_ring = nullptr;
 #if defined(BBX_UWP)
-        g_tf_ring = VirtualAllocFromApp(nullptr, 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        g_tf_ring = host_low_map(0x20000);
 #elif defined(_WIN32)
         g_tf_ring = VirtualAlloc(nullptr, 0x20000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else

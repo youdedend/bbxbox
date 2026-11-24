@@ -21,6 +21,10 @@
 // Wraps fn (a SysV function) so the guest can call it. Returns fn unchanged on
 // platforms without the trampoline.
 void* thunk_wrap(void* fn);
+// Called right before guest _start spawns threads: subsequent dynamic stubs
+// allocate a fresh RW->RX page rather than flipping a live executable stub page
+// back to RW under strict W^X.
+void thunk_mark_guest_live();
 
 // thunk_wrap(), plus the guest's rsp and rbp as SysV arguments 4 and 5. Only
 // valid for an entry point patched at a function's first byte, where rsp

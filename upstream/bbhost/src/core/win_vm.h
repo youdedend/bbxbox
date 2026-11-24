@@ -67,4 +67,9 @@ void win_vm_dump_views();
 // them; the range becomes placeholder again.
 bool win_vm_unmap(void* at, std::uint64_t len);
 
+// Updates recorded view protection for [at, at+len) so the SEC_RESERVE
+// demand-commit VEH honors PAGE_NOACCESS and mprotect changes without eagerly
+// committing reserved pages.
+void win_vm_set_view_prot(void* at, std::uint64_t len, unsigned long protect);
+
 #endif

@@ -168,6 +168,21 @@ TEST(GuestMem_PlanStaysInsideTheSlabTable) {
     CHECK(none.refused.find("RAM") != std::string::npos);
 }
 
+TEST(GuestMem_PlanConsoleDmemAndAliasShareSlabs) {
+    const GuestPlan plan = PlanConsoleGuestMemory();
+    CHECK(plan.ok());
+    CHECK_EQ(plan.slabs_resident, kGuestSlabCount);
+    const std::vector<std::uint8_t> bytes = plan.table.Bytes();
+    // Direct memory at 0x100000000..0x240000000 maps to slabs 1..20, and the GPU
+    // alias at 0xff00000000..0x1000000000 mirrors the first 4 GiB (slabs 1..16).
+    CHECK(ShaderWalk(bytes, 0x100000000ull) == (GuestSlot{1, 0}));
+    CHECK(ShaderWalk(bytes, 0x142c00000ull) == ShaderWalk(bytes, kGuestGpuAliasBase + 0x42c00000ull));
+    CHECK(ShaderWalk(bytes, 0x200000000ull) == (GuestSlot{17, 0}));
+    CHECK(ShaderWalk(bytes, 0x23fff0000ull) == (GuestSlot{20, kGuestSlabBytes - kPageBytes}));
+    // Low window [0, 2.75 GiB) maps to slabs 21..31.
+    CHECK(ShaderWalk(bytes, 0x0ull) == (GuestSlot{21, 0}));
+}
+
 // host_gpu_mem_write's input: the range cut where it moves to another slab, with
 // byte offsets inside the buffer's own coordinates. An unmapped page is not a
 // write target, and neither is a run that would run off the end of a slab.

@@ -38,6 +38,8 @@ struct ThreadBody {
     void* arg;
     void* retval;
     void* tcb;
+    void* low_stack;
+    std::size_t low_stack_bytes;
     std::uint64_t exit_jb[12];
     bool can_exit;
     bool detached;
@@ -338,26 +340,9 @@ int test_thread_start_ms() {
     return ms;
 }
 
-void* thread_tramp(void* p) {
-#if defined(_WIN32)
-    using SetStackGuaranteeFn = BOOL(WINAPI*)(PULONG);
-    if (const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
-        if (const auto set_guarantee = reinterpret_cast<SetStackGuaranteeFn>(
-                ::GetProcAddress(k32, "SetThreadStackGuarantee"))) {
-            ULONG stack_guarantee = 65536;
-            (void)set_guarantee(&stack_guarantee);
-        }
-    }
-#endif
+void* thread_run_guest_body(void* p) {
     auto* t = static_cast<gsync::Thread*>(p);
     ThreadBody* b = body(t);
-    gsync::set_current_thread(t);
-    b->pt = pthread_self();
-    b->tid = host_thread_id();
-    b->started = true;
-    if (b->name[0]) {
-        host_thread_set_name(b->name);
-    }
     using Fn = void*(GUEST_ABI*)(void*);  // the guest's thread function
     // scePthreadExit longjmps back here from inside HLE (host FS, host
     // stack); hle_setjmp_raw has no same-stack check.
@@ -380,6 +365,41 @@ void* thread_tramp(void* p) {
         b->can_exit = false;
         guest_thread_leave(b->tcb);
     }
+    return b->retval;
+}
+
+void* thread_tramp(void* p) {
+#if defined(_WIN32)
+    using SetStackGuaranteeFn = BOOL(WINAPI*)(PULONG);
+    if (const HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll")) {
+        if (const auto set_guarantee = reinterpret_cast<SetStackGuaranteeFn>(
+                ::GetProcAddress(k32, "SetThreadStackGuarantee"))) {
+            ULONG stack_guarantee = 65536;
+            (void)set_guarantee(&stack_guarantee);
+        }
+    }
+#endif
+    auto* t = static_cast<gsync::Thread*>(p);
+    ThreadBody* b = body(t);
+    gsync::set_current_thread(t);
+    b->pt = pthread_self();
+    b->tid = host_thread_id();
+    b->started = true;
+    if (b->name[0]) {
+        host_thread_set_name(b->name);
+    }
+#if defined(BBX_UWP)
+    if (b->low_stack != nullptr) {
+        host_call_on_low_stack(thread_run_guest_body, t, b->low_stack, b->low_stack_bytes);
+        host_low_stack_free(b->low_stack, b->low_stack_bytes);
+        b->low_stack = nullptr;
+        b->low_stack_bytes = 0;
+    } else {
+        thread_run_guest_body(t);
+    }
+#else
+    thread_run_guest_body(t);
+#endif
     void* r = b->retval;
     if (b->detached) {
         gsync::thread_free(t);
@@ -409,23 +429,38 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     b->prio = ga ? ga->prio : 700;
     const bool detached = ga && ga->detach;
     b->detached = detached;
+    b->low_stack = nullptr;
+    b->low_stack_bytes = 0;
     if (name) {
         std::strncpy(b->name, name, sizeof(b->name) - 1);
     }
     pthread_attr_t ha;
     pthread_attr_init(&ha);
+#if defined(BBX_UWP)
+    // Place every guest pthread stack below 1 TiB so Bloodborne's 40-bit
+    // pointer packing never truncates stack-allocated addresses.
+    const std::size_t guest_stack = ((stack ? stack : kMinGuestStack) + 65535u) & ~std::size_t{65535u};
+    b->low_stack = host_low_stack_alloc(guest_stack);
+    if (b->low_stack != nullptr) {
+        b->low_stack_bytes = guest_stack;
+        pthread_attr_setstacksize(&ha, 256 * 1024);
+    } else if (stack >= 16384) {
+        pthread_attr_setstacksize(&ha, stack);
+    }
+#else
     if (stack >= 16384) {
         pthread_attr_setstacksize(&ha, stack);
     }
+#endif
     if (detached) {
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     }
     static int logs = 0;
     if (logs < 48) {
         ++logs;
-        host_log("pthread_create %s entry=0x%llx arg=%p stack=0x%zx -> %p", b->name,
+        host_log("pthread_create %s entry=0x%llx arg=%p stack=0x%zx low=%p -> %p", b->name,
                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(entry)), arg, stack,
-                 static_cast<void*>(t));
+                 b->low_stack, static_cast<void*>(t));
     }
     // Publish the handle before the thread can run so the child never sees
     // an empty slot.
@@ -438,6 +473,10 @@ int pthread_create_impl(void** th, void** attr, void* entry, void* arg, const ch
     if (e) {
         g_threads_starting.fetch_sub(1);
         *th = nullptr;
+        if (b->low_stack != nullptr) {
+            host_low_stack_free(b->low_stack, b->low_stack_bytes);
+            b->low_stack = nullptr;
+        }
         gsync::thread_free(t);
         return to_freebsd(e);
     }

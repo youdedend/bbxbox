@@ -1085,7 +1085,17 @@ GUEST_ABI int hle_save_dirname_search(const SaveSearchCond* cond, SaveSearchResu
     }
     std::vector<std::string> found;
     std::string root = hle_fs_map_path("/data/saves");
-#if !defined(_WIN32)
+#if defined(BBX_UWP)
+    std::vector<bbx::hostfs::DirEntry> entries;
+    if (bbx::hostfs::ListDir(root, &entries)) {
+        for (const auto& e : entries) {
+            if (e.name.empty() || e.name[0] == '.') continue;
+            if (glob_match(cond->dir_name, e.name.c_str()) && save_dir_exists(e.name.c_str())) {
+                found.push_back(e.name);
+            }
+        }
+    }
+#elif !defined(_WIN32)
     if (DIR* d = ::opendir(root.c_str())) {
         while (dirent* e = ::readdir(d)) {
             if (e->d_name[0] == '.') {

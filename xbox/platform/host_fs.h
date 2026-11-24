@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -126,6 +127,9 @@ struct Ops {
 [[nodiscard]] bool Rename(const std::string& from, const std::string& to, bool replace);
 [[nodiscard]] bool Canonical(const std::string& path, std::string* out);
 [[nodiscard]] int LastError();
+// Opens a C stdio FILE* through the platform's AppContainer-safe path (using
+// CreateFile2FromAppW + _open_osfhandle + _fdopen on UWP, std::fopen on desktop).
+[[nodiscard]] std::FILE* OpenStream(const char* path, const char* mode);
 
 // --- path habits -----------------------------------------------------------
 // The dump's paths arrive as `/app0/...` with forward slashes and the host's

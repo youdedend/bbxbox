@@ -774,6 +774,8 @@ struct GuestCompute::Impl {
             bound_slice = {};
         }
         bound_srv_copies.clear();
+        bound_cb_stride.fill(0);
+        bound_cb_w3.fill(0);
         bound_key = key;
         std::memcpy(bound_user_data.data(), d.user_data, sizeof(bound_user_data));
 
@@ -812,6 +814,12 @@ struct GuestCompute::Impl {
                 ++nulls;
                 break;
             case d3d12::BindingVerdict::kWrite:
+                if (binding >= gcn::kBindingStorageBuffer0 &&
+                    binding < gcn::kBindingStorageBuffer0 + gcn::kMaxBuffers) {
+                    const std::uint32_t buf_idx = binding - gcn::kBindingStorageBuffer0;
+                    bound_cb_stride[buf_idx] = write.view.stride != 0 ? write.view.stride : write.dwords;
+                    bound_cb_w3[buf_idx] = write.view.word3;
+                }
                 if (write.kind == d3d12::BindingKind::kUav) {
                     if (!WriteBufferUav(new_slice.offset, slot.index, write)) {
                         ++refused;

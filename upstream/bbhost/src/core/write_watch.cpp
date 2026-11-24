@@ -533,9 +533,10 @@ bool write_watch_install() {
         g_host_hi = g_host_lo + nt->OptionalHeader.SizeOfImage;
     }
 #if defined(BBX_UWP)
-    // A packaged title may not register a vectored exception handler (the
-    // console partition's headers do not declare the call): the watch is a
-    // development aid, and off means the writes go through unwatched.
+    // A packaged title does not run write_watch_veh; disable arming cleanly so
+    // any caller that checks g_enabled/g_arming_off sees the watch is inactive.
+    g_arming_off.store(true, std::memory_order_release);
+    g_enabled = false;
     return false;
 #else
     static PVOID h = AddVectoredExceptionHandler(1, write_watch_veh);

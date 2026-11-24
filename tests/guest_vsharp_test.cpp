@@ -146,13 +146,17 @@ TEST(GuestVSharp_AnUnalignedBaseIsRefused) {
 
 TEST(GuestVSharp_ABaseAboveTheWindowIsRefusedEvenWhenShort) {
     // 1 TiB is where the guest's own pointers live; a V# in a dispatch names the
-    // mapped slabs, which are far below it. The address is legal for the guest
-    // and not addressable by the page table, so it is refused, not truncated.
+    // mapped slabs (up to 9 GiB primary or inside the GPU alias window).
     std::uint32_t words[4] = {};
-    // 8 GiB: representable in a V# (40-bit base) and above the 7.75 GiB window.
-    MakeVSharp(words, 0x2'0000'0000ull, 0, 16);
+    // 10 GiB: representable in a V# (40-bit base) and above the 9 GiB primary window.
+    MakeVSharp(words, 0x2'8000'0000ull, 0, 16);
     const SlotDecision decision = DecideSlot(words);
     CHECK(decision.verdict == SlotVerdict::kOutsideGuest);
+
+    // A V# inside the GPU alias window [0xff00000000, +4 GiB) is bindable.
+    MakeVSharp(words, kGuestGpuAliasBase + 0x1000'0000ull, 16, 64);
+    const SlotDecision alias_decision = DecideSlot(words);
+    CHECK(alias_decision.verdict == SlotVerdict::kBindable);
 }
 
 TEST(GuestVSharp_AnOverflowingRangeIsRefusedRatherThanWrapped) {

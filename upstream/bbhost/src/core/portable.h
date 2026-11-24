@@ -113,13 +113,22 @@ const void* host_memmem(const void* hay, std::size_t hay_len, const void* needle
 
 // The guest heap. One family on each platform: Windows' aligned allocations
 // must be freed by their own free, so every guest block goes through
-// _aligned_* there, and through the C library here. Zeroed where the caller
-// asks (memalign and the nothrow new promise it).
+// _aligned_* there, and through the C library here. Under BBX_UWP every block
+// is placed below 1 TiB so Bloodborne's 40-bit packed pointers stay intact.
+// Zeroed where the caller asks (memalign and the nothrow new promise it).
 void* host_guest_malloc(std::size_t n);
 void* host_guest_calloc(std::size_t n, std::size_t size);
 void* host_guest_realloc(void* p, std::size_t n);
 void* host_guest_memalign(std::size_t align, std::size_t n);  // zeroed
 void host_guest_free(void* p);
+
+// Raw page allocation guaranteed below 1 TiB (< 0x10000000000) for guest stacks,
+// tessellation rings, and TCBs on platforms with high-entropy >1 TiB ASLR.
+void* host_low_map(std::size_t size);
+void host_low_free(void* p, std::size_t size);
+void* host_low_stack_alloc(std::size_t size);
+void host_low_stack_free(void* p, std::size_t size);
+void* host_call_on_low_stack(void* (*fn)(void*), void* arg, void* stack_base, std::size_t stack_size);
 
 // Pages for generated code: RWX on request (the thunk stubs), RW otherwise.
 // Under BBX_UWP "on request" means "will hold code, so it is never RWX": the

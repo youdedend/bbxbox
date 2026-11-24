@@ -257,6 +257,7 @@ target_sources(bbxbox PRIVATE
     # console run at 954a97c died of the handler re-entering itself, and these are
     # the same functions the host tests hold to.
     "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_fault_filter.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/host/core/bbx_redzone.cpp"
 )
 
 target_compile_features(bbxbox PRIVATE cxx_std_20)

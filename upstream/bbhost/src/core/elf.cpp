@@ -17,14 +17,15 @@ namespace {
 constexpr std::uint32_t PT_LOAD = 1;
 constexpr std::uint32_t PT_SCE_DYNLIBDATA = 0x61000000;
 constexpr std::uint32_t PT_SCE_PROC_PARAM = 0x61000001;
+constexpr std::uint32_t PT_SCE_RELRO = 0x61000010;
 constexpr std::uint32_t PF_X = 1;
 
 constexpr std::uint64_t DT_NULL = 0;
 constexpr std::uint64_t DT_INIT = 12;
 constexpr std::uint64_t DT_FINI = 13;
-constexpr std::uint64_t DT_SCE_STRTAB = 0x6100003d;
+constexpr std::uint64_t DT_SCE_STRTAB = 0x61000035;
 constexpr std::uint64_t DT_SCE_SYMTAB = 0x61000039;
-constexpr std::uint64_t DT_SCE_SYMENT = 0x61000035;
+constexpr std::uint64_t DT_SCE_SYMENT = 0x6100003d;
 constexpr std::uint64_t DT_SCE_JMPREL = 0x61000029;
 constexpr std::uint64_t DT_SCE_PLTRELSZ = 0x6100002d;
 constexpr std::uint64_t DT_SCE_RELA = 0x61000033;
@@ -147,7 +148,7 @@ bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena) {
     const Elf64_Phdr* ph = reinterpret_cast<const Elf64_Phdr*>(file.data() + eh.e_phoff);
     const Elf64_Phdr* dynlib_ph = nullptr;
     for (int i = 0; i < eh.e_phnum; ++i) {
-        if (ph[i].p_type == PT_LOAD) {
+        if (ph[i].p_type == PT_LOAD || ph[i].p_type == PT_SCE_RELRO) {
             min_va = std::min(min_va, ph[i].p_vaddr);
             max_va = std::max(max_va, ph[i].p_vaddr + ph[i].p_memsz);
         }
@@ -179,12 +180,12 @@ bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena) {
     }
 
     for (int i = 0; i < eh.e_phnum; ++i) {
-        if (ph[i].p_type != PT_LOAD) {
+        if (ph[i].p_type != PT_LOAD && ph[i].p_type != PT_SCE_RELRO) {
             continue;
         }
         image->segments.push_back({ph[i].p_vaddr, ph[i].p_filesz, ph[i].p_memsz, ph[i].p_flags});
         void* dest = guest_ptr(image->mem, image->mem.slide + ph[i].p_vaddr);
-        if (ph[i].p_filesz) {
+        if (ph[i].p_filesz && ph[i].p_offset + ph[i].p_filesz <= file.size()) {
             std::memcpy(dest, file.data() + ph[i].p_offset, ph[i].p_filesz);
         }
     }
@@ -232,6 +233,9 @@ bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena) {
     // in DT_SCE_RELA. Identify by magnitude instead of trusting the tag names.
     if (rela == 24 && relaent > 24) {
         std::swap(rela, relaent);
+    }
+    if (strtab == 24 && syment > 24) {
+        std::swap(strtab, syment);
     }
     if (relaent != 24) {
         relaent = 24;

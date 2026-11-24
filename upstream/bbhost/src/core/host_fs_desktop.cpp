@@ -355,4 +355,14 @@ const Ops kOps = {
 
 const Ops& Table() { return kOps; }
 
+std::FILE* OpenStream(const char* path, const char* mode) {
+    if (path == nullptr || mode == nullptr) {
+        Fail(EINVAL);
+        return nullptr;
+    }
+    std::FILE* f = std::fopen(path, mode);
+    if (f == nullptr) Fail(errno);
+    return f;
+}
+
 }  // namespace bbx::hostfs
