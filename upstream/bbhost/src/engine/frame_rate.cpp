@@ -1767,8 +1767,7 @@ void rate_write(std::uint32_t bn, const void* src, std::size_t n) {
     // PAGE_READWRITE while guest threads are running triggers a fatal DEP fault
     // on any thread executing on that 4 KiB page. Skip runtime .text rewrites
     // once guest threads are live (boot-time patches still apply before _start).
-    extern std::uint64_t hle_threads_made();
-    if (bn < kCodeEnd && hle_threads_made() > 0) {
+    if (bn < kCodeEnd && ::hle_threads_made() > 0) {
         return;
     }
 #endif
