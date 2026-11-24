@@ -80,6 +80,7 @@
 #include "core/imports.h"
 #include "core/legacy_cpu.h"
 #include "core/portable.h"
+#include "core/thunk.h"
 #include "engine/addr.h"
 #include "engine/debug_menu.h"
 #include "guest_abi.h"
@@ -92,6 +93,7 @@
 #include "host/perf_meter.h"
 #include "host/settings.h"
 #include "host/settings_store.h"
+#include "src/host/core/bbx_redzone.h"
 #include "src/host/core/bbx_self.h"
 #include "upstream/bbhost/src/log.h"
 
